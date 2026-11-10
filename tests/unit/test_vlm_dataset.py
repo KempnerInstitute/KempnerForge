@@ -894,11 +894,20 @@ class TestTextOnlyRows:
         assert item["input_ids"].shape == (8,)
         assert 0 < int(item["text_len"]) <= 8
 
-    @pytest.mark.parametrize("wrap", [lambda image: image, lambda image: [image]])
+    @pytest.mark.parametrize(
+        "wrap", [lambda image: image, lambda image: [image], lambda image: [None, image]]
+    )
     def test_a_row_with_an_image_is_unchanged(self, wrap):
         rows = [{"image": wrap(_make_image(8)), "caption": "a b"}]
         ds = _dataset_over(rows, allow_text_only=True)
         assert ds[0]["pixel_values"].shape == (3, 16, 16)
+
+    def test_a_list_of_nothing_is_text_only_and_a_list_of_several_raises(self):
+        ds = _dataset_over([{"image": [None, None], "caption": "a b"}], allow_text_only=True)
+        assert ds[0]["pixel_values"].shape == (0, 3, 16, 16)
+        rows = [{"image": [_make_image(8), _make_image(8)], "caption": "a b"}]
+        with pytest.raises(ValueError, match="holds 2 images"):
+            _dataset_over(rows)[0]
 
     def test_a_row_without_an_image_raises_by_default(self):
         ds = _dataset_over([{"image": None, "caption": "a b"}], allow_text_only=False)
@@ -1120,4 +1129,6 @@ class TestPackVLMSamples:
         with pytest.raises(ValueError, match="hf_allow_text_only"):
             collator([doc])
         packed = PackedVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2, allow_text_only=True)
+        assert packed([doc])["pixel_values"].shape == (0, 3, 4, 4)
+        doc["pixel_values"] = torch.zeros(0, 2, 3, 4, 4)
         assert packed([doc])["pixel_values"].shape == (0, 3, 4, 4)

@@ -257,9 +257,13 @@ def _warn_sample_masked_for_prompt(min_text_len: int, max_text_len: int) -> None
         )
 
 
-def _is_missing_image(value: Any) -> bool:
-    """True for a row without an image: ``None`` or an empty list of images."""
-    return value is None or (isinstance(value, list | tuple) and len(value) == 0)
+def _images_of(value: Any) -> list[Any]:
+    """The images an image field holds: none for ``None``, a list's present entries, else it."""
+    if value is None:
+        return []
+    if isinstance(value, list | tuple):
+        return [image for image in value if image is not None]
+    return [value]
 
 
 def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
@@ -465,18 +469,21 @@ class HuggingFaceVLMDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         row = self._ds[idx]
-        image = row[self._image_field]
-        if isinstance(image, list | tuple) and len(image) == 1:
-            image = image[0]
-        if _is_missing_image(image):
+        images = _images_of(row[self._image_field])
+        if not images:
             if not self._allow_text_only:
                 raise ValueError(
                     f"row {idx} has no image in field {self._image_field!r}; set "
                     "data.hf_allow_text_only = true to train on text-only rows"
                 )
             pixels = torch.zeros(0, 3, self._image_size, self._image_size)
+        elif len(images) > 1:
+            raise ValueError(
+                f"row {idx} holds {len(images)} images in field {self._image_field!r}; "
+                "a document takes one image"
+            )
         else:
-            pixels = pil_to_tensor(image, self._image_size, self._image_mean, self._image_std)
+            pixels = pil_to_tensor(images[0], self._image_size, self._image_mean, self._image_std)
         text_val = row[self._text_field]
         if not isinstance(text_val, str):
             raise TypeError(
@@ -623,6 +630,8 @@ def pack_vlm_samples(
         views = sample["pixel_values"]
         if views.dim() == 3:
             views = views.unsqueeze(0)
+        elif views.shape[0] == 0:
+            views = views.reshape(0, *views.shape[-3:])
         if views.shape[0] == 0 and not allow_text_only:
             raise ValueError(
                 "pack_vlm_samples got a text-only document; set data.hf_allow_text_only = true "

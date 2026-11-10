@@ -160,7 +160,11 @@ def _build_vlm_pipeline(
                 max_text_len=vlm_cfg.max_text_len,
                 allow_text_only=dataset.has_text_only_rows,
             )
-            logger.info(f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}")
+            rows = "with" if dataset.has_text_only_rows else "without"
+            logger.info(
+                f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
+                f"{rows} text-only rows"
+            )
 
     sampler = DistributedSampler(
         dataset,
