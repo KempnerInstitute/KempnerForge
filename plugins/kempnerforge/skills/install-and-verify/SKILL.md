@@ -29,7 +29,7 @@ Run every step in the background so the user isn't blocked — in Claude Code, s
 
 ## Context (auto-generated, do not edit)
 <!-- context-begin -->
-Lint scope: kempnerforge/ tests/ scripts/
+Lint scope: . (whole tree)
 Type-check scope: kempnerforge/
 Dev group: ruff, pyright[nodejs], pytest, pytest-timeout, vulture
 GPU test paths (NOT here): tests/integration/, tests/distributed/, tests/e2e/
