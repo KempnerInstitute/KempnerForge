@@ -13,7 +13,7 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.distributed as dist
@@ -33,6 +33,9 @@ from kempnerforge.training.freeze import apply_freeze_specs, freeze_meta_at_step
 from kempnerforge.training.grad import maybe_no_sync
 from kempnerforge.training.hooks import HookRunner, StepContext
 from kempnerforge.training.runtime import PipelineBundle, RuntimeContext, pp_group
+
+if TYPE_CHECKING:
+    from kempnerforge.model.transformer import Transformer
 
 logger = get_logger(__name__)
 
@@ -448,14 +451,13 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
     model = session.model
 
     if mc.is_moe:
-        inner = inner_transformer(model)
-        moe_metrics = {"moe/aux_loss": inner.get_moe_aux_loss().item()}  # type: ignore[attr-defined]
-        moe_metrics["moe/router_z_loss"] = inner.get_moe_router_z_loss().item()  # type: ignore[attr-defined]
+        inner = cast("Transformer", inner_transformer(model))
+        moe_metrics = {"moe/aux_loss": inner.get_moe_aux_loss().item()}
+        moe_metrics["moe/router_z_loss"] = inner.get_moe_router_z_loss().item()
         routers: list[tuple[str | None, torch.Tensor]] = [
-            (None, counts)
-            for counts in inner.get_expert_counts().values()  # type: ignore[attr-defined]
+            (None, counts) for counts in inner.get_expert_counts().values()
         ]
-        for per_modality in inner.get_mot_expert_counts().values():  # type: ignore[attr-defined]
+        for per_modality in getattr(inner, "get_mot_expert_counts", dict)().values():
             routers.extend(per_modality.items())
         moe_metrics.update(_expert_balance(routers))
         tracker.log_eval(moe_metrics, step)
