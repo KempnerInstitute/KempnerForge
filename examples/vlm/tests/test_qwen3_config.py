@@ -108,7 +108,7 @@ def test_only_the_vision_side_trains(config: JobConfig) -> None:
     assert [(spec.module, spec.frozen) for spec in config.vlm.freeze] == [("transformer", True)]
 
 
-def test_warm_start_is_weights_only(config: JobConfig) -> None:
+def test_warm_start_skips_the_optimizer(config: JobConfig) -> None:
     assert config.checkpoint.load_path == "path-to-init-checkpoint"
     assert config.checkpoint.exclude_from_loading == ["optimizer"]
 

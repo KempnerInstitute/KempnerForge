@@ -438,9 +438,38 @@ class TestCheckpointConfig:
         with pytest.raises(ValueError, match="interval must be positive"):
             CheckpointConfig(interval=0)
 
-    @pytest.mark.parametrize("keys", [[], ["model"], ["optimizer"], ["model", "optimizer"]])
-    def test_exclude_from_loading_accepts_the_two_state_keys(self, keys):
+    @pytest.mark.parametrize(
+        "keys",
+        [
+            [],
+            ["model"],
+            ["optimizer"],
+            ["model", "optimizer"],
+            ["optimizer", "train_state"],
+            ["train_state", "optimizer"],
+        ],
+    )
+    def test_exclude_from_loading_accepts_the_state_keys(self, keys):
         assert CheckpointConfig(exclude_from_loading=keys).exclude_from_loading == keys
+
+    @pytest.mark.parametrize(
+        "keys",
+        [["train_state"], ["model", "train_state"], ["model", "optimizer", "train_state"]],
+    )
+    def test_train_state_is_rejected_outside_the_weights_only_pair(self, keys):
+        with pytest.raises(ValueError, match="must be \\['optimizer', 'train_state'\\]"):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    @pytest.mark.parametrize(
+        "keys", [["optimizer", "optimizer"], ["optimizer", "train_state", "train_state"]]
+    )
+    def test_exclude_from_loading_rejects_a_repeated_key(self, keys):
+        with pytest.raises(ValueError, match="repeats a key"):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    def test_exclude_from_loading_rejects_a_bare_string(self):
+        with pytest.raises(ValueError, match="must be a list"):
+            CheckpointConfig(exclude_from_loading="optimizer")  # type: ignore[arg-type]
 
     @pytest.mark.parametrize(
         "keys",
@@ -455,6 +484,19 @@ class TestCheckpointConfig:
         toml = tmp_path / "ckpt.toml"
         toml.write_text('[checkpoint]\nexclude_from_loading = ["lm_head"]\n')
         with pytest.raises(ValueError, match="exclude_from_loading"):
+            load_config(str(toml), cli_args=[])
+
+    @pytest.mark.parametrize("keys", [[["optimizer", "train_state"]], [{"optimizer": True}]])
+    def test_exclude_from_loading_rejects_unhashable_elements(self, keys):
+        with pytest.raises(
+            ValueError, match="accepts only 'model', 'optimizer' and/or 'train_state'"
+        ):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    def test_nested_exclude_from_loading_is_validated_from_toml(self, tmp_path):
+        toml = tmp_path / "ckpt.toml"
+        toml.write_text('[checkpoint]\nexclude_from_loading = [["optimizer", "train_state"]]\n')
+        with pytest.raises(ValueError, match="accepts only"):
             load_config(str(toml), cli_args=[])
 
     def test_dyn_ckpt_window_defaults_to_none(self):
