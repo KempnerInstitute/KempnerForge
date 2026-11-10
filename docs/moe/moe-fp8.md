@@ -109,12 +109,6 @@ and there only on attention, the output head and dense-layer MLPs:
 the shared expert is part of that half but is excluded too, so it
 stays bf16.
 
-For the 7B dense Llama reference (see
-[Benchmarks § MFU scaling](../reference/benchmarks.md#mfu-scaling-dense)),
-FP8 provides a measurable throughput lift at 16 GPUs. For MoE runs,
-the same config would see a smaller lift because the expert portion
-of compute runs at bf16 regardless.
-
 ## Config
 
 One switch:
@@ -134,10 +128,11 @@ edit `apply_float8` directly.
 Three separate constraints:
 
 - **FP8 + TP**: Not supported.
-  [`JobConfig.__post_init__`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/job.py)
+  [`JobConfig.validate`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/job.py)
   raises when `train.mixed_precision = "fp8"` and `distributed.tp > 1`.
-  Reason: `Float8Linear`'s weight wrapper calls `aten.is_pinned` on
-  DTensor, which has no sharding strategy yet. See
+  Reason: torchao's `Float8Linear` does not compose with the DTensor
+  sharding of the TP plan, and the float8 all-gather also calls
+  `aten.is_pinned` on `DTensor`, which has no sharding strategy yet. See
   [FP8 § TP incompatibility](../distributed/fp8.md#tp-incompatibility).
 - **FP8 + EP**: Fine. Experts are excluded from FP8, so EP — which
   operates on experts — is orthogonal to the conversion.

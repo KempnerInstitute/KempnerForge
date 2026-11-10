@@ -13,17 +13,18 @@ page is the researcher-facing decision and workflow.
 | If… | FP8 is likely to help |
 |-----|:---------------------:|
 | You're on H100 / H200 | yes |
-| You're on A100 / V100 or older | no (falls back, no speedup) |
+| You're on A100 / V100 or older | no (`torch._scaled_mm` raises; FP8 does not run) |
 | Model is dense (no MoE) or MoE with heavy attention | yes |
 | Model is tiny (dim < ~1024) | marginal |
 | You need TP (`distributed.tp > 1`) | **blocked** — see below |
 | You need the absolute-best eval loss at small step counts | maybe not — see [Accuracy tradeoff](#accuracy-tradeoff) |
 
-Expected gain on Hopper: the FSDP2 all-gather moves half the bytes,
-and matmuls run on fourth-gen tensor cores instead of bf16 tensor
-cores. Exact MFU numbers are workload-dependent; consult
-[Reference § Benchmarks](../reference/benchmarks.md#mfu-scaling-dense)
-for measured values.
+Where the gain comes from on Hopper: the FSDP2 all-gather moves half
+the bytes, and the converted matmuls run as FP8 GEMMs, whose peak is
+twice the bf16 peak. How much of that reaches end-to-end throughput
+depends on the model and batch shape, so compare `tok/s` against a bf16
+run of the same config; the logged MFU uses the bf16 peak for both
+([MFU § FP8 caveat](../metrics-and-profiling/mfu.md#fp8-caveat)).
 
 ## Turn it on
 
@@ -43,7 +44,7 @@ before AC/FSDP2, and the master weights stay bf16, or fp32 with
 ### Reference config
 
 [`configs/train/7b_16gpu_fp8.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/7b_16gpu_fp8.toml)
-is a production-ready 7B Llama-3 recipe on 16 H100s:
+is the 7B Llama-3 FP8 recipe for 16 GPUs (4 nodes of 4):
 
 ```toml
 [train]
@@ -68,7 +69,7 @@ activations OOM.
 | Pairing | Works? | Notes |
 |---------|:------:|-------|
 | FP8 + FSDP2 | yes | Primary path. `enable_fsdp_float8_all_gather=True` is on by default. |
-| FP8 + TP | **no** | Config validation rejects this — see [`JobConfig.__post_init__`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/job.py). |
+| FP8 + TP | **no** | Config validation rejects this; see [`JobConfig.validate`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/job.py). |
 | FP8 + EP | yes | Experts and the router are excluded from FP8 conversion; attention and dense blocks still use FP8. |
 | FP8 + `torch.compile` | yes | Recommended combination. |
 | FP8 + PP | yes | PP stages compose with FP8 the same way as bf16. |
@@ -186,14 +187,15 @@ multiple of 16, or train in bf16.
 config validator ran. Either set `distributed.tp = 1` (and let FSDP
 handle sharding) or drop `mixed_precision = "fp8"`.
 
-**`torch._scaled_mm` warning about unsupported hardware.** You're on
-a pre-Hopper GPU. FP8 falls back to bf16 matmul and you get no
-speedup — disable FP8 for this cluster.
+**`RuntimeError: torch._scaled_mm is only supported on CUDA devices with compute capability >= 9.0 or 8.9` in the first step.**
+The GPU is older than FP8 support (an A100 or older). FP8 does not fall
+back to bf16 matmuls there; train with `mixed_precision = "bf16"` on
+this cluster.
 
-**`aten.is_pinned` DTensor error at model build.** A TP + FP8
-combination slipped past the config check. The guard in
-[`apply_float8`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/parallel.py)
-is explicit about this.
+**`aten.is_pinned` DTensor error at model build.** `apply_float8` was
+called on a model with tensor-parallel weights outside the config path;
+the config check rejects FP8 with `tp > 1`. Build with `tp = 1`, or
+train without FP8.
 
 **Loss diverges in the first ~50 steps.** Expected early-step noise
 is subtle; an actual divergence usually means the LR is set for
@@ -219,7 +221,5 @@ slightly larger than bf16 matmul. Drop `batch_size` or switch to
   — the `FP8 + TP` check.
 - [Debug training regressions](debug-training-regressions.md) — the
   profiler workflow to verify FP8 kernels are firing.
-- [Reference § Benchmarks](../reference/benchmarks.md) — measured MFU
-  for FP8 runs at several model sizes.
 - [`configs/train/7b_16gpu_fp8.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/7b_16gpu_fp8.toml)
   — the reference recipe this page points at.

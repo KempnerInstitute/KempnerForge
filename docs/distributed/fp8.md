@@ -96,20 +96,22 @@ currently hard-codes the default (see
 # aten.is_pinned on DTensors, which has no sharding strategy yet.
 ```
 
-(Comment from `apply_float8`.) When TP is on, the float8 all-gather
-path triggers `aten.is_pinned` on DTensor, which PyTorch doesn't
-have a sharding rule for and which errors out. Workaround: set
-`enable_fsdp_float8_all_gather=False` manually if combining TP + FP8
-— the conversion still applies, only the FP8 all-gather optimization
-is disabled.
+Config validation rejects `train.mixed_precision = "fp8"` with
+`distributed.tp > 1` (`JobConfig.validate`), so a TP + FP8 run stops at
+startup. The reason in the error is that torchao's `Float8Linear` does
+not compose with the DTensor sharding the TP plan applies. The comment
+above, from the `apply_float8` docstring, records a second problem, in
+the float8 all-gather. Turning off `enable_fsdp_float8_all_gather` is
+not a workaround: the config check rejects the combination either way.
 
 See [Validation rules](../configuration/validation-rules.md) (the
 **FP8 + TP** section) for the config-level check.
 
 ## Application order
 
-FP8 conversion runs **after** TP / EP (so it sees the already-TP-wrapped
-DTensors) and **before** AC / FSDP2:
+FP8 conversion runs **after** TP / EP and **before** AC / FSDP2. In
+practice TP is off whenever FP8 is on (see
+[TP incompatibility](#tp-incompatibility)):
 
 ```
 apply_tensor_parallel(model, mesh)
@@ -170,9 +172,12 @@ recipes / filters require editing `apply_float8` directly.
 
 ## Hardware
 
-FP8 requires H100 / H200 or newer (Hopper+ with fourth-gen Tensor
-Cores). On Ampere (A100), `torch._scaled_mm` falls back and the
-speedup disappears — usually with an explicit PyTorch warning.
+FP8 needs `torch._scaled_mm`, which runs on GPUs of compute capability
+8.9 (Ada) or 9.0 and newer (Hopper, such as H100 and H200). On older
+GPUs such as the A100 it raises in the first forward,
+`torch._scaled_mm is only supported on CUDA devices with compute
+capability >= 9.0 or 8.9`, so an FP8 run stops there instead of falling
+back to bf16. Train in bf16 on those GPUs.
 
 ## Example: `7b_16gpu_fp8.toml`
 
@@ -187,10 +192,10 @@ dp_shard = -1                     # auto — fills the mesh
 tp = 1
 ```
 
-With 16× H200 and TP off, `enable_fsdp_float8_all_gather=True` is the
-full FP8 path — FSDP2 all-gathers ride FP8, matmuls run on Hopper
-tensor cores, master weights stay bf16 (fp32 with `fp32_master_weights`). Benchmark in
-[Benchmarks § MFU scaling](../reference/benchmarks.md#mfu-scaling-dense).
+With 16 H200s and TP off, `enable_fsdp_float8_all_gather=True` is the
+full FP8 path: FSDP2 all-gathers ride FP8, matmuls run on Hopper
+tensor cores, and master weights stay bf16 (fp32 with
+`fp32_master_weights`).
 
 ## Accuracy notes
 
@@ -211,11 +216,9 @@ different `mixed_precision` to transition phases.
 - [FSDP2 § Mixed precision policy](fsdp2.md#mixed-precision-policy) —
   how `MixedPrecisionPolicy` interacts with FP8 (it doesn't — FSDP2
   sees FP8 as bf16 with an attached scale).
-- [Tensor parallelism](tensor-parallelism.md) — the TP + FP8 +
-  `enable_fsdp_float8_all_gather=False` interaction.
+- [Tensor parallelism](tensor-parallelism.md): the TP plan, which FP8
+  does not run with yet.
 - [Parallelism order](../architecture/parallelism-order.md) (see
   **Float8 before AC and FSDP**) — why FP8 runs between EP and AC.
 - [Validation rules](../configuration/validation-rules.md) (see
   **FP8 + TP**) — the config-level `tp > 1 + fp8` check.
-- [Benchmarks](../reference/benchmarks.md) — measured FP8 MFU
-  numbers.
