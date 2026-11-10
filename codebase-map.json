@@ -355,6 +355,7 @@
         "tests/unit/test_mot.py::TestMoTAttentionNumerical",
         "tests/unit/test_mot.py::TestMoTBlock",
         "tests/unit/test_mot.py::TestWarmStartHelper",
+        "tests/unit/test_activation_checkpointing.py::TestMoTWarmStart",
         "tests/unit/test_model.py::TestMoT",
         "tests/integration/test_vlm_mot.py",
         "tests/distributed/test_vlm_mot_fsdp.py"

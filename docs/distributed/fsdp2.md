@@ -209,8 +209,23 @@ Three modes from
 | `act_ckpt` | What gets rematerialized |
 |------------|--------------------------|
 | `"none"` | Nothing; fastest; uses most memory |
-| `"full"` | Every `TransformerBlock` — entire block is recomputed on backward |
-| `"selective"` | Only the `Attention` module within each block — MLP activations stay materialized |
+| `"full"` | Every block, each child of `layers` and `cross_attention_layers` whatever its class (`TransformerBlock`, `MoTBlock`, `MoMaBlock`, `CrossAttentionBlock`); the entire block is recomputed on backward |
+| `"selective"` | Only the attention module within each block (`Attention`, `MoTAttention` or `CrossAttention`); MLP activations stay materialized |
+
+`apply_ac` logs the classes it wrapped and returns the number of
+modules it wrapped. Under `"selective"`, a block that holds none of
+those attention classes stays unwrapped, and `apply_ac` warns with
+the block's class; `"full"` covers it. A block that already holds a
+`CheckpointWrapper` is left as it is, so a second call wraps nothing.
+
+Wrapping adds a `_checkpoint_wrapped_module.` segment to the names
+`named_modules()` and `named_parameters()` give whatever is inside, for
+example `transformer.layers.0._checkpoint_wrapped_module.attn.q_proj.image.weight`.
+`state_dict()` and DCP checkpoints drop it, so a checkpoint loads
+under any mode. Freeze patterns match the `named_parameters()` names,
+though: the default module aliases end in `*` and still match, while a
+raw pattern that spells a path inside a wrapped module, such as
+`transformer.layers.0.attn.*`, matches nothing under `"full"`.
 
 All three use `CheckpointImpl.NO_REENTRANT` — the modern
 `torch.utils.checkpoint` implementation that composes cleanly with
