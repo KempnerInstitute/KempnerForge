@@ -1457,6 +1457,98 @@ class TestMLflowTelemetry:
             random.setstate(saved)
 
 
+class TestWarmStartRun:
+    """A checkpoint.load_path warm start logs to a run of its own, tagged with its source (#511).
+
+    Real MLflow over a local file store, through the real CheckpointManager and
+    restore_checkpoint; the tag names are spelled out, so the tests fail on main by behavior.
+    """
+
+    @staticmethod
+    def _stage1(mlflow, tmp_path):
+        """A source run that logged steps 1..10, and its checkpoint at step 5."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.checkpoint import CheckpointConfig
+
+        uri = (tmp_path / "mlruns").as_uri()
+        store = mlflow.MlflowClient(uri)
+        source = store.create_run(store.create_experiment("ws"), run_name="stage1").info.run_id
+        for s in range(1, 11):
+            store.log_metric(source, "train/loss", float(s), step=s)
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        stage1 = CheckpointManager(CheckpointConfig(dir=str(tmp_path / "stage1")), model, optimizer)
+        stage1.save(step=5, extra={"mlflow_run_id": source})
+        return uri, store, source
+
+    @staticmethod
+    def _stage2(tmp_path, uri, experiment, last_step):
+        """Launch stage 2 with ``load_path`` at stage 1's step 5 (an auto-resume once stage 2
+        has saved), log ``train/loss`` up to ``last_step`` and save there.
+
+        Returns the restored step, the run the backend logged to, and whether it was active.
+        """
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.training.data_pipeline import PhaseState
+        from kempnerforge.training.entry import restore_checkpoint
+        from kempnerforge.training.loop import checkpoint_extra
+
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        job = JobConfig()
+        job.checkpoint.dir = str(tmp_path / "stage2")
+        job.checkpoint.load_path = str(tmp_path / "stage1" / "step_5")
+        job.metrics = _mlflow_cfg(
+            mlflow_tracking_uri=uri, mlflow_experiment=experiment, mlflow_run_name="stage2"
+        )
+        manager = CheckpointManager(job.checkpoint, model, optimizer)
+        step, _ = restore_checkpoint(job, model, None, manager)
+        backend = MLflowBackend(job.metrics, job)
+        for s in range(step + 1, last_step + 1):
+            backend.log({"train/loss": 100.0 + s}, step=s)
+        _flush(backend)
+        active = backend._active
+        manager.save(step=last_step, extra=checkpoint_extra(job, last_step, PhaseState()))
+        backend.close()
+        return step, job.metrics.mlflow_run_id, active
+
+    @pytest.mark.parametrize("experiment", ["ws", "stage2"], ids=["same", "other-experiment"])
+    def test_a_warm_start_logs_to_a_new_run_and_leaves_the_source_run_alone(
+        self, monkeypatch, tmp_path, experiment
+    ):
+        mlflow = pytest.importorskip("mlflow")
+        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+        monkeypatch.setenv("MLFLOW_DISABLE_TELEMETRY", "true")
+        uri, store, source = self._stage1(mlflow, tmp_path)
+        step, new, active = self._stage2(tmp_path, uri, experiment, last_step=7)
+        assert (step, active) == (5, True)
+        assert new and new != source
+        history = {m.step: m.value for m in store.get_metric_history(new, "train/loss")}
+        assert history == {6: 106.0, 7: 107.0}
+        run = store.get_run(new)
+        assert run.data.tags["kempnerforge.warm_start.source_run_id"] == source
+        assert run.data.tags["kempnerforge.warm_start.checkpoint"] == str(
+            (tmp_path / "stage1" / "step_5").resolve()
+        )
+        assert run.data.params["checkpoint.load_path"] == str(tmp_path / "stage1" / "step_5")
+        assert store.get_run(source).info.run_name == "stage1"
+        assert [m.value for m in store.get_metric_history(source, "train/loss")] == [
+            float(s) for s in range(1, 11)
+        ]
+
+    def test_a_requeued_warm_start_continues_its_own_run(self, monkeypatch, tmp_path):
+        """Once stage 2 has saved, a requeue resumes stage 2's checkpoint and its new run."""
+        mlflow = pytest.importorskip("mlflow")
+        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+        monkeypatch.setenv("MLFLOW_DISABLE_TELEMETRY", "true")
+        uri, store, source = self._stage1(mlflow, tmp_path)
+        _, first, _ = self._stage2(tmp_path, uri, "ws", last_step=7)
+        step, second, _ = self._stage2(tmp_path, uri, "ws", last_step=9)
+        assert step == 7 and second == first != source
+        history = {m.step: m.value for m in store.get_metric_history(first, "train/loss")}
+        assert history == {6: 106.0, 7: 107.0, 8: 108.0, 9: 109.0}
+
+
 class TestRunOwner:
     def test_start_and_end_share_one_thread_that_is_not_the_caller(self):
         seen: list = []

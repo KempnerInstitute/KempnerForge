@@ -193,11 +193,17 @@ if config.metrics.mlflow_run_id:
     extra["mlflow_run_id"] = config.metrics.mlflow_run_id
 ```
 
-On resume it is restored right after `ckpt_mgr.load(...)`:
+On an auto-resume from `checkpoint.dir` it is restored right after `ckpt_mgr.load(...)`:
 
 ```python
-if ckpt_extra_loaded.get("mlflow_run_id"):
-    config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
+# training/entry.py::restore_checkpoint
+if resume_path is not None:
+    if ckpt_extra_loaded.get("wandb_run_id"):
+        config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
+    if ckpt_extra_loaded.get("mlflow_run_id"):
+        config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
+elif rank_zero:
+    _tag_warm_start_run(config, ckpt_extra_loaded)
 ```
 
 `start_run(run_id=...)` then reattaches to the same run, so metrics continue on one curve across
@@ -208,6 +214,19 @@ re-logging the steps the run already holds: every metric at or below the highest
 step in the run's history is dropped, so re-executing the steps between the last checkpoint and
 the crash does not duplicate points. If that history cannot be read, nothing is skipped. The
 params, tags and artifacts are not written again.
+
+**Warm start.** A `checkpoint.load_path` warm start, which runs only while `checkpoint.dir`
+holds no checkpoint, is a new run: the run ids its checkpoint carries are not restored, so the
+backend starts a new MLflow run with its own params, tags and artifacts, and the run that saved
+the checkpoint keeps its name and its steps. Rank 0 adds two tags to the new run through
+`metrics.mlflow_tags` (a configured tag of the same name wins):
+`kempnerforge.warm_start.checkpoint`, the real path of the step directory it loaded, and
+`kempnerforge.warm_start.source_run_id`, the MLflow run that saved it, read from the
+checkpoint's `metadata.json` (else from its `train_state.pt`) and left out when neither records
+one. The warm start's own checkpoints record its new run, so a requeue after its first save
+auto-resumes that run; one preempted before its first save starts another new run, as a fresh
+run does. To log a warm start into an existing run on purpose, set `metrics.mlflow_run_id`: a
+run id the config sets is kept, and the resume rules above apply to it.
 
 ## Finding a checkpoint's run
 
@@ -221,9 +240,9 @@ Each checkpoint's `metadata.json` names the live run in its `tracking` list
 All four fields are always present and non-empty, or the entry is left out. `tracking_uri` is
 the URI the backend resolved (config, then `$MLFLOW_TRACKING_URI`, then `"databricks"`) with
 any `user:token@` credentials stripped, and `experiment` the name it set the run up under. The
-entry comes from `MLflowBackend.tracking_entry()`; resume is unaffected and still restores
-`mlflow_run_id` from `train_state.pt`. Offline tools select on it, as the
-[publisher](#publishing-eval-results) does.
+entry comes from `MLflowBackend.tracking_entry()`; an auto-resume still restores
+`mlflow_run_id` from `train_state.pt`, and a warm start reads this entry to tag its new run.
+Offline tools select on it, as the [publisher](#publishing-eval-results) does.
 
 ## Registering checkpoints
 
@@ -351,8 +370,10 @@ evaluation.
   directory as `mlflow.source.git.commit`, with `mlflow.source.git.dirty` (`true` when tracked
   files differ from it), skipped quietly when git or a repository is missing;
   `metrics.mlflow_description` as the run description (`mlflow.note.content`); and every entry
-  of `metrics.mlflow_tags`. Configured tags are applied last, so one replaces an automatic tag
-  of the same key.
+  of `metrics.mlflow_tags`, which on a `checkpoint.load_path` warm start also holds
+  `kempnerforge.warm_start.checkpoint` and `kempnerforge.warm_start.source_run_id`
+  ([warm start](#run-id-and-resume)). Configured tags are applied last, so one replaces an
+  automatic tag of the same key.
 - **Artifacts**, also when a new run starts: `config.json`, the resolved `JobConfig` (TOML, CLI
   overrides and defaults applied), and the launch TOML under its own file name when the first
   command-line argument names a `.toml` file (how `scripts/train.py` takes its config); without

@@ -139,23 +139,27 @@ the rest as the third tuple element:
 
 ```python
 step, tokens_seen, extra = ckpt_mgr.load(path=..., scheduler=scheduler)
-if extra.get("wandb_run_id"):
-    config.metrics.wandb_run_id = extra["wandb_run_id"]
-if extra.get("mlflow_run_id"):
-    config.metrics.mlflow_run_id = extra["mlflow_run_id"]
+if resume_path is not None:
+    if extra.get("wandb_run_id"):
+        config.metrics.wandb_run_id = extra["wandb_run_id"]
+    if extra.get("mlflow_run_id"):
+        config.metrics.mlflow_run_id = extra["mlflow_run_id"]
 ```
 
 KempnerForge uses this for:
 
 - `phase_idx` — current curriculum phase (so training resumes the
   correct data mix without skipping forward).
-- `wandb_run_id` — so resumed runs append to the same W&B run rather
-  than starting a new one.
+- `wandb_run_id`: so an auto-resumed run appends to the same W&B run
+  rather than starting a new one. A `checkpoint.load_path` warm start
+  does not restore it, since it is a new run with runs of its own.
 - `mlflow_run_id`: the same for MLflow; on resume, steps up to the last
   `train/loss` step the run already holds are not logged again (best
-  effort: if reading the run's history fails, nothing is skipped). The
-  checkpoint's `metadata.json` also records the live run as plain JSON,
-  for tools that read it without loading this file.
+  effort: if reading the run's history fails, nothing is skipped). A
+  warm start instead tags its new run with this id, as
+  `kempnerforge.warm_start.source_run_id`. The checkpoint's
+  `metadata.json` also records the live run as plain JSON, for tools
+  that read it without loading this file.
 
 Custom training workflows can use it for anything
 `torch.save`-serializable.

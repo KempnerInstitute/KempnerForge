@@ -96,19 +96,25 @@ if resume_path or config.checkpoint.load_path:
         path=str(resume_path) if resume_path else None,
         scheduler=scheduler,
     )
-    if ckpt_extra_loaded.get("wandb_run_id"):
-        config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
-    if ckpt_extra_loaded.get("mlflow_run_id"):
-        config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
+    if resume_path:
+        if ckpt_extra_loaded.get("wandb_run_id"):
+            config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
+        if ckpt_extra_loaded.get("mlflow_run_id"):
+            config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
+    elif rank_zero:
+        _tag_warm_start_run(config, ckpt_extra_loaded)
 ```
 
 So two things can trigger a resume:
 
-- **`resume_path` found**: auto-resume; user passed nothing.
+- **`resume_path` found**: auto-resume; user passed nothing. It
+  continues the run, its MLflow and W&B runs included.
 - **`config.checkpoint.load_path` set**: a warm start from that
   path, used only while `checkpoint.dir` holds no checkpoint. Useful
   for loading pretrained weights, fine-tuning from a specific
-  checkpoint, or debugging.
+  checkpoint, or debugging. It is a new run, so it logs to new MLflow
+  and W&B runs, and its MLflow run is tagged with the checkpoint it
+  started from ([MLflow § Run ID and resume](../metrics-and-profiling/mlflow.md#run-id-and-resume)).
 
 If both are set, `resume_path` wins (auto-resume takes precedence
 over the static config). This is deliberate: SLURM requeues should
@@ -259,7 +265,11 @@ load_path = "checkpoints/step_5000"
 `load_path` is used only while `dir` holds no checkpoint. With
 `exclude_from_loading` empty it restores the full state of step 5000,
 and requeues of the new run resume from its own checkpoints in the new
-`dir`. Setting `load_path` to `step_5000` while `dir` stays
+`dir`. The new run logs to new MLflow and W&B runs, the MLflow one
+tagged with the checkpoint it started from
+([MLflow § Run ID and resume](../metrics-and-profiling/mlflow.md#run-id-and-resume)),
+while rewinding `latest` as above continues the original runs. Setting
+`load_path` to `step_5000` while `dir` stays
 `checkpoints` does not roll back: the run resumes from the newest
 checkpoint there, and rank 0 warns that `load_path` is not used.
 

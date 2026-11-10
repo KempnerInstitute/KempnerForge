@@ -330,7 +330,7 @@ enabled in one run config.
 | `enable_tensorboard` | `bool` | `False` | turn on TensorBoard backend |
 | `wandb_project` | `str` | `"kempnerforge"` | WandB project name |
 | `wandb_run_name` | `str \| None` | `None` | `None` → auto-generated |
-| `wandb_run_id` | `str` | `""` | restored from checkpoint on resume; empty = new run |
+| `wandb_run_id` | `str` | `""` | restored from the checkpoint on an auto-resume, never on a `checkpoint.load_path` warm start; empty = new run |
 | `tensorboard_dir` | `str` | `"tb_logs"` | TB log directory |
 | `enable_mlflow` | `bool` | `False` | turn on MLflow backend (Databricks or local) |
 | `mlflow_tracking_uri` | `str \| None` | `None` | tracking URI; `None` → `$MLFLOW_TRACKING_URI`, else `"databricks"`; `databricks://<profile>` selects a `~/.databrickscfg` profile |
@@ -338,7 +338,7 @@ enabled in one run config.
 | `mlflow_run_name` | `str \| None` | `None` | `None` → auto-generated |
 | `mlflow_description` | `str \| None` | `None` | run description (Markdown, the `mlflow.note.content` tag), set on a new run |
 | `mlflow_tags` | `dict[str, str]` | `{}` | extra run tags, set on a new run after the automatic ones; keys and values must be non-empty strings |
-| `mlflow_run_id` | `str` | `""` | restored from checkpoint on resume; empty = new run |
+| `mlflow_run_id` | `str` | `""` | restored from the checkpoint on an auto-resume, never on a `checkpoint.load_path` warm start; empty = new run |
 | `mlflow_log_system_metrics` | `bool` | `True` | sample CPU/GPU/memory on a background thread |
 | `mlflow_system_metrics_interval` | `float` | `10.0` | seconds between system-metric samples |
 | `mlflow_register_checkpoints` | `bool` | `False` | register each committed checkpoint as an MLflow external model on the background worker; `metadata.json` records its `model_name` at save and its `model_id` once registered; requires `enable_mlflow` |
