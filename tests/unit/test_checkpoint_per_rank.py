@@ -623,8 +623,8 @@ class TestAFailedCaptureFailsEveryRank:
         mgr = _mock_mgr(tmp_path, monkeypatch)
         mgr._rank = 1
         agreed: list = []
-        agree = mgr._agree
-        monkeypatch.setattr(mgr, "_agree", lambda error: (agreed.append(error), agree(error)))
+        agree = mgr.agree
+        monkeypatch.setattr(mgr, "agree", lambda error: (agreed.append(error), agree(error)))
 
         with pytest.raises(ValueError, match=r"got ranks \[1\]"):
             mgr.save(step=1)

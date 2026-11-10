@@ -132,6 +132,31 @@ auto-resume onto a different topology anyway, set
 `checkpoint.ignore_rank_state_mismatch`: see
 [Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size).
 
+A training checkpoint also holds `train_state.pt`, and `load_path` restores
+it: the step, token count, LR schedule, dataloader position and RNG state
+continue from the saved run, and the saved freeze metadata is compared with
+the new run's. To start a new stage from a previous stage's weights alone,
+add `"train_state"`:
+
+```toml
+[checkpoint]
+load_path = "/runs/stage1/step_50000"
+exclude_from_loading = ["optimizer", "train_state"]
+```
+
+The new run then begins at step 0 with its own warmup, data order and
+freeze specs, and only the model weights come from the checkpoint.
+`"train_state"` is accepted only in that pair: with the optimizer kept, a
+restarted warmup would apply the saved moments and step counters, and a
+changed freeze would fail inside the optimizer load instead of at the
+freeze check; with the model excluded too, nothing would load. A MoT run
+with `mot_warm_start_from_text` keeps the loaded weights: the text warm
+start runs only when no checkpoint supplied the model, that is on a run
+with nothing to resume from or a warm start that excludes `"model"` and
+starts at step 0, and never on a resume. A weights-only warm start also skips the
+`metadata.json` probe for the freeze check, since the new run's own
+freeze applies.
+
 ## Symlink updates
 
 Inside `CheckpointManager.save` (rank 0 only):
