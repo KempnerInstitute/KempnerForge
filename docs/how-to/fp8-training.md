@@ -177,6 +177,11 @@ FP8 as well, make the dimension a multiple of 16: pad `vocab_size`
 `n_kv_heads * head_dim` is a multiple of 16, or pick an
 `ffn_hidden_dim` that is.
 
+**`ValueError: train.mixed_precision='fp8' needs model.dim divisible by 16`.**
+Every projection and the output head has `model.dim` on one side, so
+with this `dim` no layer could run in FP8. Use a `dim` that is a
+multiple of 16, or train in bf16.
+
 **`ValueError: FP8 + Tensor Parallelism is not yet supported`.** The
 config validator ran. Either set `distributed.tp = 1` (and let FSDP
 handle sharding) or drop `mixed_precision = "fp8"`.

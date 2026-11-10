@@ -14,7 +14,7 @@ from kempnerforge.config.model import FLEX_BLOCK_SIZE, ModelConfig
 from kempnerforge.config.optimizer import OptimizerConfig
 from kempnerforge.config.profiling import ProfilingConfig
 from kempnerforge.config.scheduler import SchedulerConfig
-from kempnerforge.config.training import TrainConfig
+from kempnerforge.config.training import FP8_DIM_MULTIPLE, TrainConfig
 from kempnerforge.config.video import VideoConfig
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import MoMaConfig, MoTConfig, VLMConfig
@@ -241,6 +241,14 @@ class JobConfig:
                 "FP8 + Tensor Parallelism is not yet supported (torchao Float8Linear "
                 "does not compose with DTensor sharding). Use FP8 with FSDP only, "
                 "or TP without FP8."
+            )
+        if self.train.is_fp8 and self.model.dim % FP8_DIM_MULTIPLE:
+            raise ValueError(
+                f"train.mixed_precision='fp8' needs model.dim divisible by {FP8_DIM_MULTIPLE} "
+                f"(got {self.model.dim}): torch._scaled_mm needs both dimensions of an FP8 "
+                f"weight divisible by {FP8_DIM_MULTIPLE}, and every attention and MLP "
+                "projection and the output head has model.dim on one side, so no layer would "
+                f"run in FP8. Use a multiple of {FP8_DIM_MULTIPLE} or train in bf16."
             )
 
         if self.model.is_moe and self.distributed.pp > 1:

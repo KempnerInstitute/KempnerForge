@@ -321,6 +321,22 @@ train.is_fp8 && distributed.tp > 1  →  ValueError
 Rationale in the error message: `torchao.Float8Linear` does not compose
 with DTensor sharding today.
 
+### FP8 geometry
+
+```
+train.is_fp8 && model.dim % 16 != 0  →  ValueError
+```
+
+`torch._scaled_mm` needs both dimensions of an FP8 weight to be
+multiples of 16, and every attention and MLP projection and the output
+head has `model.dim` on one side, so with any other `dim` no layer
+could run in FP8. Other unaligned layers are not errors: `k_proj` and
+`v_proj` with a small `n_kv_heads * head_dim`, an output head with a
+`vocab_size` such as 50257, or an explicit `ffn_hidden_dim` that is not
+a multiple of 16 stay in bf16, and `apply_float8` names them in a
+startup warning (see
+[FP8 § Exclusion rules](../distributed/fp8.md#exclusion-rules)).
+
 ### MoE + PP
 
 ```

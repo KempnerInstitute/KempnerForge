@@ -67,7 +67,10 @@ n_kv_heads = 1`), an output head with the GPT-2 vocabulary
 explicit `ffn_hidden_dim` that is not a multiple of 16. The filter
 keeps such a `Linear` in bf16, and `apply_float8` logs one warning that
 names each kept layer with its shape and count, for example
-`layers.*.attention.k_proj (8x64) x32`.
+`layers.*.attention.k_proj (8x64) x32`. Config validation rejects the
+one case the filter cannot fix: `model.dim` not a multiple of 16, where
+no layer could convert (see
+[Validation rules § FP8 geometry](../configuration/validation-rules.md#fp8-geometry)).
 
 **Embeddings & norms**: not `Linear` — `convert_to_float8_training`
 skips them automatically (no filter entry needed).

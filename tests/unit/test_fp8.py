@@ -54,6 +54,30 @@ class TestFP8Config:
         )
         config.validate(world_size=4)
 
+    @pytest.mark.parametrize("precision", ["fp8", "bf16"])
+    def test_dim_not_divisible_by_16(self, precision):
+        """No projection can run in FP8 when model.dim is not a multiple of 16 (issue #240)."""
+        from kempnerforge.config.schema import JobConfig, ModelConfig
+
+        config = JobConfig(
+            model=ModelConfig(dim=72, n_layers=2, n_heads=4, vocab_size=256),
+            train=TrainConfig(mixed_precision=precision),
+        )
+        if precision == "bf16":
+            config.validate(world_size=1)
+            return
+        with pytest.raises(ValueError, match=r"needs model.dim divisible by 16 \(got 72\)"):
+            config.validate(world_size=1)
+
+    def test_unaligned_kv_projection_passes_validation(self):
+        """head_dim 8 with one KV head is valid FP8: the filter keeps k_proj and v_proj bf16."""
+        from kempnerforge.config.schema import JobConfig, ModelConfig
+
+        JobConfig(
+            model=ModelConfig(dim=64, n_layers=2, n_heads=8, n_kv_heads=1, vocab_size=256),
+            train=TrainConfig(mixed_precision="fp8"),
+        ).validate(world_size=1)
+
 
 class TestApplyFloat8:
     """Test apply_float8 converts the right modules and skips experts."""

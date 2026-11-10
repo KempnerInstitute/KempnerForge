@@ -185,7 +185,8 @@
         "tests/unit/test_mixing.py::TestDatasetSource",
         "tests/unit/test_mixing.py::TestDataConfigMixing",
         "tests/unit/test_annealing.py::TestTrainingPhase",
-        "tests/unit/test_annealing.py::TestDataConfigPhases"
+        "tests/unit/test_annealing.py::TestDataConfigPhases",
+        "tests/unit/test_fp8.py::TestFP8Config"
       ]
     },
     "kempnerforge/config/vlm.py": {
@@ -1644,11 +1645,11 @@
       },
       "tests/unit/test_fp8.py": {
         "classes": [
-          "TestFP8Config(7)",
+          "TestFP8Config(9)",
           "TestApplyFloat8(4)",
           "TestFloat8Alignment(3)"
         ],
-        "count": 14
+        "count": 16
       },
       "tests/unit/test_packing.py": {
         "classes": [
