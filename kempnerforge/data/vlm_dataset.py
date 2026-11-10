@@ -653,6 +653,8 @@ def pack_vlm_samples(
         views = sample["pixel_values"]
         if views.dim() == 3:
             views = views.unsqueeze(0)
+        elif views.shape[0] == 0:
+            views = views.reshape(0, *views.shape[-3:])
         if views.shape[0] == 0 and not allow_text_only:
             raise ValueError(
                 "pack_vlm_samples got a text-only document; set data.hf_allow_text_only = true "
