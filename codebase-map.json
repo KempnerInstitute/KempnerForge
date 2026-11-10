@@ -1575,10 +1575,12 @@
         "classes": [
           "TestCrossEntropy(2)",
           "TestChunkedCrossEntropy(6)",
+          "TestFp32CrossEntropy(8)",
           "TestZLoss(10)",
-          "TestBuildLossFn(11)"
+          "TestBuildLossFn(12)",
+          "TestAllMaskedBatch(3)"
         ],
-        "count": 29
+        "count": 41
       },
       "tests/unit/test_moe.py": {
         "classes": [

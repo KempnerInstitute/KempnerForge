@@ -219,7 +219,9 @@ def z_loss(logits: torch.Tensor, weight: float, chunk_size: int | None = None) -
     instead of keeping a float32 copy of the logits.
 
     Args:
-        logits: Model output logits, shape (batch, seq, vocab) or (tokens, vocab).
+        logits: Model output logits, shape (batch, seq, vocab) or (tokens, vocab). A plain
+            tensor, not a DTensor: under TP the output head returns a local tensor
+            (``use_local_output``), so a DTensor never reaches the loss.
         weight: Regularization weight (PaLM uses 1e-4).
         chunk_size: Tokens per float32 chunk. ``None`` takes every token at once.
 

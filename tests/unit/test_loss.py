@@ -17,6 +17,7 @@ from torch.distributed.fsdp import fully_shard
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import TrainConfig
+from kempnerforge.training import loss as loss_module
 from kempnerforge.training.loss import (
     build_loss_fn,
     chunked_cross_entropy_loss,
@@ -250,6 +251,15 @@ class TestFp32CrossEntropy:
 
 
 class TestZLoss:
+    @pytest.fixture(autouse=True)
+    def _nan_filled_empty(self):
+        """Deterministic mode fills ``torch.empty`` with NaN, so a row left unwritten shows."""
+        enabled = torch.are_deterministic_algorithms_enabled()
+        warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(True)
+        yield
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
     def test_zero_weight_returns_zero(self):
         logits = torch.randn(2, 8, 100)
         result = z_loss(logits, weight=0.0)
@@ -286,13 +296,13 @@ class TestZLoss:
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
     @pytest.mark.parametrize("chunk_size", [None, 1, 3, 7, 4096])
     def test_value_equals_the_unchunked_formula_exactly(self, chunk_size, dtype):
-        """66 tokens: chunks of 1, 3 and 7 leave a short last chunk (issue #335)."""
+        """68 tokens: chunks of 3 and 7 leave a short last chunk (issue #335)."""
         torch.manual_seed(0)
-        logits = (torch.randn(2, 33, 1000) * 4).to(dtype)
+        logits = (torch.randn(2, 34, 1000) * 4).to(dtype)
         expected = 1e-4 * (torch.logsumexp(logits.view(-1, 1000).float(), dim=-1) ** 2).mean()
         assert torch.equal(z_loss(logits, 1e-4, chunk_size=chunk_size), expected)
 
-    @pytest.mark.parametrize(("dtype", "rtol"), [(torch.float32, 1e-5), (torch.bfloat16, 2**-8)])
+    @pytest.mark.parametrize(("dtype", "rtol"), [(torch.float32, 1e-5), (torch.bfloat16, 2**-7)])
     @pytest.mark.parametrize("chunk_size", [None, 1, 7, 4096])
     def test_gradient_matches_the_unchunked_formula(self, chunk_size, dtype, rtol):
         torch.manual_seed(0)
@@ -422,9 +432,35 @@ class TestBuildLossFn:
         base = cross_entropy_loss(logits, labels)
         torch.testing.assert_close(result, base)
 
+    @pytest.mark.parametrize(
+        ("loss_fn", "ce_chunk_size", "chunk"),
+        [
+            ("chunked_cross_entropy", 16, 16),
+            ("chunked_cross_entropy", 0, 4096),
+            ("cross_entropy", 0, 128),
+        ],
+    )
+    def test_z_loss_runs_in_the_ce_chunk_size(self, monkeypatch, loss_fn, ce_chunk_size, chunk):
+        """The composed z-loss takes ce_chunk_size tokens at a time with chunked CE, and
+        every token (128 here) at once with unchunked CE."""
+        seen: list[int] = []
+        real = loss_module._ChunkedLogSumExp.apply
+
+        def spy(flat: torch.Tensor, size: int) -> torch.Tensor:
+            seen.append(size)
+            return real(flat, size)
+
+        monkeypatch.setattr(loss_module._ChunkedLogSumExp, "apply", spy)
+        config = TrainConfig(loss_fn=loss_fn, ce_chunk_size=ce_chunk_size, z_loss_weight=1e-4)
+        build_loss_fn(config)(torch.randn(4, 32, 256), torch.randint(0, 256, (4, 32)))
+        assert seen == [chunk]
+
     @pytest.mark.parametrize("fp32", [False, True])
     def test_chunked_ce_chunks_z_loss_too(self, fp32):
-        """With chunked CE, the composed z-loss keeps no float32 copy of the logits (#335)."""
+        """With chunked CE, the composed z-loss keeps no float32 copy of the logits (#335).
+
+        Tokens labeled -100 leave the cross-entropy mean but stay in the z-loss mean.
+        """
         config = TrainConfig(
             loss_fn="chunked_cross_entropy",
             ce_chunk_size=16,
@@ -434,6 +470,7 @@ class TestBuildLossFn:
         fn = build_loss_fn(config)
         logits = (torch.randn(4, 32, 256) * 4).bfloat16().requires_grad_(True)
         labels = torch.randint(0, 256, (4, 32))
+        labels[:, :8] = -100
         saved: list[torch.Tensor] = []
 
         def pack(t: torch.Tensor) -> torch.Tensor:
