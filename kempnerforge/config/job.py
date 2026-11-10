@@ -319,13 +319,3 @@ class JobConfig:
                         "(modality_ids-based scatter/gather + expert-choice top-k cause "
                         "graph breaks). Set compile_model=false for MoMa models."
                     )
-
-                if self.train.activation_checkpointing == "full":
-                    import logging
-
-                    logging.getLogger(__name__).warning(
-                        "AC=full is currently a no-op for MoMa (apply_ac matches "
-                        "TransformerBlock only; MoMaBlock is a sibling nn.Module). "
-                        "Use ac='selective' (wraps the Attention submodule, still works) "
-                        "or reduce moma_experts_per_modality until the apply_ac refactor lands."
-                    )
