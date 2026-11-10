@@ -24,6 +24,7 @@ onto the new topology while data order and random streams restart fresh.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -32,8 +33,9 @@ import re
 import shutil
 import stat
 import threading
+import time
 import uuid
-from collections.abc import Callable, Container, Iterable
+from collections.abc import Callable, Container, Iterable, Iterator
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeGuard, cast
@@ -74,6 +76,8 @@ _NEVER_STEPPED_KEY = "optimizer_never_stepped"
 _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 _OPTIM_PREFIX = "optimizer."
 _UNRECORDED_WEIGHT_DECAY_SCOPE = "exclude_norms_and_biases"
+_TRANSIENT_REMOVE_ERRNOS = frozenset({errno.ENOTEMPTY, errno.EBUSY, errno.ENOENT})
+_REMOVE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4)
 TrackingSource = Callable[[], list[dict[str, str]]]
 CheckpointRecord = Callable[[str, dict[str, str]], None]
 
@@ -451,6 +455,35 @@ def _replace_file(path: Path, text: str) -> None:
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _remove_tree(path: Path, lock: threading.Lock, delays: Iterator[float]) -> None:
+    """Remove the directory ``path``, retrying while NFS briefly keeps it non-empty.
+
+    ``ENOTEMPTY``, ``EBUSY`` and ``ENOENT`` are retried while ``path`` exists, each retry
+    after waiting the next of ``delays``.
+
+    Args:
+        path: The directory to remove.
+        lock: Held for each attempt and released during the waits.
+        delays: The waits left, in seconds, which removals can share.
+
+    Raises:
+        OSError: Any other error, or a retried one once ``path`` is gone or
+            ``delays`` is spent.
+    """
+    while True:
+        try:
+            with lock:
+                shutil.rmtree(path)
+            return
+        except OSError as e:
+            if e.errno not in _TRANSIENT_REMOVE_ERRNOS or not path.exists():
+                raise
+            delay = next(delays, None)
+            if delay is None:
+                raise
+            time.sleep(delay)
 
 
 _URI_USERINFO = re.compile(r"(?<=://)[^/?#\s]+@")
@@ -1458,6 +1491,11 @@ class CheckpointManager:
         flush is dispatched, so ``_inflight_dir`` is what keeps a checkpoint
         that is not among the newest, as after a rewind, from being deleted
         while it is written.
+
+        A directory that NFS briefly keeps non-empty is retried after 0.05, 0.1,
+        0.2 and 0.4 s, waits that all the removals of one cleanup share, so a
+        cleanup requests at most 0.75 s of retry sleep. One that still cannot be
+        removed is logged and left for the next cleanup.
         """
         keep = self.config.keep_last_n
         if keep <= 0:
@@ -1482,12 +1520,12 @@ class CheckpointManager:
                 protected.add(d.resolve())
 
         to_remove = ckpt_dirs[:-keep] if len(ckpt_dirs) > keep else []
+        delays = iter(_REMOVE_RETRY_DELAYS)
         for d in to_remove:
             if d.resolve() in protected:
                 continue
             try:
-                with self._sidecar_lock:
-                    shutil.rmtree(d)
+                _remove_tree(d, self._sidecar_lock, delays)
             except OSError as e:
                 logger.warning(
                     f"Could not remove old checkpoint {d} ({e}); the next cleanup retries it"

@@ -419,3 +419,30 @@ class TestMoMaConfig:
     def test_nonpositive_expert_count_raises(self):
         with pytest.raises(ValueError, match="must be positive"):
             MoMaConfig(moma_experts_per_modality={"image": 0, "text": 2})
+
+
+class TestTiling:
+    def test_off_by_default(self):
+        cfg = VLMConfig()
+        assert cfg.tile_grid == 0
+        assert cfg.tile_global is True
+        assert cfg.views_per_image == 1
+
+    @pytest.mark.parametrize(
+        ("grid", "with_global", "views"),
+        [(2, True, 5), (2, False, 4), (3, True, 10), (3, False, 9)],
+    )
+    def test_views_per_image(self, grid, with_global, views):
+        assert VLMConfig(tile_grid=grid, tile_global=with_global).views_per_image == views
+
+    def test_global_flag_is_ignored_without_a_grid(self):
+        assert VLMConfig(tile_grid=0, tile_global=False).views_per_image == 1
+
+    @pytest.mark.parametrize("grid", [-1, 1])
+    def test_rejects_negative_and_one_by_one_grids(self, grid):
+        with pytest.raises(ValueError, match="vlm.tile_grid must be 0"):
+            VLMConfig(tile_grid=grid)
+
+    @pytest.mark.parametrize("arch", ["joint_decoder", "cross_attention", "mot", "moma"])
+    def test_every_arch_inherits_the_fields(self, arch):
+        assert VLMConfig.for_arch(arch, tile_grid=3).views_per_image == 10

@@ -201,8 +201,9 @@ in order, then hands a `TrainingSession` to `run_training_loop`:
 
 1. `load_config(path, cli_args)` — TOML + CLI overrides into a
    `JobConfig` dataclass (done by `scripts/train.py`).
-2. `setup_distributed(config)` — `dist.init_process_group`, `DeviceMesh`,
-   seeded RNG, world-size validation; returns a `RuntimeContext`.
+2. `setup_distributed(config)` — `JobConfig.validate(world_size)`, then
+   `dist.init_process_group`, `DeviceMesh` and seeded RNG; returns a
+   `RuntimeContext`.
 3. `build_loss_fn(tc)` — loss registry lookup with optional z-loss wrap
    (see [Losses](losses.md)).
 4. `build_model(config, runtime, loss_fn)` — architecture + full
