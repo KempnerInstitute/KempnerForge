@@ -56,8 +56,37 @@ samples `VLMCollator` batches.
   the reader's skips, per rank, and loader workers forked from the training
   process add to its count.
 
-Every sample carries one image, resized square to `image_size`, with no tiling or
-packing.
+Every sample the renderer builds carries one image, resized square to `image_size`,
+with no tiling or packing.
+
+## Tile images
+
+By default every image is one `hf_image_size` view. `vlm.tile_grid = n` encodes
+it as `n × n` crops instead, each `hf_image_size` px, cut from the image resized
+to `n × hf_image_size` square, preceded by the whole image at `hf_image_size`
+unless `vlm.tile_global = false`:
+
+```toml
+[vlm]
+arch = "joint_decoder"
+max_text_len = 256
+tile_grid = 3          # 9 crops in raster order
+tile_global = true     # plus the whole image first: 10 views
+```
+
+The views travel like a clip's frames (`pixel_values` is `(B, views, 3, H, W)`),
+so the sequence budget is `views × tokens per view + max_text_len`, and the
+config and build checks enforce it. With this example's 256 tokens per view
+and `max_text_len = 256`, the 10 views above need `model.max_seq_len` and
+`train.seq_len` of at least 2816, so raise both from the presets' 512 before
+turning tiling on. `tile_image` in `kempnerforge/data/vlm_dataset.py` is the
+preprocessor at training and at evaluation, so an evaluation tiles exactly as
+training did. The crops come from the image resized to a square canvas, so a
+wide or tall image is stretched the way its single view already is; a grid
+that follows the aspect ratio is not implemented. An image smaller than the
+`n × hf_image_size` canvas is upsampled onto it, so its crops cost tokens
+without adding detail; tiling pays off on sources larger than the canvas.
+Tiling applies to the image path only; a `[video]` run rejects it.
 
 ## Start from the pretrained backbone
 
@@ -93,7 +122,6 @@ or in core where it belongs:
 - Packing image-text documents into one sequence
 - Text-only documents in image-text batches
 - Documents with several images
-- Tiling into a global view and a 3 × 3 grid of crops (stage 2)
 - Per-module learning rates and schedules
 - Vision-encoder precision separate from the backbone's
 - Evaluation parity: chat-template prompts, image attention, the recipe's scorers

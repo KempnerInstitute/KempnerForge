@@ -64,10 +64,10 @@ initializes the collaborators:
   — owns DCP async save/load, latest-symlink, step_N directories.
 - **`resolve_resume_path(config.checkpoint.dir)`** from
   [`kempnerforge.resilience.elastic`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)
-  — follows the `latest` symlink or picks the highest `step_N`. If
-  non-`None`, `ckpt_mgr.load(resume_path)` restores model, optimizer,
-  scheduler, dataloader position, and RNG state before the loop
-  starts.
+  — follows the `latest` symlink or picks the newest `step_N` whose
+  save completed. If non-`None`, `ckpt_mgr.load(resume_path)` restores
+  model, optimizer, scheduler, dataloader position, and RNG state
+  before the loop starts.
 - **`MetricsTracker`** from
   [`kempnerforge.metrics.tracker`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/tracker.py)
   — per-step metrics + EMA smoothing + WandB / TensorBoard backends.
@@ -99,7 +99,7 @@ useful for smoke-testing the parallelism stack without any corpus.
 
 `doc_ids` is optional: non-`None` only when the dataset packs multiple
 documents into one sequence. It triggers the block-diagonal attention
-mask path (see [Model § Three attention paths](model.md#three-attention-paths)).
+mask path (see [Model § Attention paths](model.md#attention-paths)).
 
 ### 2 · `maybe_no_sync`
 
