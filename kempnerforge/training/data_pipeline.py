@@ -134,6 +134,18 @@ def _build_vlm_pipeline(
             VLMCollator,
         )
 
+        laid_out = config.data.pack_sequences or config.data.hf_max_images != 1
+        row_tokens = 0
+        if laid_out:
+            setting = "data.pack_sequences" if config.data.pack_sequences else "data.hf_max_images"
+            row_tokens = _row_tokens_per_image(tokens_per_image, setting)
+            footprint = config.data.hf_max_images * row_tokens + vlm_cfg.max_text_len
+            if footprint > tc.seq_len:
+                raise ValueError(
+                    f"data.hf_max_images={config.data.hf_max_images} images x {row_tokens} "
+                    f"tokens + vlm.max_text_len={vlm_cfg.max_text_len} is {footprint} positions, "
+                    f"over train.seq_len={tc.seq_len}; a document could not fit its row"
+                )
         dataset = HuggingFaceVLMDataset(
             dataset_name=config.data.hf_dataset_name,
             split=config.data.hf_dataset_split,
@@ -148,27 +160,18 @@ def _build_vlm_pipeline(
             max_images=config.data.hf_max_images,
         )
         pad_id = _resolve_pad_id(config.data.tokenizer_path)
-        if config.data.pack_sequences or config.data.hf_max_images != 1:
-            setting = "data.pack_sequences" if config.data.pack_sequences else "data.hf_max_images"
-            tokens_per_image = _row_tokens_per_image(tokens_per_image, setting)
-            footprint = config.data.hf_max_images * tokens_per_image + vlm_cfg.max_text_len
-            if footprint > tc.seq_len:
-                raise ValueError(
-                    f"data.hf_max_images={config.data.hf_max_images} images x {tokens_per_image} "
-                    f"tokens + vlm.max_text_len={vlm_cfg.max_text_len} is {footprint} positions, "
-                    f"over train.seq_len={tc.seq_len}; a document could not fit its row"
-                )
+        if laid_out:
             collator = PackedVLMCollator(
                 pad_id=pad_id,
                 seq_len=tc.seq_len,
-                tokens_per_image=tokens_per_image,
+                tokens_per_image=row_tokens,
                 max_docs_per_row=0 if config.data.pack_sequences else 1,
                 allow_text_only=dataset.has_text_only_rows,
             )
             layout = "packed" if config.data.pack_sequences else "one per row"
             logger.info(
                 f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
-                f"up to {config.data.hf_max_images} images x {tokens_per_image} tokens + text "
+                f"up to {config.data.hf_max_images} images x {row_tokens} tokens + text "
                 f"per document, {layout} in rows of {tc.seq_len}"
             )
         else:

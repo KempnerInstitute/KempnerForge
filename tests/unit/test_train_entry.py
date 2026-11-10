@@ -2503,6 +2503,7 @@ class TestVlmSourceBuilders:
         too_many = (config.train.seq_len - config.vlm.max_text_len) // 3 + 1
         with pytest.raises(ValueError, match="over train.seq_len"):
             dp.build_data_pipeline(config, _runtime(), tokens_per_image=too_many)
+        assert "dataset" not in seen
 
     def test_packed_image_path_takes_the_model_token_count(self, monkeypatch):
         import kempnerforge.data.vlm_dataset as vlmd
