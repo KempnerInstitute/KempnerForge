@@ -336,6 +336,7 @@ class TestZLoss:
 
     @pytest.mark.gpu
     def test_peak_memory_holds_no_full_fp32_copy(self):
+        """The peak holds the bf16 gradient, three float32 chunks and per-token vectors."""
         if not torch.cuda.is_available():
             pytest.skip("CUDA required")
         tokens, vocab, chunk = 8192, 32768, 1024
@@ -347,7 +348,11 @@ class TestZLoss:
         z_loss(logits, 1e-4, chunk_size=chunk).backward()
         torch.cuda.synchronize()
         extra = torch.cuda.max_memory_allocated() - before
-        assert extra <= tokens * vocab * 2 + 3 * chunk * vocab * 4
+        grad_bytes = tokens * vocab * 2
+        chunk_fp32_bytes = chunk * vocab * 4
+        per_token_fp32_bytes = tokens * 4
+        assert extra <= grad_bytes + 3 * chunk_fp32_bytes + 4 * per_token_fp32_bytes
+        assert extra < tokens * vocab * 4
 
 
 class TestBuildLossFn:
