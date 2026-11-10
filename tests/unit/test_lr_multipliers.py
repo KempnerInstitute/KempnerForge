@@ -840,6 +840,62 @@ class TestResume:
         assert step == 3
         assert any(not torch.equal(b, p) for b, p in zip(before, model.parameters(), strict=True))
 
+    WEIGHTS_ONLY = ["optimizer", "train_state"]
+
+    @pytest.mark.parametrize("record", ["other", "unreadable"])
+    def test_a_weights_only_warm_start_takes_the_weights_under_new_multipliers(
+        self, tmp_path, monkeypatch, record
+    ):
+        """It restores nothing laid out by param group, so it reads no multipliers record, and
+        the run starts at step 0 with each module at the new rate times its new multiplier."""
+        model, optimizer, scheduler = self._build("adamw", {"head": 2.0}, seed=0)
+        self._train(model, optimizer, scheduler, 3)
+        self._manager(tmp_path, model, optimizer, {"head": 2.0}).save(step=3, scheduler=scheduler)
+        if record == "unreadable":
+            (tmp_path / "step_3" / "metadata.json").write_bytes(b"{")
+        model2, optimizer2, scheduler2 = self._build("adamw", {"layer0": 0.5}, seed=1)
+        manager = self._manager(tmp_path, model2, optimizer2, {"layer0": 0.5})
+        reads: list[object] = []
+        monkeypatch.setattr(manager, "_broadcast_metadata", lambda *a: reads.append(a))
+        assert manager.load(scheduler=scheduler2, exclude_keys=self.WEIGHTS_ONLY) == (0, 0, {})
+        assert reads == []
+        for a, b in zip(model.parameters(), model2.parameters(), strict=True):
+            assert torch.equal(a, b), "the warm start did not take the saved weights"
+        assert not optimizer2.state
+        assert scheduler2.last_epoch == 0
+        assert scheduler2.base_lrs == pytest.approx(
+            [1e-3 * (0.5 if g.get("module") == "layer0" else 1.0) for g in optimizer2.param_groups]
+        )
+
+    def test_the_refusal_of_new_multipliers_names_the_weights_only_warm_start(self, tmp_path):
+        step_dir = self._save(tmp_path, {"head": 2.0}).resolve()
+        _, scheduler, manager = self._resume(tmp_path, {"head": 3.0})
+        with pytest.raises(ValueError, match="but this run uses") as refused:
+            manager.load(scheduler=scheduler, exclude_keys=["optimizer"])
+        assert f"checkpoint.load_path={str(step_dir)!r}" in str(refused.value)
+        assert 'checkpoint.exclude_from_loading=["optimizer", "train_state"]' in str(refused.value)
+        assert scheduler.last_epoch == 0
+        assert manager.load(scheduler=scheduler, exclude_keys=self.WEIGHTS_ONLY) == (0, 0, {})
+        assert scheduler.last_epoch == 0
+
+    @pytest.mark.parametrize("rank", [0, 1])
+    def test_a_weights_only_warm_start_issues_no_collective_of_its_own(
+        self, tmp_path, monkeypatch, rank
+    ):
+        """Every rank skips the same checks, so only the model load, which every rank enters,
+        remains."""
+        import kempnerforge.checkpoint.manager as mgr_mod
+
+        self._save(tmp_path, {"head": 2.0})
+        _, scheduler, manager = self._resume(tmp_path, {"layer0": 0.5})
+        calls = self._as_rank(monkeypatch, manager, rank)
+        loaded: list[list[str]] = []
+        monkeypatch.setattr(mgr_mod.dcp, "load", lambda state, **_: loaded.append(sorted(state)))
+        monkeypatch.setattr(mgr_mod, "set_model_state_dict", lambda *_: None)
+        assert manager.load(scheduler=scheduler, exclude_keys=self.WEIGHTS_ONLY) == (0, 0, {})
+        assert calls == []
+        assert loaded == [["model"]]
+
     @pytest.mark.parametrize("train_state", ["without_scheduler", "absent"])
     def test_no_scheduler_state_to_restore_goes_ahead(self, tmp_path, train_state):
         """Without the optimizer, a load that restores no scheduler state is not checked."""

@@ -695,16 +695,17 @@ class CheckpointManager:
             checkpoint saved with other multipliers or patterns raises ``ValueError`` on every
             rank when it restores the checkpoint's optimizer state on any rank, before anything
             is loaded, or the scheduler state in its ``train_state.pt``, before anything from
-            that file is restored. A load that restores neither goes ahead. A checkpoint that
-            records none counts as saved without multipliers. One whose ``metadata.json``
-            cannot be read, or holds an invalid record, is refused the same way when
-            multipliers are set; without them it loads as one saved without multipliers, with
-            a warning, and only a record of some is refused. With multipliers set, a load that
-            restores optimizer state into param groups laid out otherwise than at the save, a
-            group of another module at a position included, raises on every rank before
-            anything is loaded. A restored scheduler state carries the saved schedule on in
-            every group, a group of a module the checkpoint holds no group of at the saved peak
-            times its multiplier (see ``restore_train_state``).
+            that file is restored. A load that restores neither, such as a weights-only warm
+            start (``exclude_keys=["optimizer", "train_state"]``), goes ahead without reading
+            the record. A checkpoint that records none counts as saved without multipliers.
+            One whose ``metadata.json`` cannot be read, or holds an invalid record, is refused
+            the same way when multipliers are set; without them it loads as one saved without
+            multipliers, with a warning, and only a record of some is refused. With multipliers
+            set, a load that restores optimizer state into param groups laid out otherwise than
+            at the save, a group of another module at a position included, raises on every rank
+            before anything is loaded. A restored scheduler state carries the saved schedule on
+            in every group, a group of a module the checkpoint holds no group of at the saved
+            peak times its multiplier (see ``restore_train_state``).
         module_patterns: Module name to fnmatch patterns, such as ``VLMConfig.module_patterns``.
             Required for every module ``lr_multipliers`` lists.
     """
@@ -1541,7 +1542,11 @@ class CheckpointManager:
             f"{ckpt_dir} was saved with {change}. The multipliers and the patterns of their "
             f"modules decide the optimizer's param groups and their learning rates, and the "
             f"checkpoint's optimizer and scheduler state belong to the groups it was saved with. "
-            f"Resume with the saved values."
+            f"Resume with the saved values, or start from its weights alone under the new ones: "
+            f"checkpoint.load_path={str(ckpt_dir)!r} with "
+            f'checkpoint.exclude_from_loading=["optimizer", "train_state"], which restarts the '
+            f"step, schedule and data position, and a checkpoint.dir that holds no checkpoint, "
+            f"since training auto-resumes from a checkpoint there in place of load_path."
         )
 
     def apply_dataloader_state(self, dataloader: Any) -> None:

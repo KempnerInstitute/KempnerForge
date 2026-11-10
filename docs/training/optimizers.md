@@ -120,23 +120,24 @@ together. From a training checkpoint, that leaves:
   where this run's group belongs to none or the reverse, or another listed module, as when
   one stage trains the adapter and the next the vision encoder in its place), the error
   names the position and the warm start.
-- Not a new peak rate. Every resume and warm start restores the scheduler state in
-  `train_state.pt`, and the saved schedule carries on, its peak included: the scheduler's
-  param groups run from the `optimizer.lr` of the save times each one's multiplier, whatever
-  `optimizer.lr` the new stage sets. When a group names a module, the load logs the peak of
-  each module's groups, and warns when they differ from the rates the optimizer was built
-  with, as when `optimizer.lr` changed since the save.
-- Not a stage that changes the multipliers or their patterns. Every resume and warm start
-  restores `train_state.pt`, scheduler state included, since `checkpoint.exclude_from_loading`
-  takes only `"model"` and `"optimizer"`. Such a stage, like one with a new `optimizer.lr`
-  as a finetune after an alignment stage often has, needs a warm start from the weights
-  alone, which `exclude_from_loading` does not offer
-  ([#442](https://github.com/KempnerInstitute/KempnerForge/issues/442)).
+- A weights-only warm start, `checkpoint.exclude_from_loading = ["optimizer", "train_state"]`,
+  under any multipliers and patterns. It loads the model alone and nothing from
+  `train_state.pt`, so it reads no multipliers record, and the run starts at step 0 on its
+  own schedule, each module at the new `optimizer.lr` times its new multiplier. A stage that
+  changes the multipliers or their patterns, or sets a new `optimizer.lr`, as a finetune
+  after an alignment stage often does, starts this way.
+- No new peak rate in any other load. A resume, and a warm start that keeps
+  `train_state.pt`, restore its scheduler state, and the saved schedule carries on, its peak
+  included: the scheduler's param groups run from the `optimizer.lr` of the save times each
+  one's multiplier, whatever `optimizer.lr` the new stage sets. When a group names a module,
+  the load logs the peak of each module's groups, and warns when they differ from the rates
+  the optimizer was built with, as when `optimizer.lr` changed since the save.
 
 Code that builds its own `CheckpointManager` gets the same record and check by passing
 `lr_multipliers` and `module_patterns`, and calls `build_optimizer(model, config,
 module_patterns=...)` to resolve the module names. Its `load` goes ahead under any
-multipliers when it restores neither the optimizer state nor a scheduler state.
+multipliers when it restores neither the optimizer state nor a scheduler state, as with
+`exclude_keys=["optimizer", "train_state"]`.
 
 ## `adamw`
 
