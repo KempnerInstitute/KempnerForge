@@ -5,9 +5,12 @@ spawn until the ranks are joined, so no other process can take that port while t
 A rank leaves the group only once every rank has finished its part: gloo's connection setup is
 asymmetric, so a rank that left early could close a connection another rank has not yet picked
 up (pytorch/pytorch#199026). The ranks wait for each other on the store, not with a collective,
-so the wait cannot interleave with collectives a rank's own threads still run on the group, such
-as an async checkpoint save's. ``run_to_outcomes`` times one part of the ranks' work from the
-moment every rank has entered it, so start-up and exit never count against that part.
+so the wait never pairs with a collective another of the rank's threads runs on the group, such
+as an async checkpoint save's; leaving still tears the group down, so a block must finish such
+collectives before it returns. The wait gives up after a bounded time, naming the ranks still in
+their block, and a failure that reaches the test notes them as well. ``run_to_outcomes`` times
+one part of the ranks' work from the moment every rank has entered it, so start-up and exit
+never count against that part.
 """
 
 from __future__ import annotations
@@ -27,30 +30,65 @@ import torch.multiprocessing as mp
 
 HOST = "127.0.0.1"
 STORE_TIMEOUT = timedelta(seconds=300)
+LEAVE_TIMEOUT = timedelta(seconds=45)
 
 _joins = itertools.count()
 
 
 @contextlib.contextmanager
-def held_store() -> Iterator[int]:
-    """Hold a rendezvous store on a port the kernel picks, for the block; yield the port."""
+def held_store(world: int | None = None) -> Iterator[int]:
+    """Hold a rendezvous store on a port the kernel picks, for the block; yield the port.
+
+    With ``world``, an error that leaves the block gets a note naming the ranks that joined a
+    ``gloo_group`` through this store and had not finished its block.
+    """
     store = dist.TCPStore(HOST, 0, is_master=True, wait_for_workers=False, timeout=STORE_TIMEOUT)
     try:
         yield store.port
+    except BaseException as error:
+        if world is not None:
+            _note_unfinished(error, store, world)
+        raise
     finally:
         del store
 
 
+def _unfinished(store: dist.Store, world: int) -> list[int]:
+    """The ranks that joined a ``gloo_group`` through ``store`` and have not finished its block."""
+    inside = []
+    for rank in range(world):
+        if store.check([f"joined/{rank}"]):
+            join = store.get(f"joined/{rank}").decode()
+            if not store.check([f"{join}/finished/{rank}"]):
+                inside.append(rank)
+    return inside
+
+
+def _note_unfinished(error: BaseException, store: dist.Store, world: int) -> None:
+    """Note on ``error`` the ranks still inside their ``gloo_group`` block, if there are any."""
+    with contextlib.suppress(Exception):
+        inside = _unfinished(store, world)
+        if inside:
+            error.add_note(f"ranks {inside} had not finished their gloo_group block")
+
+
 def _stop(processes: Sequence[BaseProcess], grace_s: float = 5.0) -> None:
-    """Terminate the ranks still running, and kill any still alive ``grace_s`` later."""
-    for process in processes:
-        if process.is_alive():
-            process.terminate()
-    deadline = time.monotonic() + grace_s
-    for process in processes:
-        process.join(max(0.0, deadline - time.monotonic()))
-        if process.is_alive():
-            process.kill()
+    """Terminate the ranks still running, and kill any still alive ``grace_s`` later.
+
+    The kill runs even when the wait for the grace period is itself interrupted.
+    """
+    try:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        deadline = time.monotonic() + grace_s
+        for process in processes:
+            process.join(max(0.0, deadline - time.monotonic()))
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+        for process in processes:
             process.join()
 
 
@@ -58,8 +96,9 @@ def spawn(fn: Callable[..., Any], world: int, *args: Any) -> None:
     """Run ``fn(rank, world, port, *args)`` on ``world`` spawned ranks; raise what a rank raised.
 
     When the wait is interrupted, for example by a test timeout, the ranks are stopped first.
+    A failure notes the ranks that had not finished their ``gloo_group`` block.
     """
-    with held_store() as port:
+    with held_store(world) as port:
         context = mp.spawn(fn, args=(world, port, *args), nprocs=world, join=False)
         try:
             while not context.join():
@@ -76,19 +115,36 @@ def gloo_group(
     """Be ``rank`` of the ``world``-rank gloo group at ``port`` for the block.
 
     After a block that returns, the rank waits until every rank has finished its block, then
-    leaves the group. A block that raises leaves at once. ``timeout`` bounds each collective,
-    as in ``init_process_group``. Each join in a process uses keys of its own, so a rank
-    function may join, leave and join again.
+    leaves the group. A block that raises leaves at once. The wait runs no collective, but
+    leaving tears the group down, so a block must finish its background collectives, such as
+    an async save's, before it returns. ``timeout`` bounds each collective, as in
+    ``init_process_group``, and the wait, which otherwise gives up after ``LEAVE_TIMEOUT``; a
+    wait that gives up raises naming the ranks still in their block. Each join in a process
+    uses keys of its own, so a rank function may join, leave and join again.
     """
     client = dist.TCPStore(HOST, port, is_master=False, timeout=STORE_TIMEOUT)
-    store = dist.PrefixStore(f"join{next(_joins)}/", client)
+    join = f"join{next(_joins)}"
+    client.set(f"joined/{rank}", join)
+    store = dist.PrefixStore(join, client)
     dist.init_process_group("gloo", store=store, rank=rank, world_size=world, timeout=timeout)
     try:
         yield
         store.set(f"finished/{rank}", "")
-        store.wait([f"finished/{r}" for r in range(world)])
+        _wait_to_leave(store, rank, world, LEAVE_TIMEOUT if timeout is None else timeout)
     finally:
         dist.destroy_process_group()
+
+
+def _wait_to_leave(store: dist.Store, rank: int, world: int, limit: timedelta) -> None:
+    """Wait for every rank to finish its block; past ``limit``, raise naming those that have not."""
+    try:
+        store.wait([f"finished/{r}" for r in range(world)], limit)
+    except dist.DistStoreError:
+        inside = [r for r in range(world) if not store.check([f"finished/{r}"])]
+        raise TimeoutError(
+            f"rank {rank} waited {limit.total_seconds():g}s to leave the group, but ranks "
+            f"{inside} had not finished their block"
+        ) from None
 
 
 def mark(out_dir: str | Path, rank: int) -> None:
@@ -124,12 +180,13 @@ def run_to_outcomes(
     a rank still inside then fails the test as still in ``part``. The ranks get ``start_s`` from
     the spawn to enter, and ``exit_s`` to exit once every outcome is written, each failing with
     its own message. The ranks are stopped before the test fails, and when the wait is
-    interrupted.
+    interrupted. Under pytest-timeout, give the test a timeout above the three limits and the
+    stop's grace period combined, or the test timeout fires before a phase limit can.
     """
     for sub in ("reached", "outcome"):
         (out_dir / sub).mkdir(parents=True)
     everyone = set(range(world))
-    with held_store() as port:
+    with held_store(world) as port:
         context = mp.spawn(fn, args=(world, port, *args, str(out_dir)), nprocs=world, join=False)
         try:
             phase, deadline = "start", time.monotonic() + start_s

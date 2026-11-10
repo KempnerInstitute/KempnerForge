@@ -53,11 +53,12 @@ def _late_rank(rank: int, world: int, port: int, out_dir: str) -> None:
 
 
 def _reducing_in_a_thread(rank: int, world: int, port: int) -> None:
-    """Leave while this rank's own thread still reduces on the group, as an async save does.
+    """Wait to leave while this rank's own thread still reduces on the group.
 
-    Rank 0's thread starts its reduce before rank 0 leaves, and rank 1's starts a second after
-    rank 1 began to leave, so each rank sends the two in a different order. The rank waits for
-    its thread before the group is destroyed, as a process waits for its save at exit.
+    Rank 0's thread starts its reduce before rank 0 waits to leave, and rank 1's starts a second
+    after rank 1 began to wait, so a collective wait would meet the reduces in a different order
+    on each rank. The real teardown would end a reduce still in flight, so each rank joins its
+    thread before the group is destroyed.
     """
     started = threading.Event()
     totals: list[float] = []
@@ -86,6 +87,26 @@ def _reducing_in_a_thread(rank: int, world: int, port: int) -> None:
     assert totals == [float(world)]
 
 
+def _raise_on_rank_1(rank: int, world: int, port: int) -> None:
+    with gloo_group(rank, world, port):
+        if rank == 1:
+            raise ValueError("rank 1 failed")
+
+
+def _slow_block_on_rank_1(rank: int, world: int, port: int) -> None:
+    """Rank 1 stays in its block well past the 3 s rank 0 waits to leave."""
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=3)):
+        if rank == 1:
+            time.sleep(60)
+
+
+def _skip_the_reduce_on_rank_0(rank: int, world: int, port: int) -> None:
+    """Rank 1 reduces, while rank 0 returns without reducing and waits 3 s to leave."""
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=3) if rank == 0 else None):
+        if rank == 1:
+            dist.all_reduce(torch.ones(1))
+
+
 def _timed(rank: int, world: int, port: int, plan: dict, out_dir: str) -> None:
     """Sleep before the timed part, inside it and after it, as ``plan`` gives for ``rank``."""
     before, inside, after = plan.get(rank, (0.0, 0.0, 0.0))
@@ -106,9 +127,23 @@ def _stuck_ignoring_terminate(rank: int, world: int, port: int, out_dir: str) ->
     _stuck(rank, world, port, out_dir)
 
 
-def _interrupt_once_started(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list:
+def _interrupt_a_timed_join(join):
+    """Wrap a process's ``join`` so that the grace period's join, the one with a timeout, raises."""
+
+    def join_unless_timed(timeout=None):
+        if timeout is not None:
+            raise _Interrupt
+        return join()
+
+    return join_unless_timed
+
+
+def _interrupt_once_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, during_grace: bool = False
+) -> list:
     """Make the next spawn's wait raise ``_Interrupt`` once both ranks have started.
 
+    With ``during_grace``, the stop's wait for the grace period is interrupted as well.
     Returns the list the spawned processes are added to.
     """
     processes: list = []
@@ -125,6 +160,9 @@ def _interrupt_once_started(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
             raise _Interrupt
 
         context.join = interrupted_join
+        if during_grace:
+            for process in context.processes:
+                process.join = _interrupt_a_timed_join(process.join)
         return context
 
     monkeypatch.setattr(gloo_ranks.mp, "spawn", spawn_then_interrupt)
@@ -143,20 +181,33 @@ class TestHeldStore:
 
 class TestSpawn:
     @pytest.mark.parametrize(
-        ("fn", "signum"),
-        [(_stuck, signal.SIGTERM), (_stuck_ignoring_terminate, signal.SIGKILL)],
-        ids=["terminated", "killed"],
+        ("fn", "signum", "during_grace"),
+        [
+            (_stuck, signal.SIGTERM, False),
+            (_stuck_ignoring_terminate, signal.SIGKILL, False),
+            (_stuck_ignoring_terminate, signal.SIGKILL, True),
+        ],
+        ids=["terminated", "killed", "killed-after-a-second-interrupt"],
     )
-    def test_an_interrupted_wait_stops_every_rank(self, tmp_path, monkeypatch, fn, signum):
+    def test_an_interrupted_wait_stops_every_rank(
+        self, tmp_path, monkeypatch, fn, signum, during_grace
+    ):
         """A timeout that interrupts the wait leaves no rank running after the test.
 
-        A rank that ignores the terminate signal is killed once the grace period ends.
+        A rank that ignores the terminate signal is killed once the grace period ends, or at
+        once when a second interrupt cuts the grace period short.
         """
-        processes = _interrupt_once_started(tmp_path, monkeypatch)
+        processes = _interrupt_once_started(tmp_path, monkeypatch, during_grace)
         with pytest.raises(_Interrupt):
             spawn(fn, 2, str(tmp_path))
         assert sorted(p.name for p in tmp_path.iterdir()) == ["started0", "started1"]
         assert [p.exitcode for p in processes] == [-signum, -signum]
+
+    def test_a_rank_that_raises_fails_the_test(self):
+        """Rank 1's error reaches the test, and rank 0, waiting to leave, is stopped."""
+        with pytest.raises(gloo_ranks.mp.ProcessRaisedException, match="rank 1 failed") as info:
+            spawn(_raise_on_rank_1, 2)
+        assert info.value.__notes__ == ["ranks [1] had not finished their gloo_group block"]
 
 
 class TestGlooGroup:
@@ -171,9 +222,27 @@ class TestGlooGroup:
         left_0 = float((tmp_path / "left0").read_text())
         assert left_0 >= done_1
 
-    def test_a_rank_may_leave_while_its_own_thread_still_reduces(self):
-        """Waiting to leave runs no collective, so it cannot pair with another rank's reduce."""
+    def test_the_wait_to_leave_runs_no_collective(self):
+        """A reduce still in flight on a rank's own thread pairs with its peer's, not with the
+        wait to leave. Leaving would end that reduce, so a block must finish its background
+        collectives before it returns; here each rank joins its thread before the teardown."""
         spawn(_reducing_in_a_thread, 2)
+
+    def test_a_rank_that_waits_too_long_to_leave_names_the_ranks_inside(self):
+        """Rank 1 stays in its block, and rank 0 gives up after the group's 3 s timeout."""
+        message = r"rank 0 waited 3s to leave the group, but ranks \[1\] had not finished"
+        with pytest.raises(gloo_ranks.mp.ProcessRaisedException, match=message):
+            spawn(_slow_block_on_rank_1, 2)
+
+    def test_a_collective_one_rank_skips_fails_fast_naming_the_rank(self):
+        """Rank 0 skips a reduce that rank 1 runs: the test fails within seconds, not after the
+        store's timeout, and names rank 1, whichever rank's error comes first."""
+        start = time.monotonic()
+        with pytest.raises(
+            gloo_ranks.mp.ProcessRaisedException, match=r"ranks \[1\] had not finished their"
+        ):
+            spawn(_skip_the_reduce_on_rank_0, 2)
+        assert time.monotonic() - start < gloo_ranks.LEAVE_TIMEOUT.total_seconds()
 
 
 class TestRunToOutcomes:
