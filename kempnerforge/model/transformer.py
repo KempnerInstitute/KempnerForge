@@ -11,6 +11,7 @@ Design choices:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -262,28 +263,54 @@ class Transformer(nn.Module):
             )
         init_weights(self, self.config)
 
+    def _moe_mlps(self) -> Iterator[tuple[int, str | None, MoEMLP]]:
+        """Yield ``(layer_idx, modality, mlp)`` for every ``MoEMLP`` in ``layers``.
+
+        ``modality`` is ``None`` for a block whose MLP is itself a ``MoEMLP``,
+        and the modality key for one held in a per-modality ``nn.ModuleDict``
+        (a MoT block keeps one router per modality there). MoMa's ``MoMaFFN``
+        holds ``ExpertChoiceMoE`` groups, not ``MoEMLP``s, so a MoMa model
+        yields nothing.
+        """
+        for name, layer in self.layers.items():
+            mlp = layer.mlp
+            if isinstance(mlp, MoEMLP):
+                yield int(name), None, mlp
+            elif isinstance(mlp, nn.ModuleDict):
+                for modality, sub in mlp.items():
+                    if isinstance(sub, MoEMLP):
+                        yield int(name), modality, sub
+
     def set_moe_step(self, step: int, max_steps: int) -> None:
-        """Set training step on all MoE routers for adaptive bias scheduling."""
+        """Set training step on all MoE routers for adaptive bias scheduling.
+
+        Reaches every sigmoid router, including each MoT modality's.
+        """
         from kempnerforge.model.router import SigmoidTopKRouter
 
-        for layer in self.layers.values():
-            if isinstance(layer.mlp, MoEMLP) and isinstance(layer.mlp.router, SigmoidTopKRouter):
-                layer.mlp.router.set_step(step, max_steps)
+        for _, _, mlp in self._moe_mlps():
+            if isinstance(mlp.router, SigmoidTopKRouter):
+                mlp.router.set_step(step, max_steps)
 
     def get_moe_aux_loss(self) -> torch.Tensor:
-        """Collect auxiliary losses from all MoE layers. Returns 0 if dense."""
+        """Sum the auxiliary losses of every MoE router. Returns 0 if dense.
+
+        A MoT layer contributes one term per modality, so an image + text MoT
+        model sums twice as many terms as a text model with the same MoE layers.
+        """
         total = torch.tensor(0.0, device=next(self.parameters()).device)
-        for layer in self.layers.values():
-            if isinstance(layer.mlp, MoEMLP):
-                total = total + layer.mlp.aux_loss
+        for _, _, mlp in self._moe_mlps():
+            total = total + mlp.aux_loss
         return total
 
     def get_moe_router_z_loss(self) -> torch.Tensor:
-        """Collect router z-losses (ST-MoE) from all MoE layers. Returns 0 if dense."""
+        """Sum the router z-losses (ST-MoE) of every MoE router. Returns 0 if dense.
+
+        Like ``get_moe_aux_loss``, a MoT layer contributes one term per modality.
+        """
         total = torch.tensor(0.0, device=next(self.parameters()).device)
-        for layer in self.layers.values():
-            if isinstance(layer.mlp, MoEMLP):
-                total = total + layer.mlp.z_loss
+        for _, _, mlp in self._moe_mlps():
+            total = total + mlp.z_loss
         return total
 
     def get_expert_counts(self) -> dict[int, torch.Tensor]:
@@ -291,14 +318,27 @@ class Transformer(nn.Module):
 
         Returns ``{layer_idx: (num_experts,) tensor}`` for layers whose MLP
         is a ``MoEMLP`` (the standard, single-pool MoE). Returns ``{}`` for
-        dense models and for MoMa: MoMa's per-modality groups have a
-        different shape (per modality, per expert) and surface through
+        dense models, for MoT and for MoMa, whose per-modality routers
+        surface through ``get_mot_expert_counts`` and
         ``get_moma_expert_counts`` instead.
         """
-        counts = {}
-        for name, layer in self.layers.items():
-            if isinstance(layer.mlp, MoEMLP):
-                counts[int(name)] = layer.mlp.expert_counts
+        return {
+            idx: mlp.expert_counts for idx, modality, mlp in self._moe_mlps() if modality is None
+        }
+
+    def get_mot_expert_counts(self) -> dict[int, dict[str, torch.Tensor]]:
+        """Collect per-layer, per-modality expert utilization for MoT MoE layers.
+
+        Returns ``{layer_idx: {modality: (num_experts,) tensor}}`` for every
+        MoT layer whose per-modality FFNs are ``MoEMLP``s; returns ``{}``
+        otherwise. Each tensor holds the token count per expert from that
+        modality's router in the most recent forward, so the image and text
+        counts of a layer sum to different totals.
+        """
+        counts: dict[int, dict[str, torch.Tensor]] = {}
+        for idx, modality, mlp in self._moe_mlps():
+            if modality is not None:
+                counts.setdefault(idx, {})[modality] = mlp.expert_counts
         return counts
 
     def get_moma_expert_counts(self) -> dict[int, dict[str, torch.Tensor]]:

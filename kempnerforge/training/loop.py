@@ -207,6 +207,40 @@ def add_moe_losses(loss: torch.Tensor, model: torch.nn.Module, mc: Any) -> torch
     return loss
 
 
+def _expert_balance(routers: list[tuple[str | None, torch.Tensor]]) -> dict[str, float]:
+    """``moe/expert_balance`` over every router, plus one value per MoT modality.
+
+    Each router's expert counts are divided by that router's own total before
+    taking min over max, so routers that see different token counts (a MoT
+    model's image and text routers) compare as loads. Every flat MoE router sees
+    the same tokens, so for a text model this equals min over max of the raw
+    counts. A router whose counts sum to zero is skipped.
+
+    Args:
+        routers: ``(modality, counts)`` per router; ``modality`` is ``None`` for
+            a flat MoE layer.
+
+    Returns:
+        ``moe/expert_balance``, and ``moe/expert_balance/<modality>`` for each
+        MoT modality; empty when no router saw a token.
+    """
+    loads: list[tuple[str | None, torch.Tensor]] = []
+    for modality, counts in routers:
+        total = counts.float().sum()
+        if total.item() > 0:
+            loads.append((modality, counts.float() / total))
+    if not loads:
+        return {}
+    groups = {"moe/expert_balance": [load for _, load in loads]}
+    for modality in sorted({m for m, _ in loads if m is not None}):
+        groups[f"moe/expert_balance/{modality}"] = [load for m, load in loads if m == modality]
+    balance = {}
+    for key, group in groups.items():
+        values = torch.cat(group)
+        balance[key] = (values.min() / values.max()).item()
+    return balance
+
+
 def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     """PP step: collect microbatches, hand them to the schedule, broadcast loss.
 
@@ -417,10 +451,13 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
         inner = inner_transformer(model)
         moe_metrics = {"moe/aux_loss": inner.get_moe_aux_loss().item()}  # type: ignore[attr-defined]
         moe_metrics["moe/router_z_loss"] = inner.get_moe_router_z_loss().item()  # type: ignore[attr-defined]
-        expert_counts = inner.get_expert_counts()  # type: ignore[attr-defined]
-        if expert_counts:
-            all_counts = torch.stack(list(expert_counts.values())).float()
-            moe_metrics["moe/expert_balance"] = (all_counts.min() / all_counts.max()).item()
+        routers: list[tuple[str | None, torch.Tensor]] = [
+            (None, counts)
+            for counts in inner.get_expert_counts().values()  # type: ignore[attr-defined]
+        ]
+        for per_modality in inner.get_mot_expert_counts().values():  # type: ignore[attr-defined]
+            routers.extend(per_modality.items())
+        moe_metrics.update(_expert_balance(routers))
         tracker.log_eval(moe_metrics, step)
 
     if config.is_vlm:
