@@ -126,10 +126,10 @@ def _inline_image_context(
             f"the packer laid out {image_tokens} tokens per image but the adapter produces "
             f"{k}; set the packer's tokens_per_image to the adapter's output count"
         )
-    offsets = torch.arange(k, device=input_ids.device)
-    positions = (image_starts.to(input_ids.device).unsqueeze(1) + offsets).reshape(-1)
-    rows = image_rows.to(input_ids.device).repeat_interleave(k)
     device = input_ids.device
+    offsets = torch.arange(k, device=device)
+    positions = (image_starts.to(device).unsqueeze(1) + offsets).reshape(-1)
+    rows = image_rows.to(device).repeat_interleave(k)
     return ModalityContext(
         inline_embeds=embeds.reshape(n * k, dim),
         inline_rows=rows,

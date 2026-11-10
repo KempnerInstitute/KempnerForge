@@ -541,8 +541,10 @@ def pack_vlm_samples(
     (``V`` views, each an encoder input), ``input_ids`` and ``labels`` ``(T,)``
     whose first ``text_len`` positions are real (``0`` packs the image alone
     with nothing to supervise, as the unpacked path's all-masked row does). Its footprint is ``V *
-    tokens_per_image`` placeholder slots followed by ``text_len`` tokens, whose
-    last label is always ``-100`` since its next token is not in the row.
+    tokens_per_image`` placeholder slots followed by ``text_len`` tokens. The
+    last packed label is forced to ``-100`` as a guard for samples built outside
+    ``HuggingFaceVLMDataset`` (which already leaves it so): the token after a
+    trimmed ``text_len`` is not in the row.
     Documents go first-fit into rows in order: into the first open row with
     room, else a new row. A row's tail is padding that forms its own document.
 
