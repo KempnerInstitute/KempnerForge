@@ -62,6 +62,13 @@ On load, `set_rng_state()` restores them all. Result: a resumed run
 produces the **exact same loss trajectory** as an uninterrupted run,
 step for step.
 
+That holds only while nothing else draws from these generators after
+the restore. The MLflow backend keeps MLflow's usage telemetry off for
+that reason, since it would draw from `random` on a background thread;
+[MLflow § Usage telemetry](../metrics-and-profiling/mlflow.md#usage-telemetry)
+lists what can still draw and how a hook keeps its own stream
+reproducible.
+
 The one thing the RNG snapshot doesn't cover: multi-process
 dataloader workers spawned by `torch.utils.data.DataLoader` have
 their own RNG state. Their seeds are set deterministically at worker

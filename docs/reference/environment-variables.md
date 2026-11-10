@@ -108,6 +108,7 @@ Setup and auth routes: [MLflow backend](../metrics-and-profiling/mlflow.md).
 | `MLFLOW_HTTP_REQUEST_TIMEOUT` | MLflow | Set to `30` by the backend before importing `mlflow` |
 | `MLFLOW_HTTP_REQUEST_MAX_RETRIES` | MLflow | Set to `3` by the backend before importing `mlflow` |
 | `MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT` | MLflow | Set to `60` by the backend before importing `mlflow` |
+| `MLFLOW_DISABLE_TELEMETRY` | MLflow | Set to `true` by the backend before importing `mlflow`, so MLflow's usage telemetry never draws from Python's `random` after a resume restored it; export `false` to keep the telemetry ([MLflow § Usage telemetry](../metrics-and-profiling/mlflow.md#usage-telemetry)) |
 | `MLFLOW_ACTIVE_MODEL_ID` | MLflow, publisher | MLflow's process-wide active model (`mlflow.set_active_model` sets one too); never set by KempnerForge. While one is set, the eval publisher refuses to publish metrics that have no model to link to, since `log_batch` would silently link them to it |
 
 ## User-facing launch-script variables
@@ -131,7 +132,7 @@ not by any Python module:
 | `srun` (SLURM) | `SLURM_*` (incl. `SLURM_PROCID`, `SLURM_LOCALID`, `SLURM_NTASKS`, `SLURM_JOB_*`) |
 | `scripts/slurm/_run_training.sh` | Exports `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`, `NCCL_*`, `GLOO_*` before calling the trainer |
 | `init_distributed()` | Fills missing `RANK`/`LOCAL_RANK`/`WORLD_SIZE` from `SLURM_*`, missing `MASTER_ADDR`/`MASTER_PORT`, and all four `NCCL_*`/`GLOO_*` defaults |
-| MLflow backend, eval publisher | `DATABRICKS_CONFIG_PROFILE` (from a `databricks://<profile>` URI) when unset and `DATABRICKS_TOKEN` (from `DATABRICKS_API_TOKEN`) when unset or empty; the backend also fills the three `MLFLOW_*` HTTP defaults above |
+| MLflow backend, eval publisher | `DATABRICKS_CONFIG_PROFILE` (from a `databricks://<profile>` URI) when unset and `DATABRICKS_TOKEN` (from `DATABRICKS_API_TOKEN`) when unset or empty; the backend also fills the three `MLFLOW_*` HTTP defaults and `MLFLOW_DISABLE_TELEMETRY` above |
 
 ## See also
 

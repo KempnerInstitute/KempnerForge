@@ -384,6 +384,33 @@ itself, to resolve an automatic experiment path, keeps the SDK's own 300 s retry
 only the 60 s init deadline bounds it. Other MLflow clients, the publisher and the connectivity
 check included, run with MLflow's own defaults.
 
+## Usage telemetry
+
+MLflow collects anonymous usage telemetry unless told not to. The training backend turns it
+off: before it imports `mlflow` it sets `MLFLOW_DISABLE_TELEMETRY=true`, unless the variable is
+already set. MLflow's telemetry draws from Python's global `random`: the first call MLflow
+records starts a background thread that fetches the telemetry config and then calls
+`random.randint`. A resumed run makes that call after the checkpoint restored the RNG, so with
+telemetry on, a hook or a custom step function that draws from `random` would get a stream one
+draw ahead of the uninterrupted run's, and in a fresh run the draw would land at an
+unpredictable point among the training thread's own draws. Export
+`MLFLOW_DISABLE_TELEMETRY=false` to keep MLflow's telemetry at that cost.
+
+MLflow reads the variable at each call it records, so the default also holds when your code
+imports `mlflow` before the backend does, except for autologging (`mlflow.autolog()` and the
+flavor integrations), whose events MLflow records without reading it: a job that does both
+should export `MLFLOW_DISABLE_TELEMETRY=true` itself. The [publisher](#publishing-eval-results)
+runs outside training and restores no RNG, so it leaves telemetry as MLflow sets it.
+
+Two other kinds of draw from `random` remain in the tracking stack. MLflow, urllib3 and the
+Databricks SDK draw a random jitter for the wait before they retry a failed request, and a
+SQLite store before it retries a locked write, at times that depend on the network and the
+server. A local file or SQLite store draws a random name for a new run that has no
+`mlflow_run_name` (a file store can also draw when it creates an experiment), which a resume
+that reattaches its run never does. KempnerForge's own training path draws nothing from
+`random`, so the model, loss and grad norm are unaffected either way; a hook that needs a
+reproducible stream should own a `random.Random(seed)`.
+
 ## Failure modes
 
 `_ensure_init` disables the backend for the rest of the run on any failure, with a warning:

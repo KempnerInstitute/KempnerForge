@@ -50,10 +50,18 @@ _MAX_CALL_THREADS = 4
 
 
 def _import_mlflow() -> Any:
-    """Import mlflow with bounded HTTP requests; values already set in the environment win."""
+    """Import mlflow with bounded HTTP requests and its usage telemetry off.
+
+    Values already set in the environment win. The first call MLflow records starts a telemetry
+    thread that fetches a config and then draws from Python's global ``random``. A resumed run
+    makes that call after the checkpoint restored the RNG, which would leave the stream one draw
+    ahead of the uninterrupted run's, and in a fresh run the draw lands at an unpredictable point
+    among the training thread's own draws.
+    """
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "30")
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "3")
     os.environ.setdefault("MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT", "60")
+    os.environ.setdefault("MLFLOW_DISABLE_TELEMETRY", "true")
     import mlflow
 
     return mlflow

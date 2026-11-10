@@ -8,6 +8,7 @@ import importlib.machinery
 import io
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -129,17 +130,18 @@ class _FakeMlflow:
         )
 
 
-_MLFLOW_HTTP_ENV = (
+_MLFLOW_IMPORT_ENV = (
     "MLFLOW_HTTP_REQUEST_TIMEOUT",
     "MLFLOW_HTTP_REQUEST_MAX_RETRIES",
     "MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT",
+    "MLFLOW_DISABLE_TELEMETRY",
 )
 
 
 @pytest.fixture(autouse=True)
-def _unset_mlflow_http_env(monkeypatch):
-    """Start each test without the HTTP bounds; the caller's values are restored afterwards."""
-    for name in _MLFLOW_HTTP_ENV:
+def _unset_mlflow_import_env(monkeypatch):
+    """Start each test without the import defaults; the caller's values are restored afterwards."""
+    for name in _MLFLOW_IMPORT_ENV:
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
 
@@ -1075,7 +1077,7 @@ class TestMlflowHelpers:
 
 
 class _ImportSpy(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """Serves `fake` for `import mlflow` and records the HTTP bounds in force at import time."""
+    """Serves `fake` for `import mlflow` and records the import defaults in force at the time."""
 
     def __init__(self, fake):
         self.fake = fake
@@ -1085,7 +1087,7 @@ class _ImportSpy(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         return importlib.machinery.ModuleSpec(name, self) if name == "mlflow" else None
 
     def create_module(self, spec):
-        self.env_at_import = {n: os.environ.get(n) for n in _MLFLOW_HTTP_ENV}
+        self.env_at_import = {n: os.environ.get(n) for n in _MLFLOW_IMPORT_ENV}
         return self.fake
 
     def exec_module(self, module):
@@ -1109,25 +1111,29 @@ def _import_mlflow_via_spy(monkeypatch) -> _ImportSpy:
 class TestMLflowBestEffort:
     """Tracking calls are bounded in time: the training thread never waits on the server."""
 
-    def test_http_bounds_default_before_mlflow_is_imported(self, monkeypatch):
+    def test_import_defaults_are_set_before_mlflow_is_imported(self, monkeypatch):
         spy = _import_mlflow_via_spy(monkeypatch)
         assert spy.env_at_import == {
             "MLFLOW_HTTP_REQUEST_TIMEOUT": "30",
             "MLFLOW_HTTP_REQUEST_MAX_RETRIES": "3",
             "MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT": "60",
+            "MLFLOW_DISABLE_TELEMETRY": "true",
         }
 
-    def test_operator_http_bounds_win(self, monkeypatch):
+    def test_operator_values_win(self, monkeypatch):
         monkeypatch.setenv("MLFLOW_HTTP_REQUEST_TIMEOUT", "7")
         monkeypatch.setenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "9")
         monkeypatch.setenv("MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT", "11")
+        monkeypatch.setenv("MLFLOW_DISABLE_TELEMETRY", "false")
         spy = _import_mlflow_via_spy(monkeypatch)
         assert spy.env_at_import == {
             "MLFLOW_HTTP_REQUEST_TIMEOUT": "7",
             "MLFLOW_HTTP_REQUEST_MAX_RETRIES": "9",
             "MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT": "11",
+            "MLFLOW_DISABLE_TELEMETRY": "false",
         }
         assert os.environ["MLFLOW_HTTP_REQUEST_TIMEOUT"] == "7"
+        assert os.environ["MLFLOW_DISABLE_TELEMETRY"] == "false"
 
     def test_calls_name_the_run_and_run_off_the_calling_thread(self, monkeypatch):
         fm = _FakeMlflow()
@@ -1329,6 +1335,68 @@ class TestMLflowBestEffort:
         assert fm.sampling_intervals == ([2.5] if enabled else [])
         backend.close()
         assert fm.ended == ["run-xyz"] and fm.monitor_alive is False
+
+
+class TestMLflowTelemetry:
+    """MLflow's usage telemetry stays off, so it never draws from a restored Python RNG (#547)."""
+
+    def test_a_resumed_run_leaves_pythons_rng_where_the_restore_put_it(self, monkeypatch, tmp_path):
+        """A resume's first call MLflow records is a metric log, made after the RNG restore.
+
+        With telemetry on, that call starts MLflow's config fetch, whose thread then draws from
+        Python's global ``random``. Here the config is served from memory, nothing is sent, and
+        MLflow keeps its installation id under ``tmp_path``.
+        """
+        mlflow = pytest.importorskip("mlflow")
+        telemetry_client = pytest.importorskip("mlflow.telemetry.client")
+        import mlflow.telemetry.utils as telemetry_utils
+
+        class _Config:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "mlflow_version": mlflow.__version__,
+                    "rollout_percentage": 100,
+                    "ingestion_url": "http://127.0.0.1:9",
+                }
+
+        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+        monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+        monkeypatch.setattr(telemetry_utils, "_IS_IN_CI_ENV_OR_TESTING", False)
+        monkeypatch.setattr(
+            telemetry_client,
+            "requests",
+            types.SimpleNamespace(get=lambda url, timeout=None: _Config()),
+        )
+        monkeypatch.setattr(
+            telemetry_client.TelemetryClient,
+            "_process_records",
+            lambda self, records, request_timeout=1: None,
+        )
+        monkeypatch.setattr(telemetry_client, "_MLFLOW_TELEMETRY_CLIENT", None)
+        uri = (tmp_path / "mlruns").as_uri()
+        store = mlflow.MlflowClient(uri)
+        run_id = store.create_run(store.create_experiment("rng")).info.run_id
+        telemetry = telemetry_client.TelemetryClient()
+        monkeypatch.setattr(telemetry_client, "_MLFLOW_TELEMETRY_CLIENT", telemetry)
+        cfg = _mlflow_cfg(mlflow_tracking_uri=uri, mlflow_experiment="rng", mlflow_run_id=run_id)
+        saved = random.getstate()
+        try:
+            random.seed(0)
+            restored = random.getstate()
+            backend = MLflowBackend(cfg)
+            backend.log({"train/loss": 1.0}, step=5)
+            _flush(backend)
+            backend.close()
+            fetch = getattr(telemetry, "_config_thread", None)
+            if fetch is not None:
+                fetch.join(10)
+            assert random.getstate() == restored
+        finally:
+            telemetry._clean_up()
+            random.setstate(saved)
 
 
 class TestRunOwner:
