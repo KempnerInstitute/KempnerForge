@@ -96,7 +96,7 @@ def _resolve_pad_id(tokenizer_path: str) -> int:
 
 def _row_tokens_per_image(tokens_per_image: int | None, setting: str) -> int:
     """The built model's tokens per image, which laying out image slots in rows needs."""
-    if tokens_per_image is None:
+    if not tokens_per_image:
         raise ValueError(
             f"{setting} on a VLM run needs the built model's tokens per image; pass the "
             "wrapper's packed_tokens_per_image(model) as tokens_per_image"
@@ -371,8 +371,8 @@ def build_data_pipeline(
 
     Returns an empty pipeline when no source is configured — the text and PP
     step bodies then run on random tokens. ``tokens_per_image`` is the slots one
-    image takes in a packed VLM row, read off the built wrapper
-    (``packed_tokens_per_image``).
+    image takes in a laid-out VLM row, packed or one document per row, read off
+    the built wrapper (``packed_tokens_per_image``).
     """
     eos_token_id = _resolve_eos_token_id(config)
     dp_rank, dp_size = get_dp_info(runtime.device_mesh)

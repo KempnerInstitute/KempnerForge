@@ -2527,6 +2527,18 @@ class TestVlmSourceBuilders:
         with pytest.raises(ValueError, match="built model's tokens per image"):
             dp.build_data_pipeline(config, _runtime())
 
+    def test_packing_with_an_image_cap_packs_capped_documents(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        config.data.hf_max_images = 2
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=16)
+        assert seen["dataset"]["max_images"] == 2
+        assert seen["packed_collator"]["max_docs_per_row"] == 0
+        assert seen["packed_collator"]["tokens_per_image"] == 16
+
     def test_video_path_uses_the_video_collator(self, monkeypatch):
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)

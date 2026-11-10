@@ -44,6 +44,8 @@ def _dataset_over(
 
     ds = HuggingFaceVLMDataset.__new__(HuggingFaceVLMDataset)
     ds._ds = rows
+    ds._text_rows = rows
+    ds._image_rows = rows
     ds._image_field = "image"
     ds._text_field = "caption"
     ds._prompt_field = None

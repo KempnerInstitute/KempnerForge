@@ -262,6 +262,15 @@ def _warn_sample_masked_for_prompt(min_text_len: int, max_text_len: int) -> None
         )
 
 
+def _decode_image(value: Any) -> Any:
+    """A PIL image from an undecoded ``datasets`` image entry, or the image itself."""
+    if isinstance(value, dict):
+        from datasets import Image
+
+        return Image().decode_example(value)
+    return value
+
+
 def _images_of(value: Any) -> list[Any]:
     """The images an image field holds: none for ``None``, a list's present entries, else it."""
     if value is None:
@@ -465,6 +474,8 @@ class HuggingFaceVLMDataset(Dataset):
                 "HuggingFaceVLMDataset (use `split=` to resolve a single split)."
             )
         self._ds: HFDataset = ds
+        self._text_rows: Any = ds.remove_columns([image_field])
+        self._image_rows: Any = ds.select_columns([image_field]).with_format("arrow")
         self._image_field = image_field
         self._text_field = text_field
         self._prompt_field = prompt_field
@@ -489,9 +500,16 @@ class HuggingFaceVLMDataset(Dataset):
     def __len__(self) -> int:
         return len(self._ds)
 
+    def _image_value(self, idx: int) -> Any:
+        """The row's image field as stored, so only the images kept are decoded."""
+        raw = self._image_rows[idx]
+        if isinstance(raw, dict):
+            return raw[self._image_field]
+        return raw.column(self._image_field)[0].as_py()
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        row = self._ds[idx]
-        images = _images_of(row[self._image_field])
+        row = self._text_rows[idx]
+        images = _images_of(self._image_value(idx))[: self._max_images]
         if not images:
             if not self._allow_text_only:
                 raise ValueError(
@@ -501,8 +519,10 @@ class HuggingFaceVLMDataset(Dataset):
             pixels = torch.zeros(0, 3, self._image_size, self._image_size)
         else:
             tensors = [
-                pil_to_tensor(img, self._image_size, self._image_mean, self._image_std)
-                for img in images[: self._max_images]
+                pil_to_tensor(
+                    _decode_image(img), self._image_size, self._image_mean, self._image_std
+                )
+                for img in images
             ]
             pixels = tensors[0] if self._max_images == 1 else torch.stack(tensors, dim=0)
         text_val = row[self._text_field]
