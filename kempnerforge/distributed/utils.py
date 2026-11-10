@@ -170,3 +170,26 @@ def _scale_(grads: list[torch.Tensor], max_norm: float, total_norm: torch.Tensor
     for g in grads:
         g.mul_(clip_coef_clamped)
     return total_norm
+
+
+def agree_across_ranks(
+    error: BaseException | None, what: str, *, group: dist.ProcessGroup | None = None
+) -> None:
+    """Barrier on ``group`` that raises on every rank if any rank's ``what`` failed.
+
+    Every rank passes the error its own part of ``what`` raised, or ``None``. A
+    rank with an error re-raises it; when any rank has one, every other rank
+    raises a ``RuntimeError`` naming the ranks that failed, so no rank is left
+    waiting in a later collective for a rank that has raised. Without an
+    initialized process group, ``error`` is raised if set.
+    """
+    failed: list[int] = []
+    if dist.is_initialized():
+        flags = torch.zeros(dist.get_world_size(group), dtype=torch.int32)
+        flags[dist.get_rank(group)] = int(error is not None)
+        dist.all_reduce(flags, group=group)
+        failed = flags.nonzero().flatten().tolist()
+    if error is not None:
+        raise error
+    if failed:
+        raise RuntimeError(f"{what} failed on ranks {failed}")

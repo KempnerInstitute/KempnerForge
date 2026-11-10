@@ -19,7 +19,7 @@ parameters into two groups:
 The rule is `_should_decay(name, param, scope)` in
 [`optimizer.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/optimizer.py) —
 shared by all four optimizers. No decay on biases / norms is the
-Llama / GPT convention; Muon's 1D fallback AdamW inherits the same
+Llama / GPT convention; Muon's fallback AdamW inherits the same
 grouping. The token embedding and the output head are 2D, so they are
 decayed.
 
@@ -34,9 +34,10 @@ scopes. A checkpoint that holds no optimizer state, such as one converted from H
 Face or one saved before the first step, loads under either scope with a fresh
 optimizer. A checkpoint that does not record a scope was written under
 `"exclude_norms_and_biases"`, the only grouping that existed before the scope was
-recorded. To change the scope, start a new run from the checkpoint without its
-optimizer state: set `checkpoint.load_path` to it and
-`checkpoint.exclude_from_loading = ["optimizer"]`, with a `checkpoint.dir` that holds
+recorded. To change the scope, continue from the checkpoint with a fresh
+optimizer: set `checkpoint.load_path` to it and
+`checkpoint.exclude_from_loading = ["optimizer"]` (add `"train_state"` to also
+restart the step, schedule and data position), with a `checkpoint.dir` that holds
 no checkpoint. Training auto-resumes from a checkpoint in `checkpoint.dir` in place of
 `load_path`, optimizer state included (see
 [Auto-resume](../checkpointing/auto-resume.md)). Code that builds its own
@@ -132,22 +133,40 @@ muon_ns_steps = 5
 muon_nesterov = false
 muon_adjust_lr = "original"
 muon_orthogonalize = "local"
-# muon_adam_lr omitted -> use same LR as Muon for 1D params
+muon_router = false
+# muon_adam_lr omitted -> the internal AdamW uses Muon's LR
 weight_decay = 0.1
-betas = [0.9, 0.95]                     # used by internal AdamW for 1D params
+betas = [0.9, 0.95]                     # used by the internal AdamW
 eps = 1e-8
 ```
 
 Keller Jordan's Muon. Applies Newton-Schulz orthogonalization to the
-momentum buffer of each 2D weight before stepping; 1D parameters
-(biases, norms, highly rectangular matrices) fall through to an
-internal AdamW with the same hyperparameters.
+momentum buffer of each hidden weight matrix before stepping; every
+other parameter falls through to an internal AdamW with the same
+hyperparameters.
 
-How it decides which path each parameter takes
-(`_is_muon_eligible`):
+How it decides which path each parameter takes (`_muon_matrices`), by
+the module that owns it rather than by its shape:
 
-- 2D weight, aspect ratio ≤ 10 → Muon orthogonalized update.
-- 1D, or ratio > 10 → internal AdamW fallback.
+- Weight of an `nn.Linear` → Muon orthogonalized update, however
+  rectangular: attention, MLP, expert, cross-attention and adapter
+  projections.
+- The output head (`OutputHead`), `nn.Embedding` tables (the token
+  embedding, a vision tower's position embedding), conv kernels (a vision
+  tower's patch embedding), packed 3-D expert weights, norms and biases →
+  internal AdamW fallback.
+- MoE router gates (`MoEMLP`'s and MoMa's) → internal AdamW, or Muon with
+  `muon_router = true`. Practice is split:
+  [Moonlight](https://arxiv.org/abs/2502.16982) trained its MoE router
+  with Muon, while [Qwen3.8-Next](https://arxiv.org/abs/2608.30320) keeps
+  it on AdamW because Muon destabilized it early in training.
+
+A resume needs the split its checkpoint was saved with. One saved before
+Muon routed by module, from a model whose embedding or head Muon then
+orthogonalized, or saved with the other `muon_router`, fails to load and
+names the parameters that moved. A Muon checkpoint saved before the inner
+AdamW was checkpointed is the exception — see
+[DCP model § Loading](../checkpointing/dcp-model.md#loading).
 
 DTensor / FSDP2 notes:
 
@@ -173,7 +192,7 @@ DTensor / FSDP2 notes:
   [DCP model § Inner optimizers](../checkpointing/dcp-model.md#inner-optimizers).
 - `muon_adam_lr` unset (default) makes the internal AdamW use the same
   LR as Muon. Pass a smaller value (e.g. `muon_adam_lr = 1e-4`) if you
-  want 1D params on a gentler schedule.
+  want the AdamW parameters on a gentler schedule.
 
 Momentum and update scale:
 
@@ -202,7 +221,8 @@ Momentum and update scale:
 
 Newton-Schulz coefficients (hard-coded): `a = 3.4445, b = -4.7750, c =
 2.0315`, Frobenius-normalized input — standard values from the Muon
-paper.
+paper. A tall matrix is iterated as its transpose, so the Gram matrix the
+iteration squares is `min(rows, cols)` on a side.
 
 The shipped
 [`7b_16gpu_muon.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/7b_16gpu_muon.toml)

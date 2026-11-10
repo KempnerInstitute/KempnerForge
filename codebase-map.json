@@ -265,13 +265,13 @@
         "TransformerBlock": {
           "purpose": "Single pre-norm transformer block (attention + MLP with residuals). Used on text-only / Joint-Decoder / Cross-Attention paths",
           "methods": [
-            "forward(x, rope_cos, rope_sin, *, kv_cache, doc_ids)"
+            "forward(x, rope_cos, rope_sin, *, kv_cache, attn_mask)"
           ]
         },
         "Transformer": {
           "purpose": "Full decoder-only transformer (embed -> blocks -> norm -> head). Branches on isinstance(config.vlm, MoTConfig) to build MoTBlocks + per-modality mot_norms + per-modality forward path; on isinstance(config.vlm, CrossAttentionConfig) to interleave CrossAttentionBlocks at cadence; otherwise the JD / text-only path. Forward accepts a `modality: ModalityContext` kwarg with cross-arg invariants vs kv_caches",
           "methods": [
-            "forward(tokens, *, modality, kv_caches, doc_ids)",
+            "forward(tokens, *, modality, kv_caches, doc_ids, position_ids, attention_group_ids)",
             "init_weights_and_freqs()",
             "get_moe_aux_loss()",
             "get_expert_counts()",
@@ -296,7 +296,7 @@
     "kempnerforge/model/modality.py": {
       "classes": {
         "ModalityContext": {
-          "purpose": "Frozen dataclass bundling all modality-injection inputs flowing into Transformer.forward (inputs_embeds, prefix_embeds, output_slice, image_features, image_mask, modality_ids). Intra-context invariants enforced in __post_init__; cross-arg invariants vs kv_caches enforced at the top of Transformer.forward",
+          "purpose": "Frozen dataclass bundling all modality-injection inputs flowing into Transformer.forward (inputs_embeds, prefix_embeds, output_slice, image_features, image_mask, modality_ids, key_padding_mask, position_ids, attention_group_ids, rope_cos, rope_sin). Intra-context invariants enforced in __post_init__; cross-arg invariants vs kv_caches enforced at the top of Transformer.forward",
           "methods": [
             "__post_init__()"
           ]
@@ -454,10 +454,11 @@
           ]
         },
         "Attention": {
-          "purpose": "Grouped-Query Attention with RoPE, SDPA, optional QK-norm, doc_ids masking, attention weight capture",
+          "purpose": "Grouped-Query Attention with RoPE, SDPA or FlexAttention over the one attn_mask built per forward, optional QK-norm, lower-right causal bias for tokens appended to a KV cache, attention weight capture",
           "methods": [
-            "forward(x, rope_cos, rope_sin, *, kv_cache, doc_ids)",
-            "_attention_with_weights(q, k, v, seq_len, doc_ids, kv_cache)"
+            "forward(x, rope_cos, rope_sin, *, kv_cache, attn_mask)",
+            "_sdpa_context()",
+            "_attention_with_weights(q, k, v, seq_len, attn_mask, kv_cache)"
           ],
           "properties": [
             "capture_attention_weights",
@@ -732,7 +733,7 @@
       "functions": [
         "build_optimizer(model, config) -> Optimizer",
         "_newton_schulz(G, steps) -> Tensor",
-        "_is_muon_eligible(param) -> bool",
+        "_muon_matrices(model, *, routers) -> set[Tensor]",
         "_should_decay(name, param, scope) -> bool"
       ],
       "registry": [
@@ -745,6 +746,7 @@
         "tests/unit/test_training.py::TestBuildOptimizer",
         "tests/unit/test_optimizer.py::TestNewtonSchulz",
         "tests/unit/test_optimizer.py::TestMuon",
+        "tests/unit/test_optimizer.py::TestMuonRouting",
         "tests/unit/test_optimizer.py::TestAdamW",
         "tests/unit/test_additional_optimizers.py::TestLion",
         "tests/unit/test_additional_optimizers.py::TestScheduleFreeAdamW"
@@ -1188,7 +1190,8 @@
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestRNGState",
         "tests/unit/test_checkpoint.py::TestBuildTrainState",
-        "tests/unit/test_checkpoint.py::TestRestoreTrainState"
+        "tests/unit/test_checkpoint.py::TestRestoreTrainState",
+        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip"
       ]
     },
     "kempnerforge/checkpoint/manager.py": {
@@ -1224,7 +1227,7 @@
         "tests/unit/test_checkpoint.py::TestIntersectFreezeMetaByModule",
         "tests/unit/test_checkpoint_security.py::TestLoadTrainStateOwnershipGate",
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
-        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip",
+        "tests/unit/test_checkpoint.py::TestCheckpointManagerLoad",
         "tests/distributed/test_checkpoint.py"
       ]
     },
@@ -1615,11 +1618,12 @@
       },
       "tests/unit/test_optimizer.py": {
         "classes": [
-          "TestNewtonSchulz(3)",
-          "TestMuon(11)",
+          "TestNewtonSchulz(5)",
+          "TestMuon(29)",
+          "TestMuonRouting(6)",
           "TestAdamW(2)"
         ],
-        "count": 16
+        "count": 42
       },
       "tests/unit/test_eval.py": {
         "classes": [

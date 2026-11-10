@@ -438,9 +438,38 @@ class TestCheckpointConfig:
         with pytest.raises(ValueError, match="interval must be positive"):
             CheckpointConfig(interval=0)
 
-    @pytest.mark.parametrize("keys", [[], ["model"], ["optimizer"], ["model", "optimizer"]])
-    def test_exclude_from_loading_accepts_the_two_state_keys(self, keys):
+    @pytest.mark.parametrize(
+        "keys",
+        [
+            [],
+            ["model"],
+            ["optimizer"],
+            ["model", "optimizer"],
+            ["optimizer", "train_state"],
+            ["train_state", "optimizer"],
+        ],
+    )
+    def test_exclude_from_loading_accepts_the_state_keys(self, keys):
         assert CheckpointConfig(exclude_from_loading=keys).exclude_from_loading == keys
+
+    @pytest.mark.parametrize(
+        "keys",
+        [["train_state"], ["model", "train_state"], ["model", "optimizer", "train_state"]],
+    )
+    def test_train_state_is_rejected_outside_the_weights_only_pair(self, keys):
+        with pytest.raises(ValueError, match="must be \\['optimizer', 'train_state'\\]"):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    @pytest.mark.parametrize(
+        "keys", [["optimizer", "optimizer"], ["optimizer", "train_state", "train_state"]]
+    )
+    def test_exclude_from_loading_rejects_a_repeated_key(self, keys):
+        with pytest.raises(ValueError, match="repeats a key"):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    def test_exclude_from_loading_rejects_a_bare_string(self):
+        with pytest.raises(ValueError, match="must be a list"):
+            CheckpointConfig(exclude_from_loading="optimizer")  # type: ignore[arg-type]
 
     @pytest.mark.parametrize(
         "keys",
@@ -455,6 +484,19 @@ class TestCheckpointConfig:
         toml = tmp_path / "ckpt.toml"
         toml.write_text('[checkpoint]\nexclude_from_loading = ["lm_head"]\n')
         with pytest.raises(ValueError, match="exclude_from_loading"):
+            load_config(str(toml), cli_args=[])
+
+    @pytest.mark.parametrize("keys", [[["optimizer", "train_state"]], [{"optimizer": True}]])
+    def test_exclude_from_loading_rejects_unhashable_elements(self, keys):
+        with pytest.raises(
+            ValueError, match="accepts only 'model', 'optimizer' and/or 'train_state'"
+        ):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    def test_nested_exclude_from_loading_is_validated_from_toml(self, tmp_path):
+        toml = tmp_path / "ckpt.toml"
+        toml.write_text('[checkpoint]\nexclude_from_loading = [["optimizer", "train_state"]]\n')
+        with pytest.raises(ValueError, match="accepts only"):
             load_config(str(toml), cli_args=[])
 
     def test_dyn_ckpt_window_defaults_to_none(self):
@@ -722,6 +764,20 @@ class TestJobConfig:
         config = JobConfig(distributed=DistributedConfig(pp=2, dp_shard=1))
         config.validate(world_size=2)
 
+    def test_pp_eval_steps_must_be_a_multiple_of_grad_accum_steps(self):
+        def job(pp: int, steps: int, enabled: bool = True) -> JobConfig:
+            return JobConfig(
+                distributed=DistributedConfig(pp=pp, dp_shard=1),
+                train=TrainConfig(grad_accum_steps=2),
+                eval=EvalConfig(enabled=enabled, steps=steps, dataset_path="/data"),
+            )
+
+        with pytest.raises(ValueError, match=r"eval.steps \(3\) must be a multiple"):
+            job(2, 3).validate(world_size=2)
+        job(2, 4).validate(world_size=2)
+        job(1, 3).validate(world_size=1)
+        job(2, 3, enabled=False).validate(world_size=2)
+
     def test_flex_rejects_seq_len_below_block_size_at_construction(self):
         """Decidable from the config alone, so it fires in __post_init__."""
         with pytest.raises(ValueError, match="requires train.seq_len >= 128"):
@@ -752,6 +808,65 @@ class TestJobConfig:
         )
         with pytest.raises(ValueError, match="train.seq_len.*insufficient for VLM"):
             config.validate(world_size=1)
+
+    def test_tiled_views_count_toward_the_vlm_budget(self):
+        """3 × 3 crops plus the whole image are 10 views of 16 tokens: 160 + 64 text."""
+        config = JobConfig(
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=64, tile_grid=3),
+            train=TrainConfig(seq_len=200),
+        )
+        assert config.views_per_sample == 10
+        with pytest.raises(ValueError, match=r"residual_image_tokens \(160\)"):
+            config.validate(world_size=1)
+        config.train.seq_len = 224
+        config.validate(world_size=1)
+
+    def test_the_video_tiling_refusal_precedes_the_budget_check(self):
+        from kempnerforge.config.video import VideoConfig
+
+        with pytest.raises(ValueError, match="leave vlm.tile_grid at 0"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=64),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64, tile_grid=3),
+                video=VideoConfig(max_frames=8, min_frames=1, frame_size=16),
+            )
+
+    def test_tiled_views_must_fit_max_seq_len_at_construction(self):
+        with pytest.raises(ValueError, match=r"residual_image_tokens \(160\)"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=200),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64, tile_grid=3),
+            )
+
+    def test_tiling_is_refused_alongside_a_video_section(self):
+        from kempnerforge.config.video import VideoConfig
+
+        with pytest.raises(ValueError, match="leave vlm.tile_grid at 0"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=1024),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64, tile_grid=2),
+                video=VideoConfig(max_frames=2, min_frames=1, frame_size=16),
+                train=TrainConfig(seq_len=512),
+            ).validate(world_size=1)
+
+    def test_views_per_sample_is_one_for_text_and_untiled_runs(self):
+        assert JobConfig().views_per_sample == 1
+        config = JobConfig(
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=64),
+        )
+        assert config.views_per_sample == 1
 
     def test_validate_vlm_pp_rejected(self):
         config = JobConfig(
@@ -1665,6 +1780,36 @@ class TestRegistry:
         reg.register("optimizer", "x", "opt_x")
         assert reg.get("model", "x") == "model_x"
         assert reg.get("optimizer", "x") == "opt_x"
+
+    def test_unregister_removes_the_entry_and_returns_it(self):
+        reg = Registry()
+        reg.register("model", "a", "model_a")
+        reg.register("model", "b", "model_b")
+        assert reg.unregister("model", "a") == "model_a"
+        assert reg.list("model") == ["b"]
+        reg.register("model", "a", "model_a2")
+        assert reg.get("model", "a") == "model_a2"
+
+    def test_unregister_unknown_raises(self):
+        reg = Registry()
+        reg.register("model", "a", None)
+        with pytest.raises(KeyError, match=r"Unknown model: 'b'\. Available: \['a'\]"):
+            reg.unregister("model", "b")
+
+    def test_unregister_adapter_drops_its_accepts(self):
+        """The adapter and its ``accepts`` declaration leave together, so a later
+        adapter under the same name does not inherit the old declaration."""
+        reg = Registry()
+
+        def build(in_dim, out_dim, **_):
+            return None
+
+        reg.register_adapter("a", accepts=("pool_window",))(build)
+        assert reg.unregister("adapter", "a") is build
+        assert reg.list_adapters() == []
+        assert reg.get_adapter_accepts("a") is None
+        reg.register_adapter("a")(build)
+        assert reg.get_adapter_accepts("a") is None
 
     def test_builtin_optimizer_registered(self):
         from kempnerforge.config.registry import registry

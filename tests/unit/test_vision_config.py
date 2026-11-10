@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 import kempnerforge.model.vision  # noqa: F401
+from kempnerforge.config.loader import load_config
 from kempnerforge.config.registry import registry
 from kempnerforge.config.vision import VisionEncoderConfig
 
@@ -61,3 +63,46 @@ class TestVisionEncoderConfig:
         assert "random" in names
         assert "siglip2" in names
         assert "clip" in names
+
+
+class TestVisionEncoderMixedPrecision:
+    def test_unset_by_default(self):
+        cfg = VisionEncoderConfig()
+        assert cfg.mixed_precision is None
+        assert cfg.compute_dtype is None
+
+    @pytest.mark.parametrize(
+        ("precision", "dtype"), [("bf16", torch.bfloat16), ("fp32", torch.float32)]
+    )
+    def test_resolves_to_the_compute_dtype(self, precision, dtype):
+        assert VisionEncoderConfig(mixed_precision=precision).compute_dtype == dtype
+
+    def test_loads_from_toml_and_cli(self, tmp_path):
+        toml = tmp_path / "vlm.toml"
+        toml.write_text(
+            '[vision_encoder]\ntype = "random"\nmixed_precision = "fp32"\n\n'
+            "[vlm]\nmax_text_len = 32\n"
+        )
+        config = load_config(str(toml), cli_args=[])
+        assert config.vision_encoder is not None
+        assert config.vision_encoder.mixed_precision == "fp32"
+        assert config.train.mixed_precision == "bf16"
+
+        override = load_config(str(toml), cli_args=["--vision_encoder.mixed_precision=bf16"])
+        assert override.vision_encoder is not None
+        assert override.vision_encoder.compute_dtype == torch.bfloat16
+
+        unset = load_config(str(toml), cli_args=["--vision_encoder.mixed_precision=None"])
+        assert unset.vision_encoder is not None
+        assert unset.vision_encoder.mixed_precision is None
+
+    @pytest.mark.parametrize("precision", ["fp16", "fp8", "float32", ""])
+    def test_direct_construction_rejects_other_values(self, precision):
+        with pytest.raises(ValueError, match="vision_encoder.mixed_precision must be one of"):
+            VisionEncoderConfig(mixed_precision=precision)
+
+    def test_toml_rejects_other_values(self, tmp_path):
+        toml = tmp_path / "vlm.toml"
+        toml.write_text('[vision_encoder]\ntype = "random"\nmixed_precision = "fp16"\n')
+        with pytest.raises(ValueError):
+            load_config(str(toml), cli_args=[])
