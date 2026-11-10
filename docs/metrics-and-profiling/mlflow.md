@@ -95,9 +95,14 @@ variable takes the environment route, which passes on `DATABRICKS_HOST` plus a t
 either name, a username and password, or a client id and secret; with no credential variable
 set it reads the file and uses the SDK's default profile. Anything else warns without failing,
 naming the three routes, because it cannot verify OAuth, a CLI login or a metadata service
-offline. When `$MLFLOW_TRACKING_URI` selects one profile and `$DATABRICKS_CONFIG_PROFILE` names
-another, it warns, naming both, as the backend would. It parses the whole file, as the SDK
-does, but no value from the file reaches a message. It looks at the environment, not at
+offline. On the profile route it also counts the auth methods behind the profile's own key
+names and the credential variables set, as the SDK does, and warns when there is more than one,
+such as a `token` in the section beside an exported `DATABRICKS_CLIENT_ID` or a stray
+`ARM_CLIENT_ID`, unless `$DATABRICKS_AUTH_TYPE` or a non-empty `auth_type` key in the profile
+picks one: the SDK refuses such a profile, and the backend disables itself. When
+`$MLFLOW_TRACKING_URI` selects one profile and `$DATABRICKS_CONFIG_PROFILE` names another, it
+warns, naming both, as the backend would. It parses the whole file, as the SDK does, but no
+value from the file reaches a message. It looks at the environment, not at
 `mlflow_tracking_uri` in a config. Add
 `--check-credentials` to also call the workspace through the SDK by that same resolution,
 naming a profile only when one is selected; it calls whenever the offline check passes or leaves

@@ -345,6 +345,24 @@ _DATABRICKS_CREDENTIAL_VAR_AUTH: dict[str, str] = {
     "DATABRICKS_METADATA_SERVICE_URL": "metadata-service",
 }
 
+_DATABRICKS_PROFILE_KEY_AUTH: dict[str, str] = {
+    "token": "pat",
+    "username": "basic",
+    "password": "basic",
+    "client_id": "oauth",
+    "client_secret": "oauth",
+    "oidc_token_env": "env-oidc",
+    "oidc_token_filepath": "file-oidc",
+    "google_service_account": "google",
+    "google_credentials": "google",
+    "azure_workspace_resource_id": "azure",
+    "azure_use_msi": "azure",
+    "azure_client_secret": "azure",
+    "azure_client_id": "azure",
+    "azure_tenant_id": "azure",
+    "metadata_service_url": "metadata-service",
+}
+
 _DATABRICKS_ENV_AUTH: dict[str, tuple[str, tuple[tuple[str, ...], ...]]] = {
     "pat": ("token", (("DATABRICKS_TOKEN", "DATABRICKS_API_TOKEN"),)),
     "basic": ("username and password", (("DATABRICKS_USERNAME",), ("DATABRICKS_PASSWORD",))),
@@ -415,6 +433,9 @@ class _ProfileFile:
             from the file, which no message may quote.
         problem: Why the file offers no profile, or None.
         missing: The file does not exist, so the SDK reads nothing from it.
+        keys: Each profile's key names, as the SDK reads them: a named profile's own keys,
+            since the SDK does not merge ``[DEFAULT]`` into it, and ``auth_type`` only when it
+            has a value, since the SDK ignores an empty one. Names only; no value is kept.
     """
 
     profiles: frozenset[str]
@@ -422,6 +443,17 @@ class _ProfileFile:
     default_from_settings: bool
     problem: str | None
     missing: bool = False
+    keys: tuple[tuple[str, frozenset[str]], ...] = ()
+
+    def keys_of(self, profile: str) -> frozenset[str]:
+        """The key names of ``profile``; empty when the file does not offer it."""
+        return dict(self.keys).get(profile, frozenset())
+
+
+def _key_names(section: dict[str, Any]) -> frozenset[str]:
+    """A section's key names as the SDK weighs them: every key, but ``auth_type`` only when it
+    picks a method, since the SDK ignores an empty one. No value leaves this function."""
+    return frozenset(k for k, v in section.items() if k != "auth_type" or (v or "").strip())
 
 
 def _read_databricks_config(name: str) -> _ProfileFile:
@@ -457,11 +489,19 @@ def _read_databricks_config(name: str) -> _ProfileFile:
             frozenset(), "DEFAULT", False, f"{name} is malformed ({type(e).__name__})"
         )
     profiles = {section for section in parser.sections() if section != _SETTINGS_SECTION}
+    keys = {section: _key_names(parser._sections[section]) for section in profiles}
     if parser.defaults():
         profiles.add("DEFAULT")
+        keys["DEFAULT"] = _key_names(parser.defaults())
     parser.remove_option(parser.default_section, "default_profile")
     default = parser.get(_SETTINGS_SECTION, "default_profile", raw=True, fallback="").strip()
-    return _ProfileFile(frozenset(profiles), default or "DEFAULT", bool(default), None)
+    return _ProfileFile(
+        frozenset(profiles),
+        default or "DEFAULT",
+        bool(default),
+        None,
+        keys=tuple(sorted(keys.items())),
+    )
 
 
 def _databricks_env_credentials() -> tuple[str, ...]:
@@ -505,6 +545,32 @@ def _databricks_env_auth() -> tuple[str | None, str]:
     return next(iter(complete.values())), ""
 
 
+def _profile_auth_conflict(keys: frozenset[str], section: str) -> str | None:
+    """Why the SDK would refuse a profile with these key names in this environment, or None.
+
+    The SDK loads the environment first, fills in from the profile every attribute the
+    environment left unset, and refuses credentials of more than one auth method unless
+    $DATABRICKS_AUTH_TYPE or an ``auth_type`` key in the profile picks one. ``section`` names
+    the profile in the message; only key and variable names are reported, never a value.
+    """
+    if os.environ.get("DATABRICKS_AUTH_TYPE") or "auth_type" in keys:
+        return None
+    sources: dict[str, list[str]] = {}
+    for key in sorted(keys):
+        if family := _DATABRICKS_PROFILE_KEY_AUTH.get(key):
+            sources.setdefault(family, []).append(f"{key} in {section}")
+    for name, family in _DATABRICKS_CREDENTIAL_VAR_AUTH.items():
+        if os.environ.get(name):
+            sources.setdefault(family, []).append(f"${name}")
+    if len(sources) <= 1:
+        return None
+    named = "; ".join(f"{family}: {', '.join(where)}" for family, where in sorted(sources.items()))
+    return (
+        f"credentials for more than one auth method are configured ({named}), which the SDK "
+        "rejects unless $DATABRICKS_AUTH_TYPE or an auth_type key in the profile picks one"
+    )
+
+
 def check_mlflow(check_credentials: bool = False) -> CheckResult:
     """Check the Databricks auth route for MLflow, resolved the way the SDK resolves it.
 
@@ -515,7 +581,12 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
     the environment route applies instead. With none selected, any Databricks credential
     variable makes the SDK skip the file, so the environment route applies; otherwise the file's
     default profile does. A route no offline evidence settles, SDK OAuth among them, is a WARN
-    naming all three routes rather than a pass. On the profile route, a $DATABRICKS_CONFIG_PROFILE
+    naming all three routes rather than a pass.
+
+    On the profile route the SDK counts the auth methods behind the profile's own key names and
+    the environment's credential variables together, and refuses more than one unless
+    $DATABRICKS_AUTH_TYPE or a non-empty ``auth_type`` key in the profile picks one; such a
+    profile is a WARN naming the keys and variables, never a value. A $DATABRICKS_CONFIG_PROFILE
     that names another profile than the URI is a WARN naming both: the backend keeps it, so the
     run's SDK clients built from the environment alone would use another profile than MLflow's
     tracking calls.
@@ -558,6 +629,9 @@ def check_mlflow(check_credentials: bool = False) -> CheckResult:
                 WARN,
                 f"no Databricks credentials found ({problem}); {_MLFLOW_AUTH_ROUTES}",
             )
+        section = f"[{profile}]" if quotable else "the profile [__settings__] default_profile names"
+        if conflict := _profile_auth_conflict(config.keys_of(profile), section):
+            return CheckResult("mlflow", WARN, f"{conflict}; {_MLFLOW_AUTH_ROUTES}")
         if mismatch := _profile_mismatch():
             return CheckResult("mlflow", WARN, mismatch)
         found = (
