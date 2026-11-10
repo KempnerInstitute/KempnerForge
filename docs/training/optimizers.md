@@ -34,9 +34,10 @@ scopes. A checkpoint that holds no optimizer state, such as one converted from H
 Face or one saved before the first step, loads under either scope with a fresh
 optimizer. A checkpoint that does not record a scope was written under
 `"exclude_norms_and_biases"`, the only grouping that existed before the scope was
-recorded. To change the scope, start a new run from the checkpoint without its
-optimizer state: set `checkpoint.load_path` to it and
-`checkpoint.exclude_from_loading = ["optimizer"]`, with a `checkpoint.dir` that holds
+recorded. To change the scope, continue from the checkpoint with a fresh
+optimizer: set `checkpoint.load_path` to it and
+`checkpoint.exclude_from_loading = ["optimizer"]` (add `"train_state"` to also
+restart the step, schedule and data position), with a `checkpoint.dir` that holds
 no checkpoint. Training auto-resumes from a checkpoint in `checkpoint.dir` in place of
 `load_path`, optimizer state included (see
 [Auto-resume](../checkpointing/auto-resume.md)). Code that builds its own

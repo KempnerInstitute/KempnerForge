@@ -1611,6 +1611,85 @@ class TestSaveCheckpointRegistration:
         ]
 
 
+class TestWeightsOnlyWarmStart:
+    def _saved(self, tmp_path, monkeypatch, freeze):
+        from types import SimpleNamespace
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        sched = torch.optim.lr_scheduler.StepLR(mgr.checkpointed_optimizers[0], step_size=1)
+        sched.step()
+        sched.step()
+        loader = SimpleNamespace(state_dict=lambda: {"epoch": 3})
+        mgr.save(
+            step=9,
+            tokens_seen=900,
+            scheduler=sched,
+            dataloader=loader,
+            extra={"vlm_freeze": freeze},
+        )
+        return tmp_path / "step_9"
+
+    def test_train_state_is_skipped(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        assert (ckpt_dir / "train_state.pt").exists()
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        sched = torch.optim.lr_scheduler.StepLR(mgr.checkpointed_optimizers[0], step_size=1)
+        loader = MagicMock(spec=["load_state_dict"])
+        step, tokens, extra = mgr.load(
+            path=str(ckpt_dir),
+            scheduler=sched,
+            dataloader=loader,
+            exclude_keys=["optimizer", "train_state"],
+        )
+        assert (step, tokens, extra) == (0, 0, {})
+        assert sched.last_epoch == 0
+        loader.load_state_dict.assert_not_called()
+        assert mgr._pending_dataloader_state is None
+        import kempnerforge.checkpoint.manager as manager_mod
+
+        manager_mod.dcp.load.assert_called_once()
+        assert set(manager_mod.dcp.load.call_args.args[0]) == {"model"}
+
+    def test_without_a_dataloader_no_state_is_stashed(self, tmp_path, monkeypatch):
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        step, _, _ = mgr.load(path=str(ckpt_dir), exclude_keys=["optimizer", "train_state"])
+        assert step == 0
+        assert mgr._pending_dataloader_state is None
+
+    def test_freeze_comparison_is_skipped(self, tmp_path, monkeypatch):
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        step, _, _ = mgr.load(
+            path=str(ckpt_dir),
+            exclude_keys=["optimizer", "train_state"],
+            vlm_freeze_expected=_freeze_meta(("vision_encoder", False)),
+        )
+        assert step == 0
+
+    @pytest.mark.parametrize(
+        "keys", [["train_state"], ["model", "train_state"], ["model", "optimizer", "train_state"]]
+    )
+    def test_train_state_outside_the_pair_is_refused(self, tmp_path, monkeypatch, keys):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="must be \\['optimizer', 'train_state'\\]"):
+            mgr.load(path=str(tmp_path / "absent"), exclude_keys=keys)
+
+    def test_nested_exclude_is_refused_before_loading(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="accepts only"):
+            mgr.load(path=str(tmp_path / "absent"), exclude_keys=[["optimizer", "train_state"]])
+
+    def test_without_the_key_the_train_state_is_restored(self, tmp_path, monkeypatch):
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        step, tokens, _ = mgr.load(path=str(ckpt_dir), exclude_keys=["optimizer"])
+        assert (step, tokens) == (9, 900)
+        assert mgr._pending_dataloader_state == {"epoch": 3}
+
+
 class TestLoadVLMFreezeCompare:
     def test_match_passes(self, tmp_path, monkeypatch):
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
@@ -2261,9 +2340,9 @@ class TestSyncBarrierGroup:
 
     def test_agree_without_a_process_group_raises_only_its_own_error(self, tmp_path):
         mgr = self._mgr(tmp_path)
-        mgr._agree(None)
+        mgr.agree(None)
         with pytest.raises(OSError, match="No space left"):
-            mgr._agree(OSError(28, "No space left on device"))
+            mgr.agree(OSError(28, "No space left on device"))
 
     def test_init_creates_dedicated_gloo_group(self, tmp_path, monkeypatch):
         import kempnerforge.checkpoint.manager as mgr_mod
@@ -2305,18 +2384,18 @@ class TestSyncBarrierGroup:
 
     def test_agree_uses_dedicated_group_not_default(self, tmp_path, monkeypatch):
         groups = self._four_ranks(monkeypatch, [])
-        self._mgr(tmp_path)._agree(None)
+        self._mgr(tmp_path).agree(None)
         assert groups == ["GLOO_PG"]
 
     def test_agree_raises_on_every_rank_when_others_failed(self, tmp_path, monkeypatch):
         self._four_ranks(monkeypatch, [1, 3])
         with pytest.raises(RuntimeError, match=r"Checkpoint save failed on ranks \[1, 3\]"):
-            self._mgr(tmp_path)._agree(None)
+            self._mgr(tmp_path).agree(None)
 
     def test_agree_reraises_this_ranks_own_error(self, tmp_path, monkeypatch):
         self._four_ranks(monkeypatch, [2])
         with pytest.raises(OSError, match="No space left"):
-            self._mgr(tmp_path)._agree(OSError(28, "No space left on device"))
+            self._mgr(tmp_path).agree(OSError(28, "No space left on device"))
 
 
 class TestCheckpointManagerLoad:
