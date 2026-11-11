@@ -179,7 +179,8 @@ number on this page is with full AC because it was necessary to fit
 the batch size. The cost is roughly 30% more compute per step;
 usually you don't have a choice, because without AC you OOM.
 
-`"selective"` checkpoints a subset of blocks — sometimes usable for
+`"selective"` checkpoints only the attention module inside each block,
+so MLP activations stay in memory. It is sometimes usable for
 smaller models where full AC leaves GPUs underutilized. Measured
 marginal on most configs in the benchmark.
 

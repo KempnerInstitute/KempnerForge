@@ -26,6 +26,7 @@ import torch
 from torch.distributed._composable.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
+    CheckpointWrapper,
     apply_activation_checkpointing,
     checkpoint_wrapper,
 )
@@ -33,7 +34,10 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ActivationCheckpointing
-from kempnerforge.model.transformer import Transformer, TransformerBlock
+from kempnerforge.model.attention import Attention
+from kempnerforge.model.cross_attention import CrossAttention
+from kempnerforge.model.mot import MoTAttention
+from kempnerforge.model.transformer import Transformer
 
 if TYPE_CHECKING:
     from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
@@ -133,39 +137,96 @@ def autocast_dtype(
     return compute_dtype
 
 
-def apply_ac(model: Transformer, mode: ActivationCheckpointing) -> None:
-    """Apply activation checkpointing to the model.
+_ATTENTION_TYPES = (Attention, MoTAttention, CrossAttention)
+
+
+def _ac_blocks(model: torch.nn.Module) -> list[tuple[torch.nn.ModuleDict, str]]:
+    """``(container, key)`` of every child of ``layers`` and ``cross_attention_layers``.
+
+    A pipeline stage has no ``cross_attention_layers``, and a model without
+    cross-attention has an empty one.
+    """
+    blocks = []
+    for name in ("layers", "cross_attention_layers"):
+        container = getattr(model, name, None)
+        if container is not None:
+            blocks.extend((container, key) for key in container)
+    return blocks
+
+
+def _is_checkpointed(module: torch.nn.Module) -> bool:
+    """Whether ``module`` is, or holds, a ``CheckpointWrapper``."""
+    return any(isinstance(m, CheckpointWrapper) for m in module.modules())
+
+
+def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpointing | str) -> int:
+    """Apply activation checkpointing to the model's blocks.
 
     Must be called BEFORE apply_fsdp2.
 
+    The blocks are the children of ``model.layers`` and, when present,
+    ``model.cross_attention_layers``, selected by position, so every block
+    class is covered: ``TransformerBlock``, ``MoTBlock``, ``MoMaBlock`` and
+    ``CrossAttentionBlock`` alike. A block that already holds a
+    ``CheckpointWrapper`` is left as it is, so calling this twice wraps
+    nothing new.
+
     Args:
-        model: Transformer model.
-        mode: Checkpointing mode — "none", "full", or "selective".
-            full: checkpoint every TransformerBlock (maximum memory savings).
-            selective: checkpoint only Attention modules (balanced trade-off).
+        model: Transformer model or pipeline stage.
+        mode: Checkpointing mode, "none", "full", or "selective", as an
+            ``ActivationCheckpointing`` member or its string value. ``full``
+            checkpoints every block (maximum memory savings); ``selective``
+            checkpoints the ``Attention``, ``MoTAttention`` and
+            ``CrossAttention`` modules inside each block (balanced trade-off)
+            and warns, naming the class, about a block that holds none of them.
+
+    Returns:
+        The number of modules this call wrapped.
     """
+    mode = ActivationCheckpointing(mode)
     if mode == ActivationCheckpointing.none:
-        return
+        return 0
 
     wrapper_fn = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+    blocks = _ac_blocks(model)
+    wrapped: dict[str, int] = {}
+    for container, key in blocks:
+        if _is_checkpointed(container[key]):
+            continue
+        if mode == ActivationCheckpointing.full:
+            container[key] = wrapper_fn(container[key])
+        else:
+            apply_activation_checkpointing(
+                container[key],
+                checkpoint_wrapper_fn=wrapper_fn,
+                check_fn=lambda m: isinstance(m, _ATTENTION_TYPES),
+            )
+        for m in container[key].modules():
+            if isinstance(m, CheckpointWrapper):
+                name = type(m._checkpoint_wrapped_module).__name__
+                wrapped[name] = wrapped.get(name, 0) + 1
 
-    if mode == ActivationCheckpointing.full:
-        apply_activation_checkpointing(
-            model,
-            checkpoint_wrapper_fn=wrapper_fn,
-            check_fn=lambda m: isinstance(m, TransformerBlock),
+    uncovered = [type(c[k]).__name__ for c, k in blocks if not _is_checkpointed(c[k])]
+    if not blocks:
+        logger.warning(
+            f"activation_checkpointing={mode.value!r} checkpoints nothing: the model has no "
+            "blocks in layers or cross_attention_layers"
         )
-        logger.info("Applied full activation checkpointing (per TransformerBlock)")
-
-    elif mode == ActivationCheckpointing.selective:
-        from kempnerforge.model.attention import Attention
-
-        apply_activation_checkpointing(
-            model,
-            checkpoint_wrapper_fn=wrapper_fn,
-            check_fn=lambda m: isinstance(m, Attention),
+    elif uncovered:
+        logger.warning(
+            f"activation_checkpointing={mode.value!r} leaves {len(uncovered)} of {len(blocks)} "
+            f"blocks unwrapped ({', '.join(sorted(set(uncovered)))}): they hold no Attention, "
+            "MoTAttention or CrossAttention module. Use 'full' to checkpoint them whole."
         )
-        logger.info("Applied selective activation checkpointing (Attention only)")
+    if wrapped:
+        counts = ", ".join(f"{n} {name}" for name, n in wrapped.items())
+        logger.info(f"Applied {mode.value} activation checkpointing: wrapped {counts}")
+    elif blocks and not uncovered:
+        logger.info(
+            f"Activation checkpointing ({mode.value}) wrapped nothing new: every block "
+            "was already checkpointed"
+        )
+    return sum(wrapped.values())
 
 
 def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True) -> None:

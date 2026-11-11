@@ -256,6 +256,21 @@ class JobConfig:
                 "or TP without FP8."
             )
 
+        if (
+            self.model.is_moe
+            and self.model.moe_router == "sigmoid_topk"
+            and self.train.activation_checkpointing == "full"
+        ):
+            raise ValueError(
+                "model.moe_router = 'sigmoid_topk' does not support "
+                "train.activation_checkpointing = 'full': the sigmoid router updates its expert "
+                "bias in place in every training forward, so the backward's replay of a "
+                "checkpointed block routes with a moved bias, can pick other experts than the "
+                "forward did, and then raises CheckpointError. Use activation_checkpointing = "
+                "'selective', which checkpoints attention only and leaves the MoE layers out "
+                "of the replay."
+            )
+
         if self.model.is_moe and self.distributed.pp > 1:
             alternatives = (
                 "Use FSDP instead; MoT runs neither TP nor EP."
@@ -275,9 +290,7 @@ class JobConfig:
                     f"(distributed.ep={self.distributed.ep}): the FSDP2 wrap for expert-parallel "
                     "blocks expects layer.attention and layer.mlp, and MoTBlock names its "
                     "attention attn and keeps its FFNs per modality, so a MoT model with experts "
-                    "fails to build. Set distributed.ep = 1. MoT with MoE then trains, but "
-                    "without its load-balancing loss, router z-loss, bias schedule or balance "
-                    "metric (https://github.com/KempnerInstitute/KempnerForge/issues/308)."
+                    "fails to build. Set distributed.ep = 1."
                 )
             if isinstance(self.vlm, MoMaConfig):
                 raise ValueError(
@@ -331,14 +344,4 @@ class JobConfig:
                         "torch.compile is not yet validated for MoMa dispatch "
                         "(modality_ids-based scatter/gather + expert-choice top-k cause "
                         "graph breaks). Set compile_model=false for MoMa models."
-                    )
-
-                if self.train.activation_checkpointing == "full":
-                    import logging
-
-                    logging.getLogger(__name__).warning(
-                        "AC=full is currently a no-op for MoMa (apply_ac matches "
-                        "TransformerBlock only; MoMaBlock is a sibling nn.Module). "
-                        "Use ac='selective' (wraps the Attention submodule, still works) "
-                        "or reduce moma_experts_per_modality until the apply_ac refactor lands."
                     )

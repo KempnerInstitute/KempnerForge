@@ -9,6 +9,9 @@ Covers:
 - ``mot_warm_start_from_text_stack``: dense -> per-modality copy, idempotency,
   no-op on non-MoT modules, shape-mismatch rejection, optional
   ``transformer.`` prefix on source keys.
+- The ``Transformer`` MoE accessors on a MoT model with experts: the aux
+  loss, router z-loss, bias step and expert counts reach every per-modality
+  router.
 
 No GPU required; uses CPU tensors.
 """
@@ -22,9 +25,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.config.vision import VisionEncoderConfig
+from kempnerforge.config.vlm import MoMaConfig, MoTConfig, VLMConfig
+from kempnerforge.distributed.parallel import build_parallel_model
+from kempnerforge.model.moe import MoEMLP
 from kempnerforge.model.mot import MoTAttention, MoTBlock, mot_warm_start_from_text_stack
 from kempnerforge.model.position import apply_rope, precompute_rope_frequencies
+from kempnerforge.model.router import SigmoidTopKRouter
+from kempnerforge.model.transformer import Transformer
+from kempnerforge.model.vlm import inner_transformer
 
 DEVICE = torch.device("cpu")
 
@@ -620,3 +631,132 @@ class TestWarmStartHelper:
             source_full["layers.0.attention.o_proj.weight"],
         )
         assert torch.equal(harness.layers["1"].attn.o_proj["image"].weight, zero_o_proj)
+
+
+def _build_vlm(vlm: VLMConfig, **model_kw) -> Transformer:
+    """A 4-layer VLM built the way training builds it, after one forward; its Transformer."""
+    torch.manual_seed(0)
+    cfg = ModelConfig(
+        dim=64,
+        n_layers=4,
+        n_heads=4,
+        vocab_size=256,
+        max_seq_len=128,
+        ffn_hidden_dim=128,
+        **model_kw,
+    )
+    wrapper = build_parallel_model(
+        cfg,
+        torch.device("cpu"),
+        None,
+        vision_config=VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+        adapter_config=AdapterConfig(),
+        vlm_config=vlm,
+        param_dtype=torch.float32,
+    )
+    ids = torch.randint(0, 256, (2, 16))
+    wrapper(torch.randn(2, 3, 32, 32), ids, ids)
+    return inner_transformer(wrapper)
+
+
+def _mot_moe(router: str = "softmax_topk") -> Transformer:
+    """MoT with 4 experts, top-2, in layers 1 and 3: four routers, one per layer and modality."""
+    return _build_vlm(
+        MoTConfig(max_text_len=32),
+        num_experts=4,
+        moe_top_k=2,
+        moe_frequency=2,
+        moe_router=router,
+    )
+
+
+def _modality_routers(transformer: Transformer) -> list[tuple[int, str, MoEMLP]]:
+    """Every per-modality ``MoEMLP`` of a MoT model, found by walking its blocks directly."""
+    found = []
+    for idx, layer in transformer.layers.items():
+        for modality in layer.modalities:
+            mlp = layer.mlp[modality]
+            if isinstance(mlp, MoEMLP):
+                found.append((int(idx), modality, mlp))
+    return found
+
+
+class TestMoTMoEAccessors:
+    """The ``Transformer`` MoE accessors reach every per-modality router of a MoT model.
+
+    A MoT layer keeps its routers one level down, in a per-modality ``ModuleDict``.
+    """
+
+    def test_aux_loss_sums_every_modality_router(self):
+        transformer = _mot_moe()
+        routers = _modality_routers(transformer)
+        assert len(routers) == 4
+        aux = transformer.get_moe_aux_loss()
+        assert aux.requires_grad
+        assert aux.item() > 0
+        torch.testing.assert_close(aux, sum(mlp.aux_loss for _, _, mlp in routers))
+
+    def test_aux_loss_gradient_reaches_every_router_gate(self):
+        transformer = _mot_moe()
+        transformer.get_moe_aux_loss().backward()
+        for idx, modality, mlp in _modality_routers(transformer):
+            grad = mlp.router.gate.weight.grad
+            assert grad is not None and grad.abs().sum() > 0, f"layer {idx} {modality}"
+
+    def test_router_z_loss_sums_every_modality_router(self):
+        transformer = _mot_moe()
+        z = transformer.get_moe_router_z_loss()
+        assert z.item() > 0
+        expected = sum(mlp.z_loss for _, _, mlp in _modality_routers(transformer))
+        torch.testing.assert_close(z, expected)
+
+    def test_set_moe_step_reaches_modality_routers(self):
+        transformer = _mot_moe(router="sigmoid_topk")
+        transformer.set_moe_step(42, 1000)
+        routers = [mlp.router for _, _, mlp in _modality_routers(transformer)]
+        assert len(routers) == 4
+        for router in routers:
+            assert isinstance(router, SigmoidTopKRouter)
+            assert (router._step, router._max_steps) == (42, 1000)
+
+    def test_mot_expert_counts_are_per_layer_and_modality(self):
+        """Each router counts its own tokens: 2 rows of 8 image or 16 text tokens, top-2."""
+        transformer = _mot_moe()
+        counts = transformer.get_mot_expert_counts()
+        assert sorted(counts) == [1, 3]
+        for idx, modality, mlp in _modality_routers(transformer):
+            assert counts[idx][modality] is mlp.expert_counts
+        for per_modality in counts.values():
+            assert sorted(per_modality) == ["image", "text"]
+            assert per_modality["image"].sum().item() == 2 * 8 * 2
+            assert per_modality["text"].sum().item() == 2 * 16 * 2
+
+    def test_flat_expert_counts_stay_empty_for_mot(self):
+        assert _mot_moe().get_expert_counts() == {}
+
+    def test_text_moe_counts_stay_flat(self):
+        torch.manual_seed(0)
+        cfg = ModelConfig(
+            dim=64,
+            n_layers=4,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=64,
+            num_experts=4,
+            moe_top_k=2,
+            moe_frequency=2,
+        )
+        model = Transformer(cfg)
+        model(torch.randint(0, 256, (2, 16)))
+        assert sorted(model.get_expert_counts()) == [1, 3]
+        assert model.get_mot_expert_counts() == {}
+
+    def test_moma_contributes_no_moe_terms(self):
+        """MoMa's expert-choice groups are not ``MoEMLP``s and carry no aux loss by design."""
+        transformer = _build_vlm(MoMaConfig(max_text_len=32))
+        aux = transformer.get_moe_aux_loss()
+        assert aux.item() == 0.0
+        assert not aux.requires_grad
+        assert transformer.get_moe_router_z_loss().item() == 0.0
+        assert transformer.get_expert_counts() == {}
+        assert transformer.get_mot_expert_counts() == {}

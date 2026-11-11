@@ -277,7 +277,9 @@
             "forward(tokens, *, modality, kv_caches, doc_ids, position_ids, attention_group_ids)",
             "init_weights_and_freqs()",
             "get_moe_aux_loss()",
+            "get_moe_router_z_loss()",
             "get_expert_counts()",
+            "get_mot_expert_counts()",
             "set_moe_step(step, max_steps)"
           ]
         }
@@ -293,7 +295,8 @@
         "tests/unit/test_model.py::TestPrefixEmbeds",
         "tests/unit/test_model.py::TestModalityIdsCrossArgs",
         "tests/unit/test_model.py::TestCrossAttentionInterleaving",
-        "tests/unit/test_model.py::TestMoT"
+        "tests/unit/test_model.py::TestMoT",
+        "tests/unit/test_mot.py::TestMoTMoEAccessors"
       ]
     },
     "kempnerforge/model/modality.py": {
@@ -358,6 +361,7 @@
         "tests/unit/test_mot.py::TestMoTAttentionNumerical",
         "tests/unit/test_mot.py::TestMoTBlock",
         "tests/unit/test_mot.py::TestWarmStartHelper",
+        "tests/unit/test_activation_checkpointing.py::TestMoTWarmStart",
         "tests/unit/test_model.py::TestMoT",
         "tests/integration/test_vlm_mot.py",
         "tests/distributed/test_vlm_mot_fsdp.py"
@@ -919,6 +923,7 @@
       "tested_by": [
         "tests/unit/test_train_entry.py::TestRunTrainingLoop",
         "tests/unit/test_train_entry.py::TestBatchStream",
+        "tests/unit/test_train_entry.py::TestMoEMetrics",
         "tests/unit/test_train_entry.py::TestSelectStepFn",
         "tests/unit/test_train_entry.py::TestCheckpointExtra",
         "tests/unit/test_train_entry.py::TestUnfreezeAtAStage",
@@ -1103,7 +1108,9 @@
       "functions": [
         "build_parallel_model(model_config, device, device_mesh, *, ac_mode, mp_policy, param_dtype, compile_model, fp8) -> nn.Module (dispatches to _build_vlm when model_config.vlm is set)",
         "_build_vlm(model_config, device, device_mesh, *, ac_mode, mp_policy, param_dtype, compile_model, fp8) -> VLMWrapper",
-        "apply_ac(model, mode)",
+        "apply_ac(model, mode) -> int",
+        "_ac_blocks(model) -> list[tuple[nn.ModuleDict, str]]",
+        "_is_checkpointed(module) -> bool",
         "apply_float8(model, enable_fsdp_float8_all_gather)",
         "apply_fsdp2(model, device_mesh, mp_policy, reshard_after_forward) (text-only path; shares _fsdp_wrap_transformer_blocks with VLM)",
         "_apply_fsdp_vlm(wrapper, device_mesh, mp_policy, reshard_after_forward) (VLM-aware FSDP: inner Transformer per-block + adapter + encoder wrap unless no step of the run trains it)",
@@ -1123,6 +1130,10 @@
         "tests/unit/test_distributed.py::TestApplyFsdpVLMGuards",
         "tests/unit/test_distributed.py::TestBuildParallelModelVLM",
         "tests/unit/test_distributed.py::TestFsdpWrapTransformerBlocksHelper",
+        "tests/unit/test_activation_checkpointing.py::TestWhatGetsWrapped",
+        "tests/unit/test_activation_checkpointing.py::TestCheckpointingTakesEffect",
+        "tests/unit/test_activation_checkpointing.py::TestLogging",
+        "tests/unit/test_activation_checkpointing.py::TestUnderFsdp2",
         "tests/unit/test_unfreeze_fsdp.py",
         "tests/distributed/test_freeze_schedule_fsdp.py"
       ]
