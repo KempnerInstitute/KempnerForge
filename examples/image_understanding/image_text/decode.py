@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from PIL import Image, ImageOps
+from PIL.TiffImagePlugin import TiffImageFile
 
 from .points import pixels_to_percent
 from .skip import UnusableRowError
@@ -60,7 +61,11 @@ def decode_upright(source: str | Path | bytes) -> Decoded:
     try:
         with Image.open(io.BytesIO(source) if isinstance(source, bytes) else source) as image:
             orientation = image.getexif().get(EXIF_ORIENTATION, 1)
-            stored_size = image.size
+            stored_size = (
+                (image.tag_v2[256], image.tag_v2[257])
+                if isinstance(image, TiffImageFile)
+                else image.size
+            )
             ImageOps.exif_transpose(image, in_place=True)
             return Decoded(image.convert("RGB"), orientation, stored_size)
     except DECODE_ERRORS as exc:

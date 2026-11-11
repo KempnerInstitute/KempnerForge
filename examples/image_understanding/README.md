@@ -62,8 +62,10 @@ Every sample the renderer builds carries one image, resized square to `image_siz
 with no tiling or packing. PixMo-Count stores its points in pixels; they are
 converted to percent of the image, the unit the other PixMo sources use. A
 counting answer lists its points before the count, so a row with many points
-outruns `max_text_len` and trains only the leading points; `max_points` bounds
-the answer so the count fits.
+outruns `max_text_len` and trains only the leading points. `max_points` retains
+the count only when the cap is small enough for the label and the text budget:
+with a 40-point `dot` row at 256 tokens, a cap of 30 still cuts the count, while
+a cap of 3 keeps it.
 
 ## Tile images
 

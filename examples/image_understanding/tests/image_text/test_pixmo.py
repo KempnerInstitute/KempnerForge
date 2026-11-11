@@ -18,7 +18,7 @@ from image_text.pixmo import (
     pixmo_point_explanations,
     pixmo_pointing,
 )
-from image_text.render import ChatRenderer
+from image_text.render import ChatRenderer, RenderedDataset
 from PIL import Image
 
 
@@ -67,8 +67,11 @@ class TestCaptionsAndConversations:
         assert doc.kind == "conversation"
         assert [(t.user, t.answers) for t in doc.turns] == [("Q1", ("A1",)), ("Q2", ("A2",))]
 
-    def test_a_conversation_stops_at_its_first_bad_turn(self, tmp_path: Path) -> None:
-        messages = [["Q1", "A1"], ["Q1", "A1", "Q2", ""], ["Q1", "A1", "Q2", "", "Q3", "A3"]]
+    @pytest.mark.parametrize("bad_turn", [["Q2"], "junk", 7, ["Q1", "A1", "Q2"], ["Q2", ""]])
+    def test_a_conversation_stops_at_its_first_bad_turn(
+        self, tmp_path: Path, bad_turn: Any
+    ) -> None:
+        messages = [["Q1", "A1"], bad_turn, ["Q1", "A1", "Q2", "", "Q3", "A3"]]
         ann = _write_jsonl(
             tmp_path / "capqa.jsonl", [{"image": "pixmo_images/bb", "messages": messages}]
         )
@@ -116,10 +119,11 @@ class TestCaptionsAndConversations:
         )
         assert doc.turns[2].answers == ("Because.",)
 
-    def test_a_scalar_where_a_list_is_expected_is_refused(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("label", ["cat", "", 0, False, None])
+    def test_a_scalar_where_a_list_is_expected_is_refused(self, tmp_path: Path, label: Any) -> None:
         ann = _write_jsonl(
             tmp_path / "points.jsonl",
-            [{"image": "pixmo_images/dd", "label": "cat", "points": [{"x": 1, "y": 1}] * 3}],
+            [{"image": "pixmo_images/dd", "label": label, "points": [{"x": 1, "y": 1}] * 3}],
         )
         with pytest.raises(ValueError, match="must be lists"):
             pixmo_pointing(ann, tmp_path)
@@ -302,7 +306,7 @@ class TestPointingAndCounting:
                 }
             ],
         )
-        with pytest.raises(ValueError, match="x and y differ in length"):
+        with pytest.raises(ValueError, match="x, y differ in length"):
             pixmo_counting(count, tmp_path, multi_label=False)
 
     def test_counting_keeps_every_point_unless_capped(
@@ -352,18 +356,20 @@ class TestPointingAndCounting:
             doc = Document(
                 images=(image,), turns=(Turn("How many dot are in the image?", (reply,)),)
             )
-            renderer = ChatRenderer(tokenizer, max_text_len=96, image_size=8, answer_only=True)
+            renderer = ChatRenderer(tokenizer, max_text_len=256, image_size=8, answer_only=True)
             sample = renderer.render(doc, [reply])
             labels = sample["labels"]
             return tokenizer.decode(labels[labels != -100])
 
         every = trained(answer(None))
         assert every.startswith('<points x1="0.0"') and "I count" not in every
+        assert "I count" not in trained(answer(30))
         capped = trained(answer(3))
         assert capped.endswith("Counting the dot, I count 40.<|im_end|>")
 
+    @pytest.mark.parametrize("count_fields", [{}, {"count": None}])
     def test_a_missing_count_states_the_number_of_points(
-        self, tmp_path: Path, write_image: Callable
+        self, tmp_path: Path, write_image: Callable, count_fields: dict
     ) -> None:
         write_image("pixmo_images/hh", size=(10, 10))
         ann = _write_jsonl(
@@ -372,13 +378,13 @@ class TestPointingAndCounting:
                 {
                     "image": "pixmo_images/hh",
                     "label": "ant",
-                    "count": None,
+                    **count_fields,
                     "points": {"x": [], "y": []},
                 },
                 {
                     "image": "pixmo_images/hh",
                     "label": "bee",
-                    "count": None,
+                    **count_fields,
                     "points": {"x": [1, 2], "y": [1, 2]},
                 },
             ],
@@ -464,3 +470,52 @@ class TestUnreadableImages:
         reader = pixmo_captions(self._captions(tmp_path, ["a"]), tmp_path, prompt="P")
         with pytest.raises(IndexError):
             reader[1]
+
+
+@pytest.mark.parametrize("axis", ["x", "y"])
+@pytest.mark.parametrize("value", ["12", "", 0, False, None])
+def test_pixel_coordinate_columns_must_be_lists(tmp_path: Path, axis: str, value: Any) -> None:
+    points = {"x": [1, 2], "y": [3, 4], axis: value}
+    ann = _write_jsonl(
+        tmp_path / "count.jsonl",
+        [{"image": "a", "label": "dot", "count": 2, "points": points}],
+    )
+    with pytest.raises(ValueError, match="must be lists"):
+        pixmo_counting(ann, tmp_path, multi_label=False)
+
+
+@pytest.mark.parametrize("start", [0, 2])
+def test_rendering_continues_after_the_actual_refused_row(
+    tmp_path: Path, write_image: Callable, tokenizer: Any, start: int
+) -> None:
+    _write_stub(tmp_path, "bad")
+    write_image("good")
+    rows = [
+        {"image": "bad", "label": ["dot"] * 16, "count": [0] * 16, "points": [[]] * 16},
+        {"image": "good", "label": ["long " * 300], "count": [0], "points": [[]]},
+        {"image": "good", "label": ["cat"], "count": [0], "points": [[]]},
+    ]
+    if start:
+        rows = rows[1:] + rows[:1]
+    ann = _write_jsonl(tmp_path / "count.jsonl", rows)
+    reader = pixmo_counting(ann, tmp_path, multi_label=True)
+    renderer = ChatRenderer(tokenizer, max_text_len=256, image_size=8, answer_only=True)
+    dataset = RenderedDataset(reader, renderer)
+    sample = dataset[start]
+    labels = sample["labels"]
+    assert tokenizer.decode(labels[labels != -100]) == "I count 0 cat in the image.<|im_end|>"
+    assert reader.skipped == 1
+    assert dataset.skipped == 2
+
+
+def test_tiff_pixel_points_use_the_stored_grid(tmp_path: Path) -> None:
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    Image.new("RGB", (7, 5)).save(tmp_path / "rot.tiff", exif=exif)
+    ann = _write_jsonl(
+        tmp_path / "count.jsonl",
+        [{"image": "rot.tiff", "label": "dot", "points": {"x": [1.5, 6.5], "y": [2.5, 1.5]}}],
+    )
+    doc = pixmo_counting(ann, tmp_path, multi_label=False)[0]
+    assert doc.images[0].size == (5, 7)
+    assert doc.turns[0].answers[0].startswith('<points x1="50.0" y1="21.4" x2="70.0" y2="92.9"')
