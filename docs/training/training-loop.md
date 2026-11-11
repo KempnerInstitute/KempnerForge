@@ -97,6 +97,9 @@ see [Gradient utilities](gradient-utilities.md).
 Under PP, `pipeline_step` passes `pp_group=`, so the norm is summed over
 the stages and every stage scales by the same coefficient (see
 [Gradient utilities § Under pipeline parallelism](gradient-utilities.md#under-pipeline-parallelism)).
+Under EP it reads the EP group from the model, so the norm covers every
+rank's experts (see
+[Gradient utilities § Under expert parallelism](gradient-utilities.md#under-expert-parallelism)).
 `NaNDetector.check_loss` returns `False` when the loss or the gradient norm is
 NaN / Inf on any rank; the loop then zeroes the gradients and skips the step.
 The detector escalates to `should_rollback` after `max_consecutive` bad steps
@@ -172,7 +175,9 @@ hook_runner.on_step_end(StepContext(
 `loss` is the mean of the step's loss over the data-parallel ranks, the
 loss whose gradient the update applied, on every rank. `lr` is the LR
 the update used (for `schedule_free_adamw`, the rate before the warmup
-the optimizer applies inside `step()`). `tokens_in_step` counts the
+the optimizer applies inside `step()`). The per-module `lr/<module>` and
+`lr_adamw/<module>` metrics are read at the same point, so they describe
+the same update. `tokens_in_step` counts the
 positions the model ran on this rank, `result.tokens`, times the
 data-parallel size; a VLM step counts the image positions in the
 residual stream as well as the text.
@@ -225,8 +230,9 @@ in order, then hands a `TrainingSession` to `run_training_loop`:
 
 1. `load_config(path, cli_args)` — TOML + CLI overrides into a
    `JobConfig` dataclass (done by `scripts/train.py`).
-2. `setup_distributed(config)` — `dist.init_process_group`, `DeviceMesh`,
-   seeded RNG, world-size validation; returns a `RuntimeContext`.
+2. `setup_distributed(config)` — `JobConfig.validate(world_size)`, then
+   `dist.init_process_group`, `DeviceMesh` and seeded RNG; returns a
+   `RuntimeContext`.
 3. `build_loss_fn(tc)` — loss registry lookup with optional z-loss wrap
    (see [Losses](losses.md)).
 4. `build_model(config, runtime, loss_fn)` — architecture + full

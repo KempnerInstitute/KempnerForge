@@ -197,11 +197,12 @@ def log_eval(self, metrics: dict[str, float], step: int) -> None:
 ```
 
 Eval metrics don't touch the smoothing table — they're reported raw. The
-training loop calls `log_eval` after `run_eval`, and separately for MoE
-and per-dataset breakdowns and for checkpoint times:
+training loop calls `log_eval` after `run_eval`, and separately for per-module
+learning rates, MoE and per-dataset breakdowns, and checkpoint times:
 
 ```python
 # training/loop.py
+tracker.log_eval(lr_metrics, step)      # lr/<module> (lr_adamw/<module> under muon), with optimizer.lr_multipliers
 tracker.log_eval(moe_metrics, step)     # moe/aux_loss, moe/expert_balance
 tracker.log_eval(ds_metrics, step)      # loss/<name>, data/<name>/tokens
 tracker.log_eval(eval_metrics, step)    # eval loss

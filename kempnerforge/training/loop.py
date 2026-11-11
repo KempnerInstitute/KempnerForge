@@ -39,6 +39,7 @@ from kempnerforge.training.eval import run_eval
 from kempnerforge.training.freeze import apply_freeze_specs, freeze_meta_at_step
 from kempnerforge.training.grad import maybe_no_sync
 from kempnerforge.training.hooks import HookRunner, StepContext
+from kempnerforge.training.optimizer import module_learning_rates
 from kempnerforge.training.runtime import PipelineBundle, RuntimeContext, pp_group
 
 logger = get_logger(__name__)
@@ -728,6 +729,7 @@ def run_training_loop(
                 continue
 
             applied_lr = optimizer.param_groups[0]["lr"]
+            applied_module_lrs = module_learning_rates(optimizer)
             optimizer.step()
             _advance_lr_schedule(session)
 
@@ -765,6 +767,8 @@ def run_training_loop(
             )
 
             if step_metrics is not None:
+                if applied_module_lrs:
+                    tracker.log_eval(applied_module_lrs, step)
                 _log_periodic_metrics(session, result, step)
 
             if (

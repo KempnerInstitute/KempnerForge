@@ -212,8 +212,9 @@ cold experts get `scale > 1` (gradients amplified). The scale passes
 through the `expert_out * sorted_weights` scatter-add, so the
 routing weights still apply on top of it.
 
-The same logic runs on the EP path (`ep_dispatch_and_compute`) using
-per-local-expert receive counts — see
+The same logic runs on the EP path (`ep_dispatch_and_compute`), which
+scales each local expert by its receive count against the same average
+over all experts, so EP leaves the scale unchanged; see
 [EP § Gradient scaling](../distributed/expert-parallelism.md#gradient-scaling-optional).
 
 **Reference**: DeepSeek-V3 §3.2. Empirically small effect on short

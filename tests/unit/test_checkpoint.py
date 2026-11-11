@@ -211,7 +211,11 @@ class TestCheckpointRetention:
         assert remaining == [0, 1, 2, 4, 256, 512, 2000, 3000]
 
     def test_cleanup_retries_a_checkpoint_it_could_not_remove(self, tmp_path, monkeypatch):
-        """A failed removal is logged instead of raised, and the next cleanup retries it."""
+        """A removal that keeps failing is logged, and the next cleanup retries it.
+
+        It is tried five times with 0.75 s of waits, each try under the sidecar lock and no
+        wait under it.
+        """
         import errno
 
         from kempnerforge.checkpoint import manager as mgr_mod
@@ -220,22 +224,162 @@ class TestCheckpointRetention:
         model = torch.nn.Linear(4, 4)
         opt = torch.optim.SGD(model.parameters(), lr=0.1)
         mgr = CheckpointManager(CheckpointConfig(dir=str(tmp_path), keep_last_n=2), model, opt)
+        lock = _HeldLock()
+        mgr._sidecar_lock = lock
         for i in [10, 20, 30]:
             (tmp_path / f"step_{i}").mkdir()
+        attempts: list[tuple[str, bool]] = []
 
         def busy(path, *args, **kwargs):
+            attempts.append((Path(path).name, lock.held))
             raise OSError(errno.ENOTEMPTY, "Directory not empty", str(path))
 
+        slept: list[tuple[float, bool]] = []
         warnings: list[str] = []
         monkeypatch.setattr(mgr_mod.shutil, "rmtree", busy)
+        monkeypatch.setattr(mgr_mod.time, "sleep", lambda s: slept.append((s, lock.held)))
         monkeypatch.setattr(mgr_mod.logger, "warning", warnings.append)
         mgr._cleanup()
         assert (tmp_path / "step_10").is_dir()
+        assert attempts == [("step_10", True)] * 5
+        assert slept == [(0.05, False), (0.1, False), (0.2, False), (0.4, False)]
         assert len(warnings) == 1 and "step_10" in warnings[0], warnings
 
         monkeypatch.undo()
         mgr._cleanup()
         assert sorted(d.name for d in tmp_path.iterdir() if d.is_dir()) == ["step_20", "step_30"]
+
+    @pytest.mark.parametrize(
+        ("failures", "attempts", "left"),
+        [
+            pytest.param(
+                {"step_10": 9, "step_20": 9, "step_30": 9},
+                ["step_10"] * 5 + ["step_20", "step_30"],
+                ["step_10", "step_20", "step_30"],
+                id="the_first_outlasts_the_waits",
+            ),
+            pytest.param(
+                {"step_10": 1, "step_20": 9, "step_30": 9},
+                ["step_10"] * 2 + ["step_20"] * 4 + ["step_30"],
+                ["step_20", "step_30"],
+                id="the_first_needs_one_retry",
+            ),
+        ],
+    )
+    def test_a_cleanup_waits_at_most_0_75_s_in_all(
+        self, tmp_path, monkeypatch, failures, attempts, left
+    ):
+        """The removals of one cleanup share the 0.05, 0.1, 0.2 and 0.4 s waits.
+
+        One that fails once they are spent is logged and left for the next cleanup.
+        """
+        import errno
+
+        from kempnerforge.checkpoint import manager as mgr_mod
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        mgr = CheckpointManager(CheckpointConfig(dir=str(tmp_path), keep_last_n=1), model, opt)
+        for i in [10, 20, 30, 40]:
+            (tmp_path / f"step_{i}").mkdir()
+        rmtree = mgr_mod.shutil.rmtree
+        remaining = dict(failures)
+        tried: list[str] = []
+
+        def flaky(path, *args, **kwargs):
+            name = Path(path).name
+            tried.append(name)
+            if remaining.get(name, 0):
+                remaining[name] -= 1
+                raise OSError(errno.ENOTEMPTY, "Directory not empty", str(path))
+            return rmtree(path, *args, **kwargs)
+
+        slept: list[float] = []
+        warnings: list[str] = []
+        monkeypatch.setattr(mgr_mod.shutil, "rmtree", flaky)
+        monkeypatch.setattr(mgr_mod.time, "sleep", slept.append)
+        monkeypatch.setattr(mgr_mod.logger, "warning", warnings.append)
+        mgr._cleanup()
+        assert tried == attempts
+        assert slept == [0.05, 0.1, 0.2, 0.4]
+        assert len(warnings) == len(left)
+        remaining_dirs = sorted(d.name for d in tmp_path.iterdir() if d.is_dir())
+        assert remaining_dirs == [*left, "step_40"]
+
+    def test_cleanup_retries_a_directory_nfs_briefly_keeps_non_empty(self, tmp_path, monkeypatch):
+        """The errors NFS gives while it still holds a just-deleted file pass on a retry.
+
+        Each attempt holds the sidecar lock and the waits do not.
+        """
+        import errno
+
+        from kempnerforge.checkpoint import manager as mgr_mod
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        mgr = CheckpointManager(CheckpointConfig(dir=str(tmp_path), keep_last_n=1), model, opt)
+        lock = _HeldLock()
+        mgr._sidecar_lock = lock
+        for i in [10, 20]:
+            (tmp_path / f"step_{i}").mkdir()
+        rmtree = mgr_mod.shutil.rmtree
+        transient = [errno.ENOTEMPTY, errno.EBUSY, errno.ENOENT]
+        attempts: list[bool] = []
+
+        def held(path, *args, **kwargs):
+            attempts.append(lock.held)
+            if transient:
+                code = transient.pop(0)
+                raise OSError(code, os.strerror(code), str(path))
+            return rmtree(path, *args, **kwargs)
+
+        slept: list[tuple[float, bool]] = []
+        warnings: list[str] = []
+        monkeypatch.setattr(mgr_mod.shutil, "rmtree", held)
+        monkeypatch.setattr(mgr_mod.time, "sleep", lambda s: slept.append((s, lock.held)))
+        monkeypatch.setattr(mgr_mod.logger, "warning", warnings.append)
+        mgr._cleanup()
+
+        assert sorted(d.name for d in tmp_path.iterdir() if d.is_dir()) == ["step_20"]
+        assert attempts == [True] * 4
+        assert slept == [(0.05, False), (0.1, False), (0.2, False)]
+        assert warnings == []
+
+    @pytest.mark.parametrize("case", ["permission", "already_gone"])
+    def test_cleanup_tries_other_errors_once(self, tmp_path, monkeypatch, case):
+        """A permission error, or a directory that is already gone, is logged after one try."""
+        import errno
+
+        from kempnerforge.checkpoint import manager as mgr_mod
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        mgr = CheckpointManager(CheckpointConfig(dir=str(tmp_path), keep_last_n=1), model, opt)
+        for i in [10, 20]:
+            (tmp_path / f"step_{i}").mkdir()
+        rmtree = mgr_mod.shutil.rmtree
+        attempts: list[str] = []
+
+        def failing(path, *args, **kwargs):
+            attempts.append(Path(path).name)
+            if case == "permission":
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            rmtree(path, *args, **kwargs)
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
+
+        slept: list[float] = []
+        warnings: list[str] = []
+        monkeypatch.setattr(mgr_mod.shutil, "rmtree", failing)
+        monkeypatch.setattr(mgr_mod.time, "sleep", slept.append)
+        monkeypatch.setattr(mgr_mod.logger, "warning", warnings.append)
+        mgr._cleanup()
+
+        assert attempts == ["step_10"]
+        assert slept == []
+        assert len(warnings) == 1 and "step_10" in warnings[0], warnings
 
 
 class TestAsyncCheckpointer:
@@ -1433,6 +1577,10 @@ class TestSaveCheckpointRegistration:
         assert len(warnings) == 1 and reason in warnings[0]
 
     def test_sidecar_writes_amends_and_removals_hold_the_sidecar_lock(self, tmp_path, monkeypatch):
+        """Every sidecar write, amend and removal attempt holds the sidecar lock.
+
+        A removal that NFS makes the cleanup retry is recorded once per lock state.
+        """
         from kempnerforge.checkpoint import manager as mgr_mod
 
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
@@ -1447,7 +1595,9 @@ class TestSaveCheckpointRegistration:
             return replace(src, dst)
 
         def removed(path, *args, **kwargs):
-            held.append((f"remove {Path(path).name}", lock.held))
+            entry = (f"remove {Path(path).name}", lock.held)
+            if entry not in held:
+                held.append(entry)
             return rmtree(path, *args, **kwargs)
 
         monkeypatch.setattr(os, "replace", replaced)
@@ -1494,6 +1644,85 @@ class TestSaveCheckpointRegistration:
         assert self._sidecar(tmp_path, 3)["tracking"] == [
             {**self.MLFLOW, "model_name": "m-step_3", "model_id": "step_3-registered"}
         ]
+
+
+class TestWeightsOnlyWarmStart:
+    def _saved(self, tmp_path, monkeypatch, freeze):
+        from types import SimpleNamespace
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        sched = torch.optim.lr_scheduler.StepLR(mgr.checkpointed_optimizers[0], step_size=1)
+        sched.step()
+        sched.step()
+        loader = SimpleNamespace(state_dict=lambda: {"epoch": 3})
+        mgr.save(
+            step=9,
+            tokens_seen=900,
+            scheduler=sched,
+            dataloader=loader,
+            extra={"vlm_freeze": freeze},
+        )
+        return tmp_path / "step_9"
+
+    def test_train_state_is_skipped(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        assert (ckpt_dir / "train_state.pt").exists()
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        sched = torch.optim.lr_scheduler.StepLR(mgr.checkpointed_optimizers[0], step_size=1)
+        loader = MagicMock(spec=["load_state_dict"])
+        step, tokens, extra = mgr.load(
+            path=str(ckpt_dir),
+            scheduler=sched,
+            dataloader=loader,
+            exclude_keys=["optimizer", "train_state"],
+        )
+        assert (step, tokens, extra) == (0, 0, {})
+        assert sched.last_epoch == 0
+        loader.load_state_dict.assert_not_called()
+        assert mgr._pending_dataloader_state is None
+        import kempnerforge.checkpoint.manager as manager_mod
+
+        manager_mod.dcp.load.assert_called_once()
+        assert set(manager_mod.dcp.load.call_args.args[0]) == {"model"}
+
+    def test_without_a_dataloader_no_state_is_stashed(self, tmp_path, monkeypatch):
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        step, _, _ = mgr.load(path=str(ckpt_dir), exclude_keys=["optimizer", "train_state"])
+        assert step == 0
+        assert mgr._pending_dataloader_state is None
+
+    def test_freeze_comparison_is_skipped(self, tmp_path, monkeypatch):
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        step, _, _ = mgr.load(
+            path=str(ckpt_dir),
+            exclude_keys=["optimizer", "train_state"],
+            vlm_freeze_expected=_freeze_meta(("vision_encoder", False)),
+        )
+        assert step == 0
+
+    @pytest.mark.parametrize(
+        "keys", [["train_state"], ["model", "train_state"], ["model", "optimizer", "train_state"]]
+    )
+    def test_train_state_outside_the_pair_is_refused(self, tmp_path, monkeypatch, keys):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="must be \\['optimizer', 'train_state'\\]"):
+            mgr.load(path=str(tmp_path / "absent"), exclude_keys=keys)
+
+    def test_nested_exclude_is_refused_before_loading(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="accepts only"):
+            mgr.load(path=str(tmp_path / "absent"), exclude_keys=[["optimizer", "train_state"]])
+
+    def test_without_the_key_the_train_state_is_restored(self, tmp_path, monkeypatch):
+        ckpt_dir = self._saved(tmp_path, monkeypatch, _freeze_meta(("vision_encoder", True)))
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        step, tokens, _ = mgr.load(path=str(ckpt_dir), exclude_keys=["optimizer"])
+        assert (step, tokens) == (9, 900)
+        assert mgr._pending_dataloader_state == {"epoch": 3}
 
 
 class TestLoadVLMFreezeCompare:
@@ -2146,9 +2375,9 @@ class TestSyncBarrierGroup:
 
     def test_agree_without_a_process_group_raises_only_its_own_error(self, tmp_path):
         mgr = self._mgr(tmp_path)
-        mgr._agree(None)
+        mgr.agree(None)
         with pytest.raises(OSError, match="No space left"):
-            mgr._agree(OSError(28, "No space left on device"))
+            mgr.agree(OSError(28, "No space left on device"))
 
     def test_init_creates_dedicated_gloo_group(self, tmp_path, monkeypatch):
         import kempnerforge.checkpoint.manager as mgr_mod
@@ -2190,18 +2419,18 @@ class TestSyncBarrierGroup:
 
     def test_agree_uses_dedicated_group_not_default(self, tmp_path, monkeypatch):
         groups = self._four_ranks(monkeypatch, [])
-        self._mgr(tmp_path)._agree(None)
+        self._mgr(tmp_path).agree(None)
         assert groups == ["GLOO_PG"]
 
     def test_agree_raises_on_every_rank_when_others_failed(self, tmp_path, monkeypatch):
         self._four_ranks(monkeypatch, [1, 3])
         with pytest.raises(RuntimeError, match=r"Checkpoint save failed on ranks \[1, 3\]"):
-            self._mgr(tmp_path)._agree(None)
+            self._mgr(tmp_path).agree(None)
 
     def test_agree_reraises_this_ranks_own_error(self, tmp_path, monkeypatch):
         self._four_ranks(monkeypatch, [2])
         with pytest.raises(OSError, match="No space left"):
-            self._mgr(tmp_path)._agree(OSError(28, "No space left on device"))
+            self._mgr(tmp_path).agree(OSError(28, "No space left on device"))
 
 
 class TestCheckpointManagerLoad:
@@ -3372,6 +3601,75 @@ class TestResumeWithoutTrainStateAcrossRanks:
         mp.spawn(_load_with_a_stale_view, args=(2, _free_port(), str(tmp_path), stale), nprocs=2)
 
 
+def _refuse_on_one_stage(
+    rank: int, world: int, port: int, ckpt_dir: str, refusing: int, scope: str | None
+) -> None:
+    """Save one pipeline stage per rank, then load with stage ``refusing`` under SGD."""
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from kempnerforge.checkpoint.manager import CheckpointManager
+
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"tcp://127.0.0.1:{port}",
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        stages = [dist.new_group([r]) for r in range(world)]
+
+        def manager(optimizer_name: str) -> tuple[torch.nn.Module, CheckpointManager]:
+            torch.manual_seed(rank)
+            model = torch.nn.Linear(4, 4)
+            optimizer = (
+                torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+                if optimizer_name == "sgd"
+                else torch.optim.AdamW(model.parameters(), lr=1e-3)
+            )
+            model(torch.ones(2, 4)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            config = CheckpointConfig(dir=ckpt_dir)
+            return model, CheckpointManager(
+                config,
+                model,
+                optimizer,
+                process_group=stages[rank],
+                pp_rank=rank,
+                weight_decay_scope=scope,
+            )
+
+        manager("adamw")[1].save(step=3)
+        model, loader = manager("sgd" if rank == refusing else "adamw")
+        before = model.weight.detach().clone()
+        expected = (
+            "holds another optimizer's state"
+            if rank == refusing
+            else rf"Checkpoint load failed on ranks \[{refusing}\]"
+        )
+        with pytest.raises(RuntimeError, match=expected):
+            loader.load()
+        assert torch.equal(model.weight, before), "a refused load changed the model"
+    finally:
+        dist.destroy_process_group()
+
+
+class TestOptimizerChecksAcrossStages:
+    """Under pipeline parallelism each stage checks its own optimizer state, so they agree."""
+
+    @pytest.mark.parametrize("scope", [None, "exclude_norms_and_biases"], ids=["plain", "scope"])
+    @pytest.mark.parametrize("refusing", [0, 1], ids=["stage_0_refuses", "stage_1_refuses"])
+    def test_every_rank_refuses_when_one_stage_does(self, tmp_path, refusing, scope):
+        """No rank goes on to load while another has refused, whatever the manager records."""
+        import torch.multiprocessing as mp
+
+        args = (2, _free_port(), str(tmp_path), refusing, scope)
+        mp.spawn(_refuse_on_one_stage, args=args, nprocs=2)
+
+
 def _assert_same_state_dict(expected, actual, where="state_dict"):
     """Assert two optimizer ``state_dict()``s hold the same values, tensors bit for bit."""
     if isinstance(expected, torch.Tensor):
@@ -3672,8 +3970,8 @@ class TestWeightDecayScopeOnResume:
         """Run ``manager`` as ``rank`` of two, with what the other rank reports scripted.
 
         ``holding`` and ``failing`` list the other ranks whose DCP index holds optimizer state
-        or could not be read; ``sent`` is what rank 0's scope broadcast delivers to any other
-        rank. Returns the collectives issued, in order.
+        or could not be read; ``sent`` is what rank 0's broadcasts deliver to any other rank.
+        Returns the collectives issued, in order.
         """
         import kempnerforge.checkpoint.manager as mgr_mod
 
@@ -3723,8 +4021,9 @@ class TestWeightDecayScopeOnResume:
 
         Each rank reports through one all-reduce on the manager's gloo group whether its DCP
         index holds optimizer state, so a rank whose own part holds none still refuses a
-        scope mismatch when another rank's part holds some. The scope check broadcasts a
-        ``(scope, error)`` tuple, which tells it apart from the train-state check's broadcast.
+        scope mismatch when another rank's part holds some. Rank 0 broadcasts its read of
+        ``metadata.json`` as a ``(record, error)`` tuple, which tells it apart from the
+        train-state check's broadcast.
         """
         self._save(tmp_path, "adamw", DEFAULT_SCOPE, steps=3 if holds_here else 0)
         _, _, manager = self._resume(tmp_path, "adamw", ALL_SCOPE)
@@ -3733,7 +4032,7 @@ class TestWeightDecayScopeOnResume:
             manager,
             rank,
             holding=[1 - rank] if holds_elsewhere else [],
-            sent=(DEFAULT_SCOPE, None),
+            sent=({"weight_decay_scope": DEFAULT_SCOPE}, None),
         )
         self._stop_at_the_model_load(monkeypatch)
         if holds_here or holds_elsewhere:
@@ -3755,7 +4054,7 @@ class TestWeightDecayScopeOnResume:
         step_dir = self._save(tmp_path, "adamw", DEFAULT_SCOPE)
         (step_dir / ".metadata").unlink()
         _, _, manager = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)
-        calls = self._as_rank(monkeypatch, manager, 1, sent=(DEFAULT_SCOPE, None))
+        calls = self._as_rank(monkeypatch, manager, 1)
         with pytest.raises(FileNotFoundError):
             manager.load(path=str(step_dir))
         assert calls == [("all_reduce", "GLOO_GROUP", [[0, 1], [0, 0]])]
@@ -3786,15 +4085,16 @@ class TestWeightDecayScopeOnResume:
         assert step == 3
 
     def test_rank_zero_broadcasts_what_it_reads(self, tmp_path, monkeypatch):
-        """Once the ranks agree that optimizer state is restored, rank 0 sends the saved scope."""
-        self._save(tmp_path, "adamw", ALL_SCOPE)
+        """Once the ranks agree that optimizer state is restored, rank 0 sends what it read."""
+        step_dir = self._save(tmp_path, "adamw", ALL_SCOPE)
+        meta = json.loads((step_dir / "metadata.json").read_text())
         _, _, manager = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)
         calls = self._as_rank(monkeypatch, manager, 0)
         with pytest.raises(ValueError, match="but this run uses"):
             manager.load()
         assert calls == [
             ("all_reduce", "GLOO_GROUP", [[0, 0], [1, 0]]),
-            ("broadcast", 0, [(ALL_SCOPE, None)]),
+            ("broadcast", 0, [(meta, None)]),
         ]
 
     def test_other_ranks_act_on_what_rank_zero_sends(self, tmp_path, monkeypatch):
@@ -3802,7 +4102,7 @@ class TestWeightDecayScopeOnResume:
         step_dir = self._save(tmp_path, "adamw", DEFAULT_SCOPE)
         (step_dir / "metadata.json").write_text("{not json")
         _, _, manager = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)
-        self._as_rank(monkeypatch, manager, 1, sent=(ALL_SCOPE, None))
+        self._as_rank(monkeypatch, manager, 1, sent=({"weight_decay_scope": ALL_SCOPE}, None))
         with pytest.raises(ValueError, match="weight_decay_scope='all', but this run uses"):
             manager.load()
 
@@ -3817,7 +4117,7 @@ class TestWeightDecayScopeOnResume:
         def fail(_ckpt_dir):
             raise error
 
-        monkeypatch.setattr("kempnerforge.checkpoint.manager._read_weight_decay_scope", fail)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager._read_metadata", fail)
         calls = self._as_rank(monkeypatch, manager, 0)
         with pytest.raises(ValueError, match="Cannot check the weight_decay_scope"):
             manager.load()
