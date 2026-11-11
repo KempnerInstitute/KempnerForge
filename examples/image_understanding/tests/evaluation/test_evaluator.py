@@ -918,9 +918,11 @@ def _evaluate_on_rank(
         return SimpleNamespace(run_id="run-1", step=3)
 
     def open_split(task: EvalTask) -> Any:
+        assert dist.is_initialized(), "the split was opened before the ranks were joined"
         raise OSError("the split is not on this node")
 
     def load_tokenizer(config: Any) -> Any:
+        assert dist.is_initialized(), "the tokenizer was loaded before the ranks were joined"
         raise OSError("the tokenizer is not on this node")
 
     def start_group(config: Any, seed: int) -> None:
