@@ -272,9 +272,10 @@ Everything is checked before the run builds anything: the task file, the config 
 evaluator decodes the same runs as above), the template and its program, and the
 output root. A mistake stops the run with the valid options named.
 
-The hook is rank 0's alone and training never waits on it: the training thread
-only puts a message on a queue, and a worker thread does everything else, so no
-filesystem call or scheduler call is on the step path. A saved step is launched
+The hook is rank 0's alone and training never waits on it: apart from one look at
+the checkpoint directory when training begins, the training thread only puts a
+message on a queue, and a worker thread does everything else, so no filesystem call
+or scheduler call is on the step path. A saved step is launched
 once its directory is complete on disk, which is when the DCP `.metadata`,
 `train_state.pt` and `metadata.json` are all there, and not before: with
 asynchronous checkpointing the directory is still being written when the loop moves

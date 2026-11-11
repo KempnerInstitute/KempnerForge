@@ -811,9 +811,10 @@ def test_a_deferred_step_is_launched_once_when_a_later_step_is_saved(
     launcher.scan(run, frozenset({0}))
     save_step(run, 2)
     launcher.saved(2, run)
+    assert sorted(Path(argv[3]).name for argv, _ in popen.calls) == ["step_0", "step_2"]
     launcher.saved(2, run)
     launcher.finish(run)
-    assert sorted(Path(argv[3]).name for argv, _ in popen.calls) == ["step_0", "step_2"]
+    assert len(popen.calls) == 2
 
 
 def test_a_deferred_step_is_launched_once_by_the_last_look_when_no_later_step_is_saved(
