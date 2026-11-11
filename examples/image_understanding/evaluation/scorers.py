@@ -61,11 +61,21 @@ def vqa_accuracy(prediction: str, answers: Sequence[str]) -> float:
     ``normalize_vqa_answer``, applied to the prediction and to every reference
     whether or not the references agree.
 
-    The rounds follow the number of references given, whatever it is. With ``n``
-    references the best score is ``min(1, (n - 1) / 3)``: four or more can reach 1,
-    and a single reference always scores 0.
+    The rounds follow the number of references given. With ``n`` references the
+    best score is ``min(1, (n - 1) / 3)``: four or more can reach 1.
+
+    Raises:
+        ValueError: with no reference, or with exactly one, because the only round
+            leaves nothing to match and the score could only be 0; data with a
+            single answer per question needs another scorer.
     """
-    references = [normalize_vqa_answer(answer) for answer in _references(prediction, answers)]
+    checked = _references(prediction, answers)
+    if len(checked) == 1:
+        raise ValueError(
+            "vqa_accuracy needs at least two references, because with one the score can "
+            "only be 0; data with a single answer per question needs another scorer"
+        )
+    references = [normalize_vqa_answer(answer) for answer in checked]
     predicted = normalize_vqa_answer(prediction)
     matches = sum(answer == predicted for answer in references)
     rounds = [
