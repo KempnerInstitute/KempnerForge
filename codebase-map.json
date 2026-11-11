@@ -1719,12 +1719,13 @@
           "TestPlacementCheck(1)",
           "TestFailureOnOneRank(1)",
           "TestResumeAtTheSameLayout(11)",
+          "TestPerModuleLearningRates(2)",
           "TestLoadAtAnotherEP(18)",
           "TestUnfixedCheckpoint(8)",
           "TestExportFromAnEPCheckpoint(3)",
           "TestWithoutEP(2)"
         ],
-        "count": 59
+        "count": 61
       },
       "tests/unit/test_expert_layout.py": {
         "classes": [

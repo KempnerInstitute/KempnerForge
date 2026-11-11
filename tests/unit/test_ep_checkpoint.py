@@ -38,8 +38,10 @@ import kempnerforge.checkpoint.expert_layout as expert_layout_module
 import kempnerforge.checkpoint.manager as manager_module
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.model import ModelConfig
+from kempnerforge.config.optimizer import OptimizerConfig
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig, JobConfig
 from kempnerforge.distributed.parallel import build_parallel_model
+from kempnerforge.training.optimizer import build_optimizer
 
 SEQ = 16
 STEP = 1
@@ -47,6 +49,8 @@ FP32 = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float3
 UNPACKED_EXPERT = re.compile(r"(?P<layer>.*\.mlp)\.experts\.(?P<index>\d+)\.(?P<rest>.*)")
 PACKED_EXPERT = (".mlp.up_w", ".mlp.down_w", ".mlp.gate_w")
 MOMENTS = ("exp_avg", "exp_avg_sq")
+LR_PATTERNS = {"layer0": ["layers.0.*"], "layer1": ["layers.1.*"]}
+LR_MULTIPLIERS = {"layer0": 2.0, "layer1": 0.5}
 PACKED = {"moe_packed_experts": True}
 DP_SHARD2_EP2 = (("dp_shard", "ep"), (2, 2))
 EP4 = (("dp_shard", "ep"), (1, 4))
@@ -243,6 +247,46 @@ def _load(rank, world, port, names, sizes, overrides, step_dir, out) -> None:
         loaded = _gathered(model, optimizer, mesh)
         if rank == 0:
             torch.save(loaded, out)
+    finally:
+        dist.destroy_process_group()
+
+
+def _save_with_lr_groups(rank, world, port, names, sizes, overrides, root) -> None:
+    """Save and resume with per-module learning rates, which split the experts among groups.
+
+    Rank 0 writes the reference, what the resume gave, and both optimizers' groups.
+    """
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+        config = _config(overrides)
+        optimizer_config = OptimizerConfig(lr=1e-2, fused=False, lr_multipliers=LR_MULTIPLIERS)
+        ckpt = CheckpointConfig(dir=str(Path(root) / "ckpt"))
+        built = []
+        for seed in (0, 1):
+            torch.manual_seed(seed)
+            model = build_parallel_model(
+                config, torch.device("cpu"), mesh, mp_policy=FP32, param_dtype=torch.float32
+            )
+            optimizer = build_optimizer(model, optimizer_config, module_patterns=LR_PATTERNS)
+            manager = CheckpointManager(
+                ckpt, model, optimizer, lr_multipliers=LR_MULTIPLIERS, module_patterns=LR_PATTERNS
+            )
+            built.append((model, optimizer, manager))
+        (model, optimizer, manager), (resumed, resumed_optimizer, resumed_manager) = built
+        _train(model, optimizer, mesh)
+        reference = _gathered(model, optimizer, mesh)
+        manager.save(STEP)
+        resumed_manager.load()
+        loaded = _gathered(resumed, resumed_optimizer, mesh)
+        groups = [
+            [(g.get("module"), g["lr"], len(g["params"])) for g in o.param_groups]
+            for o in (optimizer, resumed_optimizer)
+        ]
+        if rank == 0:
+            torch.save(reference, Path(root) / "reference.pt")
+            torch.save(loaded, Path(root) / "resumed.pt")
+            torch.save(groups, Path(root) / "groups.pt")
     finally:
         dist.destroy_process_group()
 
@@ -518,6 +562,19 @@ class TestResumeAtTheSameLayout:
         root = saved_layout(layout)
         reference = torch.load(root / "reference.pt")
         assert _mismatches(torch.load(root / "resumed.pt"), reference) == []
+
+
+class TestPerModuleLearningRates:
+    @pytest.mark.parametrize("layout", ["ep2", "dp_shard2_ep2_packed"])
+    def test_resume_restores_every_group_and_expert(self, tmp_path, layout):
+        """Experts split among per-module groups resume with their weights, moments and groups."""
+        names, sizes, overrides = LAYOUTS[layout]
+        _spawn(_save_with_lr_groups, names, sizes, overrides, str(tmp_path))
+        reference = torch.load(tmp_path / "reference.pt")
+        assert _mismatches(torch.load(tmp_path / "resumed.pt"), reference) == []
+        saved, resumed = torch.load(tmp_path / "groups.pt")
+        assert resumed == saved
+        assert {"layer0", "layer1"} <= {module for module, _, _ in saved}
 
 
 class TestLoadAtAnotherEP:
