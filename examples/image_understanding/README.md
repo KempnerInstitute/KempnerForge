@@ -251,8 +251,9 @@ the scorers of their answers.
     gave the same answer, and the score is the mean over those rounds, after the
     official answer normalization (`vqa_normalization.py`) of the prediction and
     of every reference. With ten references, three matching annotators score 0.9
-    and four score 1. A sample needs several references: one alone always scores
-    0, and four or more can reach 1.
+    and four score 1. A sample needs at least two references: with one the score
+    could only be 0, so `vqa_accuracy` raises `ValueError` instead, and data with a
+    single answer per question needs another scorer. Four or more can reach 1.
   - `anls` (DocVQA): the similarity `1 - NL` to the closest reference, where `NL`
     is the Levenshtein distance over the longer length, and 0 once `NL` reaches
     0.5. Case and surrounding whitespace are ignored.
