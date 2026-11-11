@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +15,10 @@ from evaluation import periodic
 from evaluation.periodic import (
     LAUNCH_LOG_FILE,
     LAUNCHED_FILE,
+    EvaluationLauncher,
     PeriodicEvaluation,
     PeriodicEvaluationHook,
+    child_environment,
     step_dir_complete,
 )
 
@@ -52,14 +56,6 @@ class Launcher:
         child = FakeChild(self.status)
         self.children.append(child)
         return child
-
-
-class Clock:
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
 
 
 def make_settings(tmp_path: Path, command: str = COMMAND, **options: Any) -> PeriodicEvaluation:
@@ -117,15 +113,8 @@ def rank_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(periodic.dist, "get_rank", lambda: 0)
 
 
-def make_hook(
-    tmp_path: Path, launcher: Launcher, clock: Clock | None = None, **options: Any
-) -> PeriodicEvaluationHook:
-    return PeriodicEvaluationHook(
-        make_settings(tmp_path, **options.pop("settings", {})),
-        clock=clock or Clock(),
-        launch=launcher,
-        **options,
-    )
+def make_launcher(tmp_path: Path, popen: Launcher, **settings: Any) -> EvaluationLauncher:
+    return EvaluationLauncher(make_settings(tmp_path, **settings), launch=popen)
 
 
 def test_a_valid_command_is_accepted_and_creates_the_output_root(tmp_path: Path) -> None:
@@ -142,6 +131,9 @@ def test_a_valid_command_is_accepted_and_creates_the_output_root(tmp_path: Path)
         (f"{sys.executable} {{checkpoint}} {{output}} {{epoch}}", r"unknown placeholder \{epoch\}"),
         (f"{sys.executable} {{checkpoint}} {{output.x}}", r"unknown placeholder \{output.x\}"),
         (f"{sys.executable} {{checkpoint}} {{output}} {{", "malformed"),
+        (f"{sys.executable} {{checkpoint}} {{output}} {{step:04d}}", "takes no format"),
+        (f"{sys.executable} {{checkpoint!r}} {{output}}", "takes no format"),
+        (f"{sys.executable} {{checkpoint}} {{output:{{x}}}}", "takes no format"),
         (f"{sys.executable} {{checkpoint}}", r"missing \['\{output\}'\]"),
         (f"{sys.executable} {{output}} {{step}}", r"missing \['\{checkpoint\}'\]"),
         ("no-such-program-here {checkpoint} {output}", "was not found"),
@@ -227,263 +219,237 @@ def test_a_step_directory_is_complete_only_with_every_file(
     assert step_dir_complete(tmp_path / "missing") is False
 
 
-def test_a_complete_save_is_launched_at_once_detached(
-    tmp_path: Path, run: Path, rank_zero: None
+def test_a_complete_save_is_launched_detached_without_the_distributed_environment(
+    tmp_path: Path, run: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    launcher = Launcher()
-    hook = make_hook(tmp_path, launcher)
+    for name, value in {
+        "WORLD_SIZE": "4",
+        "RANK": "1",
+        "TORCHELASTIC_RUN_ID": "x",
+        "KEEP": "1",
+    }.items():
+        monkeypatch.setenv(name, value)
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
     step_dir = save_step(run, 5)
-    hook.on_checkpoint_save(5, str(run))
-    assert len(launcher.calls) == 1
-    argv, options = launcher.calls[0]
+    launcher.saved(5, run)
+    assert len(popen.calls) == 1
+    argv, options = popen.calls[0]
     assert argv[2:] == ["run.toml", str(step_dir.resolve()), str(SAMPLE_TASKS)] + [
-        str(hook.settings.step_output(5))
+        str(launcher.settings.step_output(5))
     ]
     assert options["start_new_session"] is True
     assert options["stdin"] == subprocess.DEVNULL
     assert options["stderr"] == subprocess.STDOUT
-    record = json.loads((hook.settings.step_output(5) / LAUNCHED_FILE).read_text())
+    assert options["env"]["KEEP"] == "1"
+    assert not {"WORLD_SIZE", "RANK", "TORCHELASTIC_RUN_ID"} & set(options["env"])
+    record = json.loads((launcher.settings.step_output(5) / LAUNCHED_FILE).read_text())
     assert record == {"argv": argv}
-    assert (hook.settings.step_output(5) / LAUNCH_LOG_FILE).exists()
+    assert (launcher.settings.step_output(5) / LAUNCH_LOG_FILE).exists()
 
 
-def test_a_step_is_launched_once_however_often_it_is_reported(
-    tmp_path: Path, run: Path, rank_zero: None
-) -> None:
-    launcher = Launcher()
-    hook = make_hook(tmp_path, launcher)
+def test_the_child_environment_drops_every_rendezvous_variable() -> None:
+    environment = {
+        "MASTER_ADDR": "a",
+        "MASTER_PORT": "1",
+        "LOCAL_WORLD_SIZE": "4",
+        "GROUP_RANK": "0",
+        "TORCHELASTIC_RESTART_COUNT": "0",
+        "CUDA_VISIBLE_DEVICES": "0,1",
+        "PATH": "/bin",
+    }
+    assert child_environment(environment) == {"CUDA_VISIBLE_DEVICES": "0,1", "PATH": "/bin"}
+
+
+def test_a_step_is_launched_once_however_often_it_is_reported(tmp_path: Path, run: Path) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
-    hook.on_checkpoint_save(5, str(run))
-    hook.on_checkpoint_save(5, str(run))
-    hook.on_train_end(5, 0)
-    assert len(launcher.calls) == 1
+    launcher.saved(5, run)
+    launcher.saved(5, run)
+    launcher.finish(run)
+    assert len(popen.calls) == 1
 
 
-def test_a_save_that_is_still_flushing_waits_for_a_later_check(
-    tmp_path: Path, run: Path, rank_zero: None
-) -> None:
-    launcher = Launcher()
-    clock = Clock()
-    hook = make_hook(tmp_path, launcher, clock, poll_interval=10.0)
+def test_a_save_that_is_still_flushing_waits_for_a_later_check(tmp_path: Path, run: Path) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
     step_dir = save_step(run, 5, complete=False)
-    hook.on_checkpoint_save(5, str(run))
-    assert launcher.calls == []
+    launcher.saved(5, run)
+    assert popen.calls == [] and launcher.waiting
+    launcher.check()
+    assert popen.calls == []
     finish_flush(step_dir)
-    clock.now = 4.0
-    hook.on_step_end(None)
-    assert launcher.calls == []
-    clock.now = 11.0
-    hook.on_step_end(None)
-    assert len(launcher.calls) == 1
-    hook.on_step_end(None)
-    assert len(launcher.calls) == 1
+    launcher.check()
+    assert len(popen.calls) == 1
+    launcher.check()
+    assert len(popen.calls) == 1
 
 
-def test_a_flush_that_ends_with_training_is_launched_at_the_end(
-    tmp_path: Path, run: Path, rank_zero: None
-) -> None:
-    launcher = Launcher()
-    hook = make_hook(tmp_path, launcher)
+def test_a_flush_that_ends_with_training_is_launched_at_the_end(tmp_path: Path, run: Path) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
     step_dir = save_step(run, 5, complete=False)
-    hook.on_checkpoint_save(5, str(run))
+    launcher.saved(5, run)
     finish_flush(step_dir)
-    hook.on_train_end(5, 0)
-    assert len(launcher.calls) == 1
+    launcher.finish(None)
+    assert len(popen.calls) == 1
+
+
+def test_a_save_without_a_hook_call_is_found_at_the_end(tmp_path: Path, run: Path) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 7)
+    launcher.finish(run)
+    assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_7"]
 
 
 def test_a_step_that_never_completed_is_skipped_with_a_log_line(
-    tmp_path: Path, run: Path, rank_zero: None, messages: list[str]
+    tmp_path: Path, run: Path, messages: list[str]
 ) -> None:
-    launcher = Launcher()
-    hook = make_hook(tmp_path, launcher)
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
     save_step(run, 5, complete=False)
-    hook.on_checkpoint_save(5, str(run))
-    hook.on_train_end(5, 0)
-    assert launcher.calls == []
+    launcher.saved(5, run)
+    launcher.finish(None)
+    assert popen.calls == []
     out = text(messages)
     assert "skips step 5" in out and "never became complete" in out
     messages.clear()
-    hook.on_train_end(5, 0)
+    launcher.finish(None)
     assert messages == []
 
 
 def test_a_pruned_step_is_skipped_with_a_log_line(
-    tmp_path: Path, run: Path, rank_zero: None, messages: list[str]
+    tmp_path: Path, run: Path, messages: list[str]
 ) -> None:
-    launcher = Launcher()
-    clock = Clock()
-    hook = make_hook(tmp_path, launcher, clock)
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
     step_dir = save_step(run, 5, complete=False)
-    hook.on_checkpoint_save(5, str(run))
+    launcher.saved(5, run)
     for child in step_dir.iterdir():
         child.unlink()
     step_dir.rmdir()
-    clock.now = 100.0
-    hook.on_step_end(None)
-    assert launcher.calls == []
-    out = text(messages)
-    assert "skips step 5" in out and "pruned" in out
-    assert not hook._pending
+    launcher.check()
+    assert popen.calls == []
+    assert "skips step 5" in text(messages) and "pruned" in text(messages)
+    assert not launcher.waiting
 
 
-def test_the_other_ranks_launch_nothing(
-    tmp_path: Path, run: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(periodic.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(periodic.dist, "get_rank", lambda: 1)
-    launcher = Launcher()
-    hook = make_hook(tmp_path, launcher)
-    save_step(run, 5)
-    hook.on_train_begin(JobConfig())
-    hook.on_checkpoint_save(5, str(run))
-    hook.on_step_end(None)
-    hook.on_train_end(5, 0)
-    assert launcher.calls == []
-    assert not hook._pending
-
-
-def test_a_resumed_run_launches_only_what_no_run_launched(
-    tmp_path: Path, run: Path, rank_zero: None
-) -> None:
+def test_a_resumed_run_launches_only_what_no_run_launched(tmp_path: Path, run: Path) -> None:
     first = Launcher()
     save_step(run, 5)
-    hook = make_hook(tmp_path, first)
-    hook.on_checkpoint_save(5, str(run))
+    make_launcher(tmp_path, first).saved(5, run)
     save_step(run, 10)
     resumed = Launcher()
-    again = make_hook(tmp_path, resumed)
-    config = JobConfig()
-    config.checkpoint.dir = str(run)
-    again.on_train_begin(config)
-    again.on_checkpoint_save(10, str(run))
-    again.on_checkpoint_save(5, str(run))
+    again = make_launcher(tmp_path, resumed)
+    again.scan(run)
+    again.saved(10, run)
+    again.saved(5, run)
     assert len(first.calls) == 1
     assert [argv[3] for argv, _ in resumed.calls] == [str((run / "step_10").resolve())]
 
 
-def test_a_step_with_results_is_not_launched_again(
-    tmp_path: Path, run: Path, rank_zero: None
-) -> None:
-    launcher = Launcher()
-    hook = make_hook(tmp_path, launcher)
+def test_a_step_with_results_is_not_launched_again(tmp_path: Path, run: Path) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
-    output = hook.settings.step_output(5)
+    output = launcher.settings.step_output(5)
     output.mkdir(parents=True)
     (output / "results.json").write_text("{}")
-    hook.on_checkpoint_save(5, str(run))
-    assert launcher.calls == []
+    launcher.saved(5, run)
+    assert popen.calls == []
 
 
-def test_a_claimed_step_is_not_launched_by_another_run(
-    tmp_path: Path, run: Path, rank_zero: None
-) -> None:
-    launcher = Launcher()
-    hook = make_hook(tmp_path, launcher)
+def test_a_claimed_step_is_not_launched_by_another_run(tmp_path: Path, run: Path) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
-    claimed = hook.settings.step_output(5) / LAUNCHED_FILE
+    claimed = launcher.settings.step_output(5) / LAUNCHED_FILE
     claimed.parent.mkdir(parents=True)
     claimed.write_text("{}")
-    hook.on_checkpoint_save(5, str(run))
-    assert launcher.calls == []
+    launcher.saved(5, run)
+    assert popen.calls == []
     assert claimed.exists()
 
 
-def test_the_scan_at_training_begin_takes_up_only_complete_steps(
-    tmp_path: Path, run: Path, rank_zero: None
-) -> None:
-    launcher = Launcher()
-    hook = make_hook(tmp_path, launcher)
+def test_the_scan_takes_up_only_complete_steps(tmp_path: Path, run: Path) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
     save_step(run, 10, complete=False)
     (run / "step_x").mkdir()
     (run / "step_3").write_text("")
     (run / "latest").symlink_to("step_5")
-    config = JobConfig()
-    config.checkpoint.dir = str(run)
-    hook.on_train_begin(config)
-    assert [argv[3] for argv, _ in launcher.calls] == [str((run / "step_5").resolve())]
+    launcher.scan(run)
+    assert [argv[3] for argv, _ in popen.calls] == [str((run / "step_5").resolve())]
 
 
-def test_the_scan_of_a_missing_checkpoint_directory_does_nothing(
-    tmp_path: Path, rank_zero: None
+def test_the_scan_of_a_missing_checkpoint_directory_does_nothing(tmp_path: Path) -> None:
+    popen = Launcher()
+    make_launcher(tmp_path, popen).scan(tmp_path / "none")
+    assert popen.calls == []
+
+
+def test_a_failed_launch_is_a_warning_and_is_released(
+    tmp_path: Path, run: Path, messages: list[str]
 ) -> None:
-    launcher = Launcher()
-    hook = make_hook(tmp_path, launcher)
-    config = JobConfig()
-    config.checkpoint.dir = str(tmp_path / "none")
-    hook.on_train_begin(config)
-    assert launcher.calls == []
-
-
-def test_a_failed_launch_is_a_warning_and_can_be_retried_by_a_later_run(
-    tmp_path: Path, run: Path, rank_zero: None, messages: list[str]
-) -> None:
-    launcher = Launcher(error=FileNotFoundError("no sbatch"))
-    hook = make_hook(tmp_path, launcher)
+    popen = Launcher(error=FileNotFoundError("no sbatch"))
+    launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
-    hook.on_checkpoint_save(5, str(run))
+    launcher.saved(5, run)
     assert "could not launch step 5" in text(messages)
-    assert not (hook.settings.step_output(5) / LAUNCHED_FILE).exists()
-    hook.on_train_end(5, 0)
-    assert launcher.calls == []
+    assert not (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
+    launcher.finish(None)
+    assert popen.calls == []
 
 
-def test_a_command_that_exits_non_zero_is_a_warning_and_is_released(
-    tmp_path: Path, run: Path, rank_zero: None, messages: list[str]
+def test_a_command_that_exits_non_zero_is_a_warning_and_is_not_started_again(
+    tmp_path: Path, run: Path, messages: list[str]
 ) -> None:
-    launcher = Launcher(status=3)
-    hook = make_hook(tmp_path, launcher)
+    popen = Launcher(status=3)
+    launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
-    hook.on_checkpoint_save(5, str(run))
-    assert (hook.settings.step_output(5) / LAUNCHED_FILE).exists()
-    hook.on_train_end(5, 0)
+    launcher.saved(5, run)
+    launcher.finish(None)
     assert "exited with status 3" in text(messages)
-    assert not (hook.settings.step_output(5) / LAUNCHED_FILE).exists()
+    assert (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
+    again = Launcher()
+    make_launcher(tmp_path, again).scan(run)
+    assert again.calls == []
 
 
-def test_a_running_command_is_never_waited_for(tmp_path: Path, run: Path, rank_zero: None) -> None:
-    launcher = Launcher(status=None)
-    clock = Clock()
-    hook = make_hook(tmp_path, launcher, clock)
+def test_a_running_command_is_never_waited_for(tmp_path: Path, run: Path) -> None:
+    popen = Launcher(status=None)
+    launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
-    hook.on_checkpoint_save(5, str(run))
-    hook.on_step_end(None)
-    hook.on_train_end(5, 0)
-    assert len(hook._children) == 1
-    assert (hook.settings.step_output(5) / LAUNCHED_FILE).exists()
+    launcher.saved(5, run)
+    launcher.check()
+    launcher.finish(None)
+    assert launcher.waiting
+    assert (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
 
 
-def test_an_error_in_the_hook_never_reaches_training(
-    tmp_path: Path, run: Path, rank_zero: None, messages: list[str]
+def test_a_claim_is_won_by_one_process_only(tmp_path: Path) -> None:
+    output = tmp_path / "step_1"
+    assert periodic._claim(output, ["a", "b"]) is True
+    assert periodic._claim(output, ["c"]) is False
+    assert json.loads((output / LAUNCHED_FILE).read_text()) == {"argv": ["a", "b"]}
+
+
+def test_a_step_claimed_between_the_check_and_the_launch_is_not_launched(
+    tmp_path: Path, run: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class Broken(Launcher):
-        def __call__(self, argv: list[str], **options: Any) -> FakeChild:
-            raise RuntimeError("boom")
-
-    hook = make_hook(tmp_path, Broken())
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
-    hook.on_checkpoint_save(5, str(run))
-    assert "RuntimeError: boom" in text(messages)
-
-
-def test_each_save_of_a_run_is_evaluated_once(tmp_path: Path, run: Path, rank_zero: None) -> None:
-    launcher = Launcher()
-    clock = Clock()
-    hook = make_hook(tmp_path, launcher, clock, poll_interval=1.0)
-    runner = hook.runner()
-    assert isinstance(runner, HookRunner)
-    runner.on_train_begin(JobConfig())
-    for step in (2, 4, 6):
-        save_step(run, step)
-        runner.on_checkpoint_save(step, str(run))
-        clock.now += 5.0
-        runner.on_step_end(None)
-    runner.on_train_end(6, 0)
-    assert [Path(argv[3]).name for argv, _ in launcher.calls] == ["step_2", "step_4", "step_6"]
+    monkeypatch.setattr(periodic, "_claim", lambda output, argv: False)
+    launcher.saved(5, run)
+    assert popen.calls == []
 
 
 def test_the_default_launch_starts_the_command_and_logs_its_output(
-    tmp_path: Path, run: Path, rank_zero: None
+    tmp_path: Path, run: Path
 ) -> None:
     script = tmp_path / "evaluate.py"
     script.write_text("import sys\nprint('evaluating', sys.argv[1])\n")
@@ -497,27 +463,157 @@ def test_the_default_launch_starts_the_command_and_logs_its_output(
     settings = make_settings(
         tmp_path, command=f"{sys.executable} {script} {{checkpoint}} {{output}}"
     )
-    hook = PeriodicEvaluationHook(settings, launch=launch)
+    launcher = EvaluationLauncher(settings, launch=launch)
     save_step(run, 5)
-    hook.on_checkpoint_save(5, str(run))
+    launcher.saved(5, run)
     assert children[0].wait(timeout=60) == 0
     log = (settings.step_output(5) / LAUNCH_LOG_FILE).read_text()
     assert log.strip() == f"evaluating {(run / 'step_5').resolve()}"
 
 
-def test_a_claim_is_won_by_one_process_only(tmp_path: Path) -> None:
-    output = tmp_path / "step_1"
-    assert periodic._claim(output, ["a", "b"]) is True
-    assert periodic._claim(output, ["c"]) is False
-    assert json.loads((output / LAUNCHED_FILE).read_text()) == {"argv": ["a", "b"]}
+class RecordingLauncher:
+    """Stands in for ``EvaluationLauncher`` and records what the worker thread asks of it."""
+
+    def __init__(self, fail_on: str | None = None) -> None:
+        self.calls: list[tuple[str, Any]] = []
+        self.waiting = False
+        self.fail_on = fail_on
+        self.finished = threading.Event()
+
+    def _record(self, kind: str, payload: Any) -> None:
+        self.calls.append((kind, payload))
+        if kind == self.fail_on:
+            raise RuntimeError("boom")
+
+    def scan(self, directory: str) -> None:
+        self._record("scan", directory)
+
+    def saved(self, step: int, directory: str) -> None:
+        self._record("saved", (step, directory))
+
+    def check(self) -> None:
+        self._record("check", None)
+
+    def finish(self, directory: str | None) -> None:
+        self._record("finish", directory)
+        self.finished.set()
 
 
-def test_a_step_claimed_between_the_check_and_the_launch_is_not_launched(
-    tmp_path: Path, run: Path, rank_zero: None, monkeypatch: pytest.MonkeyPatch
+def make_hook(
+    tmp_path: Path, recorder: RecordingLauncher, **options: Any
+) -> PeriodicEvaluationHook:
+    return PeriodicEvaluationHook(make_settings(tmp_path), launcher=recorder, **options)
+
+
+def config_for(run: Path) -> JobConfig:
+    config = JobConfig()
+    config.checkpoint.dir = str(run)
+    return config
+
+
+def test_the_hook_hands_a_run_to_its_worker_in_order(
+    tmp_path: Path, run: Path, rank_zero: None
 ) -> None:
-    launcher = Launcher()
-    hook = make_hook(tmp_path, launcher)
-    save_step(run, 5)
-    monkeypatch.setattr(periodic, "_claim", lambda output, argv: False)
-    hook.on_checkpoint_save(5, str(run))
-    assert launcher.calls == []
+    recorder = RecordingLauncher()
+    hook = make_hook(tmp_path, recorder)
+    runner = hook.runner()
+    assert isinstance(runner, HookRunner)
+    runner.on_train_begin(config_for(run))
+    for step in (2, 4):
+        runner.on_checkpoint_save(step, str(run))
+    runner.on_train_end(4, 0)
+    assert recorder.calls == [
+        ("scan", str(run)),
+        ("saved", (2, str(run))),
+        ("saved", (4, str(run))),
+        ("finish", str(run)),
+    ]
+    assert not hook._worker.is_alive()
+
+
+def test_the_hook_does_not_touch_the_filesystem_on_the_training_thread(
+    tmp_path: Path, run: Path, rank_zero: None
+) -> None:
+    recorder = RecordingLauncher()
+    hook = make_hook(tmp_path, recorder)
+    hook.on_train_begin(config_for(run))
+    caller = threading.get_ident()
+    seen: list[int] = []
+    original = recorder._record
+
+    def record(kind: str, payload: Any) -> None:
+        seen.append(threading.get_ident())
+        original(kind, payload)
+
+    recorder._record = record
+    hook.on_checkpoint_save(2, str(run))
+    hook.on_train_end(2, 0)
+    assert seen and caller not in seen
+
+
+def test_a_worker_error_is_a_warning_and_the_worker_goes_on(
+    tmp_path: Path, run: Path, rank_zero: None, messages: list[str]
+) -> None:
+    recorder = RecordingLauncher(fail_on="saved")
+    hook = make_hook(tmp_path, recorder)
+    hook.on_train_begin(config_for(run))
+    hook.on_checkpoint_save(2, str(run))
+    hook.on_checkpoint_save(4, str(run))
+    hook.on_train_end(4, 0)
+    assert [kind for kind, _ in recorder.calls] == ["scan", "saved", "saved", "finish"]
+    assert "RuntimeError: boom" in text(messages)
+
+
+def test_a_failing_last_look_still_ends_the_worker(
+    tmp_path: Path, run: Path, rank_zero: None, messages: list[str]
+) -> None:
+    recorder = RecordingLauncher(fail_on="finish")
+    hook = make_hook(tmp_path, recorder)
+    hook.on_train_begin(config_for(run))
+    hook.on_train_end(1, 0)
+    assert not hook._worker.is_alive()
+    assert "could not handle finish" in text(messages)
+
+
+def test_a_pending_step_is_rechecked_while_training_goes_on(
+    tmp_path: Path, run: Path, rank_zero: None
+) -> None:
+    recorder = RecordingLauncher()
+    recorder.waiting = True
+    hook = make_hook(tmp_path, recorder, poll_interval=0.01)
+    hook.on_train_begin(config_for(run))
+    deadline = time.monotonic() + 30
+    while not any(kind == "check" for kind, _ in recorder.calls) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    hook.on_train_end(1, 0)
+    assert any(kind == "check" for kind, _ in recorder.calls)
+
+
+def test_a_worker_that_does_not_finish_is_reported_and_not_waited_for(
+    tmp_path: Path, run: Path, rank_zero: None, messages: list[str]
+) -> None:
+    release = threading.Event()
+
+    class Slow(RecordingLauncher):
+        def finish(self, directory: str | None) -> None:
+            release.wait(30)
+
+    hook = make_hook(tmp_path, Slow(), finish_timeout=0.05)
+    hook.on_train_begin(config_for(run))
+    hook.on_train_end(1, 0)
+    assert "did not finish its last check" in text(messages)
+    release.set()
+    hook._worker.join(30)
+
+
+def test_the_other_ranks_start_nothing(
+    tmp_path: Path, run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(periodic.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(periodic.dist, "get_rank", lambda: 1)
+    recorder = RecordingLauncher()
+    hook = make_hook(tmp_path, recorder)
+    hook.on_train_begin(config_for(run))
+    hook.on_checkpoint_save(2, str(run))
+    hook.on_train_end(2, 0)
+    assert hook._worker is None and recorder.calls == []

@@ -18,14 +18,16 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import shlex
 import shutil
 import string
 import subprocess
-import time
-from collections.abc import Callable, Sequence
+import threading
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch.distributed as dist
 
@@ -33,7 +35,7 @@ from evaluation.evaluator import RESULTS_FILE
 from evaluation.tasks import load_tasks
 from kempnerforge.config.job import JobConfig
 from kempnerforge.metrics.logger import get_logger
-from kempnerforge.training.hooks import HookRunner, StepContext, TrainingHook
+from kempnerforge.training.hooks import HookRunner, TrainingHook
 
 logger = get_logger(__name__)
 
@@ -43,7 +45,24 @@ REQUIRED_PLACEHOLDERS = ("checkpoint", "output")
 LAUNCHED_FILE = "launched.json"
 LAUNCH_LOG_FILE = "launch.log"
 POLL_INTERVAL_SECONDS = 10.0
+FINISH_TIMEOUT_SECONDS = 60.0
 
+_DISTRIBUTED_VARIABLES = frozenset(
+    {
+        "RANK",
+        "LOCAL_RANK",
+        "GROUP_RANK",
+        "ROLE_RANK",
+        "WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+        "GROUP_WORLD_SIZE",
+        "ROLE_WORLD_SIZE",
+        "ROLE_NAME",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+    }
+)
+_DISTRIBUTED_PREFIXES = ("TORCHELASTIC_",)
 _STEP_PREFIX = "step_"
 _DCP_METADATA_FILE = ".metadata"
 _TRAIN_STATE_FILE = "train_state.pt"
@@ -118,14 +137,21 @@ def _check_command(command: str) -> None:
         if token == OVERRIDES_PLACEHOLDER:
             continue
         try:
-            fields = [
-                field for _, field, _, _ in string.Formatter().parse(token) if field is not None
+            parsed = [
+                (field, spec, conversion)
+                for _, field, spec, conversion in string.Formatter().parse(token)
+                if field is not None
             ]
         except ValueError as exc:
             raise ValueError(
                 f"the evaluation command argument {token!r} is malformed: {exc}"
             ) from exc
-        for name in fields:
+        for name, spec, conversion in parsed:
+            if spec or conversion:
+                raise ValueError(
+                    f"the placeholder {{{name}}} in the evaluation command takes no format "
+                    f"specification or conversion (got {token!r})"
+                )
             if name not in PLACEHOLDERS:
                 raise ValueError(
                     f"unknown placeholder {{{name}}} in the evaluation command; valid "
@@ -173,86 +199,68 @@ def _is_rank_zero() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
-class PeriodicEvaluationHook(TrainingHook):
-    """Starts the evaluation command for each complete checkpoint, on rank 0, without waiting.
+def child_environment(environ: Mapping[str, str]) -> dict[str, str]:
+    """``environ`` without what makes a launched process join the training run's process group.
 
-    A saved step is first pending. It is launched as soon as its directory is complete,
-    which is checked when it is saved and then at most every ``poll_interval`` seconds
-    while a step is pending, and once more when training ends, after the loop has drained
-    a pending asynchronous save. A step whose directory is gone (pruned) or never
-    completed is skipped with a log line. A step with a ``results.json`` or a
-    ``launched.json`` in its output directory is not launched again, so a resumed run
-    starts only what no earlier run started; steps that are on disk and complete when
-    training begins are taken up the same way.
+    A launched evaluation is its own job, so it must not inherit the rendezvous variables
+    of the ``torchrun`` that started training, whether it is a local script or an
+    ``sbatch`` job that exports the environment.
+    """
+    return {
+        key: value
+        for key, value in environ.items()
+        if key not in _DISTRIBUTED_VARIABLES and not key.startswith(_DISTRIBUTED_PREFIXES)
+    }
 
-    A launch that fails, or a command that exits with a non-zero status, is a warning, and
-    its ``launched.json`` is removed so a later run starts that step again. Nothing here
-    raises into the training loop.
+
+class EvaluationLauncher:
+    """Decides which saved steps to start and starts them; every call is synchronous.
+
+    A saved step is pending until its directory is complete, then it is launched. A step
+    whose directory is gone (pruned) or never completed is skipped with a log line. A
+    step with a ``results.json`` or a ``launched.json`` in its output directory is not
+    launched again, so a resumed run starts only what no run started before. A launch
+    that fails is a warning and releases its ``launched.json``; a command that exits with
+    a non-zero status is a warning that keeps it, so a step is started at most once and
+    retrying one is deleting its ``launched.json``. Nothing here raises.
     """
 
     def __init__(
         self,
         settings: PeriodicEvaluation,
         *,
-        poll_interval: float = POLL_INTERVAL_SECONDS,
-        clock: Callable[[], float] = time.monotonic,
         launch: Callable[..., subprocess.Popen] = subprocess.Popen,
     ) -> None:
         self.settings = settings
-        self._poll_interval = poll_interval
-        self._clock = clock
         self._launch = launch
         self._pending: dict[int, Path] = {}
         self._handled: set[int] = set()
         self._children: list[tuple[int, subprocess.Popen, Path]] = []
-        self._last_check = float("-inf")
 
-    def runner(self) -> HookRunner:
-        """A ``HookRunner`` holding this hook, as ``run_training`` takes it."""
-        return HookRunner([self])
+    @property
+    def waiting(self) -> bool:
+        """Whether a step is pending or a launched command has not been seen to exit."""
+        return bool(self._pending or self._children)
 
-    def on_train_begin(self, config: JobConfig) -> None:
-        self._guarded("scan the checkpoint directory", self._scan, Path(config.checkpoint.dir))
+    def saved(self, step: int, checkpoint_dir: str | Path) -> None:
+        """Note that step ``step`` was saved under ``checkpoint_dir`` and start it if complete."""
+        self._pending[step] = Path(checkpoint_dir).resolve() / f"{_STEP_PREFIX}{step}"
+        self.check()
 
-    def on_step_end(self, ctx: StepContext) -> None:
-        if self._pending or self._children:
-            self._guarded("check the pending checkpoints", self._tick)
+    def scan(self, checkpoint_dir: str | Path) -> None:
+        """Take up every complete step directory already under ``checkpoint_dir``."""
+        directory = Path(checkpoint_dir)
+        if directory.is_dir():
+            for entry in directory.iterdir():
+                suffix = entry.name[len(_STEP_PREFIX) :]
+                is_step = entry.name.startswith(_STEP_PREFIX) and suffix.isdigit()
+                if is_step and entry.is_dir() and step_dir_complete(entry):
+                    self._pending[int(suffix)] = entry.resolve()
+        self.check()
 
-    def on_checkpoint_save(self, step: int, path: str) -> None:
-        if not _is_rank_zero():
-            return
-        self._pending[step] = Path(path).resolve() / f"{_STEP_PREFIX}{step}"
-        self._guarded("check the pending checkpoints", self._check)
-
-    def on_train_end(self, step: int, tokens_seen: int) -> None:
-        self._guarded("finish the pending checkpoints", self._finish)
-
-    def _guarded(self, what: str, action: Callable[..., None], *args: object) -> None:
-        if not _is_rank_zero():
-            return
-        try:
-            action(*args)
-        except Exception as exc:
-            logger.warning(f"Periodic evaluation could not {what}: {type(exc).__name__}: {exc}")
-
-    def _scan(self, checkpoint_dir: Path) -> None:
-        if not checkpoint_dir.is_dir():
-            return
-        for entry in checkpoint_dir.iterdir():
-            suffix = entry.name[len(_STEP_PREFIX) :]
-            is_step = entry.name.startswith(_STEP_PREFIX) and suffix.isdigit()
-            if is_step and entry.is_dir() and step_dir_complete(entry):
-                self._pending[int(suffix)] = entry.resolve()
-        self._check()
-
-    def _tick(self) -> None:
+    def check(self) -> None:
+        """Start the pending steps that are complete and skip the ones that are gone."""
         self._reap()
-        if self._pending and self._clock() - self._last_check >= self._poll_interval:
-            self._check()
-
-    def _check(self) -> None:
-        self._reap()
-        self._last_check = self._clock()
         for step in sorted(self._pending):
             step_dir = self._pending[step]
             if not step_dir.exists():
@@ -266,8 +274,15 @@ class PeriodicEvaluationHook(TrainingHook):
                 del self._pending[step]
                 self._start(step, step_dir)
 
-    def _finish(self) -> None:
-        self._check()
+    def finish(self, checkpoint_dir: str | Path | None) -> None:
+        """Take a last look when training ends: a save that has drained, an emergency save.
+
+        What is still incomplete after it never will be, and is skipped with a log line.
+        """
+        if checkpoint_dir is not None:
+            self.scan(checkpoint_dir)
+        else:
+            self.check()
         for step, step_dir in sorted(self._pending.items()):
             logger.warning(
                 f"Periodic evaluation skips step {step}: {step_dir} never became complete"
@@ -295,6 +310,7 @@ class PeriodicEvaluationHook(TrainingHook):
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
+                    env=child_environment(os.environ),
                     start_new_session=True,
                 )
         except OSError as exc:
@@ -311,9 +327,91 @@ class PeriodicEvaluationHook(TrainingHook):
             if status is None:
                 running.append((step, child, log_path))
             elif status != 0:
-                (self.settings.step_output(step) / LAUNCHED_FILE).unlink(missing_ok=True)
                 logger.warning(
                     f"Periodic evaluation command for step {step} exited with status "
-                    f"{status}; its output is in {log_path}"
+                    f"{status}; its output is in {log_path}. The step is not started again "
+                    f"unless {self.settings.step_output(step) / LAUNCHED_FILE} is deleted"
                 )
         self._children = running
+
+
+class PeriodicEvaluationHook(TrainingHook):
+    """Hands each saved step to an ``EvaluationLauncher`` on a worker thread, on rank 0 only.
+
+    The training thread only puts a message on a queue, so nothing it does touches the
+    filesystem or a scheduler: the worker checks whether a step is complete (every
+    ``poll_interval`` seconds while one is pending, and when one is saved), claims and
+    launches it, and reads the exit status of what it launched. Training ending asks the
+    worker for a last look, after the loop has drained a pending asynchronous save, and
+    waits for it at most ``finish_timeout`` seconds. A step saved outside the loop's
+    hook, as by the shutdown handler, is found by that look and by the scan at the
+    start of the next run. An error on the worker is a warning, never raised into training.
+    """
+
+    def __init__(
+        self,
+        settings: PeriodicEvaluation,
+        *,
+        poll_interval: float = POLL_INTERVAL_SECONDS,
+        finish_timeout: float = FINISH_TIMEOUT_SECONDS,
+        launcher: EvaluationLauncher | None = None,
+    ) -> None:
+        self.settings = settings
+        self._launcher = launcher or EvaluationLauncher(settings)
+        self._poll_interval = poll_interval
+        self._finish_timeout = finish_timeout
+        self._messages: queue.SimpleQueue[tuple[str, Any]] = queue.SimpleQueue()
+        self._worker: threading.Thread | None = None
+        self._checkpoint_dir: str | None = None
+
+    def runner(self) -> HookRunner:
+        """A ``HookRunner`` holding this hook, as ``run_training`` takes it."""
+        return HookRunner([self])
+
+    def on_train_begin(self, config: JobConfig) -> None:
+        if not _is_rank_zero() or self._worker is not None:
+            return
+        self._checkpoint_dir = config.checkpoint.dir
+        self._worker = threading.Thread(target=self._work, name="periodic-evaluation", daemon=True)
+        self._worker.start()
+        self._messages.put(("scan", config.checkpoint.dir))
+
+    def on_checkpoint_save(self, step: int, path: str) -> None:
+        if self._worker is not None:
+            self._messages.put(("saved", (step, path)))
+
+    def on_train_end(self, step: int, tokens_seen: int) -> None:
+        if self._worker is None:
+            return
+        self._messages.put(("finish", self._checkpoint_dir))
+        self._worker.join(self._finish_timeout)
+        if self._worker.is_alive():
+            logger.warning(
+                f"Periodic evaluation did not finish its last check within "
+                f"{self._finish_timeout:g} s; steps still pending are left to the next run"
+            )
+
+    def _work(self) -> None:
+        while True:
+            try:
+                kind, payload = self._messages.get(
+                    timeout=self._poll_interval if self._launcher.waiting else None
+                )
+            except queue.Empty:
+                kind, payload = "check", None
+            try:
+                if kind == "scan":
+                    self._launcher.scan(payload)
+                elif kind == "saved":
+                    self._launcher.saved(*payload)
+                elif kind == "check":
+                    self._launcher.check()
+                else:
+                    self._launcher.finish(payload)
+                    return
+            except Exception as exc:
+                logger.warning(
+                    f"Periodic evaluation could not handle {kind}: {type(exc).__name__}: {exc}"
+                )
+                if kind == "finish":
+                    return

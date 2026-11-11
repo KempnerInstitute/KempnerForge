@@ -255,25 +255,30 @@ Everything is checked before the run builds anything: the task file, the config 
 evaluator decodes the same runs as above), the template and its program, and the
 output root. A mistake stops the run with the valid options named.
 
-The hook is rank 0's alone and training never waits on it. A saved step is launched
+The hook is rank 0's alone and training never waits on it: the training thread
+only puts a message on a queue, and a worker thread does everything else, so no
+filesystem call or scheduler call is on the step path. A saved step is launched
 once its directory is complete on disk, which is when the DCP `.metadata`,
 `train_state.pt` and `metadata.json` are all there, and not before: with
 asynchronous checkpointing the directory is still being written when the loop moves
-on, so the hook checks for it again every few seconds, with three `stat` calls, and
-once more when the loop ends, after it has drained the last save. A launch is
-started and left; its exit status is only read later, without waiting, to warn
-about a command that failed.
+on, so the worker checks for it again every few seconds, with three `stat` calls,
+and once more when the loop ends, after it has drained the last save. A launch is
+started and left, detached and without the training run's `torchrun` variables
+(`WORLD_SIZE`, `MASTER_ADDR` and the like), so an evaluator or an `sbatch` job
+starts its own process group; its exit status is only read later, without waiting,
+to warn about a command that failed. A checkpoint the shutdown handler saves
+outside the loop is found by the last look and by the next run's scan.
 
-A step is launched at most once. Before launching, the hook writes
+A step is launched at most once. Before launching, the worker writes
 `launched.json` into the step's output directory, exclusively, and skips a step
 that has it or a `results.json`; when a run resumes, it also takes up the complete
 steps already on disk, so what an earlier incarnation saved and never started is
 evaluated and nothing is evaluated twice. `launch.log` holds the command's output
 (the job id, for `sbatch`). A step that was pruned before it was complete, or never
-completed, is skipped with a log line, and a launch that fails is a warning; a
-failed command releases its `launched.json`, so the next resume starts that step
-again. An evaluation that was started and then failed is not started again by the
-run, so look for a step directory without `results.json`.
+completed, is skipped with a log line, and a launch that cannot start is a warning
+that releases its `launched.json`. A command that starts and then exits non-zero is
+a warning too, and its step is not started again: look for a step directory without
+`results.json`, and delete its `launched.json` to have the next run start it.
 
 The evaluator reads a step directory while the run goes on, and the run removes old
 ones (`checkpoint.keep_last_n`). Keep as many as the evaluations in flight need,
