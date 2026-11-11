@@ -256,7 +256,9 @@ and an absent state cannot be told apart from one that went missing, so
 a never-stepped parameter in one of those still fails the load. Start
 from it in a new `checkpoint.dir`, with `[checkpoint].load_path`
 pointing at it and `exclude_from_loading = ["optimizer"]`, which
-restores the weights and begins with a fresh optimizer. In the old
+restores the weights and begins with a fresh optimizer
+(`["optimizer", "train_state"]` also starts the step, schedule and data
+order fresh). In the old
 `checkpoint.dir` the resume would take precedence over `load_path`.
 
 A parameter whose optimizer changed since the save holds another
@@ -275,6 +277,14 @@ covers only the optimizers the load restores, so a Muon checkpoint saved
 before the inner AdamW was checkpointed is not checked: a parameter that
 moved to the inner AdamW starts fresh, and one that moved to Muon still
 fails inside `dcp.load`.
+
+Each rank runs these checks on its own part of the checkpoint, so under
+pipeline parallelism one stage can fail them while the others pass. A
+load that restores optimizer state therefore ends its checks with one
+all-reduce on the manager's gloo group, which every rank enters: a rank
+whose check failed raises its error, and every other rank raises a
+`RuntimeError` naming the ranks that failed, before any rank loads
+anything.
 
 The template also holds every param-group key the optimizer has now,
 and DCP requires each one. An optimizer whose param groups gained a key

@@ -128,6 +128,8 @@ def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPi
             prompt_field=config.data.hf_dataset_prompt_field or None,
             image_size=config.data.hf_image_size,
             dataset_config=config.data.hf_dataset_config,
+            tile_grid=vlm_cfg.tile_grid,
+            tile_global=vlm_cfg.tile_global,
         )
         collator = VLMCollator(
             pad_id=_resolve_pad_id(config.data.tokenizer_path),
