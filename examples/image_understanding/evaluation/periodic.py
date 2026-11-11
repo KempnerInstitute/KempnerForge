@@ -23,11 +23,12 @@ import shlex
 import shutil
 import string
 import subprocess
+import tempfile
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import torch.distributed as dist
 
@@ -100,6 +101,13 @@ class PeriodicEvaluation:
         if root.exists() and not root.is_dir():
             raise ValueError(f"the evaluation output root {self.output_root!r} is not a directory")
         root.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryFile(dir=root):
+                pass
+        except OSError as exc:
+            raise ValueError(
+                f"the evaluation output root {self.output_root!r} is not writable: {exc}"
+            ) from exc
 
     def argv(self, step_dir: Path, step: int) -> list[str]:
         """The command's arguments for the checkpoint ``step_dir`` of step ``step``."""
@@ -188,15 +196,32 @@ def _claim(output: Path, argv: Sequence[str]) -> bool:
     """Record that a launch of ``argv`` is under way; False when one was recorded before.
 
     The record is created exclusively, so of several processes claiming a step, one wins.
+    A record that cannot be written is removed again, so the step stays launchable.
+
+    Raises:
+        OSError: the record could not be created or written.
     """
     output.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(output / LAUNCHED_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         return False
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump({"argv": list(argv)}, f)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"argv": list(argv)}, f)
+    except Exception:
+        (output / LAUNCHED_FILE).unlink(missing_ok=True)
+        raise
     return True
+
+
+def _metadata_stamp(step_dir: Path) -> tuple[int, int, int]:
+    """Identity of the DCP ``.metadata`` of ``step_dir``, which changes when it is rewritten."""
+    try:
+        stat = (step_dir / _DCP_METADATA_FILE).stat()
+    except OSError:
+        return (0, 0, 0)
+    return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
 
 
 def _is_rank_zero() -> bool:
@@ -240,6 +265,7 @@ class EvaluationLauncher:
         self._pending: dict[int, Path] = {}
         self._handled: set[int] = set()
         self._children: list[tuple[int, subprocess.Popen, Path]] = []
+        self._rewritten: dict[int, tuple[int, int, int]] = {}
 
     @property
     def waiting(self) -> bool:
@@ -251,15 +277,27 @@ class EvaluationLauncher:
         self._pending[step] = Path(checkpoint_dir).resolve() / f"{_STEP_PREFIX}{step}"
         self.check()
 
-    def scan(self, checkpoint_dir: str | Path) -> None:
-        """Take up every complete step directory already under ``checkpoint_dir``."""
+    def scan(self, checkpoint_dir: str | Path, rewritten: Collection[int] = ()) -> None:
+        """Take up every complete step directory already under ``checkpoint_dir``.
+
+        A step in ``rewritten`` is one the run is about to save again over its complete
+        directory. It is not taken up here: it waits for its ``.metadata`` to change, which
+        is the rewrite reaching the end, or for the last look in ``finish``.
+        """
         directory = Path(checkpoint_dir)
         if directory.is_dir():
             for entry in directory.iterdir():
                 suffix = entry.name[len(_STEP_PREFIX) :]
                 is_step = entry.name.startswith(_STEP_PREFIX) and suffix.isdigit()
-                if is_step and entry.is_dir() and step_dir_complete(entry):
-                    self._pending[int(suffix)] = entry.resolve()
+                if not is_step or not entry.is_dir():
+                    continue
+                step = int(suffix)
+                if not step_dir_complete(entry):
+                    logger.info(f"Periodic evaluation skips step {step}: {entry} is not complete")
+                elif step in rewritten:
+                    self._rewritten[step] = _metadata_stamp(entry)
+                else:
+                    self._pending[step] = entry.resolve()
         self.check()
 
     def check(self) -> None:
@@ -274,7 +312,7 @@ class EvaluationLauncher:
                     "checkpoint.interval to keep more of them"
                 )
                 del self._pending[step]
-            elif step_dir_complete(step_dir):
+            elif step_dir_complete(step_dir) and not self._not_yet_rewritten(step, step_dir):
                 del self._pending[step]
                 self._start(step, step_dir)
 
@@ -283,6 +321,7 @@ class EvaluationLauncher:
 
         What is still incomplete after it never will be, and is skipped with a log line.
         """
+        self._rewritten.clear()
         if checkpoint_dir is not None:
             self.scan(checkpoint_dir)
         else:
@@ -294,6 +333,15 @@ class EvaluationLauncher:
         self._pending.clear()
         self._reap()
 
+    def _not_yet_rewritten(self, step: int, step_dir: Path) -> bool:
+        stamp = self._rewritten.get(step)
+        if stamp is None:
+            return False
+        if _metadata_stamp(step_dir) == stamp:
+            return True
+        del self._rewritten[step]
+        return False
+
     def _start(self, step: int, step_dir: Path) -> None:
         if step in self._handled:
             return
@@ -304,29 +352,56 @@ class EvaluationLauncher:
             return
         argv = self.settings.argv(step_dir, step)
         log_path = output / LAUNCH_LOG_FILE
-        claimed = False
+        child = self._spawn(step, argv, output, log_path)
+        if child is None:
+            return
+        self._children.append((step, child, log_path))
+        logger.info(f"Periodic evaluation launched step {step}: {shlex.join(argv)}")
+
+    def _spawn(
+        self, step: int, argv: list[str], output: Path, log_path: Path
+    ) -> subprocess.Popen | None:
+        """Claim the step and start its command; None when nothing was started.
+
+        Once the command has started the step stays claimed whatever happens after, such as
+        an error on closing the launch log.
+        """
+        child = None
         try:
             output.mkdir(parents=True, exist_ok=True)
             with open(log_path, "ab") as log:
-                claimed = _claim(output, argv)
-                if not claimed:
-                    logger.info(f"Periodic evaluation skips step {step}: already started")
-                    return
-                child = self._launch(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    env=child_environment(os.environ),
-                    start_new_session=True,
+                child = self._run(step, argv, output, log)
+        except OSError as exc:
+            if child is None:
+                logger.warning(f"Periodic evaluation could not launch step {step}: {exc}")
+            else:
+                logger.warning(
+                    f"Periodic evaluation could not close the launch log of step {step}: {exc}"
                 )
+        return child
+
+    def _run(
+        self, step: int, argv: list[str], output: Path, log: BinaryIO
+    ) -> subprocess.Popen | None:
+        claimed = False
+        try:
+            claimed = _claim(output, argv)
+            if not claimed:
+                logger.info(f"Periodic evaluation skips step {step}: already started")
+                return None
+            return self._launch(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=child_environment(os.environ),
+                start_new_session=True,
+            )
         except OSError as exc:
             if claimed:
                 (output / LAUNCHED_FILE).unlink(missing_ok=True)
             logger.warning(f"Periodic evaluation could not launch step {step}: {exc}")
-            return
-        self._children.append((step, child, log_path))
-        logger.info(f"Periodic evaluation launched step {step}: {shlex.join(argv)}")
+            return None
 
     def _reap(self) -> None:
         running = []
@@ -380,9 +455,18 @@ class PeriodicEvaluationHook(TrainingHook):
         if not _is_rank_zero() or self._worker is not None:
             return
         self._checkpoint_dir = config.checkpoint.dir
-        self._worker = threading.Thread(target=self._work, name="periodic-evaluation", daemon=True)
-        self._worker.start()
-        self._messages.put(("scan", config.checkpoint.dir))
+        worker = threading.Thread(target=self._work, name="periodic-evaluation", daemon=True)
+        try:
+            worker.start()
+        except Exception as exc:
+            logger.warning(
+                f"Periodic evaluation could not start its worker thread ({type(exc).__name__}: "
+                f"{exc}); periodic evaluation is off for this run"
+            )
+            return
+        self._worker = worker
+        rewritten = frozenset({0}) if config.checkpoint.is_dynamic_milestone(0) else frozenset()
+        self._messages.put(("scan", (config.checkpoint.dir, rewritten)))
 
     def on_checkpoint_save(self, step: int, path: str) -> None:
         if self._worker is not None:
@@ -409,7 +493,7 @@ class PeriodicEvaluationHook(TrainingHook):
                 kind, payload = "check", None
             try:
                 if kind == "scan":
-                    self._launcher.scan(payload)
+                    self._launcher.scan(*payload)
                 elif kind == "saved":
                     self._launcher.saved(*payload)
                 elif kind == "check":

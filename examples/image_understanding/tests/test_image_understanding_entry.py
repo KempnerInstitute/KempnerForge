@@ -166,3 +166,38 @@ def test_a_config_the_evaluator_cannot_decode_stops_the_run_before_training_star
         _run_main(_load_entry_point(), monkeypatch, str(config_path), *evaluation_flags)
     assert exc.value.code == 2
     assert "no [vlm] section" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [],
+        ["--train.max_steps=3"],
+        ["--train.tf32"],
+        ["-h"],
+        ["--help"],
+        ["--", "--train.max_steps=3"],
+        ["--train.max_steps", "3"],
+        ["--eval.interval=5"],
+        ["-x", "--eval", "y"],
+        ["--train.lr=-1"],
+    ],
+)
+def test_without_an_evaluation_flag_every_argument_list_reaches_the_loader_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments: list[str]
+) -> None:
+    module = _load_entry_point()
+    received: list[Any] = []
+    sentinel = object()
+
+    def load(path: str, cli_args: list[str]) -> object:
+        received.append((path, cli_args))
+        return sentinel
+
+    calls: list[tuple[Any, dict[str, Any]]] = []
+    monkeypatch.setattr(module, "load_config", load)
+    monkeypatch.setattr(module, "run_training", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(sys, "argv", ["train.py", "run.toml", *arguments])
+    module.main()
+    assert received == [("run.toml", arguments)]
+    assert calls == [((sentinel,), {})]

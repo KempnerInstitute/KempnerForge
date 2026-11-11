@@ -32,6 +32,8 @@ import sys
 from kempnerforge.config.loader import load_config
 from kempnerforge.training import run_training
 
+EVAL_FLAG_PREFIX = "--eval-"
+
 
 def _parse_args(argv: list[str]) -> tuple[argparse.ArgumentParser, argparse.Namespace, list[str]]:
     """The periodic-evaluation flags among ``argv`` and the config overrides that remain."""
@@ -59,16 +61,18 @@ def main() -> None:
         print("Usage: train.py <config.toml> [--section.key=value ...]")
         sys.exit(1)
 
-    parser, args, overrides = _parse_args(sys.argv[2:])
+    arguments = sys.argv[2:]
+    if not any(argument.startswith(EVAL_FLAG_PREFIX) for argument in arguments):
+        run_training(load_config(sys.argv[1], cli_args=arguments))
+        return
+
+    parser, args, overrides = _parse_args(arguments)
     config = load_config(sys.argv[1], cli_args=overrides)
     flags = {
         "--eval-tasks": args.eval_tasks,
         "--eval-command": args.eval_command,
         "--eval-output": args.eval_output,
     }
-    if all(value is None for value in flags.values()):
-        run_training(config)
-        return
     absent = [flag for flag, value in flags.items() if value is None]
     if absent:
         parser.error(f"periodic evaluation also needs {' and '.join(absent)}")

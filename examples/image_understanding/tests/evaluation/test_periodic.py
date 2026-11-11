@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -485,8 +486,8 @@ class RecordingLauncher:
         if kind == self.fail_on:
             raise RuntimeError("boom")
 
-    def scan(self, directory: str) -> None:
-        self._record("scan", directory)
+    def scan(self, directory: str, rewritten: frozenset[int] = frozenset()) -> None:
+        self._record("scan", (directory, rewritten))
 
     def saved(self, step: int, directory: str) -> None:
         self._record("saved", (step, directory))
@@ -523,7 +524,7 @@ def test_the_hook_hands_a_run_to_its_worker_in_order(
         runner.on_checkpoint_save(step, str(run))
     runner.on_train_end(4, 0)
     assert recorder.calls == [
-        ("scan", str(run)),
+        ("scan", (str(run), frozenset())),
         ("saved", (2, str(run))),
         ("saved", (4, str(run))),
         ("finish", str(run)),
@@ -632,3 +633,149 @@ def test_an_unopenable_launch_log_claims_nothing_and_spares_the_next_step(
     assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_6"]
     assert not (output / LAUNCHED_FILE).exists()
     assert "could not launch step 5" in text(messages)
+
+
+class ClosingFails:
+    """A launch log whose close fails after the command was started."""
+
+    def __init__(self, path: Path, mode: str) -> None:
+        self.stream = open(path, mode)  # noqa: SIM115
+
+    def fileno(self) -> int:
+        return self.stream.fileno()
+
+    def __enter__(self) -> ClosingFails:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.stream.close()
+        raise OSError(5, "input/output error")
+
+
+def test_a_log_that_fails_to_close_after_the_launch_keeps_the_step_launched(
+    tmp_path: Path, run: Path, messages: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    popen = Launcher(status=None)
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 5)
+    monkeypatch.setattr(periodic, "open", ClosingFails, raising=False)
+    launcher.saved(5, run)
+    assert len(popen.calls) == 1
+    assert (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
+    assert launcher.waiting
+    monkeypatch.undo()
+    again = Launcher()
+    make_launcher(tmp_path, again).scan(run)
+    assert again.calls == []
+
+
+def test_a_record_that_cannot_be_written_leaves_the_step_launchable(
+    tmp_path: Path, run: Path, messages: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        raise OSError(28, "no space left on device")
+
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 5)
+    monkeypatch.setattr(periodic.json, "dump", refuse)
+    launcher.saved(5, run)
+    monkeypatch.undo()
+    assert popen.calls == []
+    assert not (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
+    assert "could not launch step 5" in text(messages)
+    later = Launcher()
+    make_launcher(tmp_path, later).scan(run)
+    assert len(later.calls) == 1
+
+
+def test_the_scan_logs_each_incomplete_step_it_drops(
+    tmp_path: Path, run: Path, messages: list[str]
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 3, complete=False)
+    save_step(run, 4)
+    launcher.scan(run)
+    assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_4"]
+    assert "skips step 3" in text(messages) and "not complete" in text(messages)
+    assert "skips step 4" not in text(messages)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write anywhere")
+def test_an_output_root_that_cannot_be_written_is_refused(tmp_path: Path) -> None:
+    root = tmp_path / "locked"
+    root.mkdir()
+    root.chmod(0o500)
+    try:
+        with pytest.raises(ValueError, match="not writable"):
+            PeriodicEvaluation(
+                config="run.toml", tasks=str(SAMPLE_TASKS), command=COMMAND, output_root=str(root)
+            )
+    finally:
+        root.chmod(0o700)
+
+
+def test_a_thread_that_cannot_start_turns_the_hook_off_and_training_goes_on(
+    tmp_path: Path, run: Path, rank_zero: None, messages: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(self: threading.Thread) -> None:
+        raise RuntimeError("can't start new thread")
+
+    recorder = RecordingLauncher()
+    hook = make_hook(tmp_path, recorder)
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    hook.on_train_begin(config_for(run))
+    monkeypatch.undo()
+    hook.on_checkpoint_save(2, str(run))
+    hook.on_train_end(2, 0)
+    assert hook._worker is None and recorder.calls == []
+    assert "periodic evaluation is off" in text(messages)
+
+
+def test_a_step_that_a_resumed_run_saves_again_waits_for_the_rewrite(
+    tmp_path: Path, run: Path
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    step_dir = save_step(run, 0)
+    launcher.scan(run, frozenset({0}))
+    launcher.saved(0, run)
+    launcher.check()
+    assert popen.calls == []
+    rewritten = step_dir / ".metadata"
+    stamp = rewritten.stat().st_mtime_ns + 1_000_000
+    rewritten.write_text("new")
+    os.utime(rewritten, ns=(stamp, stamp))
+    launcher.check()
+    assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_0"]
+
+
+def test_a_step_that_was_not_rewritten_is_taken_up_by_the_last_look(
+    tmp_path: Path, run: Path
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 0)
+    launcher.scan(run, frozenset({0}))
+    assert popen.calls == []
+    launcher.finish(run)
+    assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_0"]
+
+
+def test_the_hook_asks_for_a_rewritten_step_zero_when_the_run_saves_it_first(
+    tmp_path: Path, run: Path, rank_zero: None
+) -> None:
+    from kempnerforge.config.checkpoint import DynamicCheckpointWindow
+
+    recorder = RecordingLauncher()
+    hook = make_hook(tmp_path, recorder)
+    config = config_for(run)
+    config.checkpoint.dyn_ckpt_window = DynamicCheckpointWindow(start=0, stop=8)
+    hook.on_train_begin(config)
+    hook.on_train_end(1, 0)
+    assert recorder.calls[0] == ("scan", (str(run), frozenset({0})))
+
+
+def test_the_stamp_of_a_directory_without_metadata_is_empty(tmp_path: Path) -> None:
+    assert periodic._metadata_stamp(tmp_path / "missing") == (0, 0, 0)

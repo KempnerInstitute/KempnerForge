@@ -234,7 +234,8 @@ training is then exactly what it is without them:
 ```bash
 uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py <config.toml> \
     --eval-tasks <tasks.toml> --eval-output /your/results/root \
-    --eval-command "sbatch --job-name=eval-{step} configs/evaluate_checkpoint.sbatch \
+    --eval-command "sbatch --job-name=eval-{step} \
+        examples/image_understanding/configs/evaluate_checkpoint.sbatch \
         {config} {checkpoint} {tasks} {output} {overrides}"
 ```
 
@@ -247,9 +248,11 @@ model the run trained. `{checkpoint}` and `{output}` are required. The template 
 split into arguments first and the placeholders filled in afterwards, so a path with
 a space is still one argument, and it is run without a shell. A SLURM user passes an
 `sbatch` line, as above, so each evaluation is its own job that outlives the run;
-`configs/evaluate_checkpoint.sbatch` is a job script to copy, with placeholders for
-the partition, account and environment. Anyone else passes a local script, which is
-started detached and keeps running when the run ends.
+`examples/image_understanding/configs/evaluate_checkpoint.sbatch` is a job script
+to copy, with placeholders for the partition, account and environment. Anyone else
+passes a local script, which is started detached and keeps running when the run
+ends. A local evaluation shares the training GPUs and slows training while it runs;
+a scheduler job runs on GPUs of its own and does not.
 
 Everything is checked before the run builds anything: the task file, the config (the
 evaluator decodes the same runs as above), the template and its program, and the
@@ -279,6 +282,10 @@ completed, is skipped with a log line, and a launch that cannot start is a warni
 that releases its `launched.json`. A command that starts and then exits non-zero is
 a warning too, and its step is not started again: look for a step directory without
 `results.json`, and delete its `launched.json` to have the next run start it.
+Once a command has started its step stays launched whatever fails afterwards. A step
+the run saves again over a directory that is already complete (step 0 of a run that
+resumes from it, with a dynamic checkpoint window) is launched once its `.metadata`
+has been rewritten, or by the last look at the end of the run.
 
 The evaluator reads a step directory while the run goes on, and the run removes old
 ones (`checkpoint.keep_last_n`). Keep as many as the evaluations in flight need,
