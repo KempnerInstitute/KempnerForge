@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Evaluation entry point for the image-understanding example.
 
-Parses argv, loads the training config and the task file, and hands off to
-``evaluation.evaluator.evaluate_checkpoint``, which decodes each task's split
-with the checkpoint's model, scores the answers and writes the results.
+Parses argv, clears the last ``results.json``, loads the training config and
+the task file, and hands off to ``evaluation.evaluator.evaluate_checkpoint``,
+which decodes each task's split with the checkpoint's model, scores the answers
+and writes the results.
 
 Usage:
     # One GPU
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 import argparse
 
-from evaluation.evaluator import evaluate_checkpoint
+from evaluation.evaluator import clear_results, evaluate_checkpoint
 from evaluation.tasks import load_tasks
 
 from kempnerforge.config.loader import load_config
@@ -58,6 +59,7 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     args, overrides = _parse_args()
+    prior_failure = clear_results(args.output)
     config = load_config(args.config, cli_args=overrides)
     evaluate_checkpoint(
         config,
@@ -66,6 +68,7 @@ def main() -> None:
         output=args.output,
         batch_size=args.batch_size,
         publish=not args.no_publish,
+        prior_failure=prior_failure,
     )
 
 

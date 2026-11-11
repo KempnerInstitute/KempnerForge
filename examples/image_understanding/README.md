@@ -206,6 +206,19 @@ A row is scored as it is or counted under a reason, never changed to fit:
 - `prompt_too_long`: the prompt and `max_new_tokens` do not fit
   `vlm.max_text_len`, the text length training lays out.
 
+A task's rows are the rows its reader yields: a reader that drops rows when it
+loads a split (a row with no question or no answer, for one) does so before the
+evaluation and does not count them. A reader that passes over rows while it is
+read must say so, either through `read_with_index`, which returns the index of
+the row it read with the document, or through a `skipped` count that moves
+whenever it passes over a row; a run of unreadable rows the reader gives up on
+(a `RuntimeError`) is counted row by row the same way, and any other
+`RuntimeError` fails the run.
+
+The prediction that is scored is the generation decoded with special tokens
+skipped and nothing else cleaned up; the scorers normalize their own input. The
+predictions file keeps the raw `generation` beside it.
+
 A task's metrics are over its scored rows, with the counts beside them. A
 missing image file, a task whose cap leaves no room for any prompt, or a task
 with no scored row fails the run.
@@ -214,11 +227,12 @@ with no scored row fails the run.
 /your/results/dir/
 ├── predictions/<task>.jsonl   # per row: question, references, generation, prediction, score
 ├── metrics.json               # <task>/<metric> to value
-└── results.json               # per task: metrics, rows, samples, skips by reason
+└── results.json               # per task: metrics, rows (its reader's), samples, skips by reason
 ```
 
-`results.json` is removed when an evaluation starts and written last, so it is
-there only for an evaluation that finished; it names the step directory it
+`results.json` is removed when an evaluation starts, before the config and the
+task file are loaded, and written last, so it is there only for an evaluation
+that finished; it names the step directory it
 evaluated. When that checkpoint's `metadata.json` records an MLflow run, rank 0
 then appends the metrics to it as `eval/<task>/<metric>` at the checkpoint's
 step. `--no-publish` turns that off, and a failure to publish is a warning with

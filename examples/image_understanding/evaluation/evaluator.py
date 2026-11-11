@@ -104,23 +104,28 @@ def check_token_budgets(renderer: ChatRenderer, tasks: Sequence[EvalTask]) -> No
             )
 
 
-def clean_generation(text: str) -> str:
-    """The decoded generation as it is scored: without surrounding whitespace."""
-    return text.strip()
-
-
 def read_row(reader: DocumentSource, index: int) -> Document | None:
     """The document of row ``index``, or ``None`` when ``reader`` passed over that row.
 
     A reader passes over a row it cannot use and returns a later one, which is
-    not the answer to this row. A reader with ``read_with_index`` says which row
-    it read. Any other is read by index, one read at a time across threads, and
-    its ``skipped`` count, when it has one, moves if it went on to another row, or
-    if it gave up after passing over a run of rows (a ``RuntimeError``).
+    not the answer to this row. A reader that passes over rows must say so: it
+    has ``read_with_index``, which returns the index of the row it read with the
+    document, or a ``skipped`` count that moves whenever it passes over a row.
+    A reader with ``read_with_index`` is read through it; any other is read by
+    index, one read at a time across threads. Either way a row is ``None`` when
+    the reader read another row, or gave up after passing over a run of rows (a
+    ``RuntimeError`` after its ``skipped`` count moved); any other
+    ``RuntimeError`` is raised.
     """
     read_with_index = getattr(reader, "read_with_index", None)
     if read_with_index is not None:
-        actual, document = read_with_index(index)
+        skipped = getattr(reader, "skipped", None)
+        try:
+            actual, document = read_with_index(index)
+        except RuntimeError:
+            if getattr(reader, "skipped", None) == skipped:
+                raise
+            return None
         return document if actual == index else None
     with _ONE_READ_AT_A_TIME:
         skipped = getattr(reader, "skipped", None)
@@ -151,7 +156,8 @@ def evaluate_batch(
 
     The rows that can be decoded are decoded together. A scored row records its
     ``question``, reference ``answers``, the decoded ``generation``, the
-    ``prediction`` that was scored, whether the decode ``stopped`` on a stop
+    ``prediction`` that was scored (the generation with special tokens skipped),
+    whether the decode ``stopped`` on a stop
     token, and its ``score``. A skipped row records the reason under ``skipped``.
 
     Raises:
@@ -178,8 +184,9 @@ def evaluate_batch(
         max_text_len=renderer.max_text_len,
     )
     for (row, turn, _), generation in zip(ready, generations, strict=True):
-        text = renderer.tokenizer.decode(list(generation.token_ids), skip_special_tokens=False)
-        prediction = clean_generation(text)
+        token_ids = list(generation.token_ids)
+        text = renderer.tokenizer.decode(token_ids, skip_special_tokens=False)
+        prediction = renderer.tokenizer.decode(token_ids, skip_special_tokens=True)
         score = scorer.score(prediction, turn.answers)
         records.append(
             {
@@ -240,21 +247,28 @@ def evaluate_checkpoint(
     *,
     batch_size: int = 32,
     publish: bool = True,
+    prior_failure: Exception | None = None,
 ) -> Record | None:
     """Evaluate ``checkpoint`` on ``tasks`` and write the results under ``output``.
 
     ``config`` is the config the checkpoint was trained with and ``checkpoint``
     a run directory, whose latest checkpoint is evaluated, or a step directory.
-    The config, the tasks' token budgets and their splits are checked before a
-    process group or the model exists. Launched as several processes, this joins
-    them into a process group, or uses the one already initialized; each rank
-    loads the model and decodes the batches ``shard_batches`` gives it, reading
-    their rows with ``data.num_workers`` threads.
+    The arguments, the config and the tasks' token budgets are checked before a
+    process group or the model exists, as they come out the same on every rank.
+    Launched as several processes, this then joins them into a process group, or
+    uses the one already initialized. What can fail on one rank alone (removing
+    the last ``results.json``, opening the tasks' splits) is recorded or done in
+    a step the ranks agree on, before the model is built, so a failure on one
+    rank fails them all; a ``prior_failure`` the caller recorded is raised there
+    on every rank too. Each rank loads the model and decodes the batches
+    ``shard_batches`` gives it, reading their rows with ``data.num_workers``
+    threads.
 
     Rank 0 writes ``predictions/<task>.jsonl`` (one line per row, in row order),
     ``metrics.json`` (``<task>/<metric>`` to value) and last ``results.json``,
     which is removed when an evaluation starts and so exists only once one has
-    finished. With ``publish``, rank 0 then appends the metrics as
+    finished; ``clear_results`` removes it before a caller loads its inputs.
+    With ``publish``, rank 0 then appends the metrics as
     ``eval/<task>/<metric>`` to the MLflow run the checkpoint was trained under;
     a failure there is logged and never raised.
 
@@ -269,13 +283,16 @@ def evaluate_checkpoint(
         UnsupportedDocumentError: a row holds a document outside the limits.
         RuntimeError: on the other ranks, when a rank failed.
     """
-    renderer, readers = _on_every_rank(
-        partial(_preflight, config, tasks, batch_size, output), "Checking the tasks"
-    )
+    prior_failure = prior_failure or clear_results(output)
+    _check_arguments(config, tasks, batch_size)
+    prepared = _attempt(partial(_build_renderer, config, tasks))
 
     started_group, rank, world_size, device = _join_ranks(config)
     apply_matmul_precision(config.train)
     output = Path(output)
+    renderer, readers = _on_every_rank(
+        partial(_open_splits, prepared, prior_failure, tasks), "Opening the splits"
+    )
     resolved = _on_rank_zero(rank, partial(_start, output, checkpoint), "Starting the evaluation")
     step_dir = Path(_gather(resolved)[0])
     model = _on_every_rank(partial(load_model, config, step_dir, device), "Loading the checkpoint")
@@ -343,29 +360,57 @@ def _prepare_row(
     return row, turn, inputs
 
 
-def _preflight(
-    config: JobConfig, tasks: Sequence[EvalTask], batch_size: int, output: str | Path
-) -> tuple[ChatRenderer, dict[str, DocumentSource]]:
-    """Clear the last results, then build the renderer and every task's reader.
+def clear_results(output: str | Path) -> OSError | None:
+    """Remove the last evaluation's ``results.json``, so a failed run leaves no finished marker.
 
-    The config, the token budgets and the splits are checked on the way.
+    Only rank 0 removes it. A removal that fails is returned, not raised, so
+    that it can be raised on every rank together, as ``prior_failure`` of
+    ``evaluate_checkpoint`` does.
     """
-    _clear_results(output)
+    rank = dist.get_rank() if dist.is_initialized() else get_world_info()[0]
+    if rank != 0:
+        return None
+    try:
+        (Path(output) / RESULTS_FILE).unlink(missing_ok=True)
+    except OSError as error:
+        return error
+    return None
+
+
+def _check_arguments(config: JobConfig, tasks: Sequence[EvalTask], batch_size: int) -> None:
     check_supported(config)
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
     if not tasks:
         raise ValueError("no task to evaluate")
+
+
+def _attempt[T](action: Callable[[], T]) -> tuple[T | None, Exception | None]:
+    """``action()`` and no error, or no value and the error it raised."""
+    try:
+        return action(), None
+    except Exception as error:
+        return None, error
+
+
+def _build_renderer(config: JobConfig, tasks: Sequence[EvalTask]) -> ChatRenderer:
     renderer = build_renderer(config)
     check_token_budgets(renderer, tasks)
-    return renderer, {task.name: _open_reader(task) for task in tasks}
+    return renderer
 
 
-def _clear_results(output: str | Path) -> None:
-    """Remove the last evaluation's ``results.json``, so a failed run leaves no finished marker."""
-    rank = dist.get_rank() if dist.is_initialized() else get_world_info()[0]
-    if rank == 0:
-        (Path(output) / RESULTS_FILE).unlink(missing_ok=True)
+def _open_splits(
+    prepared: tuple[ChatRenderer | None, Exception | None],
+    prior_failure: Exception | None,
+    tasks: Sequence[EvalTask],
+) -> tuple[ChatRenderer, dict[str, DocumentSource]]:
+    """Raise what failed before the group existed, then open every split."""
+    renderer, failure = prepared
+    if prior_failure is not None:
+        raise prior_failure
+    if failure is not None:
+        raise failure
+    return cast(ChatRenderer, renderer), {task.name: _open_reader(task) for task in tasks}
 
 
 def _open_reader(task: EvalTask) -> DocumentSource:
