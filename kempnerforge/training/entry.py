@@ -195,6 +195,8 @@ def build_checkpoint_manager(
         process_group=ckpt_pg,
         pp_rank=ckpt_pp_rank,
         weight_decay_scope=config.optimizer.weight_decay_scope,
+        lr_multipliers=config.optimizer.lr_multipliers,
+        module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
     )
 
 
@@ -367,7 +369,11 @@ def run_training(
                 f"forward passes run under torch.autocast({amp_dtype})"
             )
 
-        optimizer = build_optimizer(model, config.optimizer)
+        optimizer = build_optimizer(
+            model,
+            config.optimizer,
+            module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
+        )
         scheduler = build_scheduler(optimizer, config.scheduler, max_steps=config.train.max_steps)
 
         ckpt_mgr = build_checkpoint_manager(config, runtime, model, optimizer, pipeline)
