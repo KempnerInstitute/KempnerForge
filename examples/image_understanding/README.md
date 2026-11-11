@@ -280,9 +280,13 @@ once its directory is complete on disk, which is when the DCP `.metadata`,
 asynchronous checkpointing the directory is still being written when the loop moves
 on, so the worker checks for it again every few seconds, with three `stat` calls,
 and once more when the loop ends, after it has drained the last save. A launch is
-started and left, detached and without the training run's `torchrun` variables
-(`WORLD_SIZE`, `MASTER_ADDR` and the like), so an evaluator or an `sbatch` job
-starts its own process group; its exit status is only read later, without waiting,
+started and left, detached and without the training run's rendezvous variables
+(`RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`, `SLURM_PROCID`, `SLURM_NTASKS`
+and the other per-process and `TORCHELASTIC_*` ones), so an
+evaluator or an `sbatch` job starts its own process group. Every other variable is
+inherited, the rest of the run's `SLURM_*` variables and `CUDA_VISIBLE_DEVICES`
+included: an `sbatch` job gets its own from the scheduler, but a local script
+shares the run's, so it should set the device it evaluates on. The command's exit status is only read later, without waiting,
 to warn about a command that failed. A checkpoint the shutdown handler saves
 outside the loop is found by the last look and by the next run's scan.
 
