@@ -1841,23 +1841,38 @@ class TestPhaseTemperatureReachesSampler:
 
 
 class FakeSubMesh:
-    def __init__(self, key) -> None:
+    def __init__(self, key, coords=(0, 1)) -> None:
         self.key = key
+        self.coords = coords
 
     def get_group(self):
         return f"group:{self.key}"
 
+    def get_local_rank(self) -> int:
+        return self.coords[0]
+
+    def size(self) -> int:
+        return self.coords[1]
+
 
 class FakeMesh:
-    """Enough DeviceMesh surface for the build phases to run on CPU."""
+    """Enough DeviceMesh surface for the build phases to run on CPU.
 
-    def __init__(self, dims=("pp", "dp_shard")) -> None:
+    ``coords`` maps a dimension name to its (local rank, size); any other
+    dimension or slice reports (0, 1).
+    """
+
+    def __init__(self, dims=("pp", "dp_shard"), coords=None) -> None:
         self.mesh_dim_names = dims
+        self.coords = coords or {}
         self.sliced: list = []
 
     def __getitem__(self, key):
         self.sliced.append(key)
-        return FakeSubMesh(key)
+        return FakeSubMesh(key, self.coords.get(key, (0, 1)))
+
+    def get_local_rank(self, name) -> int:
+        return self.coords.get(name, (0, 1))[0]
 
 
 class FakeStageModule(nn.Module):
@@ -2014,6 +2029,32 @@ class TestBuildModel:
         config.distributed.pp = 2
         with pytest.raises(RuntimeError, match="requires a device mesh"):
             entry.build_model(config, _runtime(), "LOSS")
+
+
+class TestBuildCheckpointManager:
+    def test_records_the_data_pipelines_partition(self, tmp_path):
+        """The manager records the (dp_rank, dp_size) the data pipeline reads."""
+        from kempnerforge.training.data_pipeline import build_data_pipeline
+        from kempnerforge.training.entry import build_checkpoint_manager
+
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "c")
+        model = TinyTextModel()
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        single = build_checkpoint_manager(config, _runtime(), model, opt, None)
+        assert single._dp_info == (0, 1)
+
+        mesh = FakeMesh(
+            ("dp_replicate", "dp_shard", "tp"),
+            coords={"dp_replicate": (1, 2), "dp_shard": (3, 4), "tp": (1, 2)},
+        )
+        runtime = dataclasses.replace(_runtime(), device_mesh=mesh)
+        mgr = build_checkpoint_manager(config, runtime, model, opt, None)
+        assert mgr._dp_info == (7, 8)
+        assert {"dp_replicate", "dp_shard"} <= set(mesh.sliced)
+        data = build_data_pipeline(config, runtime)
+        assert (data.dp_rank, data.dp_size) == mgr._dp_info
 
 
 class FakeResumeManager:
@@ -2198,6 +2239,7 @@ class TestRestoreCheckpoint:
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
         assert mgr.load_kwargs["path"] == (str(resume) if resume_found else None)
         assert mgr.load_kwargs["exclude_keys"] == want_exclude
+        assert mgr.load_kwargs["exact_resume"] is resume_found
 
     def test_resume_with_stale_load_path_restores_full_state(self, monkeypatch, tmp_path):
         """A requeued run keeps its warm-start config; the resume must still
