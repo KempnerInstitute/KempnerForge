@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 from evaluation.scorers import SCORERS
@@ -103,6 +103,14 @@ def _unresolved(annotation_file: str, limit: MissingType = 0) -> MissingReturn: 
 
 def _unresolved_value(annotation_file: MissingType, limit: int = 0) -> list[str]:  # noqa: F821
     return [str(annotation_file)]
+
+
+def _quoted(annotation_file: str, limit: "int" = 0) -> list[str]:  # noqa: UP037
+    return [annotation_file]
+
+
+def _quoted_optional(annotation_file: str, limit: Optional["int"] = None) -> list[str]:  # noqa: UP037, UP045
+    return [annotation_file]
 
 
 class TestLoadTasks:
@@ -349,6 +357,15 @@ class TestReaderFactories:
         assert _task(limit="anything").reader_args["limit"] == "anything"
         with pytest.raises(ValueError, match="reader_args.annotation_file must be a string"):
             _task(annotation_file=3)
+
+    @pytest.mark.parametrize("factory", [_quoted, _quoted_optional])
+    def test_a_quoted_annotation_is_resolved(
+        self, monkeypatch: pytest.MonkeyPatch, factory: Any
+    ) -> None:
+        monkeypatch.setitem(READERS, "rows", factory)
+        assert _task(limit=3).reader_args["limit"] == 3
+        with pytest.raises(ValueError, match="reader_args.limit must be an integer"):
+            _task(limit="bad")
 
     def test_an_unresolved_name_never_escapes_the_loader(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

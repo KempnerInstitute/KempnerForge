@@ -31,11 +31,12 @@ import functools
 import inspect
 import re
 import tomllib
+import types
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from types import MappingProxyType, UnionType
-from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Union, get_args, get_origin, get_type_hints
 
 from image_text.testbed import chartqa, coco_captions, docvqa, textvqa, vqav2
 
@@ -79,8 +80,8 @@ def _check_choice(task: str, key: str, value: Any, options: Collection[str]) -> 
 def _annotation(factory: Any, parameter: inspect.Parameter) -> Any:
     """The annotation of ``parameter`` with a string resolved, or ``None`` when it cannot be."""
     annotation = parameter.annotation
-    if not isinstance(annotation, str):
-        return None if annotation is parameter.empty else annotation
+    if annotation is parameter.empty:
+        return None
     target = factory
     while isinstance(target, functools.partial):
         target = target.func
@@ -89,7 +90,9 @@ def _annotation(factory: Any, parameter: inspect.Parameter) -> Any:
     elif not inspect.isroutine(target):
         target = type(target).__call__
     try:
-        return eval(annotation, getattr(inspect.unwrap(target), "__globals__", {}))
+        holder = types.SimpleNamespace(__annotations__={parameter.name: annotation})
+        namespace = getattr(inspect.unwrap(target), "__globals__", {})
+        return get_type_hints(holder, globalns=namespace)[parameter.name]
     except Exception:
         return None
 
