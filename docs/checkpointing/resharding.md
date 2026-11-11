@@ -6,7 +6,8 @@ loaded at 64 GPUs (or 16, or 8, or 1) without any conversion step.
 
 No code in `CheckpointManager` does this — DCP handles it entirely.
 What KempnerForge contributes is a checkpoint layout that survives
-the trip.
+the trip. Under expert parallelism that takes one step before DCP:
+see [EP](#ep-every-expert-under-its-global-index).
 
 ## How it works
 
@@ -37,7 +38,7 @@ either error or silently leave the tensor uninitialized (it warns).
 | `dp_shard` | yes | Any factor of the parameter shape |
 | `dp_replicate` | yes | With a `dp_shard` dimension it changes how many ranks hold each shard; without one, FSDP2 shards over it, so it reshards like `dp_shard` |
 | `tp` | yes | Heads must still divide evenly |
-| `ep` | yes | `num_experts` still must divide evenly |
+| `ep` | yes | `num_experts` must still divide evenly; see [EP](#ep-every-expert-under-its-global-index) |
 | World size | yes | Pure rebalance across fewer/more ranks |
 | **`pp` stage count** | **no** | Per-stage `pp{N}/` subdirs; changing `pp` reassigns layers and moves the embedding/output to different stages |
 | Precision (bf16 → fp32) | yes | DCP upcasts on load |
@@ -73,6 +74,20 @@ The conversion path is what shipped configs use in practice: PP is
 chosen for the largest runs where memory forces it, and those runs
 typically don't need to rebalance mid-training.
 
+## EP: every expert under its global index
+
+With `ep > 1` each rank holds `num_experts / ep` experts of every MoE
+layer, numbered from 0 in its own state dict, so every EP rank would
+give DCP the same names and offsets, and DCP keeps one copy of each.
+`CheckpointManager` therefore places each rank's experts among all of
+them before DCP sees them: an unpacked expert is saved under its global
+index, and each packed weight as one tensor of `num_experts` rows. The
+checkpoint is the one an `ep=1` run writes, so DCP reshards it to any
+`ep` that divides `num_experts`, including `ep=1`, and an `ep=1`
+checkpoint loads into an EP run. Packed experts under FSDP need torch
+2.10 or newer for this. See
+[Expert parallelism § Checkpoints](../distributed/expert-parallelism.md#checkpoints).
+
 ## What to check if resharding fails
 
 - **Tensor shape mismatch**: the most common cause is that the
@@ -91,6 +106,11 @@ typically don't need to rebalance mid-training.
 - **`.metadata` disagreement between `pp{i}/` subdirs**: always a
   bug — different PP stages should save independently. File an
   issue.
+- **An EP checkpoint saved before experts had a global index**
+  ([#202](https://github.com/KempnerInstitute/KempnerForge/issues/202)):
+  it holds `num_experts / ep` experts per layer, one rank's, and the
+  others were never written. The load refuses it and says how many
+  experts it holds; no `ep` can restore the missing ones.
 - **"checkpoint per-rank state was saved with world_size=..."**: not
   a DCP failure at all. The model and optimizer reshard fine; the
   dataloader and RNG state cannot follow the topology change. See

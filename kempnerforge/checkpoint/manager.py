@@ -44,7 +44,7 @@ from typing import Any, Protocol, TypeGuard, cast
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint import DefaultLoadPlanner
+from torch.distributed.checkpoint import DefaultLoadPlanner, DefaultSavePlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -54,6 +54,12 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from kempnerforge.checkpoint.async_save import AsyncCheckpointer
+from kempnerforge.checkpoint.expert_layout import (
+    ExpertLayout,
+    check_saved_experts,
+    expert_layout,
+    moe_layers,
+)
 from kempnerforge.checkpoint.state import (
     PER_RANK_KEY,
     build_per_rank_envelope,
@@ -873,6 +879,38 @@ class CheckpointManager:
         """
         agree_across_ranks(error, what, group=self._sync_group)
 
+    def _present_experts(
+        self,
+        dcp_state: dict[str, Any],
+        load_from: Path | None = None,
+        saved_keys: Mapping[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], ExpertLayout | None]:
+        """``dcp_state`` as the checkpoint holds it, and the layout that translated it.
+
+        Under expert parallelism each rank's experts are placed among all of them (see
+        ``ExpertLayout``); otherwise ``dcp_state`` comes back with ``None``. Before a load
+        from ``load_from``, a checkpoint whose MoE layers hold fewer experts than the
+        model's is refused (see ``check_saved_experts``), reading its DCP index unless
+        ``saved_keys`` holds it. Every rank must call this: they agree on the outcome
+        before DCP's collectives, so a rank that fails raises on every rank.
+        """
+        layout = expert_layout(self.model)
+        check = load_from is not None and any(True for _ in moe_layers(self.model))
+        if layout is None and not check:
+            return dcp_state, None
+
+        def present() -> dict[str, Any]:
+            if check:
+                assert load_from is not None
+                saved = saved_keys or _dcp_keys(load_from)
+                check_saved_experts(self.model, saved, load_from)
+            return layout.to_global(dcp_state) if layout is not None else dcp_state
+
+        presented: list[dict[str, Any]] = []
+        what = "Checkpoint save" if load_from is None else "Checkpoint load"
+        self.agree(_attempt(lambda: presented.append(present())), what)
+        return presented[0], layout
+
     def set_tracking_source(self, source: TrackingSource | None) -> None:
         """Record the logging runs ``source`` reports in every later ``metadata.json``.
 
@@ -1138,6 +1176,13 @@ class CheckpointManager:
     ) -> None:
         """Save a checkpoint at the given step.
 
+        Under expert parallelism each EP rank holds a copy of every weight outside the
+        routed experts, and the copies can drift apart on GPU (#482). DCP writes each
+        chunk that several ranks hold from one of them, by default the one with the least
+        to write so far, which could join chunks of different copies into one tensor. An
+        EP save writes each such chunk from its lowest rank instead, so the checkpoint
+        holds one EP rank's copy whole.
+
         Args:
             step: Current training step.
             tokens_seen: Total tokens processed.
@@ -1158,11 +1203,15 @@ class CheckpointManager:
             optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
             dcp_state["optimizer"] = optim_state
             dcp_state[_NEVER_STEPPED_KEY] = _never_stepped_record(optim_state)
+        dcp_state, layout = self._present_experts(dcp_state)
+        save = self._async_ckpt.save
+        if layout is not None:
+            save = partial(save, planner=DefaultSavePlanner(dedup_save_to_lowest_rank=True))
         flush_error = _attempt(self._async_ckpt.wait)
         error = flush_error
         if flush_error is None:
             error = _attempt(
-                self._async_ckpt.save,
+                save,
                 dcp_state,
                 checkpoint_id=str(dcp_dir),
                 process_group=self._process_group,
@@ -1489,6 +1538,7 @@ class CheckpointManager:
             self.agree(check_error, "Checkpoint load")
 
         if dcp_state:
+            dcp_state, layout = self._present_experts(dcp_state, dcp_dir, saved_keys)
             planner = _NeverSteppedStatePlanner()
             dcp.load(
                 dcp_state,
@@ -1500,6 +1550,8 @@ class CheckpointManager:
             if load_optim:
                 optim_state = cast("dict[str, Any]", dcp_state["optimizer"])
                 _restore_never_stepped(optim_state, planner.never_stepped, dcp_dir)
+            if layout is not None:
+                dcp_state = layout.to_local(dcp_state)
             if load_model:
                 set_model_state_dict(self.model, dcp_state["model"])
             if load_optim:

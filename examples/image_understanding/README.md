@@ -60,9 +60,17 @@ samples `VLMCollator` batches.
   budget cuts away), up to `max_attempts` in a row; `skipped` counts them with
   the reader's skips, per rank, and loader workers forked from the training
   process add to its count.
+- `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
+  `points.py` writes the point answers.
 
 Every sample the renderer builds carries one image, resized square to `image_size`,
-with no tiling or packing.
+with no tiling or packing. PixMo-Count stores its points in pixels; they are
+converted to percent of the image, the unit the other PixMo sources use. A
+counting answer lists its points before the count, so a row with many points
+outruns `max_text_len` and trains only the leading points. `max_points` retains
+the count only when the cap is small enough for the label and the text budget:
+with a 40-point `dot` row at 256 tokens, a cap of 30 still cuts the count, while
+a cap of 3 keeps it.
 
 ## Tile images
 
@@ -159,9 +167,9 @@ uv run python examples/vlm/scripts/convert_hf_backbone.py \
 
 Then pass it as `--checkpoint.load_path` with
 `checkpoint.exclude_from_loading = ["optimizer"]`, so the converted weights load
-and the optimizer starts fresh. Stage 2 should start from a stage-1 checkpoint
-the same way, as weights alone with its own warmup from step 0; a warm start
-today also restores the saved step and schedule, so that is on the roadmap.
+and the optimizer starts fresh. Stage 2 starts from a stage-1 checkpoint as
+weights alone with `checkpoint.exclude_from_loading = ["optimizer", "train_state"]`,
+so its step and schedule start again from 0.
 
 ## Evaluate a checkpoint
 
@@ -306,11 +314,9 @@ or in core where it belongs:
   DataComp), chat-template rendering with the loss on the assistant turns only,
   and the mixture loader
 - Typed stage contract and pinned source manifest, which fix the stage presets
-- Starting stage 2 from stage 1's weights alone, with a fresh step and schedule
 - Text-only documents in image-text batches
 - Documents with several images
 - Per-module learning rates and schedules
-- Vision-encoder precision separate from the backbone's
 - Evaluation: periodic evaluation during training, PixMo point and count
   scorers, documents with several images or none, and image attention when
   decoding
