@@ -15,12 +15,13 @@ examples/image_understanding/
 ├── train.py              # training entry point
 ├── evaluate_checkpoint.py   # evaluation entry point (below)
 ├── configs/
-│   └── eval_tasks.toml   # sample evaluation tasks, with placeholder paths
-├── evaluation/           # checkpoint evaluator, evaluation tasks and answer scorers (below)
+│   ├── eval_tasks.toml   # sample evaluation tasks, with placeholder paths
+│   └── evaluate_checkpoint.sbatch   # sample job script for evaluating one checkpoint
+├── evaluation/           # checkpoint evaluator, periodic evaluation, tasks and scorers (below)
 ├── image_text/           # image-text dataset readers and chat renderer (below)
 └── tests/
     ├── test_image_understanding_entry.py   # the entry point loads a config and hands it off
-    ├── evaluation/       # evaluator, task-file and scorer tests (CPU)
+    ├── evaluation/       # evaluator, periodic evaluation, task-file and scorer tests (CPU)
     └── image_text/       # reader and renderer tests (CPU)
 ```
 
@@ -175,6 +176,60 @@ then appends the metrics to it as `eval/<task>/<metric>` at the checkpoint's
 step. `--no-publish` turns that off, and a failure to publish is a warning with
 the command that publishes `metrics.json` later, never a failed evaluation.
 
+## Evaluate during training
+
+`train.py` can evaluate every checkpoint the run saves, as the run goes on. It is
+off unless `--eval-tasks`, `--eval-command` and `--eval-output` are all given, and
+training is then exactly what it is without them:
+
+```bash
+uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py <config.toml> \
+    --eval-tasks <tasks.toml> --eval-output /your/results/root \
+    --eval-command "sbatch --job-name=eval-{step} configs/evaluate_checkpoint.sbatch \
+        {config} {checkpoint} {tasks} {output} {overrides}"
+```
+
+`--eval-command` is a template for the command that evaluates one checkpoint.
+Its placeholders are `{config}` and `{tasks}` (the two files above), `{checkpoint}`
+(the step directory), `{step}`, `{output}` (that step's directory under
+`--eval-output`, `step_<N>`) and `{overrides}`, which stands for the run's
+`--section.key=value` overrides as separate arguments, so the evaluation builds the
+model the run trained. `{checkpoint}` and `{output}` are required. The template is
+split into arguments first and the placeholders filled in afterwards, so a path with
+a space is still one argument, and it is run without a shell. A SLURM user passes an
+`sbatch` line, as above, so each evaluation is its own job that outlives the run;
+`configs/evaluate_checkpoint.sbatch` is a job script to copy, with placeholders for
+the partition, account and environment. Anyone else passes a local script, which is
+started detached and keeps running when the run ends.
+
+Everything is checked before the run builds anything: the task file, the config (the
+evaluator decodes the same runs as above), the template and its program, and the
+output root. A mistake stops the run with the valid options named.
+
+The hook is rank 0's alone and training never waits on it. A saved step is launched
+once its directory is complete on disk, which is when the DCP `.metadata`,
+`train_state.pt` and `metadata.json` are all there, and not before: with
+asynchronous checkpointing the directory is still being written when the loop moves
+on, so the hook checks for it again every few seconds, with three `stat` calls, and
+once more when the loop ends, after it has drained the last save. A launch is
+started and left; its exit status is only read later, without waiting, to warn
+about a command that failed.
+
+A step is launched at most once. Before launching, the hook writes
+`launched.json` into the step's output directory, exclusively, and skips a step
+that has it or a `results.json`; when a run resumes, it also takes up the complete
+steps already on disk, so what an earlier incarnation saved and never started is
+evaluated and nothing is evaluated twice. `launch.log` holds the command's output
+(the job id, for `sbatch`). A step that was pruned before it was complete, or never
+completed, is skipped with a log line, and a launch that fails is a warning; a
+failed command releases its `launched.json`, so the next resume starts that step
+again. An evaluation that was started and then failed is not started again by the
+run, so look for a step directory without `results.json`.
+
+The evaluator reads a step directory while the run goes on, and the run removes old
+ones (`checkpoint.keep_last_n`). Keep as many as the evaluations in flight need,
+or the evaluator stops on a directory that is gone.
+
 ## Evaluation tasks and scorers
 
 `evaluation/` also holds what an evaluation run is made of: the tasks to run and
@@ -239,9 +294,8 @@ or in core where it belongs:
 - Documents with several images
 - Per-module learning rates and schedules
 - Vision-encoder precision separate from the backbone's
-- Evaluation: periodic evaluation during training, PixMo point and count
-  scorers, documents with several images or none, and image attention when
-  decoding
+- Evaluation: PixMo point and count scorers, documents with several images or
+  none, and image attention when decoding
 - Run-comparison metrics: documents seen, token counts, MFU with the encoder
 
 ## Tests
