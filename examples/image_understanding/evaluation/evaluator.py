@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -115,7 +115,8 @@ def read_row(reader: DocumentSource, index: int) -> Document | None:
     A reader passes over a row it cannot use and returns a later one, which is
     not the answer to this row. A reader with ``read_with_index`` says which row
     it read. Any other is read by index, one read at a time across threads, and
-    its ``skipped`` count, when it has one, moves if it went on to another row.
+    its ``skipped`` count, when it has one, moves if it went on to another row, or
+    if it gave up after passing over a run of rows (a ``RuntimeError``).
     """
     read_with_index = getattr(reader, "read_with_index", None)
     if read_with_index is not None:
@@ -123,7 +124,12 @@ def read_row(reader: DocumentSource, index: int) -> Document | None:
         return document if actual == index else None
     with _ONE_READ_AT_A_TIME:
         skipped = getattr(reader, "skipped", None)
-        document = reader[index]
+        try:
+            document = reader[index]
+        except RuntimeError:
+            if getattr(reader, "skipped", None) == skipped:
+                raise
+            return None
         return document if getattr(reader, "skipped", None) == skipped else None
 
 
@@ -263,14 +269,10 @@ def evaluate_checkpoint(
         UnsupportedDocumentError: a row holds a document outside the limits.
         RuntimeError: on the other ranks, when a rank failed.
     """
-    check_supported(config)
-    if batch_size < 1:
-        raise ValueError(f"batch_size must be at least 1, got {batch_size}")
-    if not tasks:
-        raise ValueError("no task to evaluate")
-    renderer = build_renderer(config)
-    check_token_budgets(renderer, tasks)
-    readers = {task.name: _open_reader(task) for task in tasks}
+    _clear_results(output)
+    renderer, readers = _on_every_rank(
+        partial(_preflight, config, tasks, batch_size), "Checking the tasks"
+    )
 
     started_group, rank, world_size, device = _join_ranks(config)
     apply_matmul_precision(config.train)
@@ -342,6 +344,27 @@ def _prepare_row(
     return row, turn, inputs
 
 
+def _preflight(
+    config: JobConfig, tasks: Sequence[EvalTask], batch_size: int
+) -> tuple[ChatRenderer, dict[str, DocumentSource]]:
+    """The renderer and every task's reader, once the config, token budgets and splits check out."""
+    check_supported(config)
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be at least 1, got {batch_size}")
+    if not tasks:
+        raise ValueError("no task to evaluate")
+    renderer = build_renderer(config)
+    check_token_budgets(renderer, tasks)
+    return renderer, {task.name: _open_reader(task) for task in tasks}
+
+
+def _clear_results(output: str | Path) -> None:
+    """Remove the last evaluation's ``results.json``, so a failed run leaves no finished marker."""
+    rank = dist.get_rank() if dist.is_initialized() else get_world_info()[0]
+    if rank == 0:
+        (Path(output) / RESULTS_FILE).unlink(missing_ok=True)
+
+
 def _open_reader(task: EvalTask) -> DocumentSource:
     reader = build_reader(task)
     if len(reader) == 0:
@@ -358,15 +381,15 @@ def _join_ranks(config: JobConfig) -> tuple[bool, int, int, torch.device]:
     """
     rank, local_rank, world_size = get_world_info()
     started = False
-    if dist.is_initialized():
-        rank, world_size = dist.get_rank(), dist.get_world_size()
-    elif world_size > 1:
+    if not dist.is_initialized() and world_size > 1:
         replicas = DistributedConfig(
             backend=config.distributed.backend,
             nccl_timeout_sec=config.distributed.nccl_timeout_sec,
         )
         init_distributed(replicas, seed=config.train.seed)
         started = True
+    if dist.is_initialized():
+        rank, world_size = dist.get_rank(), dist.get_world_size()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     return started, rank, world_size, device
 
@@ -382,13 +405,14 @@ def _gather(value: Any) -> list[Any]:
 
 def _on_every_rank[T](action: Callable[[], T], what: str) -> T:
     """``action()`` on this rank; if it fails on any rank, every rank raises."""
+    value: T | None = None
+    failure: Exception | None = None
     try:
         value = action()
     except Exception as error:
-        agree_across_ranks(error, what)
-        raise
-    agree_across_ranks(None, what)
-    return value
+        failure = error
+    agree_across_ranks(failure, what)
+    return cast(T, value)
 
 
 def _on_rank_zero[T](rank: int, action: Callable[[], T], what: str) -> T | None:
@@ -416,9 +440,8 @@ def _write_json(path: Path, value: Any) -> None:
 
 
 def _start(output: Path, checkpoint: str | Path) -> str:
-    """Clear the last evaluation's ``results.json`` and name the step directory to evaluate."""
+    """Create the output directories and name the step directory to evaluate."""
     (output / PREDICTIONS_DIR).mkdir(parents=True, exist_ok=True)
-    (output / RESULTS_FILE).unlink(missing_ok=True)
     return str(resolve_checkpoint(checkpoint))
 
 

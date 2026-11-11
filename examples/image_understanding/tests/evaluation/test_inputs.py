@@ -22,7 +22,7 @@ from PIL import Image
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.loader import load_config
 
-QWEN_PROMPT = (
+THINKING_PROMPT = (
     "<|im_start|>user\nWhat is shown?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 )
 
@@ -100,10 +100,10 @@ class TestBuildPrompt:
 
     @pytest.mark.parametrize("kind", ["qa", "conversation"])
     def test_the_recipe_prompt_ends_with_the_empty_think_block(
-        self, qwen_tokenizer: Any, kind: str
+        self, bpe_tokenizer: Any, kind: str
     ) -> None:
         document = _document(user="What is shown?", kind=kind)
-        assert build_prompt(_renderer(qwen_tokenizer), document) == QWEN_PROMPT
+        assert build_prompt(_renderer(bpe_tokenizer), document) == THINKING_PROMPT
 
 
 class TestPromptTokenIds:
@@ -111,10 +111,10 @@ class TestPromptTokenIds:
     @pytest.mark.parametrize("answer", ["a cat", "42", "Yes.", "(a)", "-3.5", "A\nB", "!"])
     @pytest.mark.parametrize("user", ["What is shown?", "How many?\n", "what is 2+2 ="])
     def test_the_prompt_tokens_start_the_training_sample(
-        self, qwen_tokenizer: Any, user: str, answer: str, kind: str
+        self, bpe_tokenizer: Any, user: str, answer: str, kind: str
     ) -> None:
         """Tokenized alone, the prompt is the sample's tokens up to the reply, whatever follows."""
-        renderer = _renderer(qwen_tokenizer)
+        renderer = _renderer(bpe_tokenizer)
         document = _document(user=user, answers=(answer,), kind=kind)
         prompt_ids = list(prompt_token_ids(renderer, document))
         assert renderer.token_ids(document, [answer])[: len(prompt_ids)] == prompt_ids
