@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import socket
 import statistics
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -22,7 +23,7 @@ from evaluation.evaluator import (
     UNREADABLE_ROW,
     Decoder,
     check_token_budgets,
-    clean_generation,
+    clear_results,
     evaluate_batch,
     evaluate_checkpoint,
     merge_records,
@@ -30,7 +31,7 @@ from evaluation.evaluator import (
     shard_batches,
     summarize,
 )
-from evaluation.generation import stop_token_ids
+from evaluation.generation import Generation, stop_token_ids
 from evaluation.inputs import UnsupportedDocumentError, build_renderer
 from evaluation.scorers import SCORERS, Scorer, anls
 from evaluation.tasks import READERS, EvalTask, build_reader, load_tasks
@@ -45,6 +46,8 @@ LONG_QUESTION_ROW = 4
 LONG_PROMPT_TOKENS = 21
 EMPTY_PROMPT_TOKENS = 5
 MAX_TEXT_LEN = 32
+GROUP_TIMEOUT_SEC = 300
+RANKS_BOUND_SEC = 150
 
 
 @dataclass(frozen=True)
@@ -158,6 +161,31 @@ class TestReadRow:
             range(2, 19)
         )
 
+    def test_a_give_up_after_skipped_rows_is_none_with_a_reader_that_names_its_row(self) -> None:
+        class GivesUp(_NamesItsRow):
+            skipped = 0
+
+            def read_with_index(self, index: int) -> tuple[int, Any]:
+                self.skipped += 3
+                raise RuntimeError("gave up after 3 unreadable rows")
+
+        assert read_row(GivesUp(["a", "b"]), 1) is None
+
+    def test_an_error_of_a_reader_that_names_its_row_is_raised_without_skips(self) -> None:
+        class Broken(_NamesItsRow):
+            skipped = 0
+
+            def read_with_index(self, index: int) -> tuple[int, Any]:
+                raise RuntimeError("the reader failed")
+
+        class CountsNothing(_NamesItsRow):
+            def read_with_index(self, index: int) -> tuple[int, Any]:
+                raise RuntimeError("the reader failed")
+
+        for reader in (Broken(["a"]), CountsNothing(["a"])):
+            with pytest.raises(RuntimeError, match="the reader failed"):
+                read_row(reader, 0)
+
     def test_an_error_that_follows_no_skipped_row_is_raised(self) -> None:
         class Broken(list):
             skipped = 0
@@ -217,11 +245,27 @@ class TestEvaluateBatch:
             }
             assert record["question"] == _questions(tasks)[record["row"]]
             assert record["answers"] == ["cat", "a dog"]
-            assert record["prediction"] == clean_generation(record["generation"])
+            assert record["prediction"] == record["generation"].replace("<unk> ", "")
+            assert "<unk>" not in record["prediction"]
             assert record["score"] == anls(record["prediction"], record["answers"])
             assert isinstance(record["stopped"], bool)
             assert "<|im_end|>" not in record["generation"]
         assert len({record["generation"] for record in records}) > 1
+
+    def test_a_special_token_that_is_not_a_stop_token_is_not_scored(
+        self, run: Run, write_task: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tasks = write_task(rows=1)
+        tokenizer = _decoder(run).renderer.tokenizer
+        ids = tokenizer.convert_tokens_to_ids(["cat", "<|im_start|>"])
+        monkeypatch.setattr(
+            evaluator, "greedy_decode", lambda *args, **kwargs: [Generation(tuple(ids), True)]
+        )
+        (record,) = _batch_records(run, tasks, range(1))
+        assert record["prediction"] == "cat"
+        assert record["score"] == 1.0
+        assert record["generation"] == tokenizer.decode(ids, skip_special_tokens=False)
+        assert "<|im_start|>" in record["generation"]
 
     def test_a_prompt_too_long_for_the_budget_is_counted_and_not_cut(
         self, run: Run, write_task: Callable[..., Path]
@@ -376,6 +420,24 @@ class TestSummarize:
         records = [{"row": 0, "skipped": UNREADABLE_ROW}, {"row": 1, "skipped": PROMPT_TOO_LONG}]
         with pytest.raises(ValueError, match="task 'docvqa': none of its 2 rows was scored"):
             summarize(self.TASK, records)
+
+
+class TestClearResults:
+    def test_rank_zero_removes_the_marker_and_other_ranks_leave_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "results.json").write_text("{}")
+        monkeypatch.setattr(evaluator, "get_world_info", lambda: (1, 1, 2))
+        assert clear_results(tmp_path) is None
+        assert (tmp_path / "results.json").exists()
+        monkeypatch.setattr(evaluator, "get_world_info", lambda: (0, 0, 2))
+        assert clear_results(tmp_path) is None
+        assert not (tmp_path / "results.json").exists()
+        assert clear_results(tmp_path / "missing") is None
+
+    def test_a_removal_that_fails_is_returned(self, tmp_path: Path) -> None:
+        (tmp_path / "results.json").mkdir()
+        assert isinstance(clear_results(tmp_path), OSError)
 
 
 class TestEvaluateCheckpoint:
@@ -568,6 +630,21 @@ class TestEvaluateCheckpoint:
             _evaluate(run, tasks, tmp_path / "results")
         assert not (tmp_path / "results").exists()
 
+    def test_a_failure_from_before_the_evaluation_is_raised_before_anything_is_written(
+        self, run: Run, write_task: Callable[..., Path], tmp_path: Path
+    ) -> None:
+        tasks = load_tasks(write_task(rows=3))
+        with pytest.raises(OSError, match="cannot clear"):
+            evaluate_checkpoint(
+                run.config,
+                tasks,
+                run.step_dir,
+                tmp_path / "results",
+                publish=False,
+                prior_failure=OSError("cannot clear"),
+            )
+        assert not (tmp_path / "results").exists()
+
     def test_a_task_whose_every_prompt_is_too_long_fails_without_results(
         self, run: Run, write_task: Callable[..., Path], tmp_path: Path
     ) -> None:
@@ -751,7 +828,10 @@ def _evaluate_on_rank(
     output: str,
     unreadable_split_on: int,
 ) -> None:
-    """One rank of a gloo group evaluating; it notes how it ended and what it published."""
+    """One rank of a launch that has no group yet; it notes how it ended and what it published."""
+    import os
+    from datetime import timedelta
+
     import torch.distributed as dist
 
     notes = Path(output).parent
@@ -763,34 +843,45 @@ def _evaluate_on_rank(
     def open_split(task: EvalTask) -> Any:
         raise OSError("the split is not on this node")
 
+    def start_group(config: Any, seed: int) -> None:
+        dist.init_process_group(
+            "gloo",
+            rank=rank,
+            world_size=world,
+            init_method=f"tcp://127.0.0.1:{port}",
+            timeout=timedelta(seconds=GROUP_TIMEOUT_SEC),
+        )
+
+    os.environ.update(RANK=str(rank), LOCAL_RANK="0", WORLD_SIZE=str(world))
     evaluator.publish_metrics = publish
+    evaluator.init_distributed = start_group
     if rank == unreadable_split_on:
         evaluator.build_reader = open_split
     torch.set_num_threads(1)
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
+    ended = "finished"
     try:
-        ended = "finished"
-        try:
-            evaluate_checkpoint(
-                load_config(config, cli_args=[]),
-                load_tasks(tasks),
-                checkpoint,
-                output,
-                batch_size=2,
-            )
-        except Exception as exc:
-            ended = f"{type(exc).__name__}: {exc}"
-        (notes / f"ended-{rank}").write_text(ended)
-    finally:
+        evaluate_checkpoint(
+            load_config(config, cli_args=[]),
+            load_tasks(tasks),
+            checkpoint,
+            output,
+            batch_size=2,
+        )
+    except Exception as exc:
+        ended = f"{type(exc).__name__}: {exc}"
+    (notes / f"ended-{rank}").write_text(ended)
+    if dist.is_initialized():
         dist.destroy_process_group()
 
 
 def _spawn_ranks(
     world: int, run: Run, tasks: Path, output: Path, unreadable_split_on: int = -1
 ) -> list[str]:
-    """Evaluate on ``world`` gloo ranks; how each rank ended, in rank order."""
+    """Evaluate on ``world`` ranks with no group yet; how each rank ended, in rank order.
+
+    Every rank must end within ``RANKS_BOUND_SEC``, well under the time a rank
+    left waiting in the group's start-up would be released by its timeout.
+    """
     import torch.multiprocessing as mp
 
     args = (
@@ -802,7 +893,18 @@ def _spawn_ranks(
         str(output),
         unreadable_split_on,
     )
-    mp.spawn(_evaluate_on_rank, args=args, nprocs=world)
+    context = mp.start_processes(
+        _evaluate_on_rank, args=args, nprocs=world, join=False, start_method="spawn"
+    )
+    deadline = time.monotonic() + RANKS_BOUND_SEC
+    try:
+        while not context.join(timeout=1):
+            if time.monotonic() > deadline:
+                pytest.fail(f"the ranks did not all end within {RANKS_BOUND_SEC} s")
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.kill()
     return [(output.parent / f"ended-{rank}").read_text() for rank in range(world)]
 
 
@@ -849,7 +951,7 @@ class TestSeveralRanks:
         output = tmp_path / "ranks" / "results"
         output.parent.mkdir()
         first, second = _spawn_ranks(2, run, tasks, output, unreadable_split_on=1)
-        assert first == "RuntimeError: Checking the tasks failed on ranks [1]"
+        assert first == "RuntimeError: Opening the splits failed on ranks [1]"
         assert second == "OSError: the split is not on this node"
         assert not output.exists()
 
@@ -861,4 +963,4 @@ class TestSeveralRanks:
         (output / "results.json").mkdir(parents=True)
         first, second = _spawn_ranks(2, run, tasks, output)
         assert first.split(":")[0] in {"IsADirectoryError", "PermissionError"}
-        assert second == "RuntimeError: Checking the tasks failed on ranks [0]"
+        assert second == "RuntimeError: Opening the splits failed on ranks [0]"

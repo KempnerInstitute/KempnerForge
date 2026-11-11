@@ -136,6 +136,64 @@ def test_a_misspelled_option_is_refused_as_an_unknown_config_key(
         _handed_off(monkeypatch, *argv, "--output", "results/a", "--no-publsh")
 
 
+def _stale_results(tmp_path: Path) -> Path:
+    output = tmp_path / "results"
+    output.mkdir()
+    (output / "results.json").write_text("{}")
+    return output
+
+
+@pytest.mark.parametrize(
+    ("broken", "error"), [("config override", ValueError), ("tasks file", FileNotFoundError)]
+)
+def test_a_stale_results_json_does_not_outlive_a_config_or_tasks_that_do_not_load(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, broken: str, error: type
+) -> None:
+    output = _stale_results(tmp_path)
+    tasks = SAMPLE_TASKS if broken == "config override" else tmp_path / "missing.toml"
+    argv = [str(config_path), "--checkpoint", "runs/a", "--tasks", str(tasks)]
+    overrides = ["--no_such_section.key=1"] if broken == "config override" else []
+    with pytest.raises(error):
+        _handed_off(monkeypatch, *argv, "--output", str(output), *overrides)
+    assert not (output / "results.json").exists()
+
+
+def test_a_marker_that_cannot_be_removed_is_handed_to_the_evaluation(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = tmp_path / "results"
+    (output / "results.json").mkdir(parents=True)
+    seen = _handed_off(
+        monkeypatch,
+        str(config_path),
+        "--checkpoint",
+        "runs/a",
+        "--tasks",
+        str(SAMPLE_TASKS),
+        "--output",
+        str(output),
+    )
+    assert isinstance(seen["prior_failure"], OSError)
+
+
+def test_a_marker_that_is_removed_leaves_no_prior_failure(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output = _stale_results(tmp_path)
+    seen = _handed_off(
+        monkeypatch,
+        str(config_path),
+        "--checkpoint",
+        "runs/a",
+        "--tasks",
+        str(SAMPLE_TASKS),
+        "--output",
+        str(output),
+    )
+    assert seen["prior_failure"] is None
+    assert not (output / "results.json").exists()
+
+
 def test_the_script_evaluates_a_checkpoint(
     write_config: Callable[..., Path],
     save_checkpoint: Callable[..., Path],
