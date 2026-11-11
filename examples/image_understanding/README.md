@@ -13,9 +13,13 @@ never imports it, so this directory can be deleted without touching the core.
 examples/image_understanding/
 ├── README.md
 ├── train.py              # training entry point
+├── configs/
+│   └── eval_tasks.toml   # sample evaluation tasks, with placeholder paths
+├── evaluation/           # evaluation tasks and answer scorers (below)
 ├── image_text/           # image-text dataset readers and chat renderer (below)
 └── tests/
     ├── test_image_understanding_entry.py   # the entry point loads a config and hands it off
+    ├── evaluation/       # task-file and scorer tests (CPU)
     └── image_text/       # reader and renderer tests (CPU)
 ```
 
@@ -109,6 +113,56 @@ and the optimizer starts fresh. Stage 2 should start from a stage-1 checkpoint
 the same way, as weights alone with its own warmup from step 0; a warm start
 today also restores the saved step and schedule, so that is on the roadmap.
 
+## Evaluation tasks and scorers
+
+`evaluation/` holds what an evaluation run is made of: the tasks to run and the
+scorers of their answers. The evaluator that runs them on a checkpoint is on the
+roadmap.
+
+- `tasks.py`: `load_tasks` reads a TOML task file into frozen `EvalTask`s. A task
+  has a unique `name`, a `reader` (one of the `testbed.py` loaders) with that
+  loader's arguments in `reader_args`, a `scorer`, and `max_new_tokens`, the cap
+  on a decoded answer. The file is checked as it loads, before a reader opens
+  anything: an unknown key, reader, scorer or reader argument, a missing one, or
+  an argument of the wrong type is refused with the valid ones listed.
+  `build_reader` then opens a task's split.
+- `scorers.py`: a scorer rates one prediction against a sample's reference
+  answers with a value in [0, 1], and a task's score is the mean over its
+  samples. `get_scorer` returns one by name; its `score` rates a sample and its
+  `aggregate` turns a task's sample scores into the task's metrics.
+  - `vqa_accuracy` (VQAv2, TextVQA): an answer `m` annotators gave scores
+    `min(1, m / 3)`, averaged over leaving each annotator out, after the official
+    answer normalization (`vqa_normalization.py`) of the prediction and of every
+    reference. A sample needs several references: one alone always scores 0, and
+    four or more can reach 1.
+  - `anls` (DocVQA): the similarity `1 - NL` to the closest reference, where `NL`
+    is the Levenshtein distance over the longer length, and 0 once `NL` reaches
+    0.5. Case and surrounding whitespace are ignored.
+  - `relaxed_accuracy` (ChartQA): 1 for a number within 5 percent of a numeric
+    reference, or for text equal to a reference but for case, surrounding
+    whitespace and trailing `?`, `.` and `!`. A number is what `float` parses, so
+    `45%` and `1,000` are text.
+
+`configs/eval_tasks.toml` is a sample with five tasks and their caps (VQAv2 10,
+TextVQA 75, DocVQA 50, ChartQA human and machine 50); its paths are
+placeholders:
+
+```toml
+[[tasks]]
+name = "docvqa"
+reader = "docvqa"
+scorer = "anls"
+max_new_tokens = 50
+
+[tasks.reader_args]
+annotation_file = "path-to-docvqa-annotations"
+image_root = "path-to-docvqa-images"
+```
+
+A reader is an entry of `READERS` and a scorer an entry of `SCORERS`, so a new
+one is added there. A scorer may report several named components per sample and
+aggregate them its own way; the default is the mean of each component.
+
 ## Roadmap
 
 What the recipe still needs. Each lands as its own change in this directory,
@@ -124,7 +178,9 @@ or in core where it belongs:
 - Documents with several images
 - Per-module learning rates and schedules
 - Vision-encoder precision separate from the backbone's
-- Evaluation parity: chat-template prompts, image attention, the recipe's scorers
+- Evaluation: the evaluator that runs the tasks on a saved checkpoint, periodic
+  evaluation during training, PixMo point and count scorers, documents with
+  several images or none, and image attention when decoding
 - Run-comparison metrics: documents seen, token counts, MFU with the encoder
 
 ## Tests
