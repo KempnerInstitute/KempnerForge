@@ -121,6 +121,19 @@ class JobConfig:
                         f"vlm.max_text_len ({self.vlm.max_text_len}) = {required}"
                     )
 
+        if self.optimizer.lr_multipliers:
+            if self.vlm is None:
+                raise ValueError(
+                    "optimizer.lr_multipliers names modules of vlm.module_patterns, so it needs "
+                    "a [vlm] section"
+                )
+            unknown = sorted(set(self.optimizer.lr_multipliers) - set(self.vlm.module_patterns))
+            if unknown:
+                raise ValueError(
+                    f"optimizer.lr_multipliers names unknown modules {unknown}; the modules of "
+                    f"vlm.module_patterns are {sorted(self.vlm.module_patterns)}"
+                )
+
         if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
             raise ValueError(
                 f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE}, "
