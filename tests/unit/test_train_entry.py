@@ -3255,6 +3255,17 @@ class TinyMoEModel(nn.Module):
         return self._counts
 
 
+class TinyMoTMoEModel(TinyMoEModel):
+    """``TinyMoEModel`` with MoT's per-modality routers: no flat counts, counts per modality."""
+
+    def __init__(self, mot_counts) -> None:
+        super().__init__(counts={})
+        self._mot_counts = mot_counts
+
+    def get_mot_expert_counts(self):
+        return self._mot_counts
+
+
 def _moe_config(z_weight=0.0, aux_weight=0.1, **kw):
     config = make_config(**kw)
     config.model.num_experts = 4
@@ -3297,6 +3308,40 @@ class TestMoEMetrics:
         session.tracker.log_eval = lambda m, s: logged.append((m, s))  # type: ignore[method-assign]
         run_training_loop(session)
         return logged
+
+    def _moe_metrics(self, model):
+        logged = self._run_one_step(model, _moe_config(max_steps=1))
+        return [m for m, _ in logged if "moe/aux_loss" in m][0]
+
+    def test_expert_balance_covers_mot_routers(self):
+        """MoT counts arrive per layer and modality; the image loads are 0.25 and 0.75."""
+        mot = {1: {"image": torch.tensor([1.0, 3.0]), "text": torch.tensor([4.0, 4.0])}}
+        moe = self._moe_metrics(TinyMoTMoEModel(mot))
+        assert moe["moe/expert_balance"] == pytest.approx(1 / 3)
+        assert moe["moe/expert_balance/image"] == pytest.approx(1 / 3)
+        assert moe["moe/expert_balance/text"] == pytest.approx(1.0)
+
+    def test_expert_balance_normalizes_each_router(self):
+        """Balanced routers read 1.0 whatever tokens each saw; raw counts would read 0.25."""
+        mot = {
+            1: {"image": torch.tensor([2.0, 2.0]), "text": torch.tensor([8.0, 8.0])},
+            3: {"image": torch.tensor([2.0, 2.0]), "text": torch.tensor([8.0, 8.0])},
+        }
+        moe = self._moe_metrics(TinyMoTMoEModel(mot))
+        assert moe["moe/expert_balance"] == pytest.approx(1.0)
+
+    def test_expert_balance_skips_a_router_that_saw_no_tokens(self):
+        mot = {1: {"image": torch.tensor([0.0, 0.0]), "text": torch.tensor([3.0, 1.0])}}
+        moe = self._moe_metrics(TinyMoTMoEModel(mot))
+        assert moe["moe/expert_balance"] == pytest.approx(1 / 3)
+        assert "moe/expert_balance/image" not in moe
+
+    def test_a_model_without_mot_counts_has_no_mot_routers(self):
+        """A custom MoE model need not implement ``get_mot_expert_counts``."""
+        assert not hasattr(TinyMoEModel(), "get_mot_expert_counts")
+        moe = self._moe_metrics(TinyMoEModel(counts={"0": torch.tensor([2.0, 8.0])}))
+        assert moe["moe/expert_balance"] == pytest.approx(0.25)
+        assert not any(key.startswith("moe/expert_balance/") for key in moe)
 
     def test_expert_balance_is_min_over_max(self):
         model = TinyMoEModel(counts={"0": torch.tensor([2.0, 8.0])})

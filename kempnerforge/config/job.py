@@ -290,9 +290,7 @@ class JobConfig:
                     f"(distributed.ep={self.distributed.ep}): the FSDP2 wrap for expert-parallel "
                     "blocks expects layer.attention and layer.mlp, and MoTBlock names its "
                     "attention attn and keeps its FFNs per modality, so a MoT model with experts "
-                    "fails to build. Set distributed.ep = 1. MoT with MoE then trains, but "
-                    "without its load-balancing loss, router z-loss, bias schedule or balance "
-                    "metric (https://github.com/KempnerInstitute/KempnerForge/issues/308)."
+                    "fails to build. Set distributed.ep = 1."
                 )
             if isinstance(self.vlm, MoMaConfig):
                 raise ValueError(

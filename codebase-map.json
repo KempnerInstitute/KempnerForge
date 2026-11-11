@@ -277,7 +277,9 @@
             "forward(tokens, *, modality, kv_caches, doc_ids, position_ids, attention_group_ids)",
             "init_weights_and_freqs()",
             "get_moe_aux_loss()",
+            "get_moe_router_z_loss()",
             "get_expert_counts()",
+            "get_mot_expert_counts()",
             "set_moe_step(step, max_steps)"
           ]
         }
@@ -293,7 +295,8 @@
         "tests/unit/test_model.py::TestPrefixEmbeds",
         "tests/unit/test_model.py::TestModalityIdsCrossArgs",
         "tests/unit/test_model.py::TestCrossAttentionInterleaving",
-        "tests/unit/test_model.py::TestMoT"
+        "tests/unit/test_model.py::TestMoT",
+        "tests/unit/test_mot.py::TestMoTMoEAccessors"
       ]
     },
     "kempnerforge/model/modality.py": {
@@ -915,6 +918,7 @@
       "tested_by": [
         "tests/unit/test_train_entry.py::TestRunTrainingLoop",
         "tests/unit/test_train_entry.py::TestBatchStream",
+        "tests/unit/test_train_entry.py::TestMoEMetrics",
         "tests/unit/test_train_entry.py::TestSelectStepFn",
         "tests/unit/test_train_entry.py::TestCheckpointExtra",
         "tests/e2e/test_training_e2e.py"
