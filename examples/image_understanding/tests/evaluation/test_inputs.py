@@ -12,6 +12,7 @@ from evaluation.inputs import (
     UnsupportedDocumentError,
     build_prompt,
     build_renderer,
+    check_renderer_config,
     document_inputs,
     prompt_token_ids,
 )
@@ -70,6 +71,22 @@ class TestBuildRenderer:
         config = load_config(write_config(), cli_args=["--data.tokenizer_path="])
         with pytest.raises(ValueError, match="data.tokenizer_path is not set"):
             build_renderer(config)
+
+
+class TestCheckRendererConfig:
+    def test_a_config_with_a_vlm_and_a_tokenizer_passes(
+        self, write_config: Callable[..., Path]
+    ) -> None:
+        check_renderer_config(load_config(write_config(), cli_args=[]))
+
+    def test_a_config_without_a_vlm_or_a_tokenizer_is_refused(
+        self, write_config: Callable[..., Path]
+    ) -> None:
+        with pytest.raises(ValueError, match="no \\[vlm\\] section"):
+            check_renderer_config(JobConfig())
+        config = load_config(write_config(), cli_args=["--data.tokenizer_path="])
+        with pytest.raises(ValueError, match="data.tokenizer_path is not set"):
+            check_renderer_config(config)
 
 
 class TestBuildPrompt:

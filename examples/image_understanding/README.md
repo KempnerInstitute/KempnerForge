@@ -211,9 +211,9 @@ loads a split (a row with no question or no answer, for one) does so before the
 evaluation and does not count them. A reader that passes over rows while it is
 read must say so, either through `read_with_index`, which returns the index of
 the row it read with the document, or through a `skipped` count that moves
-whenever it passes over a row; a run of unreadable rows the reader gives up on
-(a `RuntimeError`) is counted row by row the same way, and any other
-`RuntimeError` fails the run.
+whenever it passes over a row. A reader that gives up after a run of unusable
+rows raises `NoUsableRowError` (what `first_usable` raises); each such row is
+counted as `unreadable_row`, and any other error fails the run.
 
 The prediction that is scored is the generation decoded with special tokens
 skipped and nothing else cleaned up; the scorers normalize their own input. The

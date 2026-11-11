@@ -6,7 +6,13 @@ import pickle
 
 import pytest
 from image_text import skip
-from image_text.skip import SkipLog, UnusableRowError, check_max_attempts, first_usable
+from image_text.skip import (
+    NoUsableRowError,
+    SkipLog,
+    UnusableRowError,
+    check_max_attempts,
+    first_usable,
+)
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -34,8 +40,11 @@ class TestFirstUsable:
         assert first_usable(3, 4, 2, _reader({3}), lambda *_: None) == "row 0"
 
     def test_raises_after_max_attempts(self) -> None:
-        with pytest.raises(RuntimeError, match="2 consecutive rows from index 1"):
+        with pytest.raises(NoUsableRowError, match="2 consecutive rows from index 1"):
             first_usable(1, 4, 2, _reader({1, 2}), lambda *_: None)
+
+    def test_a_give_up_is_a_runtime_error(self) -> None:
+        assert issubclass(NoUsableRowError, RuntimeError)
 
     def test_other_errors_propagate(self) -> None:
         def read(i: int) -> str:

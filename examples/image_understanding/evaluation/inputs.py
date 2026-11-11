@@ -39,8 +39,12 @@ class ModelInputs:
     prompt_ids: tuple[int, ...]
 
 
-def build_renderer(config: JobConfig) -> ChatRenderer:
-    """The training renderer for ``config``: its tokenizer, text length and image size."""
+def check_renderer_config(config: JobConfig) -> None:
+    """Refuses a ``config`` the training renderer cannot be built from.
+
+    Raises:
+        ValueError: the config has no ``[vlm]`` section or ``data.tokenizer_path`` is not set.
+    """
     if config.vlm is None:
         raise ValueError("the config has no [vlm] section, so there is no renderer to build")
     if not config.data.tokenizer_path:
@@ -48,6 +52,12 @@ def build_renderer(config: JobConfig) -> ChatRenderer:
             "data.tokenizer_path is not set; the evaluator renders prompts with the "
             "tokenizer the checkpoint was trained with"
         )
+
+
+def build_renderer(config: JobConfig) -> ChatRenderer:
+    """The training renderer for ``config``: its tokenizer, text length and image size."""
+    check_renderer_config(config)
+    assert config.vlm is not None
     return ChatRenderer(
         build_tokenizer(config.data.tokenizer_path),
         max_text_len=config.vlm.max_text_len,

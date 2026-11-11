@@ -17,6 +17,10 @@ class UnusableRowError(Exception):
     """A row a reader cannot turn into a usable document."""
 
 
+class NoUsableRowError(RuntimeError):
+    """A reader gave up after a run of rows it could not use."""
+
+
 def check_max_attempts(max_attempts: int) -> int:
     """``max_attempts``, refused unless positive."""
     if max_attempts < 1:
@@ -69,7 +73,7 @@ def first_usable[T](
 
     After a skipped row the next one tried is ``next_row(row, error)`` (by default
     the following row), wrapping around at ``length``; after ``max_attempts`` skipped
-    rows in a row it raises ``RuntimeError``. Any other error propagates.
+    rows in a row it raises ``NoUsableRowError``. Any other error propagates.
     """
     row = index
     for _ in range(max_attempts):
@@ -78,4 +82,4 @@ def first_usable[T](
         except UnusableRowError as exc:
             on_skip(row, exc)
             row = (next_row(row, exc) if next_row is not None else row + 1) % length
-    raise RuntimeError(f"{max_attempts} consecutive rows from index {index} cannot be used")
+    raise NoUsableRowError(f"{max_attempts} consecutive rows from index {index} cannot be used")

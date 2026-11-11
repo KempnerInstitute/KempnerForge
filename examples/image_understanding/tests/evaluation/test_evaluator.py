@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import socket
 import statistics
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +37,7 @@ from evaluation.inputs import UnsupportedDocumentError, build_renderer
 from evaluation.scorers import SCORERS, Scorer, anls
 from evaluation.tasks import READERS, EvalTask, build_reader, load_tasks
 from image_text.document import Document, Turn
+from image_text.skip import NoUsableRowError
 from PIL import Image
 
 from kempnerforge.config.job import JobConfig
@@ -161,15 +163,75 @@ class TestReadRow:
             range(2, 19)
         )
 
-    def test_a_give_up_after_skipped_rows_is_none_with_a_reader_that_names_its_row(self) -> None:
+    def test_a_give_up_is_none_with_a_reader_that_names_its_row(self) -> None:
         class GivesUp(_NamesItsRow):
+            def read_with_index(self, index: int) -> tuple[int, Any]:
+                raise NoUsableRowError("gave up after 3 unreadable rows")
+
+        assert read_row(GivesUp(["a", "b"]), 1) is None
+
+    def test_a_give_up_is_none_with_a_reader_read_by_index(self) -> None:
+        class GivesUp(list):
+            def __getitem__(self, index: Any) -> Any:
+                raise NoUsableRowError("gave up after 3 unreadable rows")
+
+        assert read_row(GivesUp(["a", "b"]), 1) is None
+
+    def test_an_error_that_is_not_a_give_up_is_raised_though_the_skip_count_moved(self) -> None:
+        class MovesThenFails(_NamesItsRow):
             skipped = 0
 
             def read_with_index(self, index: int) -> tuple[int, Any]:
-                self.skipped += 3
-                raise RuntimeError("gave up after 3 unreadable rows")
+                self.skipped += 1
+                raise RuntimeError("the reader failed")
 
-        assert read_row(GivesUp(["a", "b"]), 1) is None
+        with pytest.raises(RuntimeError, match="the reader failed"):
+            read_row(MovesThenFails(["a"]), 0)
+
+    def test_an_error_that_is_not_a_give_up_is_raised_by_a_reader_read_by_index(self) -> None:
+        class MovesThenFails(list):
+            skipped = 0
+
+            def __getitem__(self, index: Any) -> Any:
+                self.skipped += 1
+                raise RuntimeError("the reader failed")
+
+        with pytest.raises(RuntimeError, match="the reader failed"):
+            read_row(MovesThenFails(["a"]), 0)
+
+    def test_an_unrelated_error_is_raised_though_another_thread_moved_the_skip_count(
+        self,
+    ) -> None:
+        entered = threading.Event()
+        moved = threading.Event()
+
+        class Shared(_NamesItsRow):
+            skipped = 0
+
+            def read_with_index(self, index: int) -> tuple[int, Any]:
+                if index == 0:
+                    entered.set()
+                    assert moved.wait(timeout=30)
+                    raise RuntimeError("the reader failed")
+                self.skipped += 1
+                moved.set()
+                return index, self[index]
+
+        reader = Shared(["a", "b"])
+        outcome: list[BaseException] = []
+
+        def failing_read() -> None:
+            try:
+                read_row(reader, 0)
+            except RuntimeError as error:
+                outcome.append(error)
+
+        thread = threading.Thread(target=failing_read)
+        thread.start()
+        assert entered.wait(timeout=30)
+        assert read_row(reader, 1) == "b"
+        thread.join(timeout=30)
+        assert [str(error) for error in outcome] == ["the reader failed"]
 
     def test_an_error_of_a_reader_that_names_its_row_is_raised_without_skips(self) -> None:
         class Broken(_NamesItsRow):
@@ -671,6 +733,20 @@ class TestEvaluateCheckpoint:
         with pytest.raises(ValueError, match="data.tokenizer_path is not set"):
             evaluate_checkpoint(no_tokenizer, tasks, run.step_dir, "unused")
 
+    def test_a_config_refusal_comes_before_the_ranks_are_joined(
+        self,
+        write_config: Callable[..., Path],
+        write_task: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def joined(config: JobConfig) -> None:
+            pytest.fail("the ranks were joined before the config was refused")
+
+        monkeypatch.setattr(evaluator, "_join_ranks", joined)
+        no_tokenizer = load_config(write_config(), cli_args=["--data.tokenizer_path="])
+        with pytest.raises(ValueError, match="data.tokenizer_path is not set"):
+            evaluate_checkpoint(no_tokenizer, load_tasks(write_task()), "unused", "unused")
+
     def test_a_directory_without_a_checkpoint_is_refused(
         self, run: Run, write_task: Callable[..., Path], tmp_path: Path
     ) -> None:
@@ -826,7 +902,8 @@ def _evaluate_on_rank(
     checkpoint: str,
     tasks: str,
     output: str,
-    unreadable_split_on: int,
+    broken_rank: int,
+    broken: str,
 ) -> None:
     """One rank of a launch that has no group yet; it notes how it ended and what it published."""
     import os
@@ -843,6 +920,9 @@ def _evaluate_on_rank(
     def open_split(task: EvalTask) -> Any:
         raise OSError("the split is not on this node")
 
+    def load_tokenizer(config: Any) -> Any:
+        raise OSError("the tokenizer is not on this node")
+
     def start_group(config: Any, seed: int) -> None:
         dist.init_process_group(
             "gloo",
@@ -855,8 +935,11 @@ def _evaluate_on_rank(
     os.environ.update(RANK=str(rank), LOCAL_RANK="0", WORLD_SIZE=str(world))
     evaluator.publish_metrics = publish
     evaluator.init_distributed = start_group
-    if rank == unreadable_split_on:
-        evaluator.build_reader = open_split
+    if rank == broken_rank:
+        if broken == "split":
+            evaluator.build_reader = open_split
+        else:
+            evaluator.build_renderer = load_tokenizer
     torch.set_num_threads(1)
     ended = "finished"
     try:
@@ -875,7 +958,7 @@ def _evaluate_on_rank(
 
 
 def _spawn_ranks(
-    world: int, run: Run, tasks: Path, output: Path, unreadable_split_on: int = -1
+    world: int, run: Run, tasks: Path, output: Path, broken_rank: int = -1, broken: str = "split"
 ) -> list[str]:
     """Evaluate on ``world`` ranks with no group yet; how each rank ended, in rank order.
 
@@ -891,7 +974,8 @@ def _spawn_ranks(
         str(run.step_dir),
         str(tasks),
         str(output),
-        unreadable_split_on,
+        broken_rank,
+        broken,
     )
     context = mp.start_processes(
         _evaluate_on_rank, args=args, nprocs=world, join=False, start_method="spawn"
@@ -950,10 +1034,22 @@ class TestSeveralRanks:
         tasks = write_task(rows=8)
         output = tmp_path / "ranks" / "results"
         output.parent.mkdir()
-        first, second = _spawn_ranks(2, run, tasks, output, unreadable_split_on=1)
-        assert first == "RuntimeError: Opening the splits failed on ranks [1]"
+        first, second = _spawn_ranks(2, run, tasks, output, broken_rank=1)
+        assert first == "RuntimeError: Preparing the evaluation failed on ranks [1]"
         assert second == "OSError: the split is not on this node"
         assert not output.exists()
+
+    def test_a_tokenizer_one_rank_cannot_load_fails_every_rank_with_nothing_written(
+        self, run: Run, write_task: Callable[..., Path], tmp_path: Path
+    ) -> None:
+        tasks = write_task(rows=8)
+        output = tmp_path / "ranks" / "results"
+        output.parent.mkdir()
+        first, second = _spawn_ranks(2, run, tasks, output, broken_rank=1, broken="tokenizer")
+        assert first == "RuntimeError: Preparing the evaluation failed on ranks [1]"
+        assert second == "OSError: the tokenizer is not on this node"
+        assert not output.exists()
+        assert not list(output.parent.glob("published-*"))
 
     def test_a_marker_rank_zero_cannot_remove_fails_every_rank(
         self, run: Run, write_task: Callable[..., Path], tmp_path: Path
@@ -963,4 +1059,4 @@ class TestSeveralRanks:
         (output / "results.json").mkdir(parents=True)
         first, second = _spawn_ranks(2, run, tasks, output)
         assert first.split(":")[0] in {"IsADirectoryError", "PermissionError"}
-        assert second == "RuntimeError: Opening the splits failed on ranks [0]"
+        assert second == "RuntimeError: Preparing the evaluation failed on ranks [0]"
