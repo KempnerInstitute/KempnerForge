@@ -92,6 +92,37 @@ def _saved_optimizer_param_groups(saved_keys: Iterable[str]) -> int:
     )
 
 
+def _saved_inner_groups(
+    saved_keys: Iterable[str],
+    outer: torch.optim.Optimizer,
+    inner: Sequence[torch.optim.Optimizer],
+) -> bool:
+    """Whether a checkpoint's optimizer param groups include groups of ``inner``.
+
+    ``outer`` is the optimizer that wraps ``inner``, such as Muon around its AdamW fallback.
+    A group of ``inner`` shows by a setting that no group of ``outer`` has, such as AdamW's
+    ``betas``, so the count of saved groups alone does not decide it: ``outer`` can have as
+    many groups as the checkpoint holds of both.
+
+    Args:
+        saved_keys: The keys the checkpoint's DCP index lists.
+        outer: The optimizer that wraps ``inner``.
+        inner: The optimizers ``outer`` wraps.
+
+    Returns:
+        True when a saved group holds a setting only ``inner``'s groups have.
+    """
+    own = {key for group in outer.param_groups for key in group}
+    theirs = {key for opt in inner for group in opt.param_groups for key in group} - own
+    for key in saved_keys:
+        if not key.startswith(_OPTIM_PARAM_GROUPS_PREFIX):
+            continue
+        parts = key.removeprefix(_OPTIM_PARAM_GROUPS_PREFIX).split(".")
+        if len(parts) > 1 and parts[1] in theirs:
+            return True
+    return False
+
+
 def _drop_legacy_group_keys(
     optim_state: dict[str, Any],
     owners: Sequence[torch.optim.Optimizer],
@@ -124,49 +155,71 @@ def _drop_legacy_group_keys(
 def _take_groups_the_save_lacks(
     optim_state: dict[str, Any],
     owners: list[torch.optim.Optimizer],
-    scheduled: torch.optim.Optimizer,
+    fixed: torch.optim.Optimizer | None,
     left_out: set[str],
     saved_groups: int,
-    where: Path,
-) -> list[tuple[int, dict[str, Any]]]:
+) -> list[tuple[int, dict[str, Any]]] | None:
     """Take out of a load template the param groups that hold only parameters the save left out.
 
     An optimizer that keeps no empty param group, such as Muon's inner AdamW, saved no group
-    for them, so the template has more groups than the checkpoint; without them, the template
-    groups line up with the saved ones by position. Each taken group leaves ``owners`` too.
+    for them, and neither does one whose groups follow the trainable modules, as under
+    ``optimizer.lr_multipliers``, so the template has more groups than the checkpoint; without
+    them, the template groups line up with the saved ones by position. Each taken group leaves
+    ``owners`` too.
 
     Args:
         optim_state: The load template; its ``param_groups`` lose the taken groups.
         owners: The optimizer of each template group, kept in step with ``optim_state``.
-        scheduled: The optimizer the LR scheduler drives, which restores one rate per
-            saved group, so none of its groups may be taken.
+        fixed: The optimizer none of whose groups may be taken, or None. It is the one the LR
+            scheduler drives when the scheduler is not a ``LambdaLR``, whose saved per-group
+            state is restored by position instead of laid out for the groups the optimizer
+            has (see ``restore_train_state``).
         left_out: The parameters with neither saved state nor a never-stepped record.
         saved_groups: The number of param groups the checkpoint's index lists, 0 when it
             stores the optimizer as one opaque entry; nothing is taken then.
-        where: The checkpoint directory, named in the error.
 
     Returns:
-        The index and the group of each taken group, in ascending order of index.
-
-    Raises:
-        RuntimeError: The checkpoint holds fewer groups than the template, and taking the
-            groups of ``left_out`` does not leave as many, or takes a group of ``scheduled``.
+        The index and the group of each taken group, in ascending order of index. None, with
+        nothing taken, when the checkpoint holds fewer groups than the template and taking
+        the groups of ``left_out`` does not leave as many, or takes a group of ``fixed``.
     """
     groups = optim_state["param_groups"]
     if not saved_groups or len(groups) <= saved_groups:
         return []
     taken = [i for i, g in enumerate(groups) if g["params"] and set(g["params"]) <= left_out]
-    if len(groups) - len(taken) != saved_groups or any(owners[i] is scheduled for i in taken):
-        raise RuntimeError(
-            f"{where} holds {saved_groups} optimizer param groups and the optimizer being "
-            f"loaded has {len(groups)}, so its groups cannot be matched to the saved ones. "
-            "To continue from these weights with a fresh optimizer, set checkpoint.load_path "
-            'to this checkpoint and checkpoint.exclude_from_loading = ["optimizer"], with a '
-            "checkpoint.dir that holds no checkpoint yet."
-        )
+    if len(groups) - len(taken) != saved_groups or any(owners[i] is fixed for i in taken):
+        return None
     for i in reversed(taken):
         del owners[i]
     return [(i, groups.pop(i)) for i in reversed(taken)][::-1]
+
+
+def _rate_taken_groups(optimizer: torch.optim.Optimizer, scheduler: Any, taken: list[int]) -> None:
+    """Give the param groups a load took out the rate the restored schedule runs them at.
+
+    A taken group comes back with the rate ``optimizer`` was built at, while a saved group
+    comes back with the rate of its save, which the schedule set and an active phase's
+    ``lr_scale`` scaled. Each taken group gets the rate a ``LambdaLR`` sets, its restored base
+    rate times its lambda at the restored step, scaled as the first saved group with a
+    nonzero rate is. Nothing changes for a scheduler without per-group lambdas.
+
+    Args:
+        optimizer: The optimizer ``scheduler`` drives.
+        scheduler: The LR scheduler, its state restored.
+        taken: The indices of the taken groups among ``optimizer``'s param groups.
+    """
+    groups = optimizer.param_groups
+    base_lrs = getattr(scheduler, "base_lrs", None)
+    lambdas = getattr(scheduler, "lr_lambdas", None)
+    if not (isinstance(base_lrs, list) and isinstance(lambdas, list)):
+        return
+    if not len(base_lrs) == len(lambdas) == len(groups):
+        return
+    rates = [base * fn(scheduler.last_epoch) for base, fn in zip(base_lrs, lambdas, strict=True)]
+    saved = next((i for i, rate in enumerate(rates) if i not in taken and rate), None)
+    scale = groups[saved]["lr"] / rates[saved] if saved is not None else 1.0
+    for i in taken:
+        groups[i]["lr"] = rates[i] * scale
 
 
 def _intersect_freeze_meta_by_module(
@@ -668,7 +721,7 @@ def _check_saved_param_groups(
 def _fit_saved_optimizer(
     optim_state: dict[str, Any],
     owners: list[torch.optim.Optimizer],
-    scheduled: torch.optim.Optimizer,
+    fixed: torch.optim.Optimizer | None,
     left_out: set[str],
     saved_keys: Collection[str],
     where: Path,
@@ -681,24 +734,30 @@ def _fit_saved_optimizer(
     ``_check_saved_state_matches``), takes out the template groups the save kept no
     group for (see ``_take_groups_the_save_lacks``), drops the param-group keys the
     checkpoint predates (see ``_drop_legacy_group_keys``) and checks the groups that are
-    left against the saved ones (see ``_check_saved_param_groups``).
+    left against the saved ones (see ``_check_saved_param_groups``). When the groups the
+    save lacks cannot be taken, that check runs on the whole template first, so a layout it
+    explains, such as other parameters trainable under ``optimizer.lr_multipliers``, fails
+    with its message.
 
     Returns:
         The taken groups with their template positions, to put back after the load.
 
     Raises:
-        RuntimeError: A taken group would not reconcile the group counts, or the
-            checkpoint's optimizer state does not fit the template.
+        RuntimeError: The checkpoint's optimizer state does not fit the template, or its
+            param groups cannot be matched to the template's.
     """
     _check_saved_state_matches(optim_state, saved_keys, where)
-    taken = _take_groups_the_save_lacks(
-        optim_state,
-        owners,
-        scheduled,
-        left_out,
-        _saved_optimizer_param_groups(saved_keys),
-        where,
-    )
+    saved_groups = _saved_optimizer_param_groups(saved_keys)
+    taken = _take_groups_the_save_lacks(optim_state, owners, fixed, left_out, saved_groups)
+    if taken is None:
+        _check_saved_param_groups(optim_state, saved_keys, where, groups_vary, saved_modules)
+        raise RuntimeError(
+            f"{where} holds {saved_groups} optimizer param groups and the optimizer being "
+            f"loaded has {len(optim_state['param_groups'])}, so its groups cannot be matched "
+            "to the saved ones. To continue from these weights with a fresh optimizer, set "
+            "checkpoint.load_path to this checkpoint and checkpoint.exclude_from_loading = "
+            '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
+        )
     filled = _drop_legacy_group_keys(optim_state, owners, saved_keys)
     if filled:
         logger.warning(
@@ -1458,6 +1517,7 @@ class CheckpointManager:
         left_out: set[str] = set()
         template_groups: list[list[str]] = []
         unsaved_groups: list[tuple[int, dict[str, Any]]] = []
+        taken_scheduled: list[int] = []
         if load_optim and not train_state_exists:
             check_error = FileNotFoundError(
                 f"Cannot resume {ckpt_dir}: it holds optimizer state but no {_TRAIN_STATE_FILE}, "
@@ -1474,14 +1534,18 @@ class CheckpointManager:
             left_out = _params_the_save_left_out(fresh_if_unheld, saved_keys) & set(
                 template["state"]
             )
-            owners = [optimizer for optimizer in optimizers for _ in optimizer.param_groups]
+            positions = [(o, k) for o in optimizers for k in range(len(o.param_groups))]
+            owners = [optimizer for optimizer, _ in positions]
+            positional = scheduler is not None and not isinstance(
+                scheduler, torch.optim.lr_scheduler.LambdaLR
+            )
             fitted: list[list[tuple[int, dict[str, Any]]]] = []
             check_error = _attempt(
                 lambda: fitted.append(
                     _fit_saved_optimizer(
                         template,
                         owners,
-                        self.optimizer,
+                        self.optimizer if positional else None,
                         left_out,
                         saved_keys,
                         dcp_dir,
@@ -1491,6 +1555,11 @@ class CheckpointManager:
                 )
             )
             unsaved_groups = fitted[0] if fitted else []
+            taken_scheduled = [
+                positions[index][1]
+                for index, _ in unsaved_groups
+                if positions[index][0] is self.optimizer
+            ]
             template_groups = [list(group["params"]) for group in template["param_groups"]]
         if optimizer_requested:
             self.agree(check_error, "Checkpoint load")
@@ -1564,6 +1633,8 @@ class CheckpointManager:
                 dataloader=dataloader,
                 lr_multipliers=self._lr_multipliers,
             )
+            if scheduler is not None and "scheduler" in train_state and taken_scheduled:
+                _rate_taken_groups(self.optimizer, scheduler, taken_scheduled)
             logger.info(f"Resumed from step {step}, {tokens_seen:,} tokens seen")
         else:
             step, tokens_seen, extra = 0, 0, {}
@@ -1843,11 +1914,20 @@ class CheckpointManager:
         return resolved
 
     def _optimizers_saved_in(
-        self, dcp_dir: Path, keys: Iterable[str]
+        self, dcp_dir: Path, keys: Collection[str]
     ) -> list[torch.optim.Optimizer]:
-        """Return the optimizers saved in ``dcp_dir``; warn if the inner ones are missing."""
+        """Return the optimizers saved in ``dcp_dir``; warn if the inner ones are missing.
+
+        The inner ones are missing from a checkpoint saved before they were checkpointed,
+        whose param groups are as many as the outer optimizer's and hold none of the inner
+        ones' settings (see ``_saved_inner_groups``).
+        """
         inner = self.checkpointed_optimizers[1:]
-        if not inner or _saved_optimizer_param_groups(keys) != len(self.optimizer.param_groups):
+        if (
+            not inner
+            or _saved_optimizer_param_groups(keys) != len(self.optimizer.param_groups)
+            or _saved_inner_groups(keys, self.optimizer, inner)
+        ):
             return self.checkpointed_optimizers
         name = type(self.optimizer).__name__
         n_params = sum(p.numel() for opt in inner for g in opt.param_groups for p in g["params"])

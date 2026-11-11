@@ -3118,6 +3118,16 @@ class TestMuonResume:
         for (name, ref), p in zip(ref_model.named_parameters(), model2.parameters(), strict=True):
             assert torch.equal(ref, p), f"{name} diverged from the uninterrupted run"
 
+    def test_saved_inner_groups_show_by_settings_only_the_inner_groups_have(self):
+        """Muon's own settings do not mark an inner group, AdamW's do, whatever the count."""
+        from kempnerforge.checkpoint.manager import _saved_inner_groups
+
+        _, opt = self._build(seed=0)
+        own = {f"optimizer.param_groups.{i}.ns_steps" for i in range(2)}
+        assert not _saved_inner_groups(own, opt, [opt._adam])
+        assert _saved_inner_groups(own | {"optimizer.param_groups.1.betas"}, opt, [opt._adam])
+        assert not _saved_inner_groups({"optimizer.state.w.exp_avg"}, opt, [opt._adam])
+
     def test_checkpoint_without_inner_state_resumes_muon_and_warns(self, tmp_path):
         """A checkpoint without the inner AdamW resumes Muon alone and warns."""
         import logging
@@ -3499,20 +3509,88 @@ class TestMuonResume:
         with pytest.raises(RuntimeError, match=held):
             manager2.load(path=str(step_dir), fresh_if_unheld=self.LEFT_OUT)
 
-    def test_a_group_of_the_scheduled_optimizer_is_never_taken(self, tmp_path):
-        """Its LR scheduler restores one rate per saved group, so such a group is refused."""
+    def test_a_group_of_the_fixed_optimizer_is_never_taken(self):
+        """A scheduler other than a LambdaLR restores its rates by position, so the optimizer
+        it drives keeps every group; nothing is taken when its group would be."""
         from kempnerforge.checkpoint.manager import _take_groups_the_save_lacks
 
         outer, inner = object(), object()
         state = {"param_groups": [{"params": ["a"]}, {"params": ["b"]}]}
-        with pytest.raises(RuntimeError, match="cannot be matched"):
-            _take_groups_the_save_lacks(state, [outer, inner], outer, {"a"}, 1, tmp_path)
-
         owners = [outer, inner]
-        taken = _take_groups_the_save_lacks(state, owners, outer, {"b"}, 1, tmp_path)
+        assert _take_groups_the_save_lacks(state, owners, outer, {"a"}, 1) is None
+        assert state["param_groups"] == [{"params": ["a"]}, {"params": ["b"]}]
+        assert owners == [outer, inner]
+
+        taken = _take_groups_the_save_lacks(state, owners, outer, {"b"}, 1)
         assert taken == [(1, {"params": ["b"]})]
         assert state["param_groups"] == [{"params": ["a"]}]
         assert owners == [outer]
+
+    def test_with_no_fixed_optimizer_any_left_out_group_is_taken(self):
+        """A LambdaLR's state is laid out for the groups the optimizer has, so the group of
+        the optimizer it drives is taken like any other."""
+        from kempnerforge.checkpoint.manager import _take_groups_the_save_lacks
+
+        outer, inner = object(), object()
+        state = {"param_groups": [{"params": ["a"]}, {"params": ["b"]}]}
+        owners = [outer, inner]
+        taken = _take_groups_the_save_lacks(state, owners, None, {"a"}, 1)
+        assert taken == [(0, {"params": ["a"]})]
+        assert state["param_groups"] == [{"params": ["b"]}]
+        assert owners == [inner]
+
+    def test_groups_the_left_out_names_do_not_explain_are_not_taken(self):
+        from kempnerforge.checkpoint.manager import _take_groups_the_save_lacks
+
+        outer = object()
+        state = {"param_groups": [{"params": ["a"]}, {"params": ["b"]}, {"params": ["c"]}]}
+        owners = [outer, outer, outer]
+        assert _take_groups_the_save_lacks(state, owners, None, {"a"}, 1) is None
+        assert len(state["param_groups"]) == 3
+        assert owners == [outer, outer, outer]
+
+    @staticmethod
+    def _three_groups(lambda_fn=None):
+        params = [torch.nn.Parameter(torch.zeros(1)) for _ in range(3)]
+        rates = (1e-3, 1e-4, 1e-3)
+        optimizer = torch.optim.SGD(
+            [{"params": [p], "lr": lr} for p, lr in zip(params, rates, strict=True)]
+        )
+        if lambda_fn is None:
+            return optimizer, torch.optim.lr_scheduler.StepLR(optimizer, step_size=2)
+        return optimizer, torch.optim.lr_scheduler.LambdaLR(optimizer, lambda_fn)
+
+    def test_a_taken_group_runs_at_its_scheduled_rate_scaled_as_the_saved_ones(self):
+        """It gets its base rate times the lambda at the restored step, times the phase scale
+        the saved groups carry."""
+        from kempnerforge.checkpoint.manager import _rate_taken_groups
+
+        optimizer, scheduler = self._three_groups(lambda step: 0.5 + step / 10)
+        for _ in range(4):
+            optimizer.step()
+            scheduler.step()
+        for group in optimizer.param_groups:
+            group["lr"] *= 0.5
+        expected = [g["lr"] for g in optimizer.param_groups]
+        optimizer.param_groups[1]["lr"] = 123.0
+        _rate_taken_groups(optimizer, scheduler, [1])
+        assert [g["lr"] for g in optimizer.param_groups] == expected
+
+    def test_a_taken_group_rests_while_the_schedule_is_at_zero(self):
+        from kempnerforge.checkpoint.manager import _rate_taken_groups
+
+        optimizer, scheduler = self._three_groups(lambda step: 0.0 if step == 0 else 1.0)
+        optimizer.param_groups[1]["lr"] = 123.0
+        _rate_taken_groups(optimizer, scheduler, [1])
+        assert optimizer.param_groups[1]["lr"] == 0.0
+
+    def test_a_scheduler_without_lambdas_leaves_the_taken_rates(self):
+        from kempnerforge.checkpoint.manager import _rate_taken_groups
+
+        optimizer, scheduler = self._three_groups()
+        optimizer.param_groups[1]["lr"] = 123.0
+        _rate_taken_groups(optimizer, scheduler, [1])
+        assert optimizer.param_groups[1]["lr"] == 123.0
 
 
 REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))

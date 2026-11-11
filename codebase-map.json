@@ -1258,7 +1258,7 @@
         "_recorded_lr_multipliers(meta, metadata_path) -> dict (none recorded means empty)",
         "_recorded_lr_layout(meta, metadata_path) -> (patterns, group_modules) (lr_module_patterns, and lr_group_modules: the module of each optimizer param group, recorded without PP)",
         "_check_saved_param_groups(optim_state, saved_keys, where, groups_vary, saved_modules) (refuses another group count, a missing setting, a module key where this run has none, or another module at a position per the recorded lr_group_modules)",
-        "_fit_saved_optimizer(optim_state, owners, scheduled, left_out, saved_keys, where, groups_vary, saved_modules) -> taken groups (checks the saved state kinds, takes the groups the save kept none of, drops legacy group keys, then checks the remaining groups)",
+        "_fit_saved_optimizer(optim_state, owners, fixed, left_out, saved_keys, where, groups_vary, saved_modules) -> taken groups (checks the saved state kinds, takes the groups the save kept none of, drops legacy group keys, then checks the remaining groups; when none can be taken, the group check speaks before the generic mismatch error)",
         "_params_the_save_left_out(fqns, saved_keys) -> set[str] (named parameters with neither saved optimizer state nor a never-stepped record)",
         "_restore_left_out(optim_state, template_groups, left_out, where) (empty state for them, in the saved group of their group's other parameters or an empty saved group in its place; refuses a name the saved groups list)"
       ],
