@@ -146,6 +146,28 @@ class TestReadRow:
         for row, document in enumerate(documents):
             assert document is None or document.turns[0].user == _questions(tasks)[row]
 
+    def test_a_run_of_rows_the_reader_gives_up_on_is_none_for_each_row(
+        self, write_task: Callable[..., Path]
+    ) -> None:
+        tasks = write_task(rows=24)
+        for row in range(2, 19):
+            _corrupt(tasks, row)
+        reader = build_reader(load_tasks(tasks)[0])
+        documents = [read_row(reader, row) for row in range(24)]
+        assert [row for row, document in enumerate(documents) if document is None] == list(
+            range(2, 19)
+        )
+
+    def test_an_error_that_follows_no_skipped_row_is_raised(self) -> None:
+        class Broken(list):
+            skipped = 0
+
+            def __getitem__(self, index: Any) -> Any:
+                raise RuntimeError("the reader failed")
+
+        with pytest.raises(RuntimeError, match="the reader failed"):
+            read_row(Broken(["a"]), 0)
+
     def test_an_image_that_does_not_decode_is_not_answered_by_the_next_row(
         self, write_task: Callable[..., Path]
     ) -> None:
@@ -579,6 +601,31 @@ class TestEvaluateCheckpoint:
         with pytest.raises(FileNotFoundError, match="holds no saved weights"):
             evaluate_checkpoint(run.config, tasks, tmp_path, tmp_path / "results")
 
+    def test_a_run_of_unreadable_rows_is_counted_row_by_row(
+        self, run: Run, write_task: Callable[..., Path], tmp_path: Path
+    ) -> None:
+        tasks = write_task(rows=20)
+        for row in range(2, 19):
+            _corrupt(tasks, row)
+        results = _evaluate(run, tasks, tmp_path / "results")
+        summary = results["tasks"]["docvqa"]
+        assert (summary["rows"], summary["samples"], summary["skipped"]) == (
+            20,
+            3,
+            {UNREADABLE_ROW: 17},
+        )
+
+    def test_a_refused_run_leaves_no_results_json_of_an_earlier_one(
+        self, run: Run, write_task: Callable[..., Path], tmp_path: Path
+    ) -> None:
+        output = tmp_path / "results"
+        tasks = write_task(rows=3)
+        _evaluate(run, tasks, output)
+        assert (output / "results.json").exists()
+        with pytest.raises(ValueError, match="batch_size must be at least 1"):
+            _evaluate(run, tasks, output, batch_size=0)
+        assert not (output / "results.json").exists()
+
     def test_results_json_exists_only_once_an_evaluation_has_finished(
         self, run: Run, write_task: Callable[..., Path], tmp_path: Path
     ) -> None:
@@ -603,6 +650,36 @@ def _published(monkeypatch: pytest.MonkeyPatch, error: Exception | None = None) 
 
     monkeypatch.setattr(evaluator, "publish_metrics", publish)
     return calls
+
+
+class TestJoiningRanks:
+    def test_a_launch_of_several_processes_starts_and_ends_its_group(
+        self,
+        run: Run,
+        write_task: Callable[..., Path],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import torch.distributed as dist
+
+        started: list[Any] = []
+
+        def start_group(config: Any, seed: int) -> None:
+            started.append((config.backend, seed))
+            dist.init_process_group(
+                "gloo", rank=0, world_size=1, init_method=f"tcp://127.0.0.1:{_free_port()}"
+            )
+
+        def end_group() -> None:
+            started.append("ended")
+            dist.destroy_process_group()
+
+        monkeypatch.setattr(evaluator, "get_world_info", lambda: (0, 0, 2))
+        monkeypatch.setattr(evaluator, "init_distributed", start_group)
+        monkeypatch.setattr(evaluator, "destroy_distributed", end_group)
+        _evaluate(run, write_task(rows=3), tmp_path / "results")
+        assert started == [(run.config.distributed.backend, run.config.train.seed), "ended"]
+        assert not dist.is_initialized()
 
 
 class TestPublishing:
@@ -665,7 +742,14 @@ def _free_port() -> int:
 
 
 def _evaluate_on_rank(
-    rank: int, world: int, port: int, config: str, checkpoint: str, tasks: str, output: str
+    rank: int,
+    world: int,
+    port: int,
+    config: str,
+    checkpoint: str,
+    tasks: str,
+    output: str,
+    unreadable_split_on: int,
 ) -> None:
     """One rank of a gloo group evaluating; it notes how it ended and what it published."""
     import torch.distributed as dist
@@ -676,7 +760,12 @@ def _evaluate_on_rank(
         (notes / f"published-{rank}").write_text(json.dumps([str(checkpoint_dir), metrics]))
         return SimpleNamespace(run_id="run-1", step=3)
 
+    def open_split(task: EvalTask) -> Any:
+        raise OSError("the split is not on this node")
+
     evaluator.publish_metrics = publish
+    if rank == unreadable_split_on:
+        evaluator.build_reader = open_split
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
@@ -698,11 +787,21 @@ def _evaluate_on_rank(
         dist.destroy_process_group()
 
 
-def _spawn_ranks(world: int, run: Run, tasks: Path, output: Path) -> list[str]:
+def _spawn_ranks(
+    world: int, run: Run, tasks: Path, output: Path, unreadable_split_on: int = -1
+) -> list[str]:
     """Evaluate on ``world`` gloo ranks; how each rank ended, in rank order."""
     import torch.multiprocessing as mp
 
-    args = (world, _free_port(), str(run.config_path), str(run.step_dir), str(tasks), str(output))
+    args = (
+        world,
+        _free_port(),
+        str(run.config_path),
+        str(run.step_dir),
+        str(tasks),
+        str(output),
+        unreadable_split_on,
+    )
     mp.spawn(_evaluate_on_rank, args=args, nprocs=world)
     return [(output.parent / f"ended-{rank}").read_text() for rank in range(world)]
 
@@ -742,3 +841,24 @@ class TestSeveralRanks:
         assert second.startswith("FileNotFoundError")
         assert not (output / "results.json").exists()
         assert not list(output.parent.glob("published-*"))
+
+    def test_a_split_one_rank_cannot_open_fails_every_rank_before_any_decoding(
+        self, run: Run, write_task: Callable[..., Path], tmp_path: Path
+    ) -> None:
+        tasks = write_task(rows=8)
+        output = tmp_path / "ranks" / "results"
+        output.parent.mkdir()
+        first, second = _spawn_ranks(2, run, tasks, output, unreadable_split_on=1)
+        assert first == "RuntimeError: Checking the tasks failed on ranks [1]"
+        assert second == "OSError: the split is not on this node"
+        assert not output.exists()
+
+    def test_a_marker_rank_zero_cannot_remove_fails_every_rank(
+        self, run: Run, write_task: Callable[..., Path], tmp_path: Path
+    ) -> None:
+        tasks = write_task(rows=8)
+        output = tmp_path / "ranks" / "results"
+        (output / "results.json").mkdir(parents=True)
+        first, second = _spawn_ranks(2, run, tasks, output)
+        assert first.split(":")[0] in {"IsADirectoryError", "PermissionError"}
+        assert second == "RuntimeError: Checking the tasks failed on ranks [0]"

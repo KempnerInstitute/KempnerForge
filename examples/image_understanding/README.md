@@ -363,7 +363,7 @@ or in core where it belongs:
 ## Tests
 
 The tests live outside the repo's `tests/` tree (the main suite's
-`testpaths`), so run them by path. They need no GPU; the renderer and prompt
+`testpaths`), so run them by path. They need no GPU; the renderer
 tests download the `Qwen/Qwen3-0.6B` tokenizer once:
 
 ```bash

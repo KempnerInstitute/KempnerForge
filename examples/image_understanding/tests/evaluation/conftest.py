@@ -19,7 +19,6 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-QWEN = "Qwen/Qwen3-0.6B"
 SPECIAL_TOKENS = ("<|endoftext|>", "<|im_start|>", "<|im_end|>", "<unk>")
 WORDS = (
     "user assistant what is shown in the image ? how many which color a an one two three "
@@ -30,6 +29,19 @@ CHAT_TEMPLATE = (
     "{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}"
     "{% endfor %}"
     "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+)
+THINKING_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'assistant' %}"
+    "{{ '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' + message['content'] }}"
+    "{{ '<|im_end|>\\n' }}"
+    "{% else %}"
+    "{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}"
+    "{% if enable_thinking is defined and enable_thinking is false %}"
+    "{{ '<think>\\n\\n</think>\\n\\n' }}{% endif %}{% endif %}"
 )
 CONFIG = """\
 [model]
@@ -71,11 +83,31 @@ QUESTIONS = (
 
 
 @pytest.fixture(scope="session")
-def qwen_tokenizer() -> Any:
-    """The Qwen3 tokenizer, loaded once for the tests of the recipe's prompt."""
-    from transformers import AutoTokenizer
+def bpe_tokenizer() -> Any:
+    """A byte-level BPE chat tokenizer whose template ends the prompt with an empty think block."""
+    from tokenizers import Tokenizer, decoders, pre_tokenizers
+    from tokenizers.models import BPE
+    from tokenizers.trainers import BpeTrainer
+    from transformers import PreTrainedTokenizerFast
 
-    return AutoTokenizer.from_pretrained(QWEN)
+    backend = Tokenizer(BPE())
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    trainer = BpeTrainer(
+        vocab_size=400,
+        special_tokens=list(SPECIAL_TOKENS),
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+    )
+    corpus = [*QUESTIONS, "What is shown? How many? Yes. No. a cat 42 -3.5 (a) A B 2+2 ="] * 20
+    backend.train_from_iterator(corpus, trainer)
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="<unk>",
+        pad_token="<|endoftext|>",
+        eos_token="<|im_end|>",
+        additional_special_tokens=["<|im_start|>"],
+        chat_template=THINKING_CHAT_TEMPLATE,
+    )
 
 
 @pytest.fixture(scope="session")
