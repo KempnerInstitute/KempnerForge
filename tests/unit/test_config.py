@@ -32,7 +32,6 @@ from kempnerforge.config.schema import (
     VisionEncoderConfig,
     VLMConfig,
 )
-from kempnerforge.config.vlm import MoMaConfig
 
 
 class TestModelConfig:
@@ -438,9 +437,38 @@ class TestCheckpointConfig:
         with pytest.raises(ValueError, match="interval must be positive"):
             CheckpointConfig(interval=0)
 
-    @pytest.mark.parametrize("keys", [[], ["model"], ["optimizer"], ["model", "optimizer"]])
-    def test_exclude_from_loading_accepts_the_two_state_keys(self, keys):
+    @pytest.mark.parametrize(
+        "keys",
+        [
+            [],
+            ["model"],
+            ["optimizer"],
+            ["model", "optimizer"],
+            ["optimizer", "train_state"],
+            ["train_state", "optimizer"],
+        ],
+    )
+    def test_exclude_from_loading_accepts_the_state_keys(self, keys):
         assert CheckpointConfig(exclude_from_loading=keys).exclude_from_loading == keys
+
+    @pytest.mark.parametrize(
+        "keys",
+        [["train_state"], ["model", "train_state"], ["model", "optimizer", "train_state"]],
+    )
+    def test_train_state_is_rejected_outside_the_weights_only_pair(self, keys):
+        with pytest.raises(ValueError, match="must be \\['optimizer', 'train_state'\\]"):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    @pytest.mark.parametrize(
+        "keys", [["optimizer", "optimizer"], ["optimizer", "train_state", "train_state"]]
+    )
+    def test_exclude_from_loading_rejects_a_repeated_key(self, keys):
+        with pytest.raises(ValueError, match="repeats a key"):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    def test_exclude_from_loading_rejects_a_bare_string(self):
+        with pytest.raises(ValueError, match="must be a list"):
+            CheckpointConfig(exclude_from_loading="optimizer")  # type: ignore[arg-type]
 
     @pytest.mark.parametrize(
         "keys",
@@ -455,6 +483,19 @@ class TestCheckpointConfig:
         toml = tmp_path / "ckpt.toml"
         toml.write_text('[checkpoint]\nexclude_from_loading = ["lm_head"]\n')
         with pytest.raises(ValueError, match="exclude_from_loading"):
+            load_config(str(toml), cli_args=[])
+
+    @pytest.mark.parametrize("keys", [[["optimizer", "train_state"]], [{"optimizer": True}]])
+    def test_exclude_from_loading_rejects_unhashable_elements(self, keys):
+        with pytest.raises(
+            ValueError, match="accepts only 'model', 'optimizer' and/or 'train_state'"
+        ):
+            CheckpointConfig(exclude_from_loading=keys)
+
+    def test_nested_exclude_from_loading_is_validated_from_toml(self, tmp_path):
+        toml = tmp_path / "ckpt.toml"
+        toml.write_text('[checkpoint]\nexclude_from_loading = [["optimizer", "train_state"]]\n')
+        with pytest.raises(ValueError, match="accepts only"):
             load_config(str(toml), cli_args=[])
 
     def test_dyn_ckpt_window_defaults_to_none(self):
@@ -681,6 +722,31 @@ class TestJobConfig:
             train=TrainConfig(fp32_master_weights=True),
         )
         config.validate(world_size=2)
+
+    @pytest.mark.parametrize("arch", [None, "joint_decoder", "cross_attention", "mot"])
+    def test_validate_sigmoid_router_with_full_ac_rejected(self, arch) -> None:
+        """The sigmoid router moves its bias in every forward, so a replayed block can route
+        tokens to other experts; every arch with MoE layers is rejected, text included."""
+        config = _vlm_job(arch, num_experts=2)
+        config.model.moe_router = "sigmoid_topk"
+        config.train.activation_checkpointing = ActivationCheckpointing.full
+        match = r"'sigmoid_topk' does not support .*'full'.*= 'selective'"
+        with pytest.raises(ValueError, match=match):
+            config.validate(world_size=1)
+
+    @pytest.mark.parametrize(
+        ("router", "mode"),
+        [
+            ("sigmoid_topk", ActivationCheckpointing.selective),
+            ("sigmoid_topk", ActivationCheckpointing.none),
+            ("softmax_topk", ActivationCheckpointing.full),
+        ],
+    )
+    def test_validate_sigmoid_router_without_full_ac_passes(self, router, mode) -> None:
+        config = _vlm_job("mot", num_experts=2)
+        config.model.moe_router = router
+        config.train.activation_checkpointing = mode
+        config.validate(world_size=1)
 
     def test_validate_dense_with_pp_passes(self):
         config = JobConfig(
@@ -1025,14 +1091,6 @@ class TestVLMParallelismSupport:
         with pytest.raises(ValueError, match=r"Use FSDP, TP, or EP instead"):
             _vlm_job(None, pp=2, num_experts=2).validate(world_size=2)
 
-    def test_mot_expert_parallel_error_points_at_the_missing_moe_losses(self):
-        """The fix it gives, ep = 1, trains MoT with MoE without its MoE losses (#308), so the
-        error says so and links the issue."""
-        with pytest.raises(ValueError, match=r"ep = 1\. MoT with MoE then trains, but without"):
-            _vlm_job("mot", ep=2, num_experts=2).validate(world_size=2)
-        with pytest.raises(ValueError, match=r"KempnerForge/issues/308"):
-            _vlm_job("mot", ep=2, num_experts=2).validate(world_size=2)
-
     @pytest.mark.parametrize(
         ("arch", "tp", "ep", "num_experts"),
         [
@@ -1150,95 +1208,6 @@ class TestHfEncoderOverrideWarning:
         with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
             self._vlm_config_with(type="random", feature_dim=384, num_tokens=64)
         assert not any("random" in r.getMessage() for r in caplog.records)
-
-
-class TestMoMaAcFullWarning:
-    """``JobConfig.validate`` warns when MoMa is paired with
-    ``activation_checkpointing="full"`` because ``apply_ac`` matches
-    ``isinstance(m, TransformerBlock)`` only — and ``MoMaBlock`` is a
-    sibling ``nn.Module``, so AC=full silently no-ops on MoMa. The
-    ``selective`` branch wraps ``isinstance(m, Attention)`` and
-    ``MoMaBlock.attention`` is a standard ``Attention``, so
-    ``selective`` and ``none`` are correct and MUST NOT warn. Non-MoMa
-    arches are unaffected and must not warn either.
-
-    Mirrors ``TestHfEncoderOverrideWarning``'s caplog plumbing: the
-    ``kempnerforge`` logger has propagation disabled by
-    ``metrics.logger._configure_root``, so we re-enable it for the
-    duration of each test so pytest's root-attached caplog can observe
-    records from ``kempnerforge.config.job``.
-    """
-
-    def setup_method(self):
-        import logging
-
-        self._kf_logger = logging.getLogger("kempnerforge")
-        self._old_propagate = self._kf_logger.propagate
-        self._kf_logger.propagate = True
-
-    def teardown_method(self):
-        self._kf_logger.propagate = self._old_propagate
-
-    def _moma_job(self, ac: ActivationCheckpointing) -> JobConfig:
-        return JobConfig(
-            model=ModelConfig(max_seq_len=1024),
-            train=TrainConfig(
-                seq_len=576,
-                activation_checkpointing=ac,
-                compile_model=False,
-            ),
-            vision_encoder=VisionEncoderConfig(type="random", feature_dim=256, num_tokens=64),
-            adapter=AdapterConfig(),
-            vlm=MoMaConfig(max_text_len=512),
-        )
-
-    def test_warns_on_full(self, caplog):
-        cfg = self._moma_job(ActivationCheckpointing.full)
-        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
-            cfg.validate(world_size=1)
-        assert any(
-            "AC=full is currently a no-op for MoMa" in r.getMessage()
-            and "selective" in r.getMessage()
-            for r in caplog.records
-        )
-
-    def test_no_warning_on_selective(self, caplog):
-        cfg = self._moma_job(ActivationCheckpointing.selective)
-        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
-            cfg.validate(world_size=1)
-        assert not any(
-            "AC=full is currently a no-op for MoMa" in r.getMessage() for r in caplog.records
-        )
-
-    def test_no_warning_on_none(self, caplog):
-        cfg = self._moma_job(ActivationCheckpointing.none)
-        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
-            cfg.validate(world_size=1)
-        assert not any(
-            "AC=full is currently a no-op for MoMa" in r.getMessage() for r in caplog.records
-        )
-
-    def test_no_warning_for_non_moma_arch_with_full(self, caplog):
-        """A non-MoMa arch (default joint_decoder) with AC=full uses
-        TransformerBlock-shaped layers, which apply_ac handles correctly.
-        The MoMa-only warning must not fire.
-        """
-        cfg = JobConfig(
-            model=ModelConfig(max_seq_len=1024),
-            train=TrainConfig(
-                seq_len=576,
-                activation_checkpointing=ActivationCheckpointing.full,
-                compile_model=False,
-            ),
-            vision_encoder=VisionEncoderConfig(type="random", feature_dim=256, num_tokens=64),
-            adapter=AdapterConfig(),
-            vlm=VLMConfig(max_text_len=512),
-        )
-        with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
-            cfg.validate(world_size=1)
-        assert not any(
-            "AC=full is currently a no-op for MoMa" in r.getMessage() for r in caplog.records
-        )
 
 
 class TestTomlLoading:

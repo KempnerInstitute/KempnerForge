@@ -22,7 +22,7 @@ fp8
 | [Device mesh](device-mesh.md) | Mesh construction, dimension order, sub-mesh extraction (`get_dp_mesh` / `get_tp_mesh` / `get_pp_mesh`), example meshes from shipped configs |
 | [FSDP2](fsdp2.md) | Composable `fully_shard()`, per-block + top-level wrap, mixed-precision policy, `reshard_after_forward`, EP-MoE per-sub-module wrapping, activation checkpointing modes |
 | [Tensor parallelism](tensor-parallelism.md) | `ColwiseParallel` / `RowwiseParallel` / `SequenceParallel` plan, forward / post-hooks on embeddings + attention + MLP, meta-device init, head divisibility |
-| [Expert parallelism](expert-parallelism.md) | All-to-all dispatch + combine, unused-expert grad kludge, EP + TP + FSDP composition, gradient scaling |
+| [Expert parallelism](expert-parallelism.md) | All-to-all dispatch + combine, unused-expert grad kludge, EP + TP + FSDP composition, expert gradients and clipping, gradient scaling |
 | [Pipeline parallelism](pipeline-parallelism.md) | Layer assignment, `PipelineStageModule`, 1F1B / GPipe / interleaved schedules, per-stage DCP checkpointing |
 | [FP8](fp8.md) | `torchao.float8` conversion, filter rules (no experts / router, no dimension that is not a multiple of 16), `enable_fsdp_float8_all_gather`, TP incompatibility |
 

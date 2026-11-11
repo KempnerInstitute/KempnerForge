@@ -69,14 +69,31 @@ For `sigmoid_topk`, the coefficient has no effect by default
 `moe_sequence_aux_loss_weight > 0`; see
 [Aux loss § Sequence-level](../moe/aux-loss-and-balancing.md#sequence-level-aux-loss-sigmoid-only).
 
+On a MoT VLM each modality's router gets the same pressure per unit of
+the coefficient as a text model's router, but the logged
+`moe/aux_loss` sums one term per router, so with balanced routers an
+image + text MoT model reads about twice what a text model with the
+same MoE layers reads; see
+[Aux loss § Training-loop integration](../moe/aux-loss-and-balancing.md#training-loop-integration).
+
 ## Diagnose hot/cold experts
 
-The training loop logs two MoE-specific metrics when `num_experts > 0`:
+The training loop logs these MoE-specific metrics when `num_experts > 0`:
 
 ```
-moe/aux_loss        # scalar aux loss this step (dispatches to WandB/TB)
-moe/expert_balance  # min/max across (layer × expert) — 1.0 = perfect uniform
+moe/aux_loss                   # aux loss summed over routers (dispatches to WandB/TB)
+moe/router_z_loss              # router z-loss summed over routers
+moe/expert_balance             # min/max of expert loads across routers, 1.0 = perfect uniform
+moe/expert_balance/<modality>  # the same over one modality's routers, MoT only
 ```
+
+Each router's counts are first divided by that router's own total, so
+the balance compares each expert's share of its router's tokens. In a
+text model every router sees the same tokens, and this is min/max of
+the raw counts across (layer × expert). A MoT model has a router per
+modality, and its image and text routers see different numbers of
+tokens; `moe/expert_balance/image` and `moe/expert_balance/text` show
+which modality a collapse is in.
 
 Interpretation:
 
@@ -89,9 +106,11 @@ Interpretation:
   If it happens for one step, ignore. If it persists across many
   logging intervals, you have a dead expert.
 
-For per-layer detail, call `Transformer.get_expert_counts()` —
-returns `dict[layer_idx → tensor(num_experts,)]`. Useful to spot
-*which* layer is collapsing:
+For per-layer detail, call `Transformer.get_expert_counts()`, which
+returns `dict[layer_idx → tensor(num_experts,)]`; for a MoT model it
+is empty, and `Transformer.get_mot_expert_counts()` returns
+`dict[layer_idx → dict[modality → tensor(num_experts,)]]` instead.
+Useful to spot *which* layer is collapsing:
 
 ```python
 # In a custom script or notebook

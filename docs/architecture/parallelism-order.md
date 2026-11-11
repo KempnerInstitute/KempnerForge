@@ -91,8 +91,10 @@ has no sharding strategy yet.
 
 ### 4 · Activation Checkpointing before FSDP
 
-`apply_ac` wraps `TransformerBlock` (mode `full`) or just `Attention`
-(mode `selective`, the balanced trade-off) in `CheckpointWrapper`. Mode
+`apply_ac` wraps every block in `layers` and `cross_attention_layers`
+(mode `full`), whatever its class, or just the `Attention`,
+`MoTAttention` and `CrossAttention` modules inside them (mode
+`selective`, the balanced trade-off) in `CheckpointWrapper`. Mode
 `none` is a no-op.
 
 AC must run **before** FSDP2. FSDP2 bucketizes parameters at the

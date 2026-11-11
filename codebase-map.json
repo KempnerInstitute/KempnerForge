@@ -89,9 +89,12 @@
     "kempnerforge/config/optimizer.py": {
       "classes": {
         "OptimizerConfig": {
-          "purpose": "Optimizer settings (name, lr, betas, weight_decay, muon params, schedule_free_warmup_steps)"
+          "purpose": "Optimizer settings (name, lr, betas, weight_decay, muon params, schedule_free_warmup_steps, weight_decay_scope, lr_multipliers per vlm.module_patterns module)"
         }
-      }
+      },
+      "functions": [
+        "checked_lr_multipliers(multipliers) -> dict[str, float]"
+      ]
     },
     "kempnerforge/config/scheduler.py": {
       "enums": [
@@ -275,7 +278,9 @@
             "forward(tokens, *, modality, kv_caches, doc_ids, position_ids, attention_group_ids)",
             "init_weights_and_freqs()",
             "get_moe_aux_loss()",
+            "get_moe_router_z_loss()",
             "get_expert_counts()",
+            "get_mot_expert_counts()",
             "set_moe_step(step, max_steps)"
           ]
         }
@@ -291,7 +296,8 @@
         "tests/unit/test_model.py::TestPrefixEmbeds",
         "tests/unit/test_model.py::TestModalityIdsCrossArgs",
         "tests/unit/test_model.py::TestCrossAttentionInterleaving",
-        "tests/unit/test_model.py::TestMoT"
+        "tests/unit/test_model.py::TestMoT",
+        "tests/unit/test_mot.py::TestMoTMoEAccessors"
       ]
     },
     "kempnerforge/model/modality.py": {
@@ -356,6 +362,7 @@
         "tests/unit/test_mot.py::TestMoTAttentionNumerical",
         "tests/unit/test_mot.py::TestMoTBlock",
         "tests/unit/test_mot.py::TestWarmStartHelper",
+        "tests/unit/test_activation_checkpointing.py::TestMoTWarmStart",
         "tests/unit/test_model.py::TestMoT",
         "tests/integration/test_vlm_mot.py",
         "tests/distributed/test_vlm_mot_fsdp.py"
@@ -732,7 +739,10 @@
         }
       },
       "functions": [
-        "build_optimizer(model, config) -> Optimizer",
+        "build_optimizer(model, config, module_patterns=None) -> Optimizer",
+        "module_learning_rates(optimizer) -> dict[str, float] (keyed lr/<module>, lr_adamw/<module>)",
+        "_split_by_module(model, param_groups, config, module_patterns) -> list[dict]",
+        "_module_owners(model, modules, module_patterns) -> (owners, enclosing) (over every parameter name; a parameter several listed modules match goes to the one whose matches the others strictly contain; identical or partly overlapping matches are refused)",
         "_newton_schulz(G, steps) -> Tensor",
         "_muon_matrices(model, *, routers) -> set[Tensor]",
         "_should_decay(name, param, scope) -> bool"
@@ -745,6 +755,8 @@
       ],
       "tested_by": [
         "tests/unit/test_training.py::TestBuildOptimizer",
+        "tests/unit/test_lr_multipliers.py::TestGroups",
+        "tests/unit/test_lr_multipliers.py::TestMuonFallback",
         "tests/unit/test_optimizer.py::TestNewtonSchulz",
         "tests/unit/test_optimizer.py::TestMuon",
         "tests/unit/test_optimizer.py::TestMuonRouting",
@@ -907,6 +919,7 @@
       "tested_by": [
         "tests/unit/test_train_entry.py::TestRunTrainingLoop",
         "tests/unit/test_train_entry.py::TestBatchStream",
+        "tests/unit/test_train_entry.py::TestMoEMetrics",
         "tests/unit/test_train_entry.py::TestSelectStepFn",
         "tests/unit/test_train_entry.py::TestCheckpointExtra",
         "tests/e2e/test_training_e2e.py"
@@ -923,6 +936,7 @@
       "tested_by": [
         "tests/unit/test_train_entry.py::TestRunTraining",
         "tests/unit/test_train_entry.py::TestBuildPhaseHelpers",
+        "tests/unit/test_train_entry.py::TestStageChangeWarmStart",
         "tests/e2e/test_training_e2e.py",
         "tests/smoke/test_smoke.py"
       ]
@@ -1085,7 +1099,9 @@
       "functions": [
         "build_parallel_model(model_config, device, device_mesh, *, ac_mode, mp_policy, param_dtype, compile_model, fp8) -> nn.Module (dispatches to _build_vlm when model_config.vlm is set)",
         "_build_vlm(model_config, device, device_mesh, *, ac_mode, mp_policy, param_dtype, compile_model, fp8) -> VLMWrapper",
-        "apply_ac(model, mode)",
+        "apply_ac(model, mode) -> int",
+        "_ac_blocks(model) -> list[tuple[nn.ModuleDict, str]]",
+        "_is_checkpointed(module) -> bool",
         "apply_float8(model, enable_fsdp_float8_all_gather)",
         "apply_fsdp2(model, device_mesh, mp_policy, reshard_after_forward) (text-only path; shares _fsdp_wrap_transformer_blocks with VLM)",
         "_apply_fsdp_vlm(wrapper, device_mesh, mp_policy, reshard_after_forward) (VLM-aware FSDP: inner Transformer per-block + adapter + optional encoder wrap based on freeze)",
@@ -1104,7 +1120,11 @@
         "tests/unit/test_distributed.py::TestDefaultMpPolicy",
         "tests/unit/test_distributed.py::TestApplyFsdpVLMGuards",
         "tests/unit/test_distributed.py::TestBuildParallelModelVLM",
-        "tests/unit/test_distributed.py::TestFsdpWrapTransformerBlocksHelper"
+        "tests/unit/test_distributed.py::TestFsdpWrapTransformerBlocksHelper",
+        "tests/unit/test_activation_checkpointing.py::TestWhatGetsWrapped",
+        "tests/unit/test_activation_checkpointing.py::TestCheckpointingTakesEffect",
+        "tests/unit/test_activation_checkpointing.py::TestLogging",
+        "tests/unit/test_activation_checkpointing.py::TestUnderFsdp2"
       ]
     },
     "kempnerforge/distributed/tensor_parallel.py": {
@@ -1126,14 +1146,24 @@
             "forward(ctx, x, output_split_sizes, input_split_sizes, group)",
             "backward(ctx, grad_output)"
           ]
+        },
+        "_ScaleGrad": {
+          "purpose": "Identity forward that scales the gradient, averaging routed-expert gradients over the EP group",
+          "methods": [
+            "forward(ctx, x, scale)",
+            "backward(ctx, grad_output)"
+          ]
         }
       },
       "functions": [
         "ep_dispatch_and_compute(x, weights, indices, moe, ep_group, local_expert_start, num_local_experts, ep_world_size, gradient_scale) -> Tensor",
-        "apply_expert_parallel(model, device_mesh)"
+        "apply_expert_parallel(model, device_mesh)",
+        "expert_parallel_params(model) -> (list[Parameter], ProcessGroup | None)"
       ],
       "tested_by": [
-        "tests/distributed/test_ep.py"
+        "tests/distributed/test_ep.py",
+        "tests/unit/test_ep_gradients.py",
+        "tests/unit/test_expert_parallel.py"
       ]
     },
     "kempnerforge/distributed/pipeline_parallel.py": {
@@ -1165,23 +1195,27 @@
     "kempnerforge/distributed/utils.py": {
       "functions": [
         "get_dp_info(device_mesh) -> (dp_rank, dp_size)",
-        "clip_grad_norm_(model, max_norm, foreach) -> Tensor"
+        "clip_grad_norm_(model, max_norm, foreach, pp_group) -> Tensor"
       ],
       "tested_by": [
-        "tests/unit/test_distributed.py::TestClipGradNorm"
+        "tests/unit/test_distributed.py::TestClipGradNorm",
+        "tests/unit/test_ep_gradients.py::TestClipUnderExpertParallelism"
       ]
     },
     "kempnerforge/checkpoint/state.py": {
       "functions": [
         "get_rng_state() -> dict",
         "set_rng_state(state)",
-        "build_train_state(step, tokens_seen, scheduler, dataloader, extra) -> dict",
-        "restore_train_state(state, scheduler, dataloader) -> (step, tokens_seen)"
+        "build_train_state(step, tokens_seen, scheduler, dataloader, extra) -> dict (records scheduler_group_modules when a param group names a module)",
+        "restore_train_state(state, scheduler, dataloader, lr_multipliers) -> (step, tokens_seen)",
+        "_scheduler_state_for(scheduler, saved, saved_modules, lr_multipliers) -> dict (lays a LambdaLR state out by module for other param groups; a module with no saved group runs at the saved peak times its multiplier)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestRNGState",
         "tests/unit/test_checkpoint.py::TestBuildTrainState",
         "tests/unit/test_checkpoint.py::TestRestoreTrainState",
+        "tests/unit/test_lr_multipliers.py::TestSchedulerStateLayout",
+        "tests/unit/test_lr_multipliers.py::TestLayoutChange",
         "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip"
       ]
     },
@@ -1195,8 +1229,10 @@
             "flush_pending_save()",
             "peek_saved_step(path)",
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
-            "_read_saved_keys(ckpt_dir, dcp_dir) (this rank's DCP keys; checks the scope only when an all-reduce on the gloo group finds optimizer state on some rank)",
-            "_check_weight_decay_scope(ckpt_dir) (rank 0 reads the saved scope and broadcasts it; every rank refuses a mismatch)",
+            "_read_saved_keys(dcp_dir) -> (keys, restored_on_any_rank) (this rank's DCP keys; with a scope or multipliers an all-reduce on the gloo group tells every rank whether any rank's index holds optimizer state)",
+            "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope, multipliers and group-layout checks all decide from it)",
+            "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
+            "_check_lr_multipliers(metadata, ckpt_dir) -> saved group modules | None (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
             "_cleanup()"
@@ -1206,10 +1242,17 @@
       "functions": [
         "_load_train_state(path) -> dict (ownership-gated torch.load with weights_only=False)",
         "_intersect_freeze_meta_by_module(saved, expected) -> (saved_filt, expected_filt) (cross-arch drop-zero-match rule)",
-        "_read_weight_decay_scope(ckpt_dir) -> str (scope recorded in metadata.json; none recorded means exclude_norms_and_biases)"
+        "_read_metadata(ckpt_dir) -> dict (the JSON object metadata.json holds; empty when there is none)",
+        "_recorded_weight_decay_scope(meta, metadata_path) -> str (none recorded means exclude_norms_and_biases)",
+        "_recorded_lr_multipliers(meta, metadata_path) -> dict (none recorded means empty)",
+        "_recorded_lr_layout(meta, metadata_path) -> (patterns, group_modules) (lr_module_patterns, and lr_group_modules: the module of each optimizer param group, recorded without PP)",
+        "_check_saved_param_groups(optim_state, saved_keys, where, groups_vary, saved_modules) (refuses another group count, a missing setting, a module key where this run has none, or another module at a position per the recorded lr_group_modules)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",
+        "tests/unit/test_checkpoint.py::TestOptimizerChecksAcrossStages",
+        "tests/unit/test_lr_multipliers.py::TestResume",
+        "tests/unit/test_lr_multipliers.py::TestLayoutChange",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
         "tests/unit/test_checkpoint.py::TestPeekSavedStep",

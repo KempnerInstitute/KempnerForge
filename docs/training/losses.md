@@ -168,7 +168,8 @@ if mc.is_moe:
 ```
 
 See [MoE](../moe/index.md) for how `get_moe_aux_loss()` sums the
-per-layer router aux losses.
+router aux losses: one per MoE layer, and on a MoT model one per
+modality on each MoE layer.
 
 ## Picking one
 

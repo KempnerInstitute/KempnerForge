@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -1233,7 +1234,7 @@ def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
     monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: FakeShutdownHandler())
     monkeypatch.setattr(entry, "build_model", lambda *_a, **_k: (model, None))
     monkeypatch.setattr(
-        entry, "build_optimizer", lambda m, _c: torch.optim.SGD(m.parameters(), lr=0.05)
+        entry, "build_optimizer", lambda m, _c, **_k: torch.optim.SGD(m.parameters(), lr=0.05)
     )
     monkeypatch.setattr(
         entry,
@@ -1431,6 +1432,28 @@ class TestRunTraining:
         tokens = 2 * config.train.batch_size * config.train.seq_len
         assert hook.ends == [(2, tokens)]
 
+    @pytest.mark.parametrize("vlm", [False, True], ids=["text", "vlm"])
+    def test_the_optimizer_gets_the_vlm_module_patterns(self, monkeypatch, vlm):
+        import kempnerforge.training.entry as entry
+
+        class _Built(Exception):
+            pass
+
+        seen: dict = {}
+
+        def build_optimizer(_model, _config, module_patterns=None):
+            seen["module_patterns"] = module_patterns
+            raise _Built
+
+        _stub_entry(monkeypatch, TinyTextModel())
+        monkeypatch.setattr(entry, "build_optimizer", build_optimizer)
+        config = _vlm_config() if vlm else make_config()
+        with pytest.raises(_Built):
+            entry.run_training(config)
+        expected = config.vlm.module_patterns if config.vlm is not None else None
+        assert seen["module_patterns"] == expected
+        assert (expected is not None) is vlm
+
 
 class TestBuildPhaseHelpers:
     def test_checkpoint_manager_has_no_pp_scoping_without_pipeline(self, tmp_path):
@@ -1457,6 +1480,20 @@ class TestBuildPhaseHelpers:
         ).save(step=0)
         meta = json.loads((tmp_path / "ckpt" / "step_0" / "metadata.json").read_text())
         assert meta["weight_decay_scope"] == "all"
+
+    def test_checkpoint_manager_records_the_lr_multipliers(self, tmp_path):
+        from kempnerforge.training.entry import build_checkpoint_manager
+
+        config = _vlm_config()
+        config.checkpoint.dir = str(tmp_path / "ckpt")
+        config.optimizer.lr_multipliers = {"adapter": 2.0}
+        model = TinyTextModel()
+        build_checkpoint_manager(
+            config, _runtime(), model, torch.optim.SGD(model.parameters(), lr=0.1), None
+        ).save(step=0)
+        meta = json.loads((tmp_path / "ckpt" / "step_0" / "metadata.json").read_text())
+        assert meta["lr_multipliers"] == {"adapter": 2.0}
+        assert meta["lr_module_patterns"] == {"adapter": ["adapter", "adapter.*"]}
 
     def test_restore_checkpoint_starts_from_scratch(self, tmp_path):
         from kempnerforge.training.entry import build_checkpoint_manager, restore_checkpoint
@@ -1539,6 +1576,8 @@ class TestWeightDecayScopeWarmStart:
         config.checkpoint.exclude_from_loading = ["optimizer"]
         assert restore_checkpoint(config, model, None, manager) == (1, 0)
         assert not optimizer.state
+        config.checkpoint.exclude_from_loading = ["optimizer", "train_state"]
+        assert restore_checkpoint(config, model, None, manager) == (0, 0)
 
 
 class TestBuildDataPipeline:
@@ -1994,6 +2033,10 @@ class FakeResumeManager:
         self.load_kwargs = kw
         return self._ret
 
+    def agree(self, error, what=""):
+        if error is not None:
+            raise error
+
 
 def _entry_warnings(call):
     """Run ``call`` and return its result and the warnings the training entry logged."""
@@ -2127,7 +2170,14 @@ class TestRestoreCheckpoint:
             (False, "/somewhere/converted", ["model"], ["model"]),
             (False, "/somewhere/converted", ["model", "optimizer"], ["model", "optimizer"]),
             (False, "/somewhere/converted", [], None),
+            (
+                False,
+                "/somewhere/converted",
+                ["optimizer", "train_state"],
+                ["optimizer", "train_state"],
+            ),
             (True, None, ["optimizer"], None),
+            (True, "/somewhere/converted", ["optimizer", "train_state"], None),
             (True, None, [], None),
             (True, "/somewhere/converted", ["optimizer"], None),
             (True, "/somewhere/converted", ["model", "optimizer"], None),
@@ -2239,14 +2289,31 @@ class TestRestoreCheckpoint:
         assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(0, config.vlm)
         assert mgr.load_kwargs["exclude_keys"] == ["model"]
 
-    def test_mot_warm_start_fires_only_at_step_zero(self, monkeypatch, tmp_path):
+    def test_weights_only_warm_start_skips_the_freeze_probe(self, monkeypatch):
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
+        config = _vlm_config()
+        config.checkpoint.load_path = "/runs/stage1/step_50000"
+        config.checkpoint.exclude_from_loading = ["optimizer", "train_state"]
+        mgr = FakeResumeManager(step=0, tokens=0, saved_step=50000)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.peeked == []
+        assert mgr.load_kwargs["vlm_freeze_expected"] is None
+        assert mgr.load_kwargs["exclude_keys"] == ["optimizer", "train_state"]
+
+    @pytest.mark.parametrize("wrapped", [False, True], ids=["plain_state_dict", "model_wrapper"])
+    def test_mot_warm_start_runs_only_when_no_checkpoint_supplied_the_model(
+        self, monkeypatch, tmp_path, wrapped
+    ):
         import kempnerforge.training.entry as entry
         from kempnerforge.config.adapter import AdapterConfig
         from kempnerforge.config.vision import VisionEncoderConfig
         from kempnerforge.config.vlm import MoTConfig
 
         monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
-        monkeypatch.setattr(torch, "load", lambda *a, **k: {"model": {"w": 1}})
+        source = {"w": 1}
+        monkeypatch.setattr(torch, "load", lambda *a, **k: {"model": source} if wrapped else source)
         copied: list = []
         monkeypatch.setattr(
             entry, "mot_warm_start_from_text_stack", lambda m, src: copied.append(src)
@@ -2260,12 +2327,30 @@ class TestRestoreCheckpoint:
                 max_text_len=32, mot_warm_start_from_text=True, mot_warm_start_path="/x.pt"
             ),
         )
+        for step in (0, 4):
+            entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=step))
+            assert copied == [], f"a resume at step {step} supplied the model"
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
+        config.checkpoint.load_path = str(tmp_path / "stage1")
+        config.checkpoint.exclude_from_loading = ["optimizer", "train_state"]
+        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
+        assert copied == []
+
+        config.checkpoint.exclude_from_loading = ["model"]
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=0))
         assert copied == [{"w": 1}]
+        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=4))
+        assert copied == [{"w": 1}] * 2, "a step-4 train state without the model needs the copy"
 
         copied.clear()
-        entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(step=4))
-        assert copied == []
+        config.checkpoint.load_path = None
+        config.checkpoint.exclude_from_loading = []
+        assert entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager()) == (
+            0,
+            0,
+        )
+        assert copied == [{"w": 1}]
 
     def test_a_resume_that_overrides_load_path_warns_naming_both(self, monkeypatch, tmp_path):
         """A rollback through ``load_path`` into a ``dir`` that has checkpoints resumes instead."""
@@ -3170,6 +3255,17 @@ class TinyMoEModel(nn.Module):
         return self._counts
 
 
+class TinyMoTMoEModel(TinyMoEModel):
+    """``TinyMoEModel`` with MoT's per-modality routers: no flat counts, counts per modality."""
+
+    def __init__(self, mot_counts) -> None:
+        super().__init__(counts={})
+        self._mot_counts = mot_counts
+
+    def get_mot_expert_counts(self):
+        return self._mot_counts
+
+
 def _moe_config(z_weight=0.0, aux_weight=0.1, **kw):
     config = make_config(**kw)
     config.model.num_experts = 4
@@ -3213,6 +3309,40 @@ class TestMoEMetrics:
         run_training_loop(session)
         return logged
 
+    def _moe_metrics(self, model):
+        logged = self._run_one_step(model, _moe_config(max_steps=1))
+        return [m for m, _ in logged if "moe/aux_loss" in m][0]
+
+    def test_expert_balance_covers_mot_routers(self):
+        """MoT counts arrive per layer and modality; the image loads are 0.25 and 0.75."""
+        mot = {1: {"image": torch.tensor([1.0, 3.0]), "text": torch.tensor([4.0, 4.0])}}
+        moe = self._moe_metrics(TinyMoTMoEModel(mot))
+        assert moe["moe/expert_balance"] == pytest.approx(1 / 3)
+        assert moe["moe/expert_balance/image"] == pytest.approx(1 / 3)
+        assert moe["moe/expert_balance/text"] == pytest.approx(1.0)
+
+    def test_expert_balance_normalizes_each_router(self):
+        """Balanced routers read 1.0 whatever tokens each saw; raw counts would read 0.25."""
+        mot = {
+            1: {"image": torch.tensor([2.0, 2.0]), "text": torch.tensor([8.0, 8.0])},
+            3: {"image": torch.tensor([2.0, 2.0]), "text": torch.tensor([8.0, 8.0])},
+        }
+        moe = self._moe_metrics(TinyMoTMoEModel(mot))
+        assert moe["moe/expert_balance"] == pytest.approx(1.0)
+
+    def test_expert_balance_skips_a_router_that_saw_no_tokens(self):
+        mot = {1: {"image": torch.tensor([0.0, 0.0]), "text": torch.tensor([3.0, 1.0])}}
+        moe = self._moe_metrics(TinyMoTMoEModel(mot))
+        assert moe["moe/expert_balance"] == pytest.approx(1 / 3)
+        assert "moe/expert_balance/image" not in moe
+
+    def test_a_model_without_mot_counts_has_no_mot_routers(self):
+        """A custom MoE model need not implement ``get_mot_expert_counts``."""
+        assert not hasattr(TinyMoEModel(), "get_mot_expert_counts")
+        moe = self._moe_metrics(TinyMoEModel(counts={"0": torch.tensor([2.0, 8.0])}))
+        assert moe["moe/expert_balance"] == pytest.approx(0.25)
+        assert not any(key.startswith("moe/expert_balance/") for key in moe)
+
     def test_expert_balance_is_min_over_max(self):
         model = TinyMoEModel(counts={"0": torch.tensor([2.0, 8.0])})
         logged = self._run_one_step(model, _moe_config(max_steps=1))
@@ -3225,6 +3355,181 @@ class TestMoEMetrics:
         logged = self._run_one_step(TinyMoEModel(counts={}), _moe_config(max_steps=1))
         moe = [m for m, _ in logged if "moe/aux_loss" in m][0]
         assert "moe/expert_balance" not in moe
+
+
+class TestModuleLearningRateMetrics:
+    """Each module of ``optimizer.lr_multipliers`` logs its rate as ``lr/<module>``."""
+
+    @staticmethod
+    def _session(name="adamw", **multipliers):
+        from kempnerforge.config.optimizer import OptimizerConfig
+        from kempnerforge.training.optimizer import build_optimizer
+
+        model = TinyTextModel()
+        config = OptimizerConfig(name=name, lr=0.05, fused=False, lr_multipliers=multipliers)
+        optimizer = build_optimizer(model, config, module_patterns={"out": ["out.*"]})
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0 / (s + 1))
+        session = make_session(
+            make_config(max_steps=2), model=model, optimizer=optimizer, scheduler=scheduler
+        )
+        logged: list = []
+        session.tracker.log_eval = lambda m, s: logged.append((m, s))  # type: ignore[method-assign]
+        return session, logged
+
+    @staticmethod
+    def _logged_names(name="adamw", **multipliers) -> set[str]:
+        """Every metric name the loop sends a logging backend in a two-step run."""
+        session, _ = TestModuleLearningRateMetrics._session(name, **multipliers)
+        session.tracker = _make_tracker(session.config)
+        session.tracker.metrics_config.log_interval = 1
+        names: set[str] = set()
+
+        class Recorder:
+            def log(self, metrics, step):
+                names.update(metrics)
+
+        session.tracker._backends.append(Recorder())
+        run_training_loop(session)
+        return names
+
+    def test_the_loop_logs_each_module_rate_after_the_schedule_steps(self):
+        session, logged = self._session(out=2.0)
+        session.tracker.metrics_config.log_interval = 1
+        run_training_loop(session)
+        rates = [(m, s) for m, s in logged if any(k.startswith("lr/") for k in m)]
+        assert rates == [
+            ({"lr/out": pytest.approx(0.1 / 2)}, 1),
+            ({"lr/out": pytest.approx(0.1 / 3)}, 2),
+        ]
+
+    def test_no_module_logs_no_rate(self):
+        session, logged = self._session()
+        session.tracker.metrics_config.log_interval = 1
+        run_training_loop(session)
+        assert logged == []
+
+    def test_no_logged_name_nests_under_another(self):
+        """A file-based store keeps each name as a path, so ``a/b`` cannot sit beside ``a``."""
+        names = self._logged_names("muon", out=2.0)
+        assert {"train/lr", "lr/out", "lr_adamw/out"} <= names
+        assert not [(a, b) for a in names for b in names if b.startswith(f"{a}/")]
+
+    def test_a_file_store_keeps_every_name(self, tmp_path, monkeypatch):
+        mlflow = pytest.importorskip("mlflow")
+        from mlflow.entities import Metric
+
+        names = sorted(self._logged_names("muon", out=2.0))
+        monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+        client = mlflow.MlflowClient(tracking_uri=(tmp_path / "mlruns").as_uri())
+        run = client.create_run(client.create_experiment("names"))
+        client.log_batch(run.info.run_id, metrics=[Metric(n, 1.0, 0, 1) for n in names])
+        history = client.get_run(run.info.run_id).data.metrics
+        assert sorted(history) == names
+
+
+class TestStageChangeWarmStart:
+    """A second stage warm-starts from the first without its optimizer, with other groups.
+
+    Both stages list the same ``optimizer.lr_multipliers``; the frozen module or the
+    weight-decay scope changes, and with it the param groups the scheduler state belongs to.
+    """
+
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.vision_encoder = nn.Linear(DIM, DIM)
+            self.adapter = nn.Linear(DIM, DIM)
+            self.transformer = nn.Linear(DIM, DIM)
+
+    @staticmethod
+    def _step(session, _step):
+        from kempnerforge.training.loop import StepResult
+
+        model = session.model
+        loss = model.transformer(model.adapter(model.vision_encoder(torch.ones(2, DIM))))
+        loss = loss.square().mean()
+        loss.backward()
+        return StepResult(loss=loss.item(), grad_norm=0.0, text_tokens=1)
+
+    @classmethod
+    def _stage(cls, monkeypatch, frozen, scope, max_steps, **checkpoint):
+        """Run one stage through ``run_training`` and return the rates logged at each step."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.config.vlm import FreezeSpec
+        from kempnerforge.metrics.tracker import MetricsTracker
+        from kempnerforge.training.freeze import apply_freeze_specs
+
+        config = _vlm_config(freeze=[FreezeSpec(frozen, True)])
+        config.train.max_steps = max_steps
+        config.optimizer.lr = 2e-4
+        config.optimizer.fused = False
+        config.optimizer.weight_decay_scope = scope
+        config.optimizer.lr_multipliers = {"vision_encoder": 0.03, "adapter": 5.0}
+        config.scheduler.warmup_steps = 5
+        config.scheduler.decay_steps = 55
+        config.scheduler.min_lr_ratio = 0.1
+        config.checkpoint = CheckpointConfig(interval=1000, **checkpoint)
+        config.metrics.log_interval = 1
+        torch.manual_seed(0)
+        model = cls._Model()
+        assert config.vlm is not None
+        apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+        monkeypatch.setattr(entry, "setup_distributed", lambda _config: _runtime())
+        monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: FakeShutdownHandler())
+        monkeypatch.setattr(entry, "build_model", lambda *_a, **_k: (model, None))
+        monkeypatch.setattr(entry, "build_profiler", lambda *_a, **_k: None)
+        monkeypatch.setattr(entry, "build_data_pipeline", lambda *_a, **_k: DataPipeline())
+        monkeypatch.setattr(entry, "build_eval_dataloader", lambda *_a, **_k: None)
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: None)
+        rates: dict[int, dict[str, float]] = {}
+        end_step = MetricsTracker.end_step
+
+        def record_end_step(self, **kwargs):
+            rates.setdefault(kwargs["step"], {})["train/lr"] = kwargs["lr"]
+            return end_step(self, **kwargs)
+
+        def record_log_eval(self, metrics, step):
+            rates.setdefault(step, {}).update(
+                {name: rate for name, rate in metrics.items() if name.startswith("lr")}
+            )
+
+        monkeypatch.setattr(MetricsTracker, "end_step", record_end_step)
+        monkeypatch.setattr(MetricsTracker, "log_eval", record_log_eval)
+        entry.run_training(config, step_fn=cls._step)
+        return rates
+
+    @staticmethod
+    def _factor(step: int) -> float:
+        return 0.1 + 0.45 * (1 + math.cos(math.pi * (step - 5) / 55))
+
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            (
+                ("transformer", "exclude_norms_and_biases"),
+                ("vision_encoder", "exclude_norms_and_biases"),
+            ),
+            (("vision_encoder", "all"), ("vision_encoder", "exclude_norms_and_biases")),
+        ],
+        ids=["frozen-module-swapped", "scope-changed"],
+    )
+    def test_each_group_continues_at_its_module_rate(self, tmp_path, monkeypatch, first, second):
+        first_rates = self._stage(monkeypatch, *first, 10, dir=str(tmp_path / "first"))
+        assert first_rates[10]["lr/adapter"] == pytest.approx(1e-3 * self._factor(10))
+        rates = self._stage(
+            monkeypatch,
+            *second,
+            12,
+            dir=str(tmp_path / "second"),
+            load_path=str(tmp_path / "first" / "step_10"),
+            exclude_from_loading=["optimizer"],
+        )
+        assert sorted(rates) == [11, 12]
+        for step in (11, 12):
+            assert rates[step] == {
+                "train/lr": pytest.approx(2e-4 * self._factor(step), rel=1e-6),
+                "lr/adapter": pytest.approx(1e-3 * self._factor(step), rel=1e-6),
+            }
 
 
 class TestPerDatasetMetrics:
