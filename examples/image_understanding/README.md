@@ -92,6 +92,55 @@ that follows the aspect ratio is not implemented. An image smaller than the
 without adding detail; tiling pays off on sources larger than the canvas.
 Tiling applies to the image path only; a `[video]` run rejects it.
 
+## Pack documents
+
+By default every row holds one document: its image tokens, then its text
+right-padded to `vlm.max_text_len`. With `data.pack_sequences = true` on a
+`joint_decoder` run, `PackedVLMCollator` packs the `train.batch_size` documents
+of each micro-batch first-fit into rows of `train.seq_len` instead. Each
+document is its image's token slots followed by its real text, `doc_ids` keeps
+attention inside a document, and the wrapper writes each image's tokens over
+its slots (`ModalityContext.inline_embeds`). Each document's positions
+restart at 0, so a document sees the positions it would on the unpacked path,
+and the LM head runs on the text positions only, so the loss and the head's
+memory match the unpacked path too. The z-loss averages over those positions,
+where the unpacked path's also averages over each row's text padding, so the
+two differ slightly when `train.z_loss_weight > 0`. Packing does not run with
+`train.mixed_precision = "fp8"`.
+The number of rows follows the documents' lengths, so it varies between
+micro-batches.
+
+```toml
+[vision_encoder]
+type = "siglip2"
+path = "google/siglip2-so400m-patch16-512"
+
+[adapter]
+type = "avgpool"
+pool_window = 2            # 256 tokens per image in the row
+
+[vlm]
+arch = "joint_decoder"
+max_text_len = 256         # per-document text cap
+
+[data]
+pack_sequences = true
+hf_image_size = 512        # the checkpoint's resolution: 32 × 32 patches
+
+[model]
+max_seq_len = 2048         # the RoPE table must cover a full row
+
+[train]
+seq_len = 2048             # row length; batch_size documents per micro-batch
+```
+
+`attention_backend = "flex"` makes the packed mask block-sparse. Under
+`compile_model`, a micro-batch that packs into a single row compiles its own
+graph (a size of 1 cannot be made dynamic), so size `train.batch_size` for at
+least two rows. The views of
+an image attend causally; bidirectional image attention is a follow-up on the
+core's attention groups. A `[video]` run and the other arches do not pack.
+
 ## Start from the pretrained backbone
 
 Stage 1 warm-starts from a checkpoint that holds the pretrained Qwen3-0.6B
@@ -182,7 +231,6 @@ or in core where it belongs:
   and the mixture loader
 - Typed stage contract and pinned source manifest, which fix the stage presets
 - Starting stage 2 from stage 1's weights alone, with a fresh step and schedule
-- Packing image-text documents into one sequence
 - Text-only documents in image-text batches
 - Documents with several images
 - Per-module learning rates and schedules
