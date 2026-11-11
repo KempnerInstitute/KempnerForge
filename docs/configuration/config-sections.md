@@ -142,6 +142,7 @@ are shared (AdamW/Lion) or optimizer-specific.
 | `muon_router` | `bool` | `False` | Orthogonalize MoE router gates with Muon instead of its AdamW fallback |
 | `schedule_free_warmup_steps` | `int` | `0` | internal warmup for schedule-free |
 | `weight_decay_scope` | `"exclude_norms_and_biases" \| "all"` | `"exclude_norms_and_biases"` | which parameters are decayed; `"all"` decays every parameter, as `torch.optim.AdamW` does by default. A resume that restores optimizer state saved under the other scope is refused |
+| `lr_multipliers` | `dict[str, float]` | `{}` | per-module learning rates: each `vlm.module_patterns` module listed trains at `lr` times its multiplier, in its own param groups (see [Optimizers § Per-module learning rates](../training/optimizers.md#per-module-learning-rates)). A resume that restores optimizer or scheduler state saved with other multipliers, or other patterns for their modules, is refused |
 
 ## `[scheduler]` — `SchedulerConfig`
 

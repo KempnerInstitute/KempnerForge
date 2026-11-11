@@ -15,6 +15,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 
+from kempnerforge.distributed.expert_parallel import expert_parallel_params
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,13 +61,20 @@ def clip_grad_norm_(
     via stack, then combines across groups.
 
     Falls back to ``torch.nn.utils.clip_grad_norm_`` when there is only one mesh
-    (pure FSDP or single-GPU).
+    (pure FSDP or single-GPU) and neither pipeline nor expert parallelism, whose
+    norms need a sum over their own group.
 
     Under pipeline parallelism ``model`` holds one stage, so pass the stages'
     process group as ``pp_group``: the squared stage norms are summed over it, and
     every stage returns the whole model's norm and scales by the same coefficient.
     Every stage must make the call, including one without gradients, since the
     sum is a collective.
+
+    Under expert parallelism each EP rank holds its own routed experts and a copy
+    of every other parameter. The experts' squared norms are summed over the EP
+    group the ``MoEMLP`` layers record, and the copies' are averaged over it, so
+    every EP rank returns the whole model's norm and scales by the same
+    coefficient. Every EP rank must make the call.
 
     Args:
         model: Model whose gradients to clip.
@@ -78,10 +87,15 @@ def clip_grad_norm_(
         Total gradient norm (before clipping).
     """
     grads = [p.grad for p in model.parameters() if p.grad is not None]
-    if pp_group is not None:
+    expert_params, ep_group = expert_parallel_params(model)
+    if pp_group is not None or ep_group is not None:
         device = grads[0].device if grads else next(model.parameters()).device
-        norm_sq = _norm_sq(grads, device)
-        dist.all_reduce(norm_sq, op=dist.ReduceOp.SUM, group=pp_group)
+        if ep_group is None:
+            norm_sq = _norm_sq(grads, device)
+        else:
+            norm_sq = _ep_norm_sq(model, expert_params, ep_group, device)
+        if pp_group is not None:
+            dist.all_reduce(norm_sq, op=dist.ReduceOp.SUM, group=pp_group)
         return _scale_(grads, max_norm, norm_sq.sqrt())
     if not grads:
         return torch.tensor(0.0)
@@ -130,6 +144,26 @@ def _norm_sq(grads: list[torch.Tensor], device: torch.device) -> torch.Tensor:
             group_norm_sq = group_norm_sq.full_tensor()  # type: ignore[reportAttributeAccessIssue]
         total_norm_sq = total_norm_sq + group_norm_sq
     return total_norm_sq
+
+
+def _ep_norm_sq(
+    model: torch.nn.Module,
+    expert_params: list[torch.nn.Parameter],
+    ep_group: dist.ProcessGroup,
+    device: torch.device,
+) -> torch.Tensor:
+    """Squared L2 norm of the whole model's gradients under expert parallelism.
+
+    One all-reduce over ``ep_group`` sums the squared norms of each rank's routed
+    experts and averages those of the parameters every EP rank holds a copy of, so
+    every EP rank gets the same value even if the copies differ in the last bits.
+    """
+    expert_ids = {id(p) for p in expert_params}
+    expert = [p.grad for p in expert_params if p.grad is not None]
+    shared = [p.grad for p in model.parameters() if p.grad is not None and id(p) not in expert_ids]
+    norm_sq = _norm_sq(shared, device) / dist.get_world_size(ep_group) + _norm_sq(expert, device)
+    dist.all_reduce(norm_sq, op=dist.ReduceOp.SUM, group=ep_group)
+    return norm_sq
 
 
 def _scale_(grads: list[torch.Tensor], max_norm: float, total_norm: torch.Tensor) -> torch.Tensor:
