@@ -484,6 +484,26 @@ def test_pixel_coordinate_columns_must_be_lists(tmp_path: Path, axis: str, value
         pixmo_counting(ann, tmp_path, multi_label=False)
 
 
+@pytest.mark.parametrize("axis", ["x", "y"])
+def test_pixel_coordinates_missing_an_axis_are_refused(tmp_path: Path, axis: str) -> None:
+    points = {"x": [1, 2], "y": [3, 4]}
+    del points[axis]
+    ann = _write_jsonl(
+        tmp_path / "count.jsonl",
+        [{"image": "a", "label": "dot", "count": 2, "points": points}],
+    )
+    with pytest.raises(ValueError, match=f"missing {axis}"):
+        pixmo_counting(ann, tmp_path, multi_label=False)
+
+
+def test_explicitly_empty_coordinate_lists_are_kept(tmp_path: Path) -> None:
+    ann = _write_jsonl(
+        tmp_path / "count.jsonl",
+        [{"image": "a", "label": "dot", "count": 0, "points": {"x": [], "y": []}}],
+    )
+    assert len(pixmo_counting(ann, tmp_path, multi_label=False)) == 1
+
+
 @pytest.mark.parametrize("start", [0, 2])
 def test_rendering_continues_after_the_actual_refused_row(
     tmp_path: Path, write_image: Callable, tokenizer: Any, start: int

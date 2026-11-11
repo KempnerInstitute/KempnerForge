@@ -162,9 +162,9 @@ uv run python examples/vlm/scripts/convert_hf_backbone.py \
 
 Then pass it as `--checkpoint.load_path` with
 `checkpoint.exclude_from_loading = ["optimizer"]`, so the converted weights load
-and the optimizer starts fresh. Stage 2 should start from a stage-1 checkpoint
-the same way, as weights alone with its own warmup from step 0; a warm start
-today also restores the saved step and schedule, so that is on the roadmap.
+and the optimizer starts fresh. Stage 2 starts from a stage-1 checkpoint as
+weights alone with `checkpoint.exclude_from_loading = ["optimizer", "train_state"]`,
+so its step and schedule start again from 0.
 
 ## Roadmap
 
@@ -175,11 +175,9 @@ or in core where it belongs:
   DataComp), chat-template rendering with the loss on the assistant turns only,
   and the mixture loader
 - Typed stage contract and pinned source manifest, which fix the stage presets
-- Starting stage 2 from stage 1's weights alone, with a fresh step and schedule
 - Text-only documents in image-text batches
 - Documents with several images
 - Per-module learning rates and schedules
-- Vision-encoder precision separate from the backbone's
 - Evaluation parity: chat-template prompts, image attention, the recipe's scorers
 - Run-comparison metrics: documents seen, token counts, MFU with the encoder
 
