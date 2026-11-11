@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -18,8 +19,9 @@ import torch
 import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.config.checkpoint import is_weights_only
 from kempnerforge.config.job import JobConfig
-from kempnerforge.config.vlm import MoTConfig
+from kempnerforge.config.vlm import MoTConfig, VLMConfig
 from kempnerforge.distributed.parallel import (
     apply_ac,
     apply_float8,
@@ -30,11 +32,13 @@ from kempnerforge.distributed.parallel import (
 )
 from kempnerforge.distributed.setup import destroy_distributed
 from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
+from kempnerforge.distributed.utils import get_dp_info
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
+from kempnerforge.model.masking import use_dynamic_flex_shapes
 from kempnerforge.model.mot import mot_warm_start_from_text_stack
 from kempnerforge.model.transformer import Transformer
-from kempnerforge.model.vlm import inner_transformer
+from kempnerforge.model.vlm import inner_transformer, packed_tokens_per_image
 from kempnerforge.profiling.profiler import build_profiler
 from kempnerforge.resilience.elastic import resolve_resume_path
 from kempnerforge.resilience.health import NaNDetector
@@ -177,6 +181,8 @@ def build_checkpoint_manager(
     With PP, each stage has different parameters — DCP needs a group scoped
     to ranks within the same PP stage (all non-PP mesh dimensions), and each
     stage saves DCP shards to its own subdirectory to avoid file collisions.
+    The manager records each rank's data-parallel coordinates, the partition
+    ``build_data_pipeline`` reads, with the per-rank loader/RNG state.
     """
     ckpt_pg = None
     ckpt_pp_rank = None
@@ -192,8 +198,38 @@ def build_checkpoint_manager(
         optimizer,
         process_group=ckpt_pg,
         pp_rank=ckpt_pp_rank,
+        dp_info=get_dp_info(device_mesh),
         weight_decay_scope=config.optimizer.weight_decay_scope,
+        lr_multipliers=config.optimizer.lr_multipliers,
+        module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
     )
+
+
+def _mot_text_warm_start(
+    vlm_cfg: VLMConfig | None,
+    model: torch.nn.Module,
+    agree: Callable[[BaseException | None, str], None],
+) -> None:
+    """Copy the dense block weights of ``mot_warm_start_path`` into a MoT model.
+
+    ``agree`` is the checkpoint manager's rank agreement: every rank reports
+    whether it read the source before any rank enters the copy's DTensor
+    collectives, so a rank that cannot read the file fails the run on every rank
+    instead of leaving the others waiting until the process-group timeout.
+    """
+    if not isinstance(vlm_cfg, MoTConfig) or not vlm_cfg.mot_warm_start_from_text:
+        return
+    source = {}
+    error = None
+    try:
+        source = torch.load(vlm_cfg.mot_warm_start_path, map_location="cpu", weights_only=True)
+        if isinstance(source, dict) and "model" in source:
+            source = source["model"]
+    except Exception as exc:
+        error = exc
+    agree(error, f"MoT warm-start: reading {vlm_cfg.mot_warm_start_path}")
+    mot_warm_start_from_text_stack(inner_transformer(model), source)
+    logger.info(f"MoT warm-start: copied dense block weights from {vlm_cfg.mot_warm_start_path}")
 
 
 def _unused_load_path_message(config: JobConfig, resume_path: Path) -> str:
@@ -297,8 +333,9 @@ def restore_checkpoint(
     """Auto-resume from ``latest`` (or ``checkpoint.load_path``).
 
     Returns ``(step, tokens_seen)`` — ``(0, 0)`` when there is nothing to
-    resume from. Also restores the metrics run ids, runs the MoT warm-start
-    hook, and re-applies the effective freeze at the resumed step.
+    resume from. Also restores the metrics run ids, runs the MoT text warm
+    start when no checkpoint supplied the model weights and the run starts at
+    step 0, and re-applies the effective freeze at the resumed step.
 
     A checkpoint in ``checkpoint.dir`` takes precedence over ``checkpoint.load_path``, so a
     requeued warm start resumes rather than starting over; rank 0 then warns that
@@ -321,7 +358,9 @@ def restore_checkpoint(
         resume_path = Path(chosen[0]) if chosen[0] else None
     else:
         resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
+    vlm_cfg = config.vlm
     if not resume_path and not config.checkpoint.load_path:
+        _mot_text_warm_start(vlm_cfg, model, ckpt_mgr.agree)
         return 0, 0
     rank_zero = not dist.is_initialized() or dist.get_rank() == 0
     if (
@@ -332,21 +371,22 @@ def restore_checkpoint(
     ):
         logger.warning(_unused_load_path_message(config, resume_path))
 
-    vlm_cfg = config.vlm
+    warm_start_exclude = (
+        (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
+    )
+    weights_only = is_weights_only(warm_start_exclude)
     vlm_freeze_expected = None
-    if config.is_vlm:
+    if config.is_vlm and not weights_only:
         assert vlm_cfg is not None
         probe_step = ckpt_mgr.peek_saved_step(str(resume_path) if resume_path else None) or 0
         vlm_freeze_expected = freeze_meta_at_step(probe_step, vlm_cfg)
 
-    warm_start_exclude = (
-        (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
-    )
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
         scheduler=scheduler,
         exclude_keys=warm_start_exclude,
         vlm_freeze_expected=vlm_freeze_expected,
+        exact_resume=resume_path is not None,
     )
     if resume_path is not None:
         if ckpt_extra_loaded.get("wandb_run_id"):
@@ -356,14 +396,8 @@ def restore_checkpoint(
     elif rank_zero:
         _tag_warm_start_run(config, ckpt_extra_loaded)
 
-    if isinstance(vlm_cfg, MoTConfig) and vlm_cfg.mot_warm_start_from_text and step == 0:
-        source = torch.load(vlm_cfg.mot_warm_start_path, map_location="cpu", weights_only=True)
-        if isinstance(source, dict) and "model" in source:
-            source = source["model"]
-        mot_warm_start_from_text_stack(inner_transformer(model), source)
-        logger.info(
-            f"MoT warm-start: copied dense block weights from {vlm_cfg.mot_warm_start_path}"
-        )
+    if warm_start_exclude is not None and "model" in warm_start_exclude:
+        _mot_text_warm_start(vlm_cfg, model, ckpt_mgr.agree)
 
     if vlm_cfg is not None and vlm_cfg.freeze_schedule:
         valid_modules = set(vlm_cfg.module_patterns.keys())
@@ -397,6 +431,7 @@ def run_training(
         nan_detector = NaNDetector(action="warn", max_consecutive=10)
 
         loss_fn = build_loss_fn(config.train)
+        use_dynamic_flex_shapes(config.is_vlm and config.data.pack_sequences)
         model, pipeline = build_model(config, runtime, loss_fn)
         amp_dtype = autocast_dtype(model, config.train.master_dtype, config.train.param_dtype)
         if amp_dtype is not None:
@@ -405,7 +440,11 @@ def run_training(
                 f"forward passes run under torch.autocast({amp_dtype})"
             )
 
-        optimizer = build_optimizer(model, config.optimizer)
+        optimizer = build_optimizer(
+            model,
+            config.optimizer,
+            module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
+        )
         scheduler = build_scheduler(optimizer, config.scheduler, max_steps=config.train.max_steps)
 
         ckpt_mgr = build_checkpoint_manager(config, runtime, model, optimizer, pipeline)
@@ -418,7 +457,10 @@ def run_training(
 
         prof = build_profiler(config.profiling, rank=runtime.rank)
 
-        data = build_data_pipeline(config, runtime)
+        tokens_per_image = (
+            packed_tokens_per_image(model) if config.is_vlm and config.data.pack_sequences else None
+        )
+        data = build_data_pipeline(config, runtime, tokens_per_image=tokens_per_image)
         if data.dataloader is not None:
             ckpt_mgr.apply_dataloader_state(data.dataloader)
 
@@ -449,6 +491,7 @@ def run_training(
         run_training_loop(session, step=step, tokens_seen=tokens_seen)
         finished = True
     finally:
+        use_dynamic_flex_shapes(False)
         if tracker is not None:
             tracker.close()
         if finished:

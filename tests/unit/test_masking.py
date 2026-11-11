@@ -946,3 +946,19 @@ class TestMoMaGetsTheSharedMask:
         assert len(seen) == len(model.layers)
         assert seen[0] is not None
         assert all(mask is seen[0] for mask in seen)
+
+
+def test_dynamic_flex_shapes_toggle_swaps_and_restores_the_compiled_helpers():
+    from kempnerforge.model import masking
+
+    static = masking.flex_attention_fn(True)
+    try:
+        masking.use_dynamic_flex_shapes(True)
+        assert masking.flex_attention_fn(True) is masking._FLEX_DYNAMIC
+        assert masking._CREATE_BLOCK_MASK_COMPILED is masking._CREATE_BLOCK_MASK_DYNAMIC
+        masking.use_dynamic_flex_shapes(True)
+        assert masking.flex_attention_fn(True) is masking._FLEX_DYNAMIC
+    finally:
+        masking.use_dynamic_flex_shapes(False)
+    assert masking.flex_attention_fn(True) is static
+    assert masking._CREATE_BLOCK_MASK_COMPILED is masking._CREATE_BLOCK_MASK_STATIC
