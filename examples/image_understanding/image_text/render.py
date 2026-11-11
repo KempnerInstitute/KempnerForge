@@ -178,13 +178,15 @@ class ChatRenderer:
         encoded = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
         full = encoded["input_ids"]
         cut = len(full) > self.max_text_len
-        ids = full[: self.max_text_len - 1] + [self._end_id] if cut else full
+        kept = full[: self.max_text_len - 1] if cut else full
+        ends_already = cut and kept[-1] == self._end_id
+        ids = kept if ends_already or not cut else kept + [self._end_id]
         if self.answer_only:
             trained = [
                 any(s < end and e > start for start, end in spans)
-                for s, e in encoded["offset_mapping"][: self.max_text_len - cut]
+                for s, e in encoded["offset_mapping"][: len(kept)]
             ]
-            if cut:
+            if len(ids) > len(kept):
                 trained.append(trained[-1])
         else:
             trained = [True] * len(ids)

@@ -54,7 +54,10 @@ version.
 
 During generation, `Transformer.forward` slices `cos`/`sin` starting at
 `kv_caches[0].seq_len` so incremental tokens get the correct absolute
-positions.
+positions. A caller may instead give the positions of the tokens being
+appended (`position_ids`, by argument or on the `ModalityContext`) or the
+rotation itself (`modality.rope_cos`/`rope_sin`, built from the same
+tables), at prefill and at every decode step alike.
 
 ## Attention
 
@@ -91,7 +94,7 @@ After Q/K/V are computed, KV heads are expanded to `n_heads` via
 When `qk_norm=True`, per-head `RMSNorm(head_dim, eps=norm_eps)` is applied to Q and K
 before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
 
-### Three attention paths
+### Attention paths
 
 1. **Masked** (packed `doc_ids`, visibility groups or a key padding mask passed
    to the model): `kempnerforge.model.masking.build_attention_mask` combines
@@ -99,14 +102,20 @@ before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
    mask, built once per forward at the Transformer or pipeline-stage boundary in
    the form the configured backend consumes (a dense boolean mask for SDPA, a
    `BlockMask` for flex). Every block receives it as `attn_mask`.
-2. **Standard causal** (training and prefill, no mask inputs): SDPA with
-   `is_causal=True`.
+2. **Standard causal** (training and prefill into an empty cache, no mask
+   inputs): SDPA with `is_causal=True`.
 3. **Single-token decode** (`seq_len == 1` with a KV cache): no mask, so the
    query attends to all cached positions. `is_causal=True` here would
    incorrectly restrict attention to only the first key. Mask inputs are
-   refused together with a KV cache.
+   refused together with a KV cache, whether passed as arguments or carried
+   on the ``ModalityContext``.
+4. **Several tokens appended to a filled cache** (`seq_len > 1` with cached
+   keys): SDPA with `torch.nn.attention.bias.causal_lower_right`, so each new
+   token attends to every cached key and to the new keys up to its own
+   position. `is_causal=True` would align the triangle to the first key
+   instead.
 
-A fourth, slower path fires only when `capture_attention_weights=True`:
+A further, slower path fires only when `capture_attention_weights=True`:
 `_attention_with_weights` computes `softmax(Q·Kᵀ / √d)` manually so
 attention weights can be extracted for interpretability. Don't enable it
 for training runs.
@@ -129,7 +138,9 @@ silent-incorrectness risk. Keep them module-level.
 ### SDPA backend
 
 `sdpa_backend` (default `"auto"`) selects flash / mem-efficient / cudnn /
-math via a context manager. `"auto"` lets PyTorch pick.
+math via a context manager. `"auto"` lets PyTorch pick. Cached multi-token
+appends use `causal_lower_right` without a dense mask or kernel fallback,
+so a pinned flash backend stays enabled.
 
 ## MLP
 

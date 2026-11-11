@@ -136,6 +136,18 @@ class TestChatRenderer:
         assert sample["labels"][22] == end_id and sample["labels"][23] == -100
         assert _trained_text(tokenizer, sample).endswith("word<|im_end|>")
 
+    def test_a_cut_after_a_turn_end_adds_no_second_one(self, tokenizer: Any) -> None:
+        renderer = _renderer(tokenizer)
+        ids = renderer.token_ids(_conversation(), ["A1.", "A2."])
+        end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        first_end = ids.index(end_id, ids.index(end_id) + 1) + 1
+        sample = _renderer(tokenizer, max_text_len=first_end + 1).render(
+            _conversation(), ["A1.", "A2."]
+        )
+        assert sample["input_ids"].tolist()[:first_end] == ids[:first_end]
+        assert sample["input_ids"][first_end] == renderer.pad_id
+        assert _trained_text(tokenizer, sample) == "A1.<|im_end|>"
+
     @pytest.mark.parametrize("max_text_len", [12, 16])
     def test_a_reply_cut_away_by_the_budget_is_refused(
         self, tokenizer: Any, max_text_len: int
