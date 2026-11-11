@@ -20,7 +20,9 @@ from kempnerforge.data.vlm_dataset import (
     _tokenize_and_mask,
     check_prompt_fits,
     frames_to_clip_tensor,
+    image_to_views,
     pil_to_tensor,
+    tile_image,
 )
 
 
@@ -55,6 +57,80 @@ class TestPILToTensor:
     def test_non_pil_raises(self):
         with pytest.raises(TypeError, match="Expected a PIL.Image"):
             pil_to_tensor(torch.randn(3, 16, 16), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+
+
+def _quadrant_image(size: int = 64) -> Image.Image:
+    """An image whose four quadrants are solid red, green, blue and white."""
+    img = Image.new("RGB", (size, size))
+    half = size // 2
+    corners = [(0, 0), (half, 0), (0, half), (half, half)]
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)]
+    for (left, top), color in zip(corners, colors, strict=True):
+        img.paste(color, (left, top, left + half, top + half))
+    return img
+
+
+class TestTileImage:
+    def test_global_view_then_crops_in_raster_order(self):
+        img = _quadrant_image(64)
+        views = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2)
+        assert views.shape == (5, 3, 16, 16)
+        assert torch.equal(views[0], pil_to_tensor(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD))
+        expected = [(1.0, -1.0, -1.0), (-1.0, 1.0, -1.0), (-1.0, -1.0, 1.0), (1.0, 1.0, 1.0)]
+        for view, color in zip(views[1:], expected, strict=True):
+            interior = view[:, 2:-2, 2:-2].mean(dim=(1, 2))
+            assert torch.allclose(interior, torch.tensor(color), atol=1e-6)
+
+    def test_crops_cover_the_canvas_exactly(self):
+        img = Image.effect_noise((48, 48), 64).convert("RGB")
+        views = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=3)
+        assert views.shape == (10, 3, 16, 16)
+        rows = [torch.cat(list(views[1 + 3 * r : 4 + 3 * r]), dim=2) for r in range(3)]
+        stitched = torch.cat(rows, dim=1)
+        assert torch.equal(stitched, pil_to_tensor(img, 48, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD))
+
+    def test_without_the_global_view(self):
+        img = _quadrant_image(64)
+        with_global = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2)
+        crops = tile_image(
+            img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2, tile_global=False
+        )
+        assert crops.shape == (4, 3, 16, 16)
+        assert torch.equal(crops, with_global[1:])
+
+    def test_grayscale_promoted_to_rgb(self):
+        views = tile_image(
+            Image.new("L", (40, 40), color=128),
+            8,
+            DEFAULT_IMAGE_MEAN,
+            DEFAULT_IMAGE_STD,
+            tile_grid=2,
+        )
+        assert views.shape == (5, 3, 8, 8)
+        assert views.dtype == torch.float32
+
+    def test_non_pil_raises(self):
+        with pytest.raises(TypeError, match="Expected a PIL.Image"):
+            tile_image(
+                torch.randn(3, 16, 16), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2
+            )
+
+    @pytest.mark.parametrize("grid", [0, 1])
+    def test_grid_below_two_raises(self, grid):
+        with pytest.raises(ValueError, match="grid must be >= 2"):
+            tile_image(_make_image(), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=grid)
+
+    def test_image_to_views_selects_by_grid(self):
+        img = _quadrant_image(64)
+        one = image_to_views(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        assert torch.equal(one, pil_to_tensor(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD))
+        tiled = image_to_views(
+            img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2, tile_global=False
+        )
+        crops = tile_image(
+            img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2, tile_global=False
+        )
+        assert torch.equal(tiled, crops)
 
 
 class _MockTokenizer:
@@ -598,6 +674,13 @@ class TestVLMCollator:
         batch = collator([self._sample(3, max_text_len=8) for _ in range(4)])
         assert batch["pixel_values"].shape == (4, 3, 32, 32)
 
+    def test_tiled_views_stack_like_frames(self):
+        collator = VLMCollator(pad_id=0, max_text_len=8)
+        samples = [self._sample(3, max_text_len=8) for _ in range(4)]
+        for sample in samples:
+            sample["pixel_values"] = torch.randn(5, 3, 32, 32)
+        assert collator(samples)["pixel_values"].shape == (4, 5, 3, 32, 32)
+
     def test_empty_batch_raises(self):
         collator = VLMCollator(pad_id=0, max_text_len=8)
         with pytest.raises(ValueError, match="empty batch"):
@@ -644,6 +727,8 @@ class TestHuggingFaceVLMDataset:
                 self._image_size = 32
                 self._image_mean = DEFAULT_IMAGE_MEAN
                 self._image_std = DEFAULT_IMAGE_STD
+                self._tile_grid = 0
+                self._tile_global = True
                 self._max_text_len = max_text_len
                 self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
@@ -654,6 +739,32 @@ class TestHuggingFaceVLMDataset:
         assert item["input_ids"].shape == (16,)
         assert item["labels"].shape == (16,)
         assert item["input_ids"].dtype == torch.long
+
+    @pytest.mark.parametrize(("tile_global", "views"), [(True, 5), (False, 4)])
+    def test_tiling_yields_one_view_per_crop(self, tiny_hf_dataset, tile_global, views):
+        ds = HuggingFaceVLMDataset(
+            dataset_name=tiny_hf_dataset,
+            split="train",
+            image_field="image",
+            text_field="caption",
+            tokenizer_path="gpt2",
+            max_text_len=8,
+            image_size=16,
+            tile_grid=2,
+            tile_global=tile_global,
+        )
+        item = ds[1]
+        assert item["pixel_values"].shape == (views, 3, 16, 16)
+        expected = tile_image(
+            ds._ds[1]["image"],
+            16,
+            DEFAULT_IMAGE_MEAN,
+            DEFAULT_IMAGE_STD,
+            tile_grid=2,
+            tile_global=tile_global,
+        )
+        assert torch.equal(item["pixel_values"], expected)
+        assert item["input_ids"].shape == (8,)
 
     def test_init_load_from_disk_single_split(self, tiny_hf_dataset):
         """Real ``__init__`` on a dataset saved by ``save_to_disk`` (single
@@ -766,6 +877,8 @@ class TestHuggingFaceVLMDataset:
                 self._image_size = 32
                 self._image_mean = DEFAULT_IMAGE_MEAN
                 self._image_std = DEFAULT_IMAGE_STD
+                self._tile_grid = 0
+                self._tile_global = True
                 self._max_text_len = max_text_len
                 self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
@@ -818,6 +931,8 @@ class TestHuggingFaceVLMDataset:
                 self._image_size = 16
                 self._image_mean = DEFAULT_IMAGE_MEAN
                 self._image_std = DEFAULT_IMAGE_STD
+                self._tile_grid = 0
+                self._tile_global = True
                 self._max_text_len = max_text_len
                 self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
