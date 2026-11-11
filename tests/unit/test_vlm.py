@@ -695,6 +695,7 @@ class TestMultiImageDocuments:
             batch["input_ids"],
             batch["labels"],
             doc_ids=batch["doc_ids"],
+            position_ids=batch["position_ids"],
             image_rows=batch["image_rows"],
             image_starts=batch["image_starts"],
             image_tokens=int(batch["image_tokens"]),
