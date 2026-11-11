@@ -41,6 +41,7 @@ from kempnerforge.checkpoint.state import build_train_state, restore_train_state
 from kempnerforge.config.checkpoint import is_weights_only, validate_exclude_keys
 from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES, checked_lr_multipliers
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
+from kempnerforge.data.dataloader import DataPositionError, StreamingDataLoader
 from kempnerforge.distributed.utils import agree_across_ranks
 
 logger = logging.getLogger(__name__)
@@ -742,6 +743,8 @@ class CheckpointManager:
             raise ValueError(f"lr_multipliers needs module_patterns for {missing}")
         self._lr_module_patterns = {module: sorted(set(patterns[module])) for module in listed}
         self._pending_dataloader_state: dict[str, Any] | None = None
+        self._pending_dataloader_warm_start = False
+        self._pending_dataloader_missing = False
         self._pending_finalize: tuple[int, Path] | None = None
         self._inflight_dir: Path | None = None
         self._tracking_source: TrackingSource | None = None
@@ -1125,6 +1128,7 @@ class CheckpointManager:
         dataloader: Any | None = None,
         exclude_keys: list[str] | None = None,
         vlm_freeze_expected: list[dict[str, Any]] | None = None,
+        warm_start: bool = False,
     ) -> tuple[int, int, dict[str, Any]]:
         """Load a checkpoint and restore all state.
 
@@ -1147,6 +1151,12 @@ class CheckpointManager:
                 a mismatch raises ``ValueError`` unless the checkpoint
                 config has ``ignore_freeze_mismatch=True``, in which case
                 the load proceeds with a warning.
+            warm_start: True when this load starts a new run from another
+                run's checkpoint (``checkpoint.load_path``) rather than
+                resuming this one. A data position that cannot carry over to
+                this run's loader, passed here as ``dataloader`` or later to
+                ``apply_dataloader_state``, then starts the data at its first
+                sample with a warning, instead of raising ``DataPositionError``.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
@@ -1353,6 +1363,13 @@ class CheckpointManager:
                 self._check_lr_multipliers(self._broadcast_metadata(ckpt_dir), ckpt_dir)
             if dataloader is None and "dataloader" in train_state:
                 self._pending_dataloader_state = train_state["dataloader"]
+                self._pending_dataloader_warm_start = warm_start
+            self._pending_dataloader_missing = "dataloader" not in train_state
+            if dataloader is not None:
+                if "dataloader" in train_state:
+                    self._pending_dataloader_state = train_state.pop("dataloader")
+                    self._pending_dataloader_warm_start = warm_start
+                self.apply_dataloader_state(dataloader)
             step, tokens_seen, extra = restore_train_state(
                 train_state,
                 scheduler=scheduler,
@@ -1557,15 +1574,37 @@ class CheckpointManager:
         This method applies the stashed state once the loader exists.
 
         No-op if no state is pending, or if the loader does not support
-        ``load_state_dict`` (e.g., plain torch DataLoader for HF streaming).
+        ``load_state_dict`` (e.g., a plain torch DataLoader). A position the
+        loader cannot carry over raises ``DataPositionError`` on a resume; after
+        a ``warm_start`` load the data starts at its first sample instead, with
+        a warning that names the reason. A restored checkpoint that holds no
+        data position, such as a streaming checkpoint saved before streaming
+        positions were recorded, leaves a stateful loader at its first sample,
+        with a warning.
         """
+        missing, self._pending_dataloader_missing = self._pending_dataloader_missing, False
         if self._pending_dataloader_state is None:
+            if missing and dataloader is not None and hasattr(dataloader, "load_state_dict"):
+                start = (
+                    "the stream restarts at its first document"
+                    if isinstance(dataloader, StreamingDataLoader)
+                    else "the data starts at its first sample"
+                )
+                logger.warning(f"The restored checkpoint holds no data position, so {start}")
             return
+        state, self._pending_dataloader_state = self._pending_dataloader_state, None
         if dataloader is None or not hasattr(dataloader, "load_state_dict"):
-            self._pending_dataloader_state = None
             return
-        dataloader.load_state_dict(self._pending_dataloader_state)
-        self._pending_dataloader_state = None
+        try:
+            dataloader.load_state_dict(state)
+        except DataPositionError as e:
+            if not self._pending_dataloader_warm_start:
+                raise
+            logger.warning(
+                f"The warm start's data position does not carry over to this run, so the "
+                f"data starts at its first sample: {e}"
+            )
+            return
         logger.info("Applied stashed dataloader state")
 
     def _newest_complete_checkpoint(self) -> Path | None:

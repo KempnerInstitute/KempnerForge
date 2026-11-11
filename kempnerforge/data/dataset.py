@@ -15,6 +15,7 @@ from __future__ import annotations
 import bisect
 import contextlib
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -426,11 +427,14 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
     For very large datasets that don't fit in memory. Streams documents,
     tokenizes on the fly, and packs into fixed-length sequences.
 
-    Handles distributed training by sharding the document stream across ranks
-    (each rank processes every world_size-th document).
+    Handles distributed training by splitting the shuffled stream across
+    data-parallel ranks with ``datasets.distributed.split_dataset_by_node``:
+    when the source's shard count divides by ``world_size`` each rank reads
+    only its own shards, and otherwise each rank keeps every
+    ``world_size``-th document of the shared order.
 
-    Use directly with ``torch.utils.data.DataLoader`` (no sampler needed —
-    IterableDataset handles its own distribution).
+    Training wraps it in ``StreamingDataLoader``, which needs no sampler and
+    restores the position on resume by replaying the stream.
 
     Args:
         dataset_name: HuggingFace dataset name (e.g., "allenai/c4").
@@ -478,6 +482,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         self._epoch = 0
         self._rank_docs_consumed = 0
         self._skip_rank_docs = 0
+        self._source_identity: dict | None = None
 
         logger.info(
             f"StreamingHuggingFaceDataset: {dataset_name} ({split}), "
@@ -492,9 +497,77 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path)
             self._eos_id = self._tokenizer.eos_token_id or 0
 
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch whose shuffle the next pass reads."""
+        self._epoch = epoch
+
+    def stream_identity(self) -> dict:
+        """The settings that decide the order of this rank's stream.
+
+        A position counted in batches replays to the same samples only while
+        these, the batch size and the loader's worker count stay the same. The
+        rank is not included: every rank replays its own stream by the same count.
+        ``source`` describes the data rather than where it is stored: see
+        ``_source``.
+        """
+        return {
+            "source": self._source(),
+            "data_parallel_size": self.world_size,
+            "seed": self.seed,
+            "shuffle_buffer_size": self.shuffle_buffer_size,
+            "seq_len": self.seq_len,
+            "tokenizer": self.tokenizer_path,
+            "pack_sequences": self._packing_enabled,
+        }
+
+    def _source(self) -> dict:
+        """What the stream reads, worked out once per process.
+
+        Local data is described by the data files ``datasets`` resolves for the
+        split, by name relative to the data directory and by size, so the same
+        files moved to another directory describe the same source, while an added,
+        removed, renamed or resized file does not. A Hub dataset is described by
+        its name and config as given, so a new revision of it with the same shard
+        count goes unnoticed. Both also record the split, the text field and the
+        shard count. File contents are not read: a file rewritten at the same size
+        goes unnoticed too.
+        """
+        if self._source_identity is None:
+            from datasets import IterableDataset, load_dataset, load_dataset_builder
+
+            stream = load_dataset(
+                self.dataset_name, self.dataset_config, split=self.split, streaming=True
+            )
+            source: dict = {
+                "config": self.dataset_config,
+                "split": self.split,
+                "text_field": self.text_field,
+                "n_shards": stream.n_shards if isinstance(stream, IterableDataset) else None,
+            }
+            root = Path(self.dataset_name)
+            if root.is_dir():
+                data_files = load_dataset_builder(
+                    self.dataset_name, self.dataset_config
+                ).config.data_files
+                files = data_files[self.split] if data_files else []
+                base = root.resolve()
+                source["files"] = sorted(
+                    (os.path.relpath(Path(f).resolve(), base), Path(f).stat().st_size)
+                    for f in files
+                )
+            else:
+                source["name"] = self.dataset_name
+            self._source_identity = source
+        return self._source_identity
+
     def _load_stream(self):
-        """Load a shuffled HuggingFace streaming dataset."""
+        """Load this rank's part of the shuffled HuggingFace stream.
+
+        Every rank shuffles with the same seed before the split, so the ranks
+        divide one shared order between them.
+        """
         from datasets import load_dataset
+        from datasets.distributed import split_dataset_by_node
 
         ds = load_dataset(
             self.dataset_name,
@@ -503,6 +576,8 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             streaming=True,
         )
         ds = ds.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer_size)  # type: ignore[reportCallIssue]
+        if self.world_size > 1:
+            ds = split_dataset_by_node(ds, rank=self.rank, world_size=self.world_size)
         return ds
 
     def __iter__(self):
@@ -512,30 +587,22 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
 
         stream = self._load_stream()
 
-        doc_idx = 0
         rank_docs = 0
 
         for example in stream:
-            if doc_idx % self.world_size != self.rank:
-                doc_idx += 1
-                continue
-
             if rank_docs < self._skip_rank_docs:
                 rank_docs += 1
-                doc_idx += 1
                 continue
 
             text = example[self.text_field]
             tokens = self._tokenizer.encode(text, add_special_tokens=False)  # type: ignore[reportOptionalMemberAccess]
             if not tokens:
                 rank_docs += 1
-                doc_idx += 1
                 continue
 
             buffer.extend(tokens)
             buffer.append(self._eos_id)  # type: ignore[reportArgumentType]
             rank_docs += 1
-            doc_idx += 1
             self._rank_docs_consumed = rank_docs
 
             while len(buffer) >= chunk_size:

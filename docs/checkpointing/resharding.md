@@ -99,7 +99,21 @@ uv run torchrun --nproc_per_node=64 scripts/train.py configs/train/7b.toml \
 
 Auto-resume follows the `latest` symlink, `CheckpointManager.load`
 calls `dcp.load`, DCP reshards the 16-way sharded state into 64-way,
-training continues from step 5000. No manual intervention.
+and training continues from step 5000.
+
+The data continues from the same sample too. The loader's checkpoint
+state counts the samples of the epoch's order that all data-parallel
+ranks consumed, and each of the 64 ranks resumes at its first sample past
+that count, so no sample is skipped or read twice (see
+[Stateful dataloader § Resuming on another data-parallel size](../data/stateful-dataloader.md#resuming-on-another-data-parallel-size)).
+Three data positions cannot carry over to another data-parallel size, and
+the resume stops with an error that names both sizes: a weighted mixture
+(`data.datasets`), a streamed dataset (`data.hf_streaming`), and a
+checkpoint saved before the loader recorded its batch size. Resume those
+on the saved data-parallel size, the last one also with its saved batch
+size; the checkpoints saved after that resume carry over to any size. A
+`checkpoint.load_path` warm start from such a checkpoint does not stop: it
+starts the data at its first sample, with a warning.
 
 The one thing that changes: effective batch size — 4× the DP ranks
 means 4× the batch per step. Adjust `grad_accum_steps` downward if

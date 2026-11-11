@@ -2708,6 +2708,7 @@ def _stub_loaders(monkeypatch, seen: dict):
         return _f
 
     monkeypatch.setattr(dp, "StatefulDataLoader", mk("stateful"))
+    monkeypatch.setattr(dp, "StreamingDataLoader", mk("streaming"))
     monkeypatch.setattr(dp, "TorchDataLoader", mk("torch_loader"))
     monkeypatch.setattr(dp, "DistributedSampler", mk("sampler"))
     monkeypatch.setattr(dp, "MixtureSampler", mk("mixture_sampler"))
@@ -2729,6 +2730,7 @@ class TestHfSourceBuilder:
         assert seen["sampler"]["kwargs"]["shuffle"] is True
 
     def test_streaming_path_shards_by_dp_rank_and_skips_the_sampler(self, monkeypatch):
+        """The stream is split by data-parallel rank and wrapped in the resumable loader."""
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
         monkeypatch.setattr(dp, "get_dp_info", lambda _m: (2, 4))
@@ -2743,7 +2745,8 @@ class TestHfSourceBuilder:
         )
         data = dp.build_data_pipeline(config, _runtime())
 
-        assert data.dataloader == "torch_loader_OBJ"
+        assert data.dataloader == "streaming_OBJ"
+        assert seen["streaming"]["kwargs"]["batch_size"] == config.train.batch_size
         assert "sampler" not in seen
         assert (made["rank"], made["world_size"]) == (2, 4)
 

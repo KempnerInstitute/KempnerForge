@@ -12,6 +12,10 @@ Both expose `set_epoch(epoch)`, `set_skip(samples)`, and `state_dict()`
 / `load_state_dict()` — the contract that `StatefulDataLoader`
 assumes.
 
+`DistributedSampler` also has `set_position(position)`, which resumes at
+a position in the epoch's global order, the same on any number of ranks
+(see [Resume position](#resume-position)).
+
 ## `DistributedSampler`
 
 Indices are partitioned across DP ranks with a stride pattern, not a
@@ -77,10 +81,25 @@ if self._skip > 0:
 ```
 
 `set_skip(k)` tells the sampler "drop the first `k` samples from
-this epoch's index list". `StatefulDataLoader` computes
-`k = batches_yielded * batch_size` on resume and passes it in. The
-reset after application is important: on the *next* epoch, no skip
-is applied, and iteration starts from index 0.
+this epoch's index list". On resume `StatefulDataLoader` passes a
+`MixtureSampler` this rank's consumed sample count this way; with a
+`DistributedSampler` it calls `set_position` instead (see
+[Resume position](#resume-position)). The reset after application is
+important: on the *next* epoch, no skip is applied, and iteration
+starts from index 0.
+
+### Resume position
+
+`set_skip(k)` counts this rank's samples, so it is right only on the
+data-parallel size that saved it. `set_position(G)` counts the samples of
+the epoch's global order that all ranks consumed together, which means
+the same on any `num_replicas`. With `G = q * num_replicas + m`, rank `r`
+skips its `q + (1 if r < m else 0)` samples that come before position `G`,
+and every rank yields `samples_after(G) = num_samples - q - (1 if m else 0)`
+samples, so no rank runs out of batches early. Like the skip, the position
+applies to the next pass only. `StatefulDataLoader` uses it for every
+resume with a `DistributedSampler`; see
+[Stateful dataloader § Resuming on another data-parallel size](stateful-dataloader.md#resuming-on-another-data-parallel-size).
 
 ## `MixtureSampler`
 
@@ -120,7 +139,10 @@ unchanged — weight changes don't re-seed.
 Same as `DistributedSampler`: `set_skip(k)` drops the first `k`
 entries of the assembled (final, shuffled) index list. Resumes are
 robust if the weights and `num_replicas` match between save and load;
-a phase change between save and load would shift the index list.
+a phase change between save and load would shift the index list. Each
+rank's list depends on `num_replicas`, so there is no global position to
+carry over: `StatefulDataLoader` refuses to resume a mixture position on
+another data-parallel size.
 
 ## What's in `state_dict`
 
@@ -135,11 +157,14 @@ Both samplers return the same keys:
 }
 ```
 
-`load_state_dict` restores **only** `epoch`. The other fields are
-recorded for diagnostic purposes — `num_replicas` and `rank` are
-local to this process and must be re-derived from the current world
-size, not transplanted from the save. `seed` is already in
-`TrainConfig` and doesn't change across resume.
+`load_state_dict` restores **only** `epoch`. `num_replicas` and `rank`
+are local to this process and are re-derived from the current world
+size, not transplanted from the save; `StatefulDataLoader` compares the
+saved `num_replicas` with the current one to decide whether a per-rank
+position still applies. `seed` comes from `TrainConfig`;
+`StatefulDataLoader` logs a warning when the saved seed or the dataset
+length differs from the run's, since its position counts samples of the
+saved order.
 
 ## Eval sampler
 

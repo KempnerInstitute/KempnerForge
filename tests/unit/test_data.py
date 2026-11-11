@@ -438,18 +438,67 @@ class TestStreamingHuggingFaceDataset:
         samples = list(ds)
         assert len(samples) == 1
 
-    def test_distributed_sharding(self):
-        """Each rank should get different documents."""
-        docs = [{"text": f"doc{i}" * 10} for i in range(20)]
+    @staticmethod
+    def _read_as_rank(rank: int, world_size: int, n_shards: int) -> tuple[int, set[int]]:
+        """Stream ``n_shards`` local shards of 5 documents as ``rank`` of ``world_size``.
 
-        results = {}
-        for rank in range(2):
-            ds = self._make_mock_dataset(seq_len=4, rank=rank, world_size=2)
-            self._patch_stream(ds, docs)
-            results[rank] = list(ds)
+        Returns how many documents this rank read from the source and which
+        documents it yielded. Document ``i`` is the text ``str(i)`` and
+        tokenizes to ``[i, i, i]``, so with ``seq_len=3`` a sample is one document.
+        """
+        from unittest.mock import patch
 
-        assert len(results[0]) > 0
-        assert len(results[1]) > 0
+        from datasets import IterableDataset
+
+        from kempnerforge.data.dataset import StreamingHuggingFaceDataset
+
+        reads: list[int] = []
+
+        def source(shards):
+            for shard in shards:
+                for j in range(5):
+                    reads.append(shard * 5 + j)
+                    yield {"text": str(shard * 5 + j)}
+
+        class Tokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return [int(text)] * 3
+
+        stream = IterableDataset.from_generator(
+            source, gen_kwargs={"shards": list(range(n_shards))}
+        )
+        with patch("datasets.load_dataset", return_value=stream):
+            ds = StreamingHuggingFaceDataset(
+                "local",
+                "train",
+                "text",
+                3,
+                "tok",
+                rank=rank,
+                world_size=world_size,
+                shuffle_buffer_size=1,
+            )
+            ds._tokenizer, ds._eos_id = Tokenizer(), 0
+            docs = {int(sample["input_ids"][0]) for sample in ds}
+        return len(reads), docs
+
+    @pytest.mark.parametrize("n_shards", [4, 3])
+    def test_distributed_sharding(self, n_shards):
+        """Every document goes to exactly one rank, whether or not the shards divide evenly."""
+        parts = [self._read_as_rank(rank, 2, n_shards)[1] for rank in range(2)]
+        assert not parts[0] & parts[1], "a document went to both ranks"
+        assert parts[0] | parts[1] == set(range(n_shards * 5))
+
+    @pytest.mark.parametrize(
+        ("n_shards", "reads"), [(4, [10, 10]), (3, [15, 15])], ids=["divisible", "fallback"]
+    )
+    def test_each_rank_reads_only_its_shards(self, n_shards, reads):
+        """A rank reads its own shards alone when the shard count divides by the ranks.
+
+        Otherwise ``split_dataset_by_node`` falls back to every rank reading the whole
+        stream and keeping every ``world_size``-th document.
+        """
+        assert [self._read_as_rank(rank, 2, n_shards)[0] for rank in range(2)] == reads
 
     def test_empty_docs_skipped(self):
         ds = self._make_mock_dataset(seq_len=4)

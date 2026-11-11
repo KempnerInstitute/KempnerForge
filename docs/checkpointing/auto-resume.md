@@ -110,6 +110,16 @@ So two things can trigger a resume:
   for loading pretrained weights, fine-tuning from a specific
   checkpoint, or debugging.
 
+A warm start restores the saved data position where it carries over to
+the new run: a single pre-tokenized, eager Hugging Face or VLM dataset
+continues at the same sample on any data-parallel size. Where it cannot,
+as with a mixture or a streamed dataset on another data-parallel size, a
+switch of `data.hf_streaming`, a changed stream, or a checkpoint saved
+before the loader recorded its batch size on another data-parallel size,
+the warm start logs a warning that names the reason and starts the data
+at its first sample. A resume from `checkpoint.dir` raises
+`DataPositionError` in those cases instead.
+
 If both are set, `resume_path` wins (auto-resume takes precedence
 over the static config). This is deliberate: SLURM requeues should
 always pick up where they left off, not re-load the initial
