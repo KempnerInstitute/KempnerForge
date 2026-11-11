@@ -304,12 +304,14 @@ class EvaluationLauncher:
             return
         argv = self.settings.argv(step_dir, step)
         log_path = output / LAUNCH_LOG_FILE
-        output.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "ab") as log:
-            if not _claim(output, argv):
-                logger.info(f"Periodic evaluation skips step {step}: already started")
-                return
-            try:
+        claimed = False
+        try:
+            output.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "ab") as log:
+                claimed = _claim(output, argv)
+                if not claimed:
+                    logger.info(f"Periodic evaluation skips step {step}: already started")
+                    return
                 child = self._launch(
                     argv,
                     stdin=subprocess.DEVNULL,
@@ -318,10 +320,11 @@ class EvaluationLauncher:
                     env=child_environment(os.environ),
                     start_new_session=True,
                 )
-            except OSError as exc:
+        except OSError as exc:
+            if claimed:
                 (output / LAUNCHED_FILE).unlink(missing_ok=True)
-                logger.warning(f"Periodic evaluation could not launch step {step}: {exc}")
-                return
+            logger.warning(f"Periodic evaluation could not launch step {step}: {exc}")
+            return
         self._children.append((step, child, log_path))
         logger.info(f"Periodic evaluation launched step {step}: {shlex.join(argv)}")
 

@@ -619,13 +619,16 @@ def test_the_other_ranks_start_nothing(
     assert hook._worker is None and recorder.calls == []
 
 
-def test_an_unopenable_launch_log_claims_nothing(tmp_path: Path, run: Path) -> None:
+def test_an_unopenable_launch_log_claims_nothing_and_spares_the_next_step(
+    tmp_path: Path, run: Path, messages: list[str]
+) -> None:
     popen = Launcher()
     launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
+    save_step(run, 6)
     output = launcher.settings.step_output(5)
     (output / LAUNCH_LOG_FILE).mkdir(parents=True)
-    with pytest.raises(OSError):
-        launcher.saved(5, run)
-    assert popen.calls == []
+    launcher.scan(run)
+    assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_6"]
     assert not (output / LAUNCHED_FILE).exists()
+    assert "could not launch step 5" in text(messages)
