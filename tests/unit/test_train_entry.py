@@ -1251,6 +1251,31 @@ def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
 
 
 class TestRunTraining:
+    def test_the_optimizer_is_built_with_the_modules_a_stage_unfreezes(self, monkeypatch):
+        """The build froze the head and a stage unfreezes it, so run_training builds the
+        optimizer while the head requires grad, then leaves it frozen for the first step."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.freeze import apply_freeze_specs
+        from kempnerforge.training.loop import StepResult
+
+        config = _head_config(max_steps=1)
+        assert config.vlm is not None
+        model = TinyVlmModel()
+        apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+        _stub_entry(monkeypatch, model)
+        seen: list = []
+
+        def build_optimizer(m, _config, **_kwargs):
+            seen.append([p.requires_grad for p in m.proj.parameters()])
+            return torch.optim.SGD([p for p in m.parameters() if p.requires_grad], lr=0.05)
+
+        monkeypatch.setattr(entry, "build_optimizer", build_optimizer)
+        entry.run_training(
+            config, step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5, text_tokens=8)
+        )
+        assert seen == [[True, True]]
+        assert not any(p.requires_grad for p in model.proj.parameters())
+
     def test_packed_vlm_batches_train_through_run_training(self, monkeypatch):
         """run_training drives vlm_step over packed rows with a real wrapper."""
         import kempnerforge.training.entry as entry
@@ -3281,6 +3306,13 @@ class TinyVlmModel(nn.Module):
         return self.proj(self.embed(input_ids)), labels
 
 
+class TracedOnceVlmModel(TinyVlmModel):
+    """``TinyVlmModel`` without the frame-mask record, so a compiled forward is traced once."""
+
+    def forward(self, pixel_values, input_ids, labels, frame_mask=None):
+        return self.proj(self.embed(input_ids)), labels
+
+
 class TestVlmStep:
     def _batch(self, with_mask=False):
         b = {
@@ -3927,6 +3959,227 @@ class TestLoopPeriodicWork:
         run_training_loop(session)
         assert data.mixture_sampler.calls  # type: ignore[union-attr]
         assert phases.lr_scale == 0.5
+
+
+def _head_config(max_steps: int) -> JobConfig:
+    """A VLM config whose build freezes ``TinyVlmModel.proj``; a stage at step 2 unfreezes it."""
+    from kempnerforge.config.vlm import DEFAULT_MODULE_PATTERNS, FreezeSpec, FreezeStage
+
+    config = _vlm_config(
+        freeze=[FreezeSpec("head")],
+        freeze_schedule=(FreezeStage(start_step=2, specs=(FreezeSpec("head", False),)),),
+        module_patterns={**DEFAULT_MODULE_PATTERNS, "head": ["proj.*"]},
+    )
+    config.train.max_steps = max_steps
+    config.train.batch_size, config.train.seq_len = 2, 4
+    config.checkpoint.interval = 1000
+    config.optimizer.fused = False
+    return config
+
+
+def _built_with_a_frozen_head(
+    config: JobConfig, compiled: bool = False
+) -> tuple[Any, torch.optim.Optimizer]:
+    """Build the model, freeze it and compile it as the build does, and build the optimizer as
+    run_training does."""
+    import kempnerforge.training.entry as entry
+    from kempnerforge.training.freeze import apply_freeze_specs
+    from kempnerforge.training.optimizer import build_optimizer
+
+    assert config.vlm is not None
+    torch.manual_seed(0)
+    model: Any = TracedOnceVlmModel() if compiled else TinyVlmModel()
+    apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+    if compiled:
+        model = torch.compile(model, backend="aot_eager")
+    with entry._trainable_for_the_run(model, config):
+        optimizer = build_optimizer(model, config.optimizer)
+    return model, optimizer
+
+
+_VLM_BATCH = {
+    "pixel_values": torch.zeros(2, 3, 4, 4),
+    "input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
+    "labels": torch.tensor([[2, 3, 4, 5], [6, 7, 8, 9]]),
+}
+
+
+class TestUnfreezeAtAStage:
+    """A module the build froze trains once a FreezeStage unfreezes it."""
+
+    def _run(self, max_steps: int, compiled: bool = False) -> tuple[Any, list]:
+        config = _head_config(max_steps)
+        model, optimizer = _built_with_a_frozen_head(config, compiled)
+        initial = [p.detach().clone() for p in model.proj.parameters()]
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _s: 1.0)
+        session = make_session(
+            config,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            data=DataPipeline(dataloader=[_VLM_BATCH]),
+        )
+        session.step_fn = vlm_step
+        run_training_loop(session)
+        return model, initial
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    def test_the_module_is_untouched_until_the_stage(self, compiled):
+        model, initial = self._run(max_steps=2, compiled=compiled)
+        assert all(p.requires_grad for p in model.proj.parameters())
+        assert all(torch.equal(p, i) for p, i in zip(model.proj.parameters(), initial, strict=True))
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    def test_the_module_trains_after_the_stage(self, compiled):
+        model, initial = self._run(max_steps=3, compiled=compiled)
+        pairs = zip(model.proj.parameters(), initial, strict=True)
+        assert all(not torch.equal(p, i) for p, i in pairs)
+
+    def test_the_stage_refreshes_the_fsdp_dtypes_of_what_it_unfroze(self, monkeypatch):
+        import kempnerforge.training.loop as loop
+
+        refreshed: list = []
+        monkeypatch.setattr(loop, "refresh_fsdp_dtypes", lambda m, params: refreshed.append(params))
+        model, _ = self._run(max_steps=2)
+        assert [[id(p) for p in params] for params in refreshed] == [
+            [id(p) for p in model.proj.parameters()]
+        ]
+
+
+class TestResumePastAnUnfreezeStage:
+    """A resume keeps a module that a stage unfreezes in the optimizer, with its saved state."""
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    @pytest.mark.parametrize("saved_step", [1, 3])
+    def test_the_resumed_optimizer_holds_the_module_and_its_state(
+        self, monkeypatch, tmp_path, saved_step, compiled
+    ):
+        """The stage after step 2 unfreezes the head the build froze. Saved at step 3, the head
+        resumes trainable with the AdamW moments it was saved with; saved at step 1, it resumes
+        frozen, held by the optimizer with no state."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.training.loop import _apply_stage_specs
+
+        config = _head_config(max_steps=4)
+        config.checkpoint.dir = str(tmp_path / "ckpt")
+        assert config.vlm is not None
+        model, optimizer = _built_with_a_frozen_head(config, compiled)
+        loss_fn = torch.nn.functional.cross_entropy
+        for step in range(1, saved_step + 1):
+            logits, labels = model(None, _VLM_BATCH["input_ids"], _VLM_BATCH["labels"])
+            loss_fn(logits.reshape(-1, VOCAB), labels.reshape(-1)).backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            if step == 2:
+                stage = config.vlm.freeze_schedule[0]
+                _apply_stage_specs(model, stage.specs, config.vlm.module_patterns)
+        CheckpointManager(config.checkpoint, model, optimizer).save(
+            step=saved_step, extra=checkpoint_extra(config, saved_step, PhaseState())
+        )
+
+        resumed, resumed_optimizer = _built_with_a_frozen_head(config, compiled)
+        saved = Path(config.checkpoint.dir) / f"step_{saved_step}"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: saved)
+        manager = CheckpointManager(config.checkpoint, resumed, resumed_optimizer)
+        assert entry.restore_checkpoint(config, resumed, None, manager) == (saved_step, 0)
+
+        held = {id(p) for group in resumed_optimizer.param_groups for p in group["params"]}
+        for param, loaded in zip(model.proj.parameters(), resumed.proj.parameters(), strict=True):
+            assert id(loaded) in held
+            assert torch.equal(param, loaded)
+            assert loaded.requires_grad is (saved_step > 2)
+            if saved_step > 2:
+                for key in ("exp_avg", "exp_avg_sq"):
+                    saved_state = optimizer.state[param][key]
+                    assert torch.equal(resumed_optimizer.state[loaded][key], saved_state)
+            else:
+                assert not resumed_optimizer.state.get(loaded)
+
+
+class TestResumeACheckpointThatLeftTheModuleOut:
+    """A checkpoint whose optimizer did not hold the module a stage unfreezes resumes that
+    module with empty optimizer state and every other parameter with its saved state."""
+
+    @pytest.mark.parametrize(
+        ("saved_by", "saved_step"),
+        [("main", 1), ("main", 3), ("a_run_without_the_stage", 1)],
+    )
+    def test_the_module_resumes_without_state_and_trains_from_its_stage(
+        self, monkeypatch, tmp_path, saved_by, saved_step
+    ):
+        """main built its optimizer without the head the build froze, and so does a run with
+        no stage that unfreezes it. Resumed into a run whose stage after step 2 unfreezes the
+        head, the head is held with no state, the other parameters keep their saved moments,
+        and the head trains from its stage on. The run without the stage is read through
+        checkpoint.load_path into an empty checkpoint.dir."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.training.freeze import apply_freeze_specs
+        from kempnerforge.training.loop import _apply_stage_specs
+        from kempnerforge.training.optimizer import build_optimizer
+
+        config = _head_config(max_steps=4)
+        config.checkpoint.dir = str(tmp_path / "ckpt")
+        assert config.vlm is not None
+        stage = config.vlm.freeze_schedule[0]
+        saving_config = _head_config(max_steps=4)
+        saving_config.checkpoint.dir = config.checkpoint.dir
+        assert saving_config.vlm is not None
+        if saved_by == "main":
+            torch.manual_seed(0)
+            model = TinyVlmModel()
+            apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+            optimizer = build_optimizer(model, config.optimizer)
+        else:
+            saving_config.vlm.freeze_schedule = ()
+            model, optimizer = _built_with_a_frozen_head(saving_config)
+
+        def train_step(m: Any, opt: torch.optim.Optimizer) -> None:
+            logits, labels = m(None, _VLM_BATCH["input_ids"], _VLM_BATCH["labels"])
+            torch.nn.functional.cross_entropy(
+                logits.reshape(-1, VOCAB), labels.reshape(-1)
+            ).backward()
+            opt.step()
+            opt.zero_grad()
+
+        for step in range(1, saved_step + 1):
+            train_step(model, optimizer)
+            if step == 2:
+                _apply_stage_specs(model, stage.specs, config.vlm.module_patterns)
+        assert not any(optimizer.state.get(p) for p in model.proj.parameters())
+        CheckpointManager(saving_config.checkpoint, model, optimizer).save(
+            step=saved_step, extra=checkpoint_extra(saving_config, saved_step, PhaseState())
+        )
+
+        saved = Path(config.checkpoint.dir) / f"step_{saved_step}"
+        if saved_by == "main":
+            monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: saved)
+        else:
+            config.checkpoint.dir = str(tmp_path / "fresh")
+            config.checkpoint.load_path = str(saved)
+        resumed, resumed_optimizer = _built_with_a_frozen_head(config)
+        manager = CheckpointManager(config.checkpoint, resumed, resumed_optimizer)
+        assert entry.restore_checkpoint(config, resumed, None, manager) == (saved_step, 0)
+
+        held = {id(p) for group in resumed_optimizer.param_groups for p in group["params"]}
+        for p in resumed.proj.parameters():
+            assert id(p) in held and p.requires_grad is (saved_step > 2)
+            assert not resumed_optimizer.state.get(p)
+        pairs = zip(model.named_parameters(), resumed.parameters(), strict=True)
+        for (name, param), loaded in pairs:
+            assert torch.equal(param, loaded), name
+            for key, value in optimizer.state.get(param, {}).items():
+                assert torch.equal(resumed_optimizer.state[loaded][key], value), f"{name}.{key}"
+
+        initial = [p.detach().clone() for p in resumed.proj.parameters()]
+        for step in range(saved_step + 1, 4):
+            train_step(resumed, resumed_optimizer)
+            if step == 2:
+                _apply_stage_specs(resumed, stage.specs, config.vlm.module_patterns)
+        train_step(resumed, resumed_optimizer)
+        after = zip(resumed.proj.parameters(), initial, strict=True)
+        assert all(not torch.equal(p, i) for p, i in after)
 
 
 class TestFreezeStageFence:

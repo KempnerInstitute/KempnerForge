@@ -11,7 +11,7 @@ than another branch inside the loop.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -20,6 +20,8 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
+from kempnerforge.config.vlm import FreezeSpec
+from kempnerforge.distributed.parallel import refresh_fsdp_dtypes
 from kempnerforge.distributed.utils import clip_grad_norm_
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
@@ -561,13 +563,37 @@ def _advance_lr_schedule(session: TrainingSession) -> None:
             pg["lr"] *= session.phases.lr_scale
 
 
+def _apply_stage_specs(
+    model: torch.nn.Module, specs: Iterable[FreezeSpec], pattern_map: dict[str, list[str]]
+) -> dict[str, int]:
+    """Apply one freeze stage's specs to the model in training.
+
+    Parameters the stage unfreezes have their FSDP2 reduction dtypes refreshed. When the
+    stage unfreezes parameters of a compiled model, ``torch.compiler.reset`` runs, which
+    clears every compiled function in the process.
+
+    Args:
+        model: The model in training, compiled or not.
+        specs: The stage's freeze specs.
+        pattern_map: Module aliases mapped to fnmatch patterns.
+
+    Returns:
+        The counts ``apply_freeze_specs`` returns.
+    """
+    frozen = {id(p) for p in model.parameters() if not p.requires_grad}
+    flipped = apply_freeze_specs(model, specs, pattern_map)
+    unfrozen = [p for p in model.parameters() if p.requires_grad and id(p) in frozen]
+    refresh_fsdp_dtypes(model, unfrozen)
+    if unfrozen and hasattr(model, "_orig_mod"):
+        torch.compiler.reset()
+        logger.info("A freeze stage unfroze parameters of a compiled model: it recompiles")
+    return flipped
+
+
 def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     """FreezeStage hook: apply any stage whose start_step matches this boundary.
 
-    AdamW + set_to_none=True default skips frozen params entirely (no SGD
-    step, no weight decay), so mutating requires_grad mid-training is a
-    clean no-op for newly-frozen params and re-enables gradient flow for
-    newly-unfrozen ones.
+    Each stage goes through ``_apply_stage_specs``.
 
     Async-save fence: drain any in-flight save FIRST so that its
     metadata.json — which records the pre-transition spec — lands before we
@@ -583,7 +609,7 @@ def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
         return
     session.checkpointer.flush_pending_save()
     for stage in pending_stages:
-        flipped = apply_freeze_specs(session.model, stage.specs, vlm_cfg.module_patterns)
+        flipped = _apply_stage_specs(session.model, stage.specs, vlm_cfg.module_patterns)
         logger.info(f"FreezeStage at step={step}: applied {flipped}")
 
 

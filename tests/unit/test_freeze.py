@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import pytest
+import torch
 import torch.nn as nn
 
-from kempnerforge.config.vlm import DEFAULT_MODULE_PATTERNS, FreezeSpec
+from kempnerforge.config.optimizer import OptimizerConfig
+from kempnerforge.config.registry import registry
+from kempnerforge.config.vlm import DEFAULT_MODULE_PATTERNS, FreezeSpec, FreezeStage, VLMConfig
 from kempnerforge.training.freeze import (
     apply_freeze_specs,
     canonical_freeze_meta,
     freeze_params,
+    trainable_during_run,
+    trainable_for_the_run,
 )
+from kempnerforge.training.optimizer import build_optimizer
 
 
 class _MiniVLM(nn.Module):
@@ -224,3 +230,166 @@ class TestEffectiveFreeze:
         base = [FreezeSpec("anything", True)]
         out = effective_freeze(step=0, base=base, schedule=[], valid_modules=None)
         assert out == base
+
+
+_ENCODER = {"vision_encoder.0.weight", "vision_encoder.0.bias"}
+_ALL = {name for name, _ in _MiniVLM().named_parameters()}
+
+
+def _unfreeze_encoder_at(step: int) -> VLMConfig:
+    return VLMConfig(
+        freeze=[FreezeSpec("vision_encoder")],
+        freeze_schedule=[FreezeStage(step, (FreezeSpec("vision_encoder", False),))],
+    )
+
+
+class TestTrainableDuringRun:
+    def test_the_build_freeze_alone(self, model):
+        config = VLMConfig(freeze=[FreezeSpec("vision_encoder")])
+        assert trainable_during_run(model, config) == _ALL - _ENCODER
+
+    def test_a_stage_that_unfreezes_a_build_frozen_module_adds_it(self, model):
+        assert trainable_during_run(model, _unfreeze_encoder_at(5)) == _ALL
+
+    def test_a_module_that_trains_until_a_stage_freezes_it_counts(self, model):
+        config = VLMConfig(freeze=[], freeze_schedule=[FreezeStage(5, (FreezeSpec("adapter"),))])
+        assert trainable_during_run(model, config) == _ALL
+
+    def test_a_module_frozen_for_the_whole_run_stays_out(self, model):
+        config = VLMConfig(
+            freeze=[FreezeSpec("vision_encoder")],
+            freeze_schedule=[
+                FreezeStage(5, (FreezeSpec("adapter"),)),
+                FreezeStage(9, (FreezeSpec("adapter", False),)),
+            ],
+        )
+        assert trainable_during_run(model, config) == _ALL - _ENCODER
+
+    def test_the_trainable_part_of_a_partly_frozen_module_counts(self, model):
+        patterns = {**DEFAULT_MODULE_PATTERNS, "encoder_bias": ["vision_encoder.0.bias"]}
+        config = VLMConfig(
+            freeze=[FreezeSpec("vision_encoder"), FreezeSpec("encoder_bias", False)],
+            module_patterns=patterns,
+        )
+        assert trainable_during_run(model, config) == _ALL - {"vision_encoder.0.weight"}
+
+    def test_a_parameter_that_only_a_resume_trains_counts(self, model):
+        """The stage unfreezes the encoder's weight and then freezes the encoder, so the run
+        keeps the weight frozen; effective_freeze orders the unfreeze last, so a resume past
+        the stage trains it."""
+        patterns = {**DEFAULT_MODULE_PATTERNS, "encoder_weight": ["vision_encoder.0.weight"]}
+        config = VLMConfig(
+            freeze=[FreezeSpec("vision_encoder")],
+            freeze_schedule=[
+                FreezeStage(5, (FreezeSpec("encoder_weight", False), FreezeSpec("vision_encoder")))
+            ],
+            module_patterns=patterns,
+        )
+        assert trainable_during_run(model, config) == _ALL - {"vision_encoder.0.bias"}
+
+    def test_a_parameter_that_only_a_resume_before_the_first_stage_trains_counts(self, model):
+        """The build applies the repeated encoder spec last, so the bias stays frozen;
+        effective_freeze keeps the encoder key where it first appeared, so a resume before the
+        stage unfreezes the bias."""
+        patterns = {**DEFAULT_MODULE_PATTERNS, "encoder_bias": ["vision_encoder.0.bias"]}
+        config = VLMConfig(
+            freeze=[
+                FreezeSpec("vision_encoder"),
+                FreezeSpec("encoder_bias", False),
+                FreezeSpec("vision_encoder"),
+            ],
+            freeze_schedule=[FreezeStage(5, (FreezeSpec("encoder_bias"),))],
+            module_patterns=patterns,
+        )
+        assert trainable_during_run(model, config) == _ALL - {"vision_encoder.0.weight"}
+
+    def test_a_parameter_built_without_grad_and_never_unfrozen_stays_out(self, model):
+        model.adapter.bias.requires_grad_(False)
+        assert trainable_during_run(model, VLMConfig(freeze=[])) == _ALL - {"adapter.bias"}
+
+    def test_the_model_is_left_as_it_is(self, model):
+        trainable_during_run(model, _unfreeze_encoder_at(5))
+        assert all(p.requires_grad for p in model.parameters())
+
+
+def test_apply_freeze_specs_reaches_the_module_a_compiled_model_wraps(model):
+    compiled = torch.compile(model, backend="eager")
+    flipped = apply_freeze_specs(compiled, [FreezeSpec("vision_encoder")], DEFAULT_MODULE_PATTERNS)
+    assert flipped == {"vision_encoder": 72}
+    frozen = {name for name, p in model.named_parameters() if not p.requires_grad}
+    assert frozen == _ENCODER
+
+
+class _Compiled(nn.Module):
+    """Wraps a module under ``_orig_mod``, as ``torch.compile`` does."""
+
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self._orig_mod = module
+
+
+class TestTrainableForTheRun:
+    def test_marks_the_parameters_a_stage_unfreezes_and_restores_them(self, model):
+        config = _unfreeze_encoder_at(5)
+        apply_freeze_specs(model, config.freeze, config.module_patterns)
+        with trainable_for_the_run(model, config):
+            assert all(p.requires_grad for p in model.parameters())
+        frozen = {name for name, p in model.named_parameters() if not p.requires_grad}
+        assert frozen == _ENCODER
+
+    def test_restores_them_when_the_body_raises(self, model):
+        config = _unfreeze_encoder_at(5)
+        apply_freeze_specs(model, config.freeze, config.module_patterns)
+        with pytest.raises(RuntimeError, match="load failed"), trainable_for_the_run(model, config):
+            raise RuntimeError("load failed")
+        frozen = {name for name, p in model.named_parameters() if not p.requires_grad}
+        assert frozen == _ENCODER
+
+    def test_leaves_a_module_frozen_for_the_whole_run_frozen(self, model):
+        config = VLMConfig(freeze=[FreezeSpec("vision_encoder")])
+        apply_freeze_specs(model, config.freeze, config.module_patterns)
+        with trainable_for_the_run(model, config):
+            frozen = {name for name, p in model.named_parameters() if not p.requires_grad}
+        assert frozen == _ENCODER
+
+    def test_reads_a_compiled_model_through_the_module_it_wraps(self, model):
+        config = _unfreeze_encoder_at(5)
+        apply_freeze_specs(model, config.freeze, config.module_patterns)
+        with trainable_for_the_run(_Compiled(model), config):
+            assert all(p.requires_grad for p in model.parameters())
+
+
+def _held(optimizer: torch.optim.Optimizer) -> set[int]:
+    """Ids of the parameters an optimizer holds, with a Muon optimizer's AdamW fallback."""
+    inner = getattr(optimizer, "_adam", None)
+    optimizers = [optimizer] if inner is None else [optimizer, inner]
+    return {id(p) for opt in optimizers for group in opt.param_groups for p in group["params"]}
+
+
+@pytest.mark.parametrize("name", sorted(registry.list("optimizer")))
+def test_a_module_the_build_froze_trains_once_a_stage_unfreezes_it(model, name):
+    """The optimizer built under trainable_for_the_run holds the frozen encoder, leaves it
+    untouched while it has no gradient, weight decay included, and updates it once the
+    stage unfreezes it."""
+    torch.manual_seed(0)
+    config = _unfreeze_encoder_at(2)
+    apply_freeze_specs(model, config.freeze, config.module_patterns)
+    with trainable_for_the_run(model, config):
+        optimizer = build_optimizer(
+            model, OptimizerConfig(name=name, lr=1e-2, weight_decay=0.1, fused=False)
+        )
+    encoder = list(model.vision_encoder.parameters())
+    assert {id(p) for p in encoder} <= _held(optimizer)
+    before = [p.detach().clone() for p in encoder]
+
+    def step() -> None:
+        out = model.transformer(model.adapter(model.vision_encoder(torch.randn(4, 8))))
+        out.square().mean().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    step()
+    assert all(torch.equal(p, b) for p, b in zip(encoder, before, strict=True))
+    apply_freeze_specs(model, config.freeze_schedule[0].specs, config.module_patterns)
+    step()
+    assert not any(torch.equal(p, b) for p, b in zip(encoder, before, strict=True))
