@@ -242,7 +242,7 @@ def test_a_complete_save_is_launched_detached_without_the_distributed_environmen
     assert options["stdin"] == subprocess.DEVNULL
     assert options["stderr"] == subprocess.STDOUT
     assert options["env"]["KEEP"] == "1"
-    assert not {"WORLD_SIZE", "RANK", "TORCHELASTIC_RUN_ID"} & set(options["env"])
+    assert not {"WORLD_SIZE", "SLURM_NTASKS", "TORCHELASTIC_RUN_ID"} & set(options["env"])
     record = json.loads((launcher.settings.step_output(5) / LAUNCHED_FILE).read_text())
     assert record == {"argv": argv}
     assert (launcher.settings.step_output(5) / LAUNCH_LOG_FILE).exists()
@@ -617,3 +617,15 @@ def test_the_other_ranks_start_nothing(
     hook.on_checkpoint_save(2, str(run))
     hook.on_train_end(2, 0)
     assert hook._worker is None and recorder.calls == []
+
+
+def test_an_unopenable_launch_log_claims_nothing(tmp_path: Path, run: Path) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 5)
+    output = launcher.settings.step_output(5)
+    (output / LAUNCH_LOG_FILE).mkdir(parents=True)
+    with pytest.raises(OSError):
+        launcher.saved(5, run)
+    assert popen.calls == []
+    assert not (output / LAUNCHED_FILE).exists()

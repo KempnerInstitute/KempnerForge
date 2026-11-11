@@ -60,6 +60,10 @@ _DISTRIBUTED_VARIABLES = frozenset(
         "ROLE_NAME",
         "MASTER_ADDR",
         "MASTER_PORT",
+        "SLURM_PROCID",
+        "SLURM_LOCALID",
+        "SLURM_NTASKS",
+        "SLURM_NPROCS",
     }
 )
 _DISTRIBUTED_PREFIXES = ("TORCHELASTIC_",)
@@ -299,12 +303,13 @@ class EvaluationLauncher:
             logger.info(f"Periodic evaluation skips step {step}: already started or finished")
             return
         argv = self.settings.argv(step_dir, step)
-        if not _claim(output, argv):
-            logger.info(f"Periodic evaluation skips step {step}: already started")
-            return
         log_path = output / LAUNCH_LOG_FILE
-        try:
-            with open(log_path, "ab") as log:
+        output.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "ab") as log:
+            if not _claim(output, argv):
+                logger.info(f"Periodic evaluation skips step {step}: already started")
+                return
+            try:
                 child = self._launch(
                     argv,
                     stdin=subprocess.DEVNULL,
@@ -313,10 +318,10 @@ class EvaluationLauncher:
                     env=child_environment(os.environ),
                     start_new_session=True,
                 )
-        except OSError as exc:
-            (output / LAUNCHED_FILE).unlink(missing_ok=True)
-            logger.warning(f"Periodic evaluation could not launch step {step}: {exc}")
-            return
+            except OSError as exc:
+                (output / LAUNCHED_FILE).unlink(missing_ok=True)
+                logger.warning(f"Periodic evaluation could not launch step {step}: {exc}")
+                return
         self._children.append((step, child, log_path))
         logger.info(f"Periodic evaluation launched step {step}: {shlex.join(argv)}")
 
