@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -733,7 +734,21 @@ def test_a_thread_that_cannot_start_turns_the_hook_off_and_training_goes_on(
     assert "periodic evaluation is off" in text(messages)
 
 
-def test_a_step_that_a_resumed_run_saves_again_waits_for_the_rewrite(
+def alternate_metadata_stat(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = Path.stat
+    calls = {"count": 0}
+
+    def stat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        if self.name == ".metadata":
+            calls["count"] += 1
+            if calls["count"] % 2 == 0:
+                raise OSError(errno.ENOENT, "gone for a moment")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_a_step_handed_to_the_scan_as_rewritten_is_not_launched_while_its_metadata_is_missing(
     tmp_path: Path, run: Path
 ) -> None:
     popen = Launcher()
@@ -741,41 +756,152 @@ def test_a_step_that_a_resumed_run_saves_again_waits_for_the_rewrite(
     step_dir = save_step(run, 0)
     launcher.scan(run, frozenset({0}))
     launcher.saved(0, run)
+    (step_dir / ".metadata").unlink()
+    launcher.check()
+    (step_dir / ".metadata").write_text("new")
     launcher.check()
     assert popen.calls == []
-    rewritten = step_dir / ".metadata"
-    stamp = rewritten.stat().st_mtime_ns + 1_000_000
-    rewritten.write_text("new")
-    os.utime(rewritten, ns=(stamp, stamp))
+
+
+def test_a_step_handed_to_the_scan_as_rewritten_is_not_launched_when_its_metadata_cannot_be_read(
+    tmp_path: Path, run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 0)
+    launcher.scan(run, frozenset({0}))
+    alternate_metadata_stat(monkeypatch)
+    launcher.saved(0, run)
     launcher.check()
-    assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_0"]
+    launcher.check()
+    assert popen.calls == []
 
 
-def test_a_step_that_was_not_rewritten_is_taken_up_by_the_last_look(
+def test_a_deferred_step_is_not_launched_by_the_scan_a_check_or_its_own_save(
+    tmp_path: Path, run: Path, messages: list[str]
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 0)
+    launcher.scan(run, frozenset({0}))
+    launcher.check()
+    launcher.saved(0, run)
+    launcher.check()
+    assert popen.calls == []
+    assert not launcher.waiting
+    assert "skips step 0" not in text(messages)
+
+
+def test_an_incomplete_deferred_step_is_not_logged_as_incomplete(
+    tmp_path: Path, run: Path, messages: list[str]
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 0, complete=False)
+    launcher.scan(run, frozenset({0}))
+    assert popen.calls == [] and "skips step 0" not in text(messages)
+
+
+def test_a_deferred_step_is_launched_once_when_a_later_step_is_saved(
     tmp_path: Path, run: Path
 ) -> None:
     popen = Launcher()
     launcher = make_launcher(tmp_path, popen)
     save_step(run, 0)
     launcher.scan(run, frozenset({0}))
-    assert popen.calls == []
+    save_step(run, 2)
+    launcher.saved(2, run)
+    launcher.saved(2, run)
     launcher.finish(run)
+    assert sorted(Path(argv[3]).name for argv, _ in popen.calls) == ["step_0", "step_2"]
+
+
+def test_a_deferred_step_is_launched_once_by_the_last_look_when_no_later_step_is_saved(
+    tmp_path: Path, run: Path
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 0)
+    launcher.scan(run, frozenset({0}))
+    launcher.saved(0, run)
+    launcher.finish(run)
+    assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_0"]
+    launcher.finish(run)
+    assert len(popen.calls) == 1
+
+
+def test_a_deferred_step_is_released_by_the_last_look_without_a_checkpoint_directory(
+    tmp_path: Path, run: Path
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 0)
+    launcher.scan(run, frozenset({0}))
+    launcher.finish(None)
     assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_0"]
 
 
-def test_the_hook_asks_for_a_rewritten_step_zero_when_the_run_saves_it_first(
-    tmp_path: Path, run: Path, rank_zero: None
+def test_a_step_zero_that_did_not_exist_at_the_start_is_launched_as_soon_as_it_is_complete(
+    tmp_path: Path, run: Path
 ) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    launcher.scan(run, frozenset())
+    save_step(run, 0)
+    launcher.saved(0, run)
+    assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_0"]
+
+
+def dynamic_config(run: Path) -> JobConfig:
     from kempnerforge.config.checkpoint import DynamicCheckpointWindow
 
-    recorder = RecordingLauncher()
-    hook = make_hook(tmp_path, recorder)
     config = config_for(run)
     config.checkpoint.dyn_ckpt_window = DynamicCheckpointWindow(start=0, stop=8)
-    hook.on_train_begin(config)
+    return config
+
+
+def test_the_hook_defers_step_zero_when_it_is_a_dynamic_milestone_and_its_directory_exists(
+    tmp_path: Path, run: Path, rank_zero: None
+) -> None:
+    save_step(run, 0)
+    recorder = RecordingLauncher()
+    hook = make_hook(tmp_path, recorder)
+    hook.on_train_begin(dynamic_config(run))
     hook.on_train_end(1, 0)
     assert recorder.calls[0] == ("scan", (str(run), frozenset({0})))
 
 
-def test_the_stamp_of_a_directory_without_metadata_is_empty(tmp_path: Path) -> None:
-    assert periodic._metadata_stamp(tmp_path / "missing") == (0, 0, 0)
+def test_the_hook_defers_nothing_when_the_step_zero_directory_does_not_exist(
+    tmp_path: Path, run: Path, rank_zero: None
+) -> None:
+    recorder = RecordingLauncher()
+    hook = make_hook(tmp_path, recorder)
+    hook.on_train_begin(dynamic_config(run))
+    hook.on_train_end(1, 0)
+    assert recorder.calls[0] == ("scan", (str(run), frozenset()))
+
+
+def test_the_hook_defers_nothing_when_step_zero_is_not_a_dynamic_milestone(
+    tmp_path: Path, run: Path, rank_zero: None
+) -> None:
+    save_step(run, 0)
+    recorder = RecordingLauncher()
+    hook = make_hook(tmp_path, recorder)
+    hook.on_train_begin(config_for(run))
+    hook.on_train_end(1, 0)
+    assert recorder.calls[0] == ("scan", (str(run), frozenset()))
+
+
+def test_an_error_while_looking_for_step_zero_counts_as_existing_and_never_raises(
+    tmp_path: Path, run: Path, rank_zero: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(self: Path) -> bool:
+        raise OSError(5, "input/output error")
+
+    recorder = RecordingLauncher()
+    hook = make_hook(tmp_path, recorder)
+    monkeypatch.setattr(Path, "exists", refuse)
+    hook.on_train_begin(dynamic_config(run))
+    monkeypatch.undo()
+    hook.on_train_end(1, 0)
+    assert recorder.calls[0] == ("scan", (str(run), frozenset({0})))

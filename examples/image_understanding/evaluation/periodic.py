@@ -215,13 +215,18 @@ def _claim(output: Path, argv: Sequence[str]) -> bool:
     return True
 
 
-def _metadata_stamp(step_dir: Path) -> tuple[int, int, int]:
-    """Identity of the DCP ``.metadata`` of ``step_dir``, which changes when it is rewritten."""
+def _steps_the_run_may_save_again(config: JobConfig) -> frozenset[int]:
+    """The steps the run may save over a directory that already exists: step 0 or none.
+
+    An error while looking counts as the directory existing. Never raises.
+    """
+    if not config.checkpoint.is_dynamic_milestone(0):
+        return frozenset()
     try:
-        stat = (step_dir / _DCP_METADATA_FILE).stat()
+        exists = (Path(config.checkpoint.dir) / f"{_STEP_PREFIX}0").exists()
     except OSError:
-        return (0, 0, 0)
-    return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+        exists = True
+    return frozenset({0}) if exists else frozenset()
 
 
 def _is_rank_zero() -> bool:
@@ -252,6 +257,11 @@ class EvaluationLauncher:
     that fails is a warning and releases its ``launched.json``; a command that exits with
     a non-zero status is a warning that keeps it, so a step is started at most once and
     retrying one is deleting its ``launched.json``. Nothing here raises.
+
+    A step the run may save again over a directory that already exists (step 0 of a
+    dynamic checkpoint window, on a run that resumes from it) is deferred: its directory
+    may be half rewritten, so it is not started until a later step is saved, since the
+    checkpoint manager finishes one save before it starts the next, or until ``finish``.
     """
 
     def __init__(
@@ -265,24 +275,37 @@ class EvaluationLauncher:
         self._pending: dict[int, Path] = {}
         self._handled: set[int] = set()
         self._children: list[tuple[int, subprocess.Popen, Path]] = []
-        self._rewritten: dict[int, tuple[int, int, int]] = {}
+        self._deferred: dict[int, Path] = {}
 
     @property
     def waiting(self) -> bool:
-        """Whether a step is pending or a launched command has not been seen to exit."""
+        """Whether a step is pending or a launched command has not been seen to exit.
+
+        A deferred step does not count: a later save or ``finish`` releases it, not polling.
+        """
         return bool(self._pending or self._children)
 
     def saved(self, step: int, checkpoint_dir: str | Path) -> None:
-        """Note that step ``step`` was saved under ``checkpoint_dir`` and start it if complete."""
+        """Note that step ``step`` was saved under ``checkpoint_dir`` and start it if complete.
+
+        A deferred step is left as it is, since its save may still be writing. Any other
+        step first releases every deferred one: the checkpoint manager finishes the previous
+        save and writes ``train_state.pt`` and ``metadata.json`` inside ``save()`` before the
+        next one starts, so once a later step is announced every earlier directory is whole.
+        """
+        if step in self._deferred:
+            return
+        self._pending.update(self._deferred)
+        self._deferred.clear()
         self._pending[step] = Path(checkpoint_dir).resolve() / f"{_STEP_PREFIX}{step}"
         self.check()
 
     def scan(self, checkpoint_dir: str | Path, rewritten: Collection[int] = ()) -> None:
         """Take up every complete step directory already under ``checkpoint_dir``.
 
-        A step in ``rewritten`` is one the run is about to save again over its complete
-        directory. It is not taken up here: it waits for its ``.metadata`` to change, which
-        is the rewrite reaching the end, or for the last look in ``finish``.
+        A step in ``rewritten`` is one the run may save again over its existing directory.
+        Complete or not, it is deferred: recorded, neither pending nor logged as incomplete,
+        and released by the save of a later step or by ``finish``.
         """
         directory = Path(checkpoint_dir)
         if directory.is_dir():
@@ -292,10 +315,10 @@ class EvaluationLauncher:
                 if not is_step or not entry.is_dir():
                     continue
                 step = int(suffix)
-                if not step_dir_complete(entry):
+                if step in rewritten:
+                    self._deferred[step] = entry.resolve()
+                elif not step_dir_complete(entry):
                     logger.info(f"Periodic evaluation skips step {step}: {entry} is not complete")
-                elif step in rewritten:
-                    self._rewritten[step] = _metadata_stamp(entry)
                 else:
                     self._pending[step] = entry.resolve()
         self.check()
@@ -312,16 +335,18 @@ class EvaluationLauncher:
                     "checkpoint.interval to keep more of them"
                 )
                 del self._pending[step]
-            elif step_dir_complete(step_dir) and not self._not_yet_rewritten(step, step_dir):
+            elif step_dir_complete(step_dir):
                 del self._pending[step]
                 self._start(step, step_dir)
 
     def finish(self, checkpoint_dir: str | Path | None) -> None:
         """Take a last look when training ends: a save that has drained, an emergency save.
 
-        What is still incomplete after it never will be, and is skipped with a log line.
+        Every deferred step is released first, so the look takes it up. What is still
+        incomplete after it never will be, and is skipped with a log line.
         """
-        self._rewritten.clear()
+        self._pending.update(self._deferred)
+        self._deferred.clear()
         if checkpoint_dir is not None:
             self.scan(checkpoint_dir)
         else:
@@ -332,15 +357,6 @@ class EvaluationLauncher:
             )
         self._pending.clear()
         self._reap()
-
-    def _not_yet_rewritten(self, step: int, step_dir: Path) -> bool:
-        stamp = self._rewritten.get(step)
-        if stamp is None:
-            return False
-        if _metadata_stamp(step_dir) == stamp:
-            return True
-        del self._rewritten[step]
-        return False
 
     def _start(self, step: int, step_dir: Path) -> None:
         if step in self._handled:
@@ -421,14 +437,19 @@ class EvaluationLauncher:
 class PeriodicEvaluationHook(TrainingHook):
     """Hands each saved step to an ``EvaluationLauncher`` on a worker thread, on rank 0 only.
 
-    The training thread only puts a message on a queue, so nothing it does touches the
-    filesystem or a scheduler: the worker checks whether a step is complete (every
+    The training thread only puts a message on a queue, so nothing it does on the step path
+    touches the filesystem or a scheduler: the worker checks whether a step is complete (every
     ``poll_interval`` seconds while one is pending, and when one is saved), claims and
     launches it, and reads the exit status of what it launched. Training ending asks the
     worker for a last look, after the loop has drained a pending asynchronous save, and
     waits for it at most ``finish_timeout`` seconds. A step saved outside the loop's
     hook, as by the shutdown handler, is found by that look and by the scan at the
     start of the next run. An error on the worker is a warning, never raised into training.
+
+    At train begin the hook looks once, on the training thread and before the loop can
+    save, whether step 0 is a dynamic checkpoint milestone whose directory already exists;
+    if so the launcher defers it, so a step the run saves again is never evaluated while it
+    may be half rewritten. That look never raises.
     """
 
     def __init__(
@@ -455,6 +476,7 @@ class PeriodicEvaluationHook(TrainingHook):
         if not _is_rank_zero() or self._worker is not None:
             return
         self._checkpoint_dir = config.checkpoint.dir
+        rewritten = _steps_the_run_may_save_again(config)
         worker = threading.Thread(target=self._work, name="periodic-evaluation", daemon=True)
         try:
             worker.start()
@@ -465,7 +487,6 @@ class PeriodicEvaluationHook(TrainingHook):
             )
             return
         self._worker = worker
-        rewritten = frozenset({0}) if config.checkpoint.is_dynamic_milestone(0) else frozenset()
         self._messages.put(("scan", (config.checkpoint.dir, rewritten)))
 
     def on_checkpoint_save(self, step: int, path: str) -> None:

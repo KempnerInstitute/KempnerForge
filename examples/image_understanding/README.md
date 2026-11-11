@@ -301,9 +301,9 @@ that releases its `launched.json`. A command that starts and then exits non-zero
 a warning too, and its step is not started again: look for a step directory without
 `results.json`, and delete its `launched.json` to have the next run start it.
 Once a command has started its step stays launched whatever fails afterwards. A step
-the run saves again over a directory that is already complete (step 0 of a run that
-resumes from it, with a dynamic checkpoint window) is launched once its `.metadata`
-has been rewritten, or by the last look at the end of the run.
+whose directory existed before the run and that the run may save again (step 0 of a
+dynamic checkpoint window) is evaluated once a later step has been saved, or at the
+end of training, never while it may be half rewritten.
 
 The evaluator reads a step directory while the run goes on, and the run removes old
 ones (`checkpoint.keep_last_n`). Keep as many as the evaluations in flight need,
