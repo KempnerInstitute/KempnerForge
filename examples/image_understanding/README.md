@@ -122,26 +122,35 @@ roadmap.
 - `tasks.py`: `load_tasks` reads a TOML task file into frozen `EvalTask`s. A task
   has a unique `name`, a `reader` (one of the `testbed.py` loaders) with that
   loader's arguments in `reader_args`, a `scorer`, and `max_new_tokens`, the cap
-  on a decoded answer. The file is checked as it loads, before a reader opens
-  anything: an unknown key, reader, scorer or reader argument, a missing one, or
-  an argument of the wrong type is refused with the valid ones listed.
-  `build_reader` then opens a task's split.
+  on a decoded answer. `reader_args` is a read-only copy. The file is checked as
+  it loads, before a reader opens anything: an unknown key, reader or scorer, an
+  unknown or missing reader argument, a required reader parameter that cannot be
+  given by keyword, and a value of the wrong TOML type for a parameter annotated
+  `str`, `Path`, `bool`, `int` or `float` (alone or with `None`) are refused with
+  the valid ones listed. Nothing else is judged at load: other annotations,
+  nested values and every limit on a value (a count of at least 1, say) are
+  checked by the reader itself when `build_reader` constructs it.
 - `scorers.py`: a scorer rates one prediction against a sample's reference
   answers with a value in [0, 1], and a task's score is the mean over its
-  samples. `get_scorer` returns one by name; its `score` rates a sample and its
+  samples. The text scorers take the prediction as a `str` and the references as
+  a non-empty sequence of `str`; anything else raises before any scoring, naming
+  the argument. `get_scorer` returns one by name; its `score` rates a sample and its
   `aggregate` turns a task's sample scores into the task's metrics.
-  - `vqa_accuracy` (VQAv2, TextVQA): an answer `m` annotators gave scores
-    `min(1, m / 3)`, averaged over leaving each annotator out, after the official
-    answer normalization (`vqa_normalization.py`) of the prediction and of every
-    reference. A sample needs several references: one alone always scores 0, and
-    four or more can reach 1.
+  - `vqa_accuracy` (VQAv2, TextVQA): each annotator is left out in turn, the
+    prediction scores `min(1, m / 3)` against the `m` remaining annotators who
+    gave the same answer, and the score is the mean over those rounds, after the
+    official answer normalization (`vqa_normalization.py`) of the prediction and
+    of every reference. With ten references, three matching annotators score 0.9
+    and four score 1. A sample needs several references: one alone always scores
+    0, and four or more can reach 1.
   - `anls` (DocVQA): the similarity `1 - NL` to the closest reference, where `NL`
     is the Levenshtein distance over the longer length, and 0 once `NL` reaches
     0.5. Case and surrounding whitespace are ignored.
   - `relaxed_accuracy` (ChartQA): 1 for a number within 5 percent of a numeric
     reference, or for text equal to a reference but for case, surrounding
-    whitespace and trailing `?`, `.` and `!`. A number is what `float` parses, so
-    `45%` and `1,000` are text.
+    whitespace and trailing `?`, `.` and `!`, applied in that order, so
+    `"yes !"` becomes `"yes "`. A number is what `float` parses, so `45%` and
+    `1,000` are text while `1_000` is 1000.
 
 `configs/eval_tasks.toml` is a sample with five tasks and their caps (VQAv2 10,
 TextVQA 75, DocVQA 50, ChartQA human and machine 50); its paths are

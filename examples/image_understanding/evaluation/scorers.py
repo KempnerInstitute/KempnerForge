@@ -1,7 +1,10 @@
 """Answer scorers for evaluation tasks, selected by name.
 
 A scorer rates one sample: the decoded prediction against that sample's
-reference, which for the scorers here is its reference answers. A sample's score
+reference, which for the scorers here is its reference answers. The text scorers
+take the prediction as a ``str`` and the references as a non-empty sequence of
+``str``; anything else raises before any scoring (``TypeError``, or
+``ValueError`` for no reference). A sample's score
 is one value in [0, 1], or a mapping of named components for a scorer that
 reports several. A task's metrics are the scorer's aggregate of its samples'
 scores, by default the mean of each component.
@@ -24,30 +27,45 @@ RELAXED_TOLERANCE = 0.05
 ZERO_TARGET_GUARD = 1e-10
 
 
-def _references(answers: Sequence[str]) -> Sequence[str]:
-    """``answers``, refused when it is one string or holds no reference."""
+def _references(prediction: str, answers: Sequence[str]) -> Sequence[str]:
+    """``answers`` once ``prediction`` and every reference are known to be strings.
+
+    Raises ``TypeError`` naming the argument when ``prediction`` is not a ``str``,
+    when ``answers`` is not a sequence of strings (a lone string, ``bytes``, a set
+    and an iterator are not) or when one reference is not a ``str``, and
+    ``ValueError`` when there is no reference.
+    """
+    if not isinstance(prediction, str):
+        raise TypeError(f"prediction must be a str, got {prediction!r}")
     if isinstance(answers, str):
-        raise TypeError("answers must be a sequence of reference answers, not one string")
+        raise TypeError("answers must be a sequence of str, not one string")
+    if not isinstance(answers, Sequence) or isinstance(answers, bytes):
+        raise TypeError(f"answers must be a sequence of str, got {answers!r}")
     if not answers:
         raise ValueError("a prediction needs at least one reference answer to be scored")
+    for position, answer in enumerate(answers):
+        if not isinstance(answer, str):
+            raise TypeError(f"answers[{position}] must be a str, got {answer!r}")
     return answers
 
 
 def vqa_accuracy(prediction: str, answers: Sequence[str]) -> float:
     """VQA accuracy of ``prediction`` against the annotators' ``answers``.
 
-    An answer that ``m`` annotators gave scores ``min(1, m / 3)``, so three make
-    it fully correct. Each annotator is left out in turn, the prediction is scored
-    against the others, and the result is the mean over those rounds (Antol et
+    Each annotator is left out in turn. In a round, the prediction scores
+    ``min(1, m / 3)``, where ``m`` is the number of the remaining annotators who
+    gave the same answer, and the result is the mean over the rounds (Antol et
     al., "VQA: Visual Question Answering", ICCV 2015; VQA v2 keeps the metric).
-    Answers are compared after ``normalize_vqa_answer``, applied to the prediction
-    and to every reference whether or not the references agree.
+    With ten references, three matching annotators score 0.9 (the rounds that
+    leave one of them out give 2/3) and four score 1. Answers are compared after
+    ``normalize_vqa_answer``, applied to the prediction and to every reference
+    whether or not the references agree.
 
     The rounds follow the number of references given, whatever it is. With ``n``
     references the best score is ``min(1, (n - 1) / 3)``: four or more can reach 1,
     and a single reference always scores 0.
     """
-    references = [normalize_vqa_answer(answer) for answer in _references(answers)]
+    references = [normalize_vqa_answer(answer) for answer in _references(prediction, answers)]
     predicted = normalize_vqa_answer(prediction)
     matches = sum(answer == predicted for answer in references)
     rounds = [
@@ -88,12 +106,16 @@ def anls(prediction: str, answers: Sequence[str]) -> float:
     whitespace, inner whitespace counts as written, and two empty strings are
     identical.
     """
+    references = _references(prediction, answers)
     predicted = prediction.strip().lower()
-    return max(_similarity(predicted, answer.strip().lower()) for answer in _references(answers))
+    return max(_similarity(predicted, answer.strip().lower()) for answer in references)
 
 
 def _trimmed(text: str) -> str:
-    """``text`` lowercased, without surrounding whitespace or trailing ``?``, ``.`` and ``!``."""
+    """``text`` stripped, lowercased, then without trailing ``?``, ``.`` and ``!``.
+
+    Whitespace is removed first, so any left before a removed mark stays.
+    """
     return text.strip().lower().rstrip("?.!")
 
 
@@ -110,18 +132,23 @@ def _matches_relaxed(prediction: str, answer: str) -> bool:
 def relaxed_accuracy(prediction: str, answers: Sequence[str]) -> float:
     """1 when ``prediction`` matches a reference, numbers within 5 percent, and 0 otherwise.
 
-    Both sides lose surrounding whitespace, case and trailing ``?``, ``.`` and
-    ``!``. When both then parse with ``float``, the prediction is correct if
+    Each side is stripped of surrounding whitespace, lowercased, and then stripped
+    of trailing ``?``, ``.`` and ``!``, in that order, so whitespace before a
+    trailing mark stays (``"yes !"`` becomes ``"yes "``). When both then parse with
+    ``float``, the prediction is correct if
     ``|prediction - target| / (|target| + ZERO_TARGET_GUARD)`` is at most
     ``RELAXED_TOLERANCE``; the guard keeps a zero target defined, and only a
     prediction within 5e-12 of zero matches one. Any other pair must be the same
-    string. A percent sign, a thousands separator or a unit makes an answer text,
-    and ``nan`` and ``inf`` parse but match nothing. With several references any
+    string. A percent sign, a comma or a unit makes an answer text, while ``float``
+    reads an underscore between digits as a separator (``"1_000"`` is 1000), and
+    ``nan`` and ``inf`` parse but match nothing. With several references any
     match counts (Masry et al., "ChartQA: A Benchmark for Question Answering about
     Charts with Visual and Logical Reasoning", Findings of ACL 2022, section 5.1,
     after Methani et al., "PlotQA: Reasoning over Scientific Plots", WACV 2020).
     """
-    return float(any(_matches_relaxed(prediction, answer) for answer in _references(answers)))
+    return float(
+        any(_matches_relaxed(prediction, answer) for answer in _references(prediction, answers))
+    )
 
 
 def mean_scores(scores: Iterable[SampleScore]) -> dict[str, float]:

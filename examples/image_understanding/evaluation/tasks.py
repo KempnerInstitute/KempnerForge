@@ -14,19 +14,28 @@ answer::
     annotation_file = "path-to-docvqa-annotations"
     image_root = "path-to-docvqa-images"
 
-The file is checked when it is loaded, before a reader opens anything.
+When the file loads, and before a reader opens anything, each task's
+``reader_args`` is checked against the signature of the reader's factory: every
+name must be a parameter that can be given by keyword, every required parameter
+must be present, a required parameter that can only be given by position makes
+the task unloadable, and a value must be of the TOML type of a parameter
+annotated ``str``, ``Path``, ``bool``, ``int`` or ``float`` (alone or with
+``None``). Nothing else is judged there: a parameter with another or an
+unresolvable annotation, a nested value, and every limit on a value are left to
+the reader, which checks them itself when ``build_reader`` constructs it.
 """
 
 from __future__ import annotations
 
+import functools
 import inspect
 import re
 import tomllib
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
-from types import UnionType
-from typing import TYPE_CHECKING, Any, Union, get_args, get_origin, get_type_hints
+from types import MappingProxyType, UnionType
+from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
 
 from image_text.testbed import chartqa, coco_captions, docvqa, textvqa, vqav2
 
@@ -67,12 +76,41 @@ def _check_choice(task: str, key: str, value: Any, options: Collection[str]) -> 
         )
 
 
+def _annotation(factory: Any, parameter: inspect.Parameter) -> Any:
+    """The annotation of ``parameter`` with a string resolved, or ``None`` when it cannot be."""
+    annotation = parameter.annotation
+    if not isinstance(annotation, str):
+        return None if annotation is parameter.empty else annotation
+    target = factory
+    while isinstance(target, functools.partial):
+        target = target.func
+    if inspect.isclass(target):
+        target = target.__init__
+    elif not inspect.isroutine(target):
+        target = type(target).__call__
+    try:
+        return eval(annotation, getattr(inspect.unwrap(target), "__globals__", {}))
+    except Exception:
+        return None
+
+
 def _check_reader_args(task: str, reader: str, args: Mapping[str, Any]) -> None:
     """Refuses ``args`` the factory of ``reader`` does not take, lacks or cannot use."""
     factory = READERS[reader]
+    every = inspect.signature(factory).parameters
+    unreachable = [
+        name
+        for name, parameter in every.items()
+        if parameter.kind is parameter.POSITIONAL_ONLY and parameter.default is parameter.empty
+    ]
+    if unreachable:
+        raise ValueError(
+            f"task {task!r}: reader {reader!r} has required parameters {unreachable} "
+            "that cannot be given by keyword"
+        )
     parameters = {
         name: parameter
-        for name, parameter in inspect.signature(factory).parameters.items()
+        for name, parameter in every.items()
         if parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)
     }
     unknown = sorted(set(args) - set(parameters))
@@ -91,9 +129,8 @@ def _check_reader_args(task: str, reader: str, args: Mapping[str, Any]) -> None:
             f"task {task!r}: reader {reader!r} needs {missing} in reader_args; "
             f"it takes {sorted(parameters)}"
         )
-    hints = get_type_hints(factory.__init__ if inspect.isclass(factory) else factory)
     for key, value in args.items():
-        judged = _judged(hints[key]) if key in hints else None
+        judged = _judged(_annotation(factory, parameters[key]))
         if judged is not None and not any(type(value) in _TOML_VALUES[m][1] for m in judged):
             expected = " or ".join(dict.fromkeys(_TOML_VALUES[m][0] for m in judged))
             raise ValueError(f"task {task!r}: reader_args.{key} must be {expected}, got {value!r}")
@@ -107,9 +144,14 @@ class EvalTask:
     arguments; ``scorer`` names an entry of ``SCORERS``; ``max_new_tokens`` caps a
     decoded answer. A task is refused with ``ValueError`` when its name is not
     letters, digits, ``.``, ``_`` and ``-`` after a leading letter or digit, when
-    it names an unknown reader or scorer, when ``reader_args`` holds an argument
-    the reader does not take, lacks one it needs or gives one the wrong type, or
-    when the cap is not an integer of at least 1.
+    it names an unknown reader or scorer, when the cap is not an integer of at
+    least 1, or when ``reader_args`` holds an argument the reader does not take,
+    lacks a required one, gives a ``str``, ``Path``, ``bool``, ``int`` or ``float``
+    parameter a value of another TOML type, or the reader has a required parameter
+    that cannot be given by keyword. Values of any other annotation and every limit
+    on a value (a count of at least 1, say) are not judged here: the reader checks
+    them when ``build_reader`` constructs it. ``reader_args`` is held as a
+    read-only copy.
     """
 
     name: str
@@ -137,7 +179,7 @@ class EvalTask:
                 f"got {self.reader_args!r}"
             )
         _check_reader_args(self.name, self.reader, self.reader_args)
-        object.__setattr__(self, "reader_args", dict(self.reader_args))
+        object.__setattr__(self, "reader_args", MappingProxyType(dict(self.reader_args)))
 
 
 _TASK_KEYS = tuple(f.name for f in fields(EvalTask))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 from dataclasses import FrozenInstanceError
@@ -77,6 +78,31 @@ def _loose(annotation_file: str, *rest: str, **options: str) -> list[str]:
 
 def _nothing() -> list[str]:
     return []
+
+
+def _positional(required: str, /, optional: int = 1) -> list[str]:
+    return [required]
+
+
+def _positional_default(first: str = "a", /, second: int = 1) -> list[str]:
+    return [first]
+
+
+def _wrapped_rows(annotation_file: str, limit: int = 0, prompt: str = "") -> list[str]:
+    return [annotation_file]
+
+
+class _Callable:
+    def __call__(self, annotation_file: str, limit: int = 0) -> list[str]:
+        return [annotation_file]
+
+
+def _unresolved(annotation_file: str, limit: MissingType = 0) -> MissingReturn:  # noqa: F821
+    return [annotation_file]
+
+
+def _unresolved_value(annotation_file: MissingType, limit: int = 0) -> list[str]:  # noqa: F821
+    return [str(annotation_file)]
 
 
 class TestLoadTasks:
@@ -299,7 +325,88 @@ class TestReaderArgs:
             _task(options="x")
 
 
+class TestReaderFactories:
+    def test_a_partial_is_checked_by_the_function_it_wraps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(READERS, "rows", functools.partial(_wrapped_rows, prompt="p"))
+        assert build_reader(_task(limit=3)) == ["ann.json"]
+        with pytest.raises(ValueError, match="reader_args.limit must be an integer"):
+            _task(limit="3")
+
+    def test_a_callable_instance_is_checked_by_its_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(READERS, "rows", _Callable())
+        assert build_reader(_task(limit=3)) == ["ann.json"]
+        with pytest.raises(ValueError, match="reader_args.limit must be an integer"):
+            _task(limit="3")
+
+    def test_an_unresolved_annotation_leaves_only_its_argument_unchecked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(READERS, "rows", _unresolved)
+        assert _task(limit="anything").reader_args["limit"] == "anything"
+        with pytest.raises(ValueError, match="reader_args.annotation_file must be a string"):
+            _task(annotation_file=3)
+
+    def test_an_unresolved_name_never_escapes_the_loader(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setitem(READERS, "docvqa", _unresolved_value)
+        loaded = load_tasks(_write(tmp_path, TASK.replace('image_root = "images"', "limit = 1")))
+        assert loaded[0].reader_args["limit"] == 1
+
+    def test_a_required_positional_only_parameter_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setitem(READERS, "docvqa", _positional)
+        _refused(
+            tmp_path,
+            HEAD,
+            "task 'docvqa': reader 'docvqa' has required parameters ['required'] "
+            "that cannot be given by keyword",
+        )
+
+    def test_an_optional_positional_only_parameter_is_not_an_argument(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(READERS, "rows", _positional_default)
+        assert build_reader(EvalTask("t", "rows", "anls", 1)) == ["a"]
+        with pytest.raises(ValueError, match=re.escape("takes no ['first']")):
+            EvalTask("t", "rows", "anls", 1, {"first": "b"})
+
+    def test_a_value_the_loader_cannot_judge_is_left_to_the_reader(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(READERS, "rows", _rows)
+        assert _task(ratings="bad").reader_args["ratings"] == "bad"
+        assert _task(limit=0).reader_args["limit"] == 0
+
+
+class TestAnnotations:
+    def test_annotations_that_are_not_strings_are_judged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def reader(annotation_file, limit=0):
+            return [annotation_file]
+
+        reader.__annotations__ = {"limit": int}
+        monkeypatch.setitem(READERS, "rows", reader)
+        with pytest.raises(ValueError, match="reader_args.limit must be an integer"):
+            _task(limit="3")
+        assert _task(annotation_file=3).reader_args["annotation_file"] == 3
+
+
 class TestEvalTask:
+    def test_the_arguments_cannot_be_changed_after_validation(self) -> None:
+        task = EvalTask("docvqa", "docvqa", "anls", 50, {"annotation_file": "a", "image_root": "b"})
+        with pytest.raises(TypeError):
+            task.reader_args["image_root"] = 7
+        with pytest.raises(TypeError):
+            task.reader_args["bogus"] = True
+        assert task.reader_args == {"annotation_file": "a", "image_root": "b"}
+
     @pytest.mark.parametrize("field", ["name", "reader", "scorer", "max_new_tokens", "reader_args"])
     def test_a_task_is_frozen(self, field: str) -> None:
         task = EvalTask("docvqa", "docvqa", "anls", 50, {"annotation_file": "a", "image_root": "b"})
