@@ -87,6 +87,11 @@ self.aux_loss:       torch.Tensor  # scalar, picked up by Transformer.get_moe_au
 self.expert_counts:  torch.Tensor  # (num_experts,), picked up by get_expert_counts()
 ```
 
+A MoT model has one router per modality in each MoE layer:
+`get_moe_aux_loss()` sums every one of them, and their counts come
+from `get_mot_expert_counts()`, keyed by layer and modality, since
+`get_expert_counts()` covers flat MoE layers only.
+
 `expert_counts` holds per-expert token counts (hard, detached) for the
 most recent forward. It's how hot/cold expert diagnosis works — see
 [MoE experiments § Hot/cold expert diagnosis](../how-to/moe-experiments.md).
