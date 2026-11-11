@@ -9,8 +9,8 @@ Validation runs in two passes:
    launchers
    ([`training/runtime.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/runtime.py),
    [`scripts/eval.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/eval.py))
-   once `world_size` is known. Checks rules that cross section
-   boundaries.
+   once `world_size` is known, before the process group starts. Checks
+   rules that cross section boundaries.
 
 All invalid cases raise `ValueError` with a message naming the fields
 involved, unless noted otherwise.
@@ -80,6 +80,14 @@ File:
 - `muon_adjust_lr ∈ {"original", "match_rms_adamw", "spectral_unclamped"}`.
 - `muon_orthogonalize ∈ {"local", "exact"}`.
 - `schedule_free_warmup_steps ≥ 0`.
+- `lr_multipliers` maps non-empty module names without `/` to finite numbers `> 0`. A non-empty one
+  needs a `[vlm]` section whose `module_patterns` names every listed module; this is checked
+  when `JobConfig` is built. When the optimizer is built, a listed module that matches no
+  parameter raises `ValueError`, and so do two listed modules that match the same parameters
+  or parameters that partly overlap; a module whose parameters another's strictly contain
+  keeps them (see [Optimizers](../training/optimizers.md#per-module-learning-rates)). Which
+  parameters the modules share depends on the model's parameter names, so only the build
+  can tell.
 
 ### `SchedulerConfig`
 
@@ -186,6 +194,40 @@ File:
 
 - `end_step > start_step`.
 
+### `AdapterConfig`
+
+File:
+[`kempnerforge/config/adapter.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/adapter.py).
+
+- `type` must name a registered adapter; the error lists them.
+- `hidden_dim >= 0`.
+- `activation ∈ {"gelu", "silu", "relu"}`.
+- `pre_norm` is `""` or a registered norm; the error lists them.
+- `pool_window > 0` and `pool_heads > 0`.
+- Every other field must be one the selected adapter uses, or stay at its
+  default. The fields an adapter uses come from its builder's parameters, or
+  from the `accepts` it registers with (see
+  [Registry](registry.md#adapters-declare-the-fields-they-use)), so the check
+  needs no list of types; the error names each unused field, its value, the
+  adapter type, and the fields that type uses:
+
+  | `type` | Uses |
+  |--------|------|
+  | `mlp_2layer` | `hidden_dim`, `activation`, `pre_norm` |
+  | `linear` | none |
+  | `avgpool` | `pool_window`, `hidden_dim`; `activation` and `pre_norm` once `hidden_dim > 0` |
+  | `attentional_pool` | `pool_window`, `pool_heads` |
+
+  A plugin adapter whose builder reads a `**kwargs` and registers no
+  `accepts` accepts every field.
+  The check runs once the TOML is applied and again once the CLI overrides
+  land, so a setting the adapter would drop stops the run before
+  `init_distributed`. The first run sees the TOML alone, so its adapter
+  fields must fit its own `type`, and a type switched on the command line
+  needs the fields it does not use reset there too
+  (for example `--adapter.hidden_dim=0 --adapter.pre_norm=`); see
+  [Config sections](config-sections.md#adapter-adapterconfig).
+
 ## Cross-section rules — `JobConfig.validate(world_size)`
 
 File:
@@ -287,6 +329,21 @@ train.is_fp8 && distributed.tp > 1  →  ValueError
 Rationale in the error message: `torchao.Float8Linear` does not compose
 with DTensor sharding today.
 
+### Sigmoid MoE router + full activation checkpointing
+
+```
+model.is_moe && model.moe_router == "sigmoid_topk"
+    && train.activation_checkpointing == "full"  →  ValueError
+```
+
+The sigmoid router updates its expert bias in place in every training
+forward. Under `"full"` the backward replays each checkpointed block's
+forward, so the replay routes with a moved bias, can send tokens to other
+experts than the forward did, and then raises `CheckpointError`. Checked
+for every arch with MoE layers, text models included. Use
+`activation_checkpointing = "selective"`, which checkpoints attention only
+and leaves the MoE layers out of the replay.
+
 ### MoE + PP
 
 ```
@@ -306,9 +363,7 @@ When `distributed.ep > 1`:
   - `mot`: the FSDP2 wrap for expert-parallel blocks expects
     `layer.attention` and `layer.mlp`, and `MoTBlock` names its attention
     `attn` and keeps its experts per modality, so the model build fails. MoT
-    with MoE trains with `ep = 1`, but without its load-balancing loss,
-    router z-loss, bias schedule or balance metric
-    ([#308](https://github.com/KempnerInstitute/KempnerForge/issues/308)).
+    with MoE trains with `ep = 1`.
   - `moma`: `apply_expert_parallel` partitions `MoEMLP` experts only, and
     MoMa's per-modality expert groups need an EP-aware dispatch that is not
     wired yet. MoMa also requires `model.num_experts = 0`, which the next

@@ -60,18 +60,19 @@ What this does:
   steps AdamW with a cosine schedule, and checkpoints to
   `checkpoints/hf_wikitext/step_N` every 100 steps.
 
-Expected output (first few lines):
+Expected output: after the startup messages, a metrics line for step 1
+and then one every 10 steps (`metrics.log_interval`), such as:
 
 ```
-[rank 0] step 10   loss 10.42  lr 6.0e-05  tok/s 8,420  mfu 2.1%
-[rank 0] step 20   loss 9.84   lr 1.2e-04  tok/s 8,510  mfu 2.1%
+2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=10.4200 | lr=6.00e-05 | grad_norm=1.842 | tok/s=8,420 | mfu=0.3% | mem=9.6/80GB | step_time=1.95s
+2026-11-04 14:03:31.630 [rank 0] INFO     [step 20] loss=9.8400 | lr=1.20e-04 | grad_norm=1.103 | tok/s=8,510 | mfu=0.3% | mem=9.6/80GB | step_time=1.93s
 ...
 ```
 
 Let it run ~50 steps (loss should drop below 10), then `Ctrl+C`.
 
 ```{note}
-MFU is low (~2%) because this is a 40M-param model on a single H100
+MFU is low (~0.3%) because this is a 40M-param model on a single H100
 — most of the runtime is framework + data loading, not matmul. MFU
 becomes meaningful at 7B+ scale. See
 [Scaling guide](scaling-guide.md).
@@ -89,8 +90,10 @@ uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/hf_wikitext.to
 tokens/sec (assumes 4× H100, bf16, Wikitext streaming fast enough to
 not bottleneck).
 
-Watch the log: every rank reports per-step metrics, but only rank 0
-writes checkpoints. By default, data appears in `checkpoints/hf_wikitext/`
+Watch the log: only rank 0 prints, so the metrics lines are rank 0's,
+and their `tok/s` counts the tokens of all 4 GPUs. Every rank writes its
+own shard of each checkpoint, and rank 0 also writes `train_state.pt`
+and `metadata.json`. By default, data appears in `checkpoints/hf_wikitext/`
 under the current working directory.
 
 ## 5. Kill and auto-resume
@@ -124,11 +127,13 @@ Relaunch the same command:
 uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/hf_wikitext.toml
 ```
 
-[`CheckpointManager`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/manager.py)
+Auto-resume
+([`resolve_resume_path`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py))
 follows the `checkpoints/hf_wikitext/latest` symlink (updated on
-every save) and falls back to the highest `step_N` directory if the
-symlink is missing. Training picks up at the next step with model,
-optimizer, scheduler, dataloader, and RNG state restored.
+every save) and falls back to the newest `step_N` directory whose save
+completed if the symlink is missing; `CheckpointManager` then loads
+it. Training picks up at the next step with model, optimizer,
+scheduler, dataloader, and RNG state restored.
 
 The dataloader resumes from the exact sample via
 `StatefulDataLoader.load_state_dict` + `DistributedSampler.set_skip`

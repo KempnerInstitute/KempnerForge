@@ -11,6 +11,7 @@ Design choices:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -283,28 +284,54 @@ class Transformer(nn.Module):
             )
         init_weights(self, self.config)
 
+    def _moe_mlps(self) -> Iterator[tuple[int, str | None, MoEMLP]]:
+        """Yield ``(layer_idx, modality, mlp)`` for every ``MoEMLP`` in ``layers``.
+
+        ``modality`` is ``None`` for a block whose MLP is itself a ``MoEMLP``,
+        and the modality key for one held in a per-modality ``nn.ModuleDict``
+        (a MoT block keeps one router per modality there). MoMa's ``MoMaFFN``
+        holds ``ExpertChoiceMoE`` groups, not ``MoEMLP``s, so a MoMa model
+        yields nothing.
+        """
+        for name, layer in self.layers.items():
+            mlp = layer.mlp
+            if isinstance(mlp, MoEMLP):
+                yield int(name), None, mlp
+            elif isinstance(mlp, nn.ModuleDict):
+                for modality, sub in mlp.items():
+                    if isinstance(sub, MoEMLP):
+                        yield int(name), modality, sub
+
     def set_moe_step(self, step: int, max_steps: int) -> None:
-        """Set training step on all MoE routers for adaptive bias scheduling."""
+        """Set training step on all MoE routers for adaptive bias scheduling.
+
+        Reaches every sigmoid router, including each MoT modality's.
+        """
         from kempnerforge.model.router import SigmoidTopKRouter
 
-        for layer in self.layers.values():
-            if isinstance(layer.mlp, MoEMLP) and isinstance(layer.mlp.router, SigmoidTopKRouter):
-                layer.mlp.router.set_step(step, max_steps)
+        for _, _, mlp in self._moe_mlps():
+            if isinstance(mlp.router, SigmoidTopKRouter):
+                mlp.router.set_step(step, max_steps)
 
     def get_moe_aux_loss(self) -> torch.Tensor:
-        """Collect auxiliary losses from all MoE layers. Returns 0 if dense."""
+        """Sum the auxiliary losses of every MoE router. Returns 0 if dense.
+
+        A MoT layer contributes one term per modality, so an image + text MoT
+        model sums twice as many terms as a text model with the same MoE layers.
+        """
         total = torch.tensor(0.0, device=next(self.parameters()).device)
-        for layer in self.layers.values():
-            if isinstance(layer.mlp, MoEMLP):
-                total = total + layer.mlp.aux_loss
+        for _, _, mlp in self._moe_mlps():
+            total = total + mlp.aux_loss
         return total
 
     def get_moe_router_z_loss(self) -> torch.Tensor:
-        """Collect router z-losses (ST-MoE) from all MoE layers. Returns 0 if dense."""
+        """Sum the router z-losses (ST-MoE) of every MoE router. Returns 0 if dense.
+
+        Like ``get_moe_aux_loss``, a MoT layer contributes one term per modality.
+        """
         total = torch.tensor(0.0, device=next(self.parameters()).device)
-        for layer in self.layers.values():
-            if isinstance(layer.mlp, MoEMLP):
-                total = total + layer.mlp.z_loss
+        for _, _, mlp in self._moe_mlps():
+            total = total + mlp.z_loss
         return total
 
     def get_expert_counts(self) -> dict[int, torch.Tensor]:
@@ -312,14 +339,27 @@ class Transformer(nn.Module):
 
         Returns ``{layer_idx: (num_experts,) tensor}`` for layers whose MLP
         is a ``MoEMLP`` (the standard, single-pool MoE). Returns ``{}`` for
-        dense models and for MoMa: MoMa's per-modality groups have a
-        different shape (per modality, per expert) and surface through
+        dense models, for MoT and for MoMa, whose per-modality routers
+        surface through ``get_mot_expert_counts`` and
         ``get_moma_expert_counts`` instead.
         """
-        counts = {}
-        for name, layer in self.layers.items():
-            if isinstance(layer.mlp, MoEMLP):
-                counts[int(name)] = layer.mlp.expert_counts
+        return {
+            idx: mlp.expert_counts for idx, modality, mlp in self._moe_mlps() if modality is None
+        }
+
+    def get_mot_expert_counts(self) -> dict[int, dict[str, torch.Tensor]]:
+        """Collect per-layer, per-modality expert utilization for MoT MoE layers.
+
+        Returns ``{layer_idx: {modality: (num_experts,) tensor}}`` for every
+        MoT layer whose per-modality FFNs are ``MoEMLP``s; returns ``{}``
+        otherwise. Each tensor holds the token count per expert from that
+        modality's router in the most recent forward, so the image and text
+        counts of a layer sum to different totals.
+        """
+        counts: dict[int, dict[str, torch.Tensor]] = {}
+        for idx, modality, mlp in self._moe_mlps():
+            if modality is not None:
+                counts.setdefault(idx, {})[modality] = mlp.expert_counts
         return counts
 
     def get_moma_expert_counts(self) -> dict[int, dict[str, torch.Tensor]]:
@@ -392,21 +432,35 @@ class Transformer(nn.Module):
         for the full intra-context invariant table. ``inline_embeds`` are
         written over the embedded ``tokens`` at ``(inline_rows,
         inline_positions)`` before the first layer, which is how a packed
-        row carries each document's image tokens before its own text.
+        row carries each document's image tokens before its own text, and
+        ``output_rows`` / ``output_positions`` pick the positions the head
+        runs on, giving ``(1, M, vocab)`` logits.
 
         Args:
             tokens: Integer token ids, shape ``(batch, seq_len)``.
             modality: Optional ``ModalityContext`` bundling pre-embedded
                 inputs, prefix embeds, output slicing, image features,
                 and modality routing tags for VLM arches. ``None`` is the
-                pure text-only forward.
+                pure text-only forward. It may also carry ``position_ids``
+                and ``attention_group_ids`` (see those arguments) or the
+                rotation itself as ``rope_cos`` and ``rope_sin``,
+                ``(batch, seq_len, head_dim // 2)`` over the residual, or
+                ``(1, seq_len, head_dim // 2)`` shared by every row, for
+                position schemes that are not one integer per token; the
+                rotation excludes ``position_ids``, covers the appended
+                tokens under ``kv_caches`` as ``position_ids`` does, is
+                applied without the model's own tables, and is unsupported
+                for MoT.
             kv_caches: Optional list of KVCache (one per layer) for
-                generation. When provided, RoPE positions are offset by
-                the current cache fill level. Cross-arg invariant:
+                generation. The tokens of this forward are appended after
+                the cached ones; without caller positions or a rotation
+                their RoPE positions continue from the cache fill level.
+                Cross-arg invariant:
                 ``kv_caches`` forbids ``modality.prefix_embeds``,
                 ``modality.output_slice``, ``modality.image_features``,
                 ``modality.modality_ids``, ``modality.key_padding_mask``,
-                ``doc_ids`` and ``attention_group_ids`` (all training-only).
+                ``doc_ids`` and ``attention_group_ids``, by argument or as
+                ``modality.attention_group_ids`` (all training-only).
             doc_ids: Optional per-token document IDs for packed sequences,
                 shape ``(batch, seq_len)`` over the residual stream. Enables
                 block-diagonal causal attention that isolates documents within
@@ -418,10 +472,14 @@ class Transformer(nn.Module):
                 positions can e.g. restart at zero at each document of a
                 packed sequence. ``None`` (default) assigns contiguous
                 positions starting at the KV-cache fill level, exactly as
-                before. Cannot be combined with ``kv_caches`` (cached
-                generation derives positions from the cache fill level);
-                unsupported for MoT, which derives per-modality positions
-                internally.
+                before. With ``kv_caches`` the tensor covers the tokens of
+                this forward alone, the ones being appended, so a caller
+                that positions its own tokens does so at prefill and at
+                every decode step alike. Unsupported for MoT, which derives
+                per-modality positions internally. A ``ModalityContext`` may carry the same tensor
+                as ``modality.position_ids`` instead, which is how a strategy
+                chooses the positions of the residual it lays out; passing
+                both raises.
             attention_group_ids: Optional per-token visibility group ids over
                 the residual stream, shape ``(batch, seq_len)``, int64;
                 negative means no group. Tokens sharing a nonnegative id see
@@ -432,12 +490,15 @@ class Transformer(nn.Module):
                 give the same visibility as ``None`` but still build a mask, so
                 ``None`` is the unmasked fast path. On MoT, ``doc_ids`` and
                 group ids need ``vlm.mot_modalities`` in residual order,
-                ``("image", "text")``.
+                ``("image", "text")``. May likewise come from
+                ``modality.attention_group_ids``, not both.
 
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
             where ``out_seq_len == seq_len`` normally or the sliced
-            length when ``modality.output_slice`` is set. Built with
+            length when ``modality.output_slice`` is set, or ``(1, M,
+            vocab_size)`` over the ``M`` positions ``modality.output_rows``
+            and ``output_positions`` pick. Built with
             ``include_output_head=False``, returns the final hidden
             states ``(batch, out_seq_len, dim)`` instead.
         """
@@ -449,6 +510,14 @@ class Transformer(nn.Module):
         modality_ids = modality.modality_ids if modality is not None else None
         key_padding_mask = modality.key_padding_mask if modality is not None else None
         inline_embeds = modality.inline_embeds if modality is not None else None
+        output_rows = modality.output_rows if modality is not None else None
+        output_positions = modality.output_positions if modality is not None else None
+        position_ids = _argument_or_context("position_ids", position_ids, modality)
+        rope_cos = modality.rope_cos if modality is not None else None
+        rope_sin = modality.rope_sin if modality is not None else None
+        attention_group_ids = _argument_or_context(
+            "attention_group_ids", attention_group_ids, modality
+        )
 
         if (tokens is None) == (inputs_embeds is None):
             raise ValueError(
@@ -480,6 +549,10 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "modality.inline_embeds is training-only; cannot be combined with kv_caches"
                 )
+            if output_rows is not None:
+                raise ValueError(
+                    "modality.output_rows is training-only; cannot be combined with kv_caches"
+                )
             if key_padding_mask is not None:
                 raise ValueError(
                     "modality.key_padding_mask is training-only; cannot be combined with kv_caches"
@@ -488,18 +561,16 @@ class Transformer(nn.Module):
                 raise ValueError("doc_ids is training-only; cannot be combined with kv_caches")
             if attention_group_ids is not None:
                 raise ValueError(
-                    "attention_group_ids is training-only; cannot be combined with kv_caches"
+                    "attention_group_ids (the argument or modality.attention_group_ids) is "
+                    "training-only; cannot be combined with kv_caches"
                 )
         text = tokens if tokens is not None else inputs_embeds
         assert text is not None
         batch = text.shape[0]
         seq_len = text.shape[1] + (prefix_embeds.shape[1] if prefix_embeds is not None else 0)
+        if rope_cos is not None and position_ids is not None:
+            raise ValueError("modality.rope_cos/rope_sin cannot be combined with position_ids")
         if position_ids is not None:
-            if kv_caches is not None:
-                raise ValueError(
-                    "position_ids cannot be combined with kv_caches; cached generation "
-                    "derives positions from the cache fill level"
-                )
             if self._mot_modalities:
                 raise ValueError(
                     "position_ids is not supported for MoT models, which derive "
@@ -522,12 +593,25 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "RoPE tables not initialized; call init_weights_and_freqs() after to_empty()"
                 )
-            n_positions = self._rope_cos.shape[0]
-            if bool((position_ids < 0).any()) or bool((position_ids >= n_positions).any()):
+            n_positions = self.config.max_seq_len
+            if bool(((position_ids < 0) | (position_ids >= n_positions)).any()):
                 raise ValueError(
                     f"position_ids must be in [0, {n_positions}) (the precomputed RoPE "
                     f"table range, model.max_seq_len); got min {int(position_ids.min())}, "
                     f"max {int(position_ids.max())}"
+                )
+        if rope_cos is not None:
+            assert rope_sin is not None
+            if self._mot_modalities:
+                raise ValueError(
+                    "modality.rope_cos/rope_sin is not supported for MoT models, which derive "
+                    "per-modality positions internally"
+                )
+            expected = (batch, seq_len, self.config.head_dim // 2)
+            if tuple(rope_cos.shape[1:]) != expected[1:] or rope_cos.shape[0] not in (1, batch):
+                raise ValueError(
+                    f"modality.rope_cos shape {tuple(rope_cos.shape)} does not match the "
+                    f"residual rotation shape {expected} (batch or 1, seq_len, head_dim // 2)"
                 )
         if modality_ids is not None and modality_ids.dtype != torch.long:
             raise ValueError(
@@ -573,17 +657,24 @@ class Transformer(nn.Module):
             h = torch.cat([prefix_embeds, h], dim=1)
 
         start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
-
-        if self._rope_cos.device != h.device:  # type: ignore[reportOptionalMemberAccess]
-            self._rope_cos = self._rope_cos.to(h.device)  # type: ignore[reportOptionalMemberAccess]
-            self._rope_sin = self._rope_sin.to(h.device)  # type: ignore[reportOptionalMemberAccess]
-        if position_ids is not None:
-            position_ids = position_ids.to(h.device)
-            cos = self._rope_cos[position_ids]  # type: ignore[reportOptionalSubscript]
-            sin = self._rope_sin[position_ids]  # type: ignore[reportOptionalSubscript]
+        if rope_cos is not None:
+            assert rope_sin is not None
+            cos, sin = rope_cos.to(h.device), rope_sin.to(h.device)
         else:
-            cos = self._rope_cos[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
-            sin = self._rope_sin[start_pos : start_pos + seq_len]  # type: ignore[reportOptionalSubscript]
+            if self._rope_cos is None or self._rope_sin is None:
+                raise ValueError(
+                    "RoPE tables not initialized; call init_weights_and_freqs() after to_empty()"
+                )
+            if self._rope_cos.device != h.device:
+                self._rope_cos = self._rope_cos.to(h.device)
+                self._rope_sin = self._rope_sin.to(h.device)
+            if position_ids is not None:
+                position_ids = position_ids.to(h.device)
+                cos = self._rope_cos[position_ids]
+                sin = self._rope_sin[position_ids]
+            else:
+                cos = self._rope_cos[start_pos : start_pos + seq_len]
+                sin = self._rope_sin[start_pos : start_pos + seq_len]
 
         if self._moma_modalities:
             assert modality_ids is not None
@@ -634,11 +725,26 @@ class Transformer(nn.Module):
 
         if output_slice is not None:
             h = h[:, output_slice, :]
+        if output_rows is not None:
+            assert output_positions is not None
+            h = h[output_rows, output_positions].unsqueeze(0)
 
         if self.output_head is not None:
             h = self.output_head(h)
 
         return h
+
+
+def _argument_or_context(
+    name: str, argument: torch.Tensor | None, modality: ModalityContext | None
+) -> torch.Tensor | None:
+    """The forward argument ``name`` or the ``ModalityContext`` field of that name, never both."""
+    from_context = getattr(modality, name) if modality is not None else None
+    if argument is not None and from_context is not None:
+        raise ValueError(
+            f"{name} was passed to Transformer.forward and set on modality.{name}; give one"
+        )
+    return argument if argument is not None else from_context
 
 
 @registry.register_model("transformer")

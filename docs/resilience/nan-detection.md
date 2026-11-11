@@ -39,9 +39,9 @@ Two things to note:
 - **The gradient norm is checked with the loss.** A finite loss can come with
   non-finite gradients: a micro-batch whose labels are all `-100` has an exact
   zero cross-entropy loss whatever its activations, and without the norm check
-  its NaN gradients would reach `optimizer.step()`. The norm can differ between
-  ranks (under expert parallelism it covers the shared parameters and only the
-  rank's experts), so it goes into the same all-reduced flag as the loss.
+  its NaN gradients would reach `optimizer.step()`. The norm goes into the same
+  all-reduced flag as the loss, so every rank skips the step together even when
+  a non-finite gradient reaches only some ranks' norms.
 - **`check_gradients` is *not* called by the training loop.** It returns a
   rank-local verdict; the gradient norm check above covers non-finite gradients.
 
@@ -204,12 +204,32 @@ if nan_detector.should_rollback:
     break
 ```
 
-Rolling back is manual: resubmit with `checkpoint.load_path` pointing at
-an earlier `step_N` directory. The reason it's not automatic is that
+Rolling back is manual: resubmit with a new, empty `checkpoint.dir` and
+`checkpoint.load_path` pointing at an earlier `step_N` directory; with
+`exclude_from_loading` empty this restores its full state. Its
+`train_state.pt` restores the scheduler's base LR whatever
+`exclude_from_loading` says, so a lower `optimizer.lr` in the resubmitted
+config does not take effect; schedule settings such as
+`scheduler.warmup_steps` do, from the restored step on. Keep the old
+`checkpoint.dir` and the run does not roll back: a checkpoint there takes
+precedence over `load_path`, so it resumes from the newest one, and rank 0
+warns that `load_path` is not used. The reason it's not automatic is that
 the *source* of the NaN determines what's safe:
 
-- **LR spike** — reduce `optimizer.lr` or `scheduler.warmup_steps`,
-  restart from an earlier checkpoint.
+- **LR spike** — lower the LR and restart from an earlier checkpoint. A
+  rollback through `load_path` brings back the saved base LR, so a lower
+  `optimizer.lr` does not take effect there. A longer
+  `scheduler.warmup_steps` does, but it can raise the LR as well as
+  lower it. One that ends before the restored step starts the decay
+  later, which never lowers the LR there. One that extends past it
+  scales the saved base LR by `step / warmup_steps` (with the default
+  `warmup_start_factor = 0`), so right after the restored step it lowers
+  the LR only when that ratio falls below the old schedule's factor
+  there (its LR at that step over the base LR). Restoring a 1000-step
+  cosine run (`optimizer.lr = 3e-4`, `min_lr_ratio = 0.1`, 10 warmup
+  steps) at step 500 with a warmup of 100 or 800 raises the LR at step
+  501 from 1.67e-4 to 1.88e-4; only a warmup longer than about 900 steps
+  lowers it.
 - **Bad data** — skip the offending shard, restart from the same
   checkpoint.
 - **FP8 overflow** — reduce `distributed.fp8_interval` or disable FP8
@@ -269,5 +289,5 @@ every rank must call it.
   steps.
 - [GPU health](gpu-health.md) — coarser health check; run it at
   startup and after any NCCL failure.
-- [Checkpointing § Auto-resume](../checkpointing/auto-resume.md) —
-  where to point `checkpoint.load_path` when rolling back.
+- [Checkpointing § Auto-resume](../checkpointing/auto-resume.md#loading-a-specific-step) —
+  how to roll back to an earlier checkpoint.

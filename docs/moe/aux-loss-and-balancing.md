@@ -23,9 +23,19 @@ aux_loss  = model.get_moe_aux_loss()
 total     = main_loss + mc.moe_aux_loss_weight * aux_loss
 ```
 
-`Transformer.get_moe_aux_loss()` walks every `MoEMLP` layer and sums
-`layer.mlp.aux_loss`. The coefficient `moe_aux_loss_weight`
+`Transformer.get_moe_aux_loss()` sums `aux_loss` over every MoE
+router: one per MoE layer, and on a Mixture-of-Transformers (MoT) VLM
+one per modality on each MoE layer, since every modality's FFN holds
+its own `MoEMLP`. The coefficient `moe_aux_loss_weight`
 (default 0.01) is the knob that scales the balance pressure.
+
+Every router gets the same pressure per unit of the coefficient, but
+the logged `moe/aux_loss` is the sum. A balanced softmax router's
+term is about 1.0, so the sum is about the number of routers, and an
+image + text MoT model logs about twice what a text model with the
+same MoE layers logs. Compare a MoT run's value with other MoT runs, or
+divide it by the number of routers. MoMa's expert-choice groups carry
+no aux loss and add nothing.
 
 For `sigmoid_topk` with no sequence aux loss, each layer's
 `aux_loss` is the scalar 0.0 — so `total = main_loss` and the
@@ -116,13 +126,15 @@ if self.bias_schedule == "linear_warmup":
 The schedule needs the current training step, which is pushed in each
 step via `model.set_moe_step(step, max_steps)` in
 the step body. `Transformer.set_moe_step` walks only sigmoid
-routers:
+routers, each MoT modality's included. `_moe_mlps()` yields every
+`MoEMLP`: the one a flat MoE layer holds, and on a MoT layer the one
+each modality holds.
 
 ```python
 # kempnerforge/model/transformer.py — set_moe_step
-for layer in self.layers.values():
-    if isinstance(layer.mlp, MoEMLP) and isinstance(layer.mlp.router, SigmoidTopKRouter):
-        layer.mlp.router.set_step(step, max_steps)
+for _, _, mlp in self._moe_mlps():
+    if isinstance(mlp.router, SigmoidTopKRouter):
+        mlp.router.set_step(step, max_steps)
 ```
 
 ## Sequence-level aux loss (sigmoid only)
@@ -167,7 +179,8 @@ self.z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
 
 Both `SoftmaxTopKRouter` and `SigmoidTopKRouter` set it. `MoEMLP.z_loss`
 surfaces the per-layer value, and `Transformer.get_moe_router_z_loss()`
-sums it across MoE layers — mirroring `aux_loss` / `get_moe_aux_loss()`.
+sums it across MoE routers, one per modality on a MoT layer, mirroring
+`aux_loss` / `get_moe_aux_loss()`.
 The training loop adds it only when the weight is positive:
 
 ```python
@@ -212,8 +225,9 @@ cold experts get `scale > 1` (gradients amplified). The scale passes
 through the `expert_out * sorted_weights` scatter-add, so the
 routing weights still apply on top of it.
 
-The same logic runs on the EP path (`ep_dispatch_and_compute`) using
-per-local-expert receive counts — see
+The same logic runs on the EP path (`ep_dispatch_and_compute`), which
+scales each local expert by its receive count against the same average
+over all experts, so EP leaves the scale unchanged; see
 [EP § Gradient scaling](../distributed/expert-parallelism.md#gradient-scaling-optional).
 
 **Reference**: DeepSeek-V3 §3.2. Empirically small effect on short
@@ -229,9 +243,14 @@ and should be validated against a baseline.
 
 `Transformer.get_expert_counts()` returns
 `dict[layer_idx → tensor(num_experts,)]` with the per-expert token
-count from the most recent forward. Interpretation rule-of-thumb:
+count from the most recent forward. It is empty for a MoT model:
+`Transformer.get_mot_expert_counts()` returns
+`dict[layer_idx → dict[modality → tensor(num_experts,)]]` instead, one
+router per modality, each counting only its own modality's tokens.
+Interpretation rule-of-thumb:
 
-- **Balanced**: counts within ~20% of `num_tokens · top_k / num_experts`.
+- **Balanced**: counts within ~20% of `num_tokens · top_k / num_experts`,
+  with `num_tokens` the tokens that router saw.
 - **Hot/cold**: one expert ≥ 2× the mean → router is specializing.
   Fine if intentional, bad if unintentional.
 - **Dead expert**: count = 0 for many consecutive steps → that

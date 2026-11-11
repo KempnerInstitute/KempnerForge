@@ -139,12 +139,14 @@ def _build_vlm_pipeline(
         if laid_out:
             setting = "data.pack_sequences" if config.data.pack_sequences else "data.hf_max_images"
             row_tokens = _row_tokens_per_image(tokens_per_image, setting)
-            footprint = config.data.hf_max_images * row_tokens + vlm_cfg.max_text_len
+            visual_tokens = config.data.hf_max_images * config.views_per_sample * row_tokens
+            footprint = visual_tokens + vlm_cfg.max_text_len
             if footprint > tc.seq_len:
                 raise ValueError(
-                    f"data.hf_max_images={config.data.hf_max_images} images x {row_tokens} "
-                    f"tokens + vlm.max_text_len={vlm_cfg.max_text_len} is {footprint} positions, "
-                    f"over train.seq_len={tc.seq_len}; a document could not fit its row"
+                    f"train.seq_len ({tc.seq_len}) cannot hold one document: {visual_tokens} "
+                    f"image tokens (data.hf_max_images={config.data.hf_max_images} x "
+                    f"{config.views_per_sample} views x {row_tokens}) + vlm.max_text_len "
+                    f"({vlm_cfg.max_text_len})"
                 )
         dataset = HuggingFaceVLMDataset(
             dataset_name=config.data.hf_dataset_name,
@@ -158,6 +160,8 @@ def _build_vlm_pipeline(
             dataset_config=config.data.hf_dataset_config,
             allow_text_only=config.data.hf_allow_text_only,
             max_images=config.data.hf_max_images,
+            tile_grid=vlm_cfg.tile_grid,
+            tile_global=vlm_cfg.tile_global,
         )
         pad_id = _resolve_pad_id(config.data.tokenizer_path)
         if laid_out:

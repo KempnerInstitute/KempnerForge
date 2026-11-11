@@ -70,9 +70,9 @@ class NaNDetector:
         A finite loss does not guarantee finite gradients: a micro-batch whose
         labels are all masked has an exact zero cross-entropy loss whatever its
         activations, so the caller passes the gradient norm as well. Each rank's
-        norm goes into the same reduced flag, since the norms can differ between
-        ranks (under expert parallelism each covers the shared parameters and
-        only that rank's experts).
+        norm goes into the same reduced flag as the loss, so every rank skips the
+        step together even when a non-finite gradient reaches only some ranks'
+        norms.
 
         Args:
             loss: The scalar loss value to check.
