@@ -17,7 +17,7 @@ from typing import Any
 
 from kempnerforge.config.schema import JobConfig, MetricsConfig
 from kempnerforge.metrics.logger import format_metrics, get_logger
-from kempnerforge.metrics.memory import get_memory_stats, get_memory_utilization
+from kempnerforge.metrics.memory import get_memory_stats
 from kempnerforge.metrics.mfu import compute_mfu, get_gpu_peak_tflops
 
 logger = get_logger(__name__)
@@ -112,10 +112,15 @@ class MetricsTracker:
     ) -> StepMetrics | None:
         """Mark the end of a training step and optionally log metrics.
 
+        A logging step reads GPU memory once, from the current device. The tracker never
+        resets the peak, so ``peak_gb`` is the most allocated since the process started, or
+        since a ``reset_peak_memory`` elsewhere (``DeviceMemoryMonitor.report`` makes one).
+
         Args:
             step: Current training step number.
             loss: Loss value for this step.
-            grad_norm: Gradient norm (after clipping).
+            grad_norm: Total gradient norm before clipping (what ``clip_grad_norm_``
+                returns); under pipeline parallelism, the whole model's norm.
             lr: Current learning rate.
             tokens_in_step: Total tokens processed in this step (across all GPUs).
 
@@ -133,9 +138,16 @@ class MetricsTracker:
             seq_len=self.seq_len,
         )
 
-        mem_stats = get_memory_stats()
-        mem_util = get_memory_utilization()
+        self._update_smoothed("loss", loss)
+        self._update_smoothed("tokens_per_sec", tokens_per_sec)
+        self._update_smoothed("mfu", mfu)
+        self._update_smoothed("step_time", step_time)
 
+        if step % self.metrics_config.log_interval != 0 and step != 1:
+            return None
+
+        mem_stats = get_memory_stats()
+        peak_gb, total_gb = mem_stats["peak_gb"], mem_stats["total_gb"]
         metrics = StepMetrics(
             loss=loss,
             grad_norm=grad_norm,
@@ -144,22 +156,13 @@ class MetricsTracker:
             mfu=mfu,
             step_time_sec=step_time,
             allocated_gb=mem_stats["allocated_gb"],
-            peak_gb=mem_stats["peak_gb"],
+            peak_gb=peak_gb,
             reserved_gb=mem_stats["reserved_gb"],
-            total_gb=mem_stats["total_gb"],
-            mem_utilization=mem_util,
+            total_gb=total_gb,
+            mem_utilization=peak_gb / total_gb if total_gb else 0.0,
         )
-
-        self._update_smoothed("loss", loss)
-        self._update_smoothed("tokens_per_sec", tokens_per_sec)
-        self._update_smoothed("mfu", mfu)
-        self._update_smoothed("step_time", step_time)
-
-        if step % self.metrics_config.log_interval == 0 or step == 1:
-            self._log_step(step, metrics)
-            return metrics
-
-        return None
+        self._log_step(step, metrics)
+        return metrics
 
     def _update_smoothed(self, key: str, value: float) -> None:
         """Update exponential moving average for a metric."""

@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.child_output import traceback_or_tail
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TRAIN_SCRIPT = str(PROJECT_ROOT / "scripts" / "train.py")
 EVAL_SCRIPT = str(PROJECT_ROOT / "scripts" / "eval.py")
@@ -159,10 +161,14 @@ def _run(hw, script, args, timeout=180):
 
 def _assert_train_ok(result, expected_steps=15):
     output = result.stdout + result.stderr
-    assert result.returncode == 0, f"Training failed (exit {result.returncode}):\n{output[-3000:]}"
-    assert "Training complete" in output, f"Training did not finish:\n{output[-3000:]}"
+    assert result.returncode == 0, (
+        f"Training failed (exit {result.returncode}):\n{traceback_or_tail(output, 3000)}"
+    )
+    assert "Training complete" in output, (
+        f"Training did not finish:\n{traceback_or_tail(output, 3000)}"
+    )
     match = re.search(r"Training complete: (\d+) steps", output)
-    assert match, f"Cannot parse step count:\n{output[-3000:]}"
+    assert match, f"Cannot parse step count:\n{traceback_or_tail(output, 3000)}"
     assert int(match.group(1)) == expected_steps
 
 
@@ -183,9 +189,11 @@ def _parse_eval_json(output: str) -> dict | None:
 
 def _assert_eval_ok(result):
     output = result.stdout + result.stderr
-    assert result.returncode == 0, f"Eval failed (exit {result.returncode}):\n{output[-3000:]}"
+    assert result.returncode == 0, (
+        f"Eval failed (exit {result.returncode}):\n{traceback_or_tail(output, 3000)}"
+    )
     data = _parse_eval_json(output)
-    assert data is not None, f"No eval JSON in output:\n{output[-3000:]}"
+    assert data is not None, f"No eval JSON in output:\n{traceback_or_tail(output, 3000)}"
     assert data["eval/loss"] > 0, f"Eval loss should be > 0: {data}"
     assert data["eval/perplexity"] > 1.0, f"Perplexity should be > 1: {data}"
     return data
@@ -505,17 +513,20 @@ class TestTrainFeatures:
 def _assert_resume_markers(output: str, expected_resume_step: int) -> None:
     """Assert the warm-resume log markers fire and carry the right step count."""
     assert "Auto-resume: found latest checkpoint" in output, (
-        f"missing auto-resume marker:\n{output[-3000:]}"
+        f"missing auto-resume marker:\n{traceback_or_tail(output, 3000)}"
     )
-    assert "Restored RNG states" in output, f"missing RNG restore marker:\n{output[-3000:]}"
+    assert "Restored RNG states" in output, (
+        f"missing RNG restore marker:\n{traceback_or_tail(output, 3000)}"
+    )
     assert f"Resumed from step {expected_resume_step}" in output, (
-        f"did not resume at step {expected_resume_step}:\n{output[-3000:]}"
+        f"did not resume at step {expected_resume_step}:\n{traceback_or_tail(output, 3000)}"
     )
     assert f"skip_batches={expected_resume_step}" in output, (
-        f"dataloader skip_batches not restored to {expected_resume_step}:\n{output[-3000:]}"
+        f"dataloader skip_batches not restored to {expected_resume_step}:\n"
+        f"{traceback_or_tail(output, 3000)}"
     )
     assert "Applied stashed dataloader state" in output, (
-        f"stashed dataloader state not applied:\n{output[-3000:]}"
+        f"stashed dataloader state not applied:\n{traceback_or_tail(output, 3000)}"
     )
 
 
@@ -562,11 +573,11 @@ class TestAutoResume:
 
         r2 = _run(hw, TRAIN_SCRIPT, args + ["--train.max_steps=30"])
         output2 = r2.stdout + r2.stderr
-        assert r2.returncode == 0, f"Resume failed:\n{output2[-3000:]}"
+        assert r2.returncode == 0, f"Resume failed:\n{traceback_or_tail(output2, 3000)}"
         _assert_resume_markers(output2, expected_resume_step=20)
         match = re.search(r"Training complete: (\d+) steps", output2)
         assert match and int(match.group(1)) == 30, (
-            f"Expected 30 steps, got output:\n{output2[-1000:]}"
+            f"Expected 30 steps, got output:\n{traceback_or_tail(output2, 1000)}"
         )
 
     def test_moe_fsdp_auto_resume(self, hw, data_path, file_pattern, data_vocab_size):
@@ -582,10 +593,10 @@ class TestAutoResume:
 
         r2 = _run(hw, TRAIN_SCRIPT, args + ["--train.max_steps=30"])
         output2 = r2.stdout + r2.stderr
-        assert r2.returncode == 0, f"MoE resume failed:\n{output2[-3000:]}"
+        assert r2.returncode == 0, f"MoE resume failed:\n{traceback_or_tail(output2, 3000)}"
         _assert_resume_markers(output2, expected_resume_step=20)
         assert "moe/aux_loss" in output2, (
-            f"MoE aux_loss metric missing post-resume:\n{output2[-1000:]}"
+            f"MoE aux_loss metric missing post-resume:\n{traceback_or_tail(output2, 1000)}"
         )
 
 
@@ -626,10 +637,12 @@ class TestRealConfigs:
             timeout=600,
         )
         output = result.stdout + result.stderr
-        assert result.returncode == 0, f"FP8 7B failed:\n{output[-3000:]}"
-        assert "Applied Float8 training" in output, f"Float8 was not applied:\n{output[-2000:]}"
+        assert result.returncode == 0, f"FP8 7B failed:\n{traceback_or_tail(output, 3000)}"
+        assert "Applied Float8 training" in output, (
+            f"Float8 was not applied:\n{traceback_or_tail(output, 2000)}"
+        )
         assert "fsdp_float8_all_gather=True" in output, (
-            f"FSDP2 float8 all-gather was not enabled:\n{output[-2000:]}"
+            f"FSDP2 float8 all-gather was not enabled:\n{traceback_or_tail(output, 2000)}"
         )
         _assert_train_ok(result, expected_steps=3)
 
