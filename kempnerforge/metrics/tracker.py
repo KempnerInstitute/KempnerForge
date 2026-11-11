@@ -102,6 +102,10 @@ class MetricsTracker:
         """Mark the beginning of a training step."""
         self._step_start = time.perf_counter()
 
+    def is_log_step(self, step: int) -> bool:
+        """Whether ``end_step`` logs ``step``: step 1 and every ``log_interval`` steps."""
+        return step % self.metrics_config.log_interval == 0 or step == 1
+
     def end_step(
         self,
         step: int,
@@ -109,6 +113,7 @@ class MetricsTracker:
         grad_norm: float,
         lr: float,
         tokens_in_step: int,
+        seq_len: int | None = None,
     ) -> StepMetrics | None:
         """Mark the end of a training step and optionally log metrics.
 
@@ -123,6 +128,8 @@ class MetricsTracker:
                 returns); under pipeline parallelism, the whole model's norm.
             lr: Current learning rate.
             tokens_in_step: Total tokens processed in this step (across all GPUs).
+            seq_len: Length of the sequences the step ran, for the MFU attention term;
+                None uses ``train.seq_len``.
 
         Returns:
             StepMetrics if this step was a logging step, None otherwise.
@@ -135,7 +142,7 @@ class MetricsTracker:
             tokens_per_sec=tokens_per_sec,
             num_gpus=self.num_gpus,
             gpu_peak_tflops=self.gpu_peak_tflops,
-            seq_len=self.seq_len,
+            seq_len=self.seq_len if seq_len is None else seq_len,
         )
 
         self._update_smoothed("loss", loss)
@@ -143,7 +150,7 @@ class MetricsTracker:
         self._update_smoothed("mfu", mfu)
         self._update_smoothed("step_time", step_time)
 
-        if step % self.metrics_config.log_interval != 0 and step != 1:
+        if not self.is_log_step(step):
             return None
 
         mem_stats = get_memory_stats()

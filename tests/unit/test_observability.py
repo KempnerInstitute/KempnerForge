@@ -113,6 +113,30 @@ class TestMetricsTracker:
         logged = [(step, m["smoothed/loss"]) for m, step in backend.log_calls]
         assert logged == [(1, 1.0), (2, pytest.approx(1.1)), (4, pytest.approx(1.561))]
 
+    def test_is_log_step_matches_the_steps_end_step_logs(self):
+        tracker = self._make_tracker(log_interval=3)
+        logged = []
+        for step in range(1, 8):
+            tracker.start_step()
+            if tracker.end_step(step=step, loss=2.0, grad_norm=1.0, lr=3e-4, tokens_in_step=8):
+                logged.append(step)
+        assert logged == [1, 3, 6]
+        assert [step for step in range(1, 8) if tracker.is_log_step(step)] == logged
+
+    def test_mfu_attention_term_uses_the_step_seq_len(self, monkeypatch):
+        """``seq_len`` from the step feeds the MFU attention term; without it, ``train.seq_len``."""
+        seen: list = []
+        monkeypatch.setattr(
+            tracker_mod, "compute_mfu", lambda *a, **k: seen.append(k["seq_len"]) or 0.0
+        )
+        tracker = self._make_tracker()
+        for step, seq_len in ((1, 12), (2, None)):
+            tracker.start_step()
+            tracker.end_step(
+                step=step, loss=2.0, grad_norm=1.0, lr=3e-4, tokens_in_step=8, seq_len=seq_len
+            )
+        assert seen == [12, tracker.seq_len]
+
     def test_end_step_reads_memory_once_per_logged_step(self, monkeypatch):
         """A logged step reads each counter once, from the current device; other steps read none."""
         tracker = self._make_tracker(log_interval=2)

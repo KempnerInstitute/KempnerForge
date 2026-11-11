@@ -67,6 +67,7 @@
             "tp_sequence_parallel",
             "head_dim",
             "computed_ffn_hidden_dim",
+            "mlp_matrices",
             "num_params_estimate"
           ]
         }
@@ -790,10 +791,11 @@
     },
     "kempnerforge/training/eval.py": {
       "functions": [
-        "run_eval(model, eval_dataloader, loss_fn, device, eval_steps, *, pp_schedule, pp_rank, pp_size, pp_group) -> dict"
+        "run_eval(model, eval_dataloader, loss_fn, device, eval_steps, *, pp_schedule, pp_rank, pp_size, pp_group, pp_n_microbatches, dp_groups) -> dict"
       ],
       "tested_by": [
-        "tests/unit/test_eval.py::TestRunEval"
+        "tests/unit/test_eval.py::TestRunEval",
+        "tests/unit/test_eval.py::TestRunEvalOverDataParallel"
       ]
     },
     "kempnerforge/training/freeze.py": {
@@ -901,7 +903,7 @@
           "purpose": "Dataloader + live iterator with epoch restart"
         },
         "StepResult": {
-          "purpose": "Loss, grad norm, text-token and per-dataset counters from one step"
+          "purpose": "Loss, grad norm, positions run, text-token count and per-source token and loss tensors from one step"
         },
         "TrainingSession": {
           "purpose": "Collaborators the step loop needs after the build phase"
@@ -921,6 +923,11 @@
         "tests/unit/test_train_entry.py::TestMoEMetrics",
         "tests/unit/test_train_entry.py::TestSelectStepFn",
         "tests/unit/test_train_entry.py::TestCheckpointExtra",
+        "tests/unit/test_train_entry.py::TestTokensCountTheBatch",
+        "tests/unit/test_train_entry.py::TestCheckpointTiming",
+        "tests/unit/test_train_entry.py::TestPerDatasetMetrics",
+        "tests/unit/test_train_entry.py::TestModuleLearningRateMetrics",
+        "tests/unit/test_dp_info.py::TestLoggedMetricsOverDataParallel",
         "tests/e2e/test_training_e2e.py"
       ]
     },
@@ -1193,10 +1200,14 @@
     "kempnerforge/distributed/utils.py": {
       "functions": [
         "get_dp_info(device_mesh) -> (dp_rank, dp_size)",
+        "data_parallel_groups(device_mesh) -> tuple[ProcessGroup, ...]",
+        "dp_all_reduce_(tensor, groups) -> Tensor",
+        "dp_mean(value, groups, device) -> float",
         "clip_grad_norm_(model, max_norm, foreach, pp_group) -> Tensor"
       ],
       "tested_by": [
         "tests/unit/test_distributed.py::TestClipGradNorm",
+        "tests/unit/test_dp_info.py::TestDataParallelReduction",
         "tests/unit/test_ep_gradients.py::TestClipUnderExpertParallelism"
       ]
     },
@@ -1223,6 +1234,7 @@
           "purpose": "DCP-based distributed checkpoint save/load/cleanup manager. Cross-arch VLM freeze-metadata validation, rank-0-authoritative train_state existence broadcast (NFS/Lustre stat() race), ownership-gated train_state.pt load",
           "methods": [
             "save(step, tokens_seen, scheduler, dataloader, extra)",
+            "has_pending_save (property: an async save to drain or a latest commit to make)",
             "wait()",
             "flush_pending_save()",
             "peek_saved_step(path)",
@@ -1253,6 +1265,7 @@
         "tests/unit/test_lr_multipliers.py::TestLayoutChange",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
+        "tests/unit/test_checkpoint.py::TestHasPendingSave",
         "tests/unit/test_checkpoint.py::TestPeekSavedStep",
         "tests/unit/test_checkpoint.py::TestSaveVLMFreezeMetadata",
         "tests/unit/test_checkpoint.py::TestLoadVLMFreezeCompare",
@@ -1289,7 +1302,8 @@
           "purpose": "Collect, smooth (EMA), and dispatch metrics to backends",
           "methods": [
             "start_step()",
-            "end_step(step, loss, grad_norm, lr, ...)",
+            "is_log_step(step) -> bool",
+            "end_step(step, loss, grad_norm, lr, tokens_in_step, seq_len)",
             "log_step(metrics, step)"
           ]
         }
@@ -1337,7 +1351,8 @@
         "compute_mfu(tokens_per_sec, config, seq_len, gpu_peak_tflops) -> float"
       ],
       "tested_by": [
-        "tests/unit/test_performance.py::TestMFU"
+        "tests/unit/test_performance.py::TestMFU",
+        "tests/unit/test_performance.py::TestEstimatesCountTheBuiltMLP"
       ]
     },
     "kempnerforge/profiling/profiler.py": {

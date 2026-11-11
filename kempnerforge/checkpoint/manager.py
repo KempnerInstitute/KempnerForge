@@ -1235,6 +1235,14 @@ class CheckpointManager:
         with self._sidecar_lock:
             _replace_file(ckpt_dir / _METADATA_FILE, text)
 
+    @property
+    def has_pending_save(self) -> bool:
+        """Whether ``wait()`` has an async save to drain or a ``latest`` commit to make.
+
+        Always False with synchronous saves, which commit inside ``save()``.
+        """
+        return self._async_ckpt.is_pending or self._pending_finalize is not None
+
     def wait(self) -> None:
         """Block until any pending async checkpoint save completes.
 

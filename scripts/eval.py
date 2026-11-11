@@ -37,7 +37,7 @@ from kempnerforge.data.dataset import MemoryMappedDataset
 from kempnerforge.data.sampler import DistributedSampler
 from kempnerforge.distributed.parallel import build_parallel_model, default_mp_policy
 from kempnerforge.distributed.setup import destroy_distributed, get_world_info, init_distributed
-from kempnerforge.distributed.utils import get_dp_info
+from kempnerforge.distributed.utils import data_parallel_groups, get_dp_info
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.resilience.elastic import resolve_resume_path
 from kempnerforge.training import build_loss_fn, run_eval
@@ -155,7 +155,14 @@ def main() -> None:
     )
     logger.info(f"Eval dataset: {len(eval_dataset):,} samples, {eval_config.steps} eval steps")
 
-    metrics = run_eval(model, eval_dataloader, loss_fn, device, eval_config.steps)
+    metrics = run_eval(
+        model,
+        eval_dataloader,
+        loss_fn,
+        device,
+        eval_config.steps,
+        dp_groups=data_parallel_groups(device_mesh),
+    )
 
     if rank == 0:
         print(f"\n{'=' * 50}")

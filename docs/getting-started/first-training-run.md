@@ -23,7 +23,7 @@ You will see one metrics line every 5 steps (controlled by
 `metrics.log_interval`):
 
 ```
-2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=9.1800 | lr=3.00e-04 | grad_norm=1.340 | tok/s=13,653 | mfu=0.1% | mem=2.1/80GB | step_time=0.15s
+2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=9.1800 | lr=2.70e-04 | grad_norm=1.340 | tok/s=13,653 | mfu=0.1% | mem=2.1/80GB | step_time=0.15s
 ```
 
 Like every line the framework logs, it starts with the local time (to the
@@ -32,13 +32,13 @@ millisecond), the rank that wrote it and the log level. The metrics follow:
 | Field | What it is |
 |-------|------------|
 | `step` | Optimizer step count. Matches checkpoint filenames. |
-| `loss` | Training cross-entropy for this step. |
-| `lr` | Current learning rate after the scheduler applies. Ramps up for 10 steps, then cosine-decays. |
+| `loss` | Training cross-entropy for this step, averaged over the data-parallel ranks. |
+| `lr` | Learning rate this step's update used: `0` at step 1, then ramping up for 10 steps before the cosine decay. For `schedule_free_adamw`, the optimizer applies its own warmup (`schedule_free_warmup_steps`) inside `step()`, so `lr` shows the rate before that warmup. |
 | `grad_norm` | L2 norm of gradients before clipping (returned by `clip_grad_norm_`). Clipping to `train.grad_clip_norm` (default 1.0) is applied in-place before the optimizer step. |
-| `tok/s` | Tokens per second throughput, this step. |
+| `tok/s` | Tokens the model ran this step, on all GPUs, over `step_time`. |
 | `mfu` | Model FLOPs Utilization — achieved FLOPs / theoretical peak for the GPU. |
 | `mem` | Peak GPU memory / total GPU memory, on rank 0's GPU. The peak is the most allocated at any point since the process started, not in this step: a high-water mark that never goes down (see [Memory monitor](../metrics-and-profiling/memory-monitor.md#why-metricstracker-doesnt-reset-peak)). |
-| `step_time` | Wall-clock time spent on this step, in seconds. |
+| `step_time` | Wall-clock time of this step, in seconds, from loading its first batch to the end of its optimizer step and LR update. Eval and checkpoint saves run after it and are not in it (nor in `tok/s` and `mfu`); each save's time is logged as `checkpoint/save_sec`. |
 
 Synthetic data means loss starts near `log(vocab_size) ≈ 10.4` and falls
 slowly because the "dataset" is random tokens — there is no real signal to

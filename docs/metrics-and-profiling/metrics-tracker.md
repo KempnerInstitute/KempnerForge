@@ -34,15 +34,29 @@ resumed run ids into the config.
 `end_step` runs four things in order:
 
 1. **Timing**: `step_time = perf_counter() - _step_start`; derives
-   `tokens_per_sec = tokens_in_step / step_time`.
+   `tokens_per_sec = tokens_in_step / step_time`. The loop calls
+   `start_step()` before the step's first batch is loaded and `end_step()`
+   after the optimizer step, the LR update and the step's freeze and phase
+   transitions, so eval, checkpoint saves and hooks are outside it.
 2. **MFU**: calls `compute_mfu(model_config, tokens_per_sec, num_gpus,
-   gpu_peak_tflops, seq_len)`. See [MFU](mfu.md).
+   gpu_peak_tflops, seq_len)`, with the `seq_len` the step ran when the loop
+   passes one, else `train.seq_len`. See [MFU](mfu.md).
 3. **EMA smoothing**: updates four smoothed keys (`loss`,
    `tokens_per_sec`, `mfu`, `step_time`) with `alpha=0.1`.
-4. **Log if due**: if `step % log_interval == 0` or `step == 1`, read GPU
-   memory once with `get_memory_stats()`, from the current device, then
-   dispatch to stdout + all backends and return a `StepMetrics`.
-   Otherwise return `None` without reading memory.
+4. **Log if due**: if `is_log_step(step)`, that is `step % log_interval == 0`
+   or `step == 1`, read GPU memory once with `get_memory_stats()`, from the
+   current device, then dispatch to stdout + all backends and return a
+   `StepMetrics`. Otherwise return `None` without reading memory.
+
+The loop hands `end_step` the step's loss averaged over the data-parallel
+ranks, the same value on every rank, and the learning rate the step's
+update used, read before `optimizer.step()` (for `schedule_free_adamw`,
+the rate before the warmup the optimizer applies inside `step()`; see
+[Schedulers](../training/schedulers.md#shared-warmup)). `tokens_in_step`
+counts the positions the model ran (all micro-steps, padding included,
+times the data-parallel size), and `seq_len` is the length of those rows;
+a VLM row holds the image positions in the residual stream as well as the
+text.
 
 The tracker never resets the CUDA peak counter, so `peak_gb` (logged as
 `gpu/peak_gb` and `mem=`) is the high-water mark of the run, and
@@ -54,7 +68,7 @@ The tracker never resets the CUDA peak counter, so `peak_gb` (logged as
 ```python
 @dataclass
 class StepMetrics:
-    loss: float           # raw, not smoothed
+    loss: float           # data-parallel mean, not smoothed
     grad_norm: float
     lr: float
     tokens_per_sec: float # global (across all GPUs)
@@ -93,7 +107,7 @@ from every data point, even ones that aren't logged.
 
 ```python
 # kempnerforge/metrics/tracker.py: end_step, after the smoothing
-if step % self.metrics_config.log_interval != 0 and step != 1:
+if not self.is_log_step(step):
     return None
 
 mem_stats = get_memory_stats()   # read on logging steps only
@@ -105,6 +119,10 @@ return metrics
 Default `log_interval = 10`. Step 1 is always logged (useful sanity check
 that the pipeline is alive). Step 0 is never reached — the training loop
 starts at `step = 1`.
+
+`is_log_step(step)` is the same test, so the loop can ask ahead of a step
+whether it will be logged: `text_step` computes the per-source losses only
+then.
 
 ## Stdout format
 
@@ -180,15 +198,25 @@ def log_eval(self, metrics: dict[str, float], step: int) -> None:
 
 Eval metrics don't touch the smoothing table — they're reported raw. The
 training loop calls `log_eval` after `run_eval`, and separately for per-module
-learning rates, MoE and per-dataset breakdowns:
+learning rates, MoE and per-dataset breakdowns, and checkpoint times:
 
 ```python
 # training/loop.py
 tracker.log_eval(lr_metrics, step)      # lr/<module> (lr_adamw/<module> under muon), with optimizer.lr_multipliers
 tracker.log_eval(moe_metrics, step)     # moe/aux_loss, moe/expert_balance
-tracker.log_eval(ds_metrics, step)      # per-source loss
+tracker.log_eval(ds_metrics, step)      # loss/<name>, data/<name>/tokens
 tracker.log_eval(eval_metrics, step)    # eval loss
+tracker.log_eval(save_metrics, step)    # checkpoint/save_sec, checkpoint/wait_sec
 ```
+
+The eval loss and the per-source metrics are reduced over the same
+data-parallel ranks as the training loss, so rank 0's backends log values
+for the whole job. `checkpoint/save_sec` is the time each save held the
+loop (for an async save, the wait for the previous upload, the staging and
+the dispatch); `checkpoint/wait_sec` is the time spent draining an async
+save: at the end of the run when a save is still pending, when a shutdown
+finds this step already saved, and when a freeze stage flushes. Neither is
+in `step_time`, except a freeze stage's flush, which runs inside its step.
 
 Each call logs with the same `step`, so a single training step can
 produce several side-by-side rows in WandB / TensorBoard.
