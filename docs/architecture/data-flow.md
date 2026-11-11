@@ -148,7 +148,8 @@ if mc.is_moe:
     loss = loss + mc.moe_aux_loss_weight * aux_loss
 ```
 
-`get_moe_aux_loss()` sums the per-layer `MoEMLP.aux_loss` attributes.
+`get_moe_aux_loss()` sums the `MoEMLP.aux_loss` attributes of every
+router: one per MoE layer, or one per modality on a MoT layer.
 For dense runs it returns `0.0` and the line is a no-op.
 
 ### 6 · Backward with gradient accumulation
@@ -242,7 +243,8 @@ hook_runner.on_step_end(StepContext(...))
 runs user-defined `TrainingHook` callbacks each step.
 
 MoE runs additionally log `moe/aux_loss` and `moe/expert_balance`
-(`min/max` of per-expert token counts) at the same cadence.
+(`min/max` of per-expert loads, each router's counts over its own
+total) at the same cadence, plus `moe/expert_balance/<modality>` on MoT.
 
 ### 11 · Periodic work
 

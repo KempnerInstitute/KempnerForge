@@ -296,6 +296,14 @@ before the inner AdamW was checkpointed is not checked: a parameter that
 moved to the inner AdamW starts fresh, and one that moved to Muon still
 fails inside `dcp.load`.
 
+Each rank runs these checks on its own part of the checkpoint, so under
+pipeline parallelism one stage can fail them while the others pass. A
+load that restores optimizer state therefore ends its checks with one
+all-reduce on the manager's gloo group, which every rank enters: a rank
+whose check failed raises its error, and every other rank raises a
+`RuntimeError` naming the ranks that failed, before any rank loads
+anything.
+
 The template also holds every param-group key the optimizer has now,
 and DCP requires each one. An optimizer whose param groups gained a key
 after its checkpoints were first written lists it in

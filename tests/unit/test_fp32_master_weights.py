@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import socket
 from collections.abc import Callable
 from pathlib import Path
@@ -89,10 +90,36 @@ def _optimizer_state_is_fp32(rank: int, world: int) -> None:
                         assert value.dtype == torch.float32, (name, key, value.dtype)
 
 
+def _module_groups_step_the_fp32_shards(rank: int, world: int) -> None:
+    """``optimizer.lr_multipliers`` groups hold the fp32 shards, each at its module's rate."""
+    patterns = {"head": ["output_head.*"], "layer0": ["layers.0.*"]}
+    multipliers = {"head": 2.0, "layer0": 0.5}
+    for name in OPTIMIZERS:
+        model = _sharded(torch.float32, world)
+        config = OptimizerConfig(name=name, lr=1e-3, fused=False, lr_multipliers=multipliers)
+        optimizer = build_optimizer(model, config, module_patterns=patterns)
+        optimizers = (optimizer, *getattr(optimizer, "inner_optimizers", ()))
+        rates = {p: g["lr"] for opt in optimizers for g in opt.param_groups for p in g["params"]}
+        model(_tokens(rank)).float().sum().backward()
+        optimizer.step()
+        for param_name, p in model.named_parameters():
+            module = next(
+                (m for m in patterns if fnmatch.fnmatch(param_name, patterns[m][0])), None
+            )
+            assert isinstance(p, DTensor) and p.dtype == torch.float32, (name, param_name)
+            assert rates[p] == 1e-3 * multipliers.get(module, 1.0), (name, param_name)
+        for opt in optimizers:
+            for state in opt.state.values():
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor) and value.is_floating_point():
+                        assert value.dtype == torch.float32, (name, key, value.dtype)
+
+
 CHECKS: dict[str, Callable[[int, int], None]] = {
     "forward": _forward_matches_a_bf16_copy,
     "small_updates": _small_updates_survive_only_in_fp32,
     "optimizer_state": _optimizer_state_is_fp32,
+    "module_groups": _module_groups_step_the_fp32_shards,
 }
 
 
