@@ -44,6 +44,13 @@ either error or silently leave the tensor uninitialized (it warns).
 | Add a new parameter | yes | Missing-from-shard → warned, default-initialized |
 | Rename a parameter | no | Old name not in `.metadata` → error (or you patch the state dict keys before `load_state_dict`) |
 
+The table is about model and optimizer state, which is all DCP reshards. The
+dataloader cursor and the RNG streams are rank-local and live outside DCP, so
+any row above that moves a rank onto a different data partition (a changed
+world size, `dp_shard`, `dp_replicate`, `tp` or `ep`) needs one extra config
+line on resume: see
+[Scaling a run to a different world size](#scaling-a-run-to-a-different-world-size).
+
 ## PP — the one special case
 
 PP stores shards per-stage under `pp0/`, `pp1/`, …. A checkpoint saved
@@ -84,8 +91,66 @@ typically don't need to rebalance mid-training.
 - **`.metadata` disagreement between `pp{i}/` subdirs**: always a
   bug — different PP stages should save independently. File an
   issue.
+- **"checkpoint per-rank state was saved with world_size=..."**: not
+  a DCP failure at all. The model and optimizer reshard fine; the
+  dataloader and RNG state cannot follow the topology change. See
+  [Scaling a run to a different world size](#scaling-a-run-to-a-different-world-size).
 
-## Example: scale-up from 16 to 64 GPUs
+## Scaling a run to a different world size
+
+DCP reshards model and optimizer state freely, but the dataloader
+cursor and the RNG streams are not DCP state. They are rank-local:
+`train_state.pt` holds one payload per rank
+([Train state](train-state.md#per-rank-state-schema-v1)), and a
+payload is only meaningful on the rank and data partition that saved
+it. An auto-resume is an *exact* resume, so it refuses to start when
+the topology moved:
+
+- a different world size, or
+- a different data-parallel layout at the same world size, which is
+  what changing `dp_shard`, `dp_replicate`, `tp` or `ep` does: with
+  `dp_shard=4` rank 2 reads data partition 2 of 4, and with
+  `dp_shard=2`, `tp=2` it reads partition 1 of 2.
+
+Both raise on every rank, with an error naming the saved topology,
+the current one, and the setting below. The refusal is deliberate:
+restoring rank 0's single copy on every rank instead would move every
+other rank's data position silently, with a loss curve that looks
+entirely normal and nothing in the logs to say that data was re-read
+or skipped.
+
+To scale anyway, add one line to the config:
+
+```toml
+[checkpoint]
+ignore_rank_state_mismatch = true
+```
+
+or pass `--checkpoint.ignore_rank_state_mismatch=true` on the command
+line. Every rank then discards the saved per-rank dataloader and RNG
+state (rank 0 logs a warning saying so) and resumes from the rest of
+the checkpoint:
+
+| State | With the flag set |
+|-------|-------------------|
+| `step`, `tokens_seen` | continue |
+| Model, optimizer, scheduler | continue, resharded by DCP onto the new topology |
+| Dataloader position | restarts from the first sample |
+| RNG streams | restart from the run's seeds |
+
+Resharding model and optimizer state never needs the flag; it is
+untouched by the per-rank state. Nor do the loads that are not an
+exact resume: a `checkpoint.load_path` warm start and
+`scripts/eval.py` ignore the per-rank state and never check the
+topology, on any world size or layout.
+
+Restarting the data is not the same as continuing it: a run that
+scales mid-flight will re-read the samples it already consumed.
+Exact data continuity across a change in the data-parallel size is
+tracked separately in
+[issue #314](https://github.com/KempnerInstitute/KempnerForge/issues/314).
+
+### Example: scale-up from 16 to 64 GPUs
 
 ```bash
 # Train at 16 GPUs
@@ -94,16 +159,21 @@ uv run torchrun --nproc_per_node=16 scripts/train.py configs/train/7b.toml \
 
 # Bump to 64 GPUs and resume
 uv run torchrun --nproc_per_node=64 scripts/train.py configs/train/7b.toml \
-    --train.max_steps=20000 --checkpoint.dir=/checkpoints/7b_run
+    --train.max_steps=20000 --checkpoint.dir=/checkpoints/7b_run \
+    --checkpoint.ignore_rank_state_mismatch=true
 ```
 
 Auto-resume follows the `latest` symlink, `CheckpointManager.load`
-calls `dcp.load`, DCP reshards the 16-way sharded state into 64-way,
-training continues from step 5000. No manual intervention.
+calls `dcp.load`, and DCP reshards the 16-way sharded state into
+64-way. Training continues from step 5000 with the model, optimizer
+and scheduler intact; the data order and the RNG streams restart,
+because the 64-rank job's data partitions are not the ones the
+16-rank job saved cursors for. Without that last flag the resume
+stops instead, naming the saved and current world sizes.
 
-The one thing that changes: effective batch size — 4× the DP ranks
-means 4× the batch per step. Adjust `grad_accum_steps` downward if
-you need to keep the global batch size constant.
+The other thing that changes is the effective batch size: 4× the DP
+ranks means 4× the batch per step. Adjust `grad_accum_steps` downward
+if you need to keep the global batch size constant.
 
 ## See also
 
