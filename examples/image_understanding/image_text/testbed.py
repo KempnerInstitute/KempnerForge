@@ -68,10 +68,20 @@ class ImageTextRows(Dataset):
         image = decode_rgb(self.image_root / row["image"])
         return Document(images=(image,), turns=(Turn(row["user"], tuple(row["answers"])),))
 
-    def __getitem__(self, index: int) -> Document:
+    def read_with_index(self, index: int) -> tuple[int, Document]:
+        """The actual row index and document after passing over unusable rows."""
         if not 0 <= index < len(self):
             raise IndexError(f"index {index} is out of range for {len(self)} rows")
-        return first_usable(index, len(self), self.max_attempts, self._read, self._skips)
+        return first_usable(
+            index,
+            len(self),
+            self.max_attempts,
+            lambda row: (row, self._read(row)),
+            self._skips,
+        )
+
+    def __getitem__(self, index: int) -> Document:
+        return self.read_with_index(index)[1]
 
 
 def _load_json(path: str | Path) -> Any:
