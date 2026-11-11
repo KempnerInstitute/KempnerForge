@@ -1886,6 +1886,35 @@ class TestDpSizeReachesTokenAccounting:
         assert (step, tokens_seen) == (2, (17 + 23) * 4)
         assert session.checkpointer.saves[-1][1] == tokens_seen
 
+    def test_packed_count_is_reduced_before_the_optimizer_steps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+        events: list[str] = []
+        counted = loop._tokens_in_step
+
+        def recording(session: TrainingSession, result: loop.StepResult) -> int:
+            events.append("count")
+            return counted(session, result)
+
+        monkeypatch.setattr(loop, "_tokens_in_step", recording)
+        session = make_session(
+            make_config(max_steps=1),
+            step_fn=lambda _session, _step: loop.StepResult(loss=1.0, grad_norm=0.5, tokens=5),
+        )
+        stepped = session.optimizer.step
+
+        def stepping(*args, **kwargs):
+            events.append("optimizer")
+            return stepped(*args, **kwargs)
+
+        monkeypatch.setattr(session.optimizer, "step", stepping)
+        step, tokens_seen = run_training_loop(session)
+        assert events == ["count", "optimizer"]
+        assert (step, tokens_seen) == (1, 5)
+
     def test_default_dp_size_is_one_not_zero(self):
         assert DataPipeline().dp_size == 1
 

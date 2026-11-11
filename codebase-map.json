@@ -426,7 +426,8 @@
         "build_modality_strategy(vlm) -> ModalityStrategy",
         "_is_encoder_frozen(specs) -> bool",
         "build_vlm_wrapper(model_config) -> VLMWrapper",
-        "inner_transformer(model) -> nn.Module"
+        "inner_transformer(model) -> nn.Module",
+        "packed_tokens_per_image(model) -> int  # slots one image takes in a packed row, read off the built VLMWrapper"
       ],
       "registry": [
         "@registry.register_modality_strategy('joint_decoder')",
@@ -479,7 +480,8 @@
     "kempnerforge/model/masking.py": {
       "functions": [
         "flex_attention_fn(compiled) -> Callable  # torch.compile'd on CUDA, eager on CPU",
-        "build_doc_causal_block_mask(doc_ids, device) -> BlockMask  # block-diagonal causal"
+        "build_doc_causal_block_mask(doc_ids, device) -> BlockMask  # block-diagonal causal",
+        "use_dynamic_flex_shapes(enabled) -> None  # select the flex pair compiled for a varying batch size (packed VLM runs) or the pinned-shape pair"
       ],
       "purpose": "FlexAttention BlockMask builders for packed sequences (model.attention_backend='flex'); replaces the dense (B, 1, S, S) SDPA mask",
       "tested_by": [

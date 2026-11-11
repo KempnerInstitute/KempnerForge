@@ -833,6 +833,17 @@ class TestJobConfig:
                 video=VideoConfig(max_frames=2, min_frames=1, frame_size=16),
             )
 
+    def test_vlm_packing_is_refused_with_fp8(self):
+        with pytest.raises(ValueError, match="does not support train.mixed_precision='fp8'"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=1024),
+                train=TrainConfig(seq_len=512, mixed_precision="fp8"),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64),
+                data=DataConfig(pack_sequences=True),
+            )
+
     def test_vlm_packing_inherits_the_sequence_parallel_refusal(self):
         """Packed rows are indexed as plain tensors, which sequence parallelism cannot carry."""
         config = JobConfig(

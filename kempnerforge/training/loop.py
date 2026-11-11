@@ -150,10 +150,10 @@ class StepResult:
     loss: float
     grad_norm: float
     text_tokens: int | None = None
-    tokens: int | None = None
     dataset_token_counts: dict[str, int] = field(default_factory=dict)
     dataset_loss_sums: dict[str, float] = field(default_factory=dict)
     dataset_loss_counts: dict[str, int] = field(default_factory=dict)
+    tokens: int | None = None
 
 
 StepFn = Callable[["TrainingSession", int], StepResult]
@@ -665,6 +665,7 @@ def run_training_loop(
 
             tracker.start_step()
             result = session.step_fn(session, step)
+            tokens_in_step = _tokens_in_step(session, result)
 
             if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
                 optimizer.zero_grad()
@@ -686,7 +687,6 @@ def run_training_loop(
             optimizer.zero_grad()
 
             step += 1
-            tokens_in_step = _tokens_in_step(session, result)
             tokens_seen += tokens_in_step
 
             _apply_step_transitions(session, step)
