@@ -215,6 +215,27 @@ class TestReferences:
             TEXT_SCORERS[name]("yes", "yes")
 
     @pytest.mark.parametrize("name", sorted(TEXT_SCORERS))
+    @pytest.mark.parametrize("prediction", [None, 0, False, b"yes", ["yes"]])
+    def test_the_prediction_must_be_a_string(self, name: str, prediction: object) -> None:
+        with pytest.raises(TypeError, match="prediction must be a str"):
+            TEXT_SCORERS[name](prediction, ["yes"])
+
+    @pytest.mark.parametrize("name", sorted(TEXT_SCORERS))
+    @pytest.mark.parametrize("answers", [None, 3, b"yes", {"yes"}, iter(["yes"])])
+    def test_the_references_must_be_a_sequence(self, name: str, answers: object) -> None:
+        with pytest.raises(TypeError, match="answers must be a sequence of str"):
+            TEXT_SCORERS[name]("yes", answers)
+
+    @pytest.mark.parametrize("name", sorted(TEXT_SCORERS))
+    @pytest.mark.parametrize("bad", [None, 0, b"yes", ["yes"]])
+    @pytest.mark.parametrize("position", [0, 1])
+    def test_every_reference_must_be_a_string(self, name: str, bad: object, position: int) -> None:
+        answers = ["yes", "yes"]
+        answers[position] = bad
+        with pytest.raises(TypeError, match=rf"answers\[{position}\] must be a str"):
+            TEXT_SCORERS[name]("yes", answers)
+
+    @pytest.mark.parametrize("name", sorted(TEXT_SCORERS))
     @pytest.mark.parametrize("prediction", ["yes", "no", ""])
     def test_a_score_is_a_float_between_zero_and_one(self, name: str, prediction: str) -> None:
         score = TEXT_SCORERS[name](prediction, _votes(7, 10))

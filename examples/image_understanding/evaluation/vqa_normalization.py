@@ -179,9 +179,11 @@ def normalize_vqa_answer(answer: str) -> str:
     digits; otherwise every occurrence becomes a space. A period is deleted unless
     a digit follows it, for the first ``MAX_PERIODS_REMOVED`` such periods. The
     answer is lowercased and split into words: a word of ``NUMBER_WORDS`` becomes
-    its digits, the ``ARTICLES`` are dropped, a word of ``CONTRACTIONS`` gets its
-    apostrophe, and the words are joined by single spaces. Apostrophes and colons
-    are kept, so a possessive stays one and a time of day stays readable.
+    its digits, the ``ARTICLES`` are dropped, a word of ``CONTRACTIONS`` is replaced
+    by its table entry, which is the word with its apostrophes except for the
+    official table's irregular ``somebody'd``, mapped to ``somebodyd``; and the
+    words are joined by single spaces. Apostrophes and colons elsewhere are kept,
+    so a possessive stays one and a time of day stays readable.
     """
     text = answer.replace("\n", " ").replace("\t", " ").strip()
     deletes_every_mark = _COMMA_BETWEEN_DIGITS.search(text) is not None
