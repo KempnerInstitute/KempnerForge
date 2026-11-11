@@ -1251,6 +1251,48 @@ def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
 
 
 class TestRunTraining:
+    def test_packed_vlm_batches_train_through_run_training(self, monkeypatch):
+        """run_training drives vlm_step over packed rows with a real wrapper."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.data.vlm_dataset import pack_vlm_samples
+        from kempnerforge.model.vlm import build_vlm_wrapper
+        from kempnerforge.training.entry import run_training
+
+        config = _vlm_config()
+        config.data.pack_sequences = True
+        config.train.max_steps = 2
+        assert config.vision_encoder is not None and config.adapter is not None
+        assert config.vlm is not None
+        model = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
+        before = next(model.transformer.parameters()).detach().clone()
+
+        def doc(text_len: int, seed: int) -> dict:
+            gen = torch.Generator().manual_seed(seed)
+            ids = torch.randint(0, 256, (text_len,), generator=gen)
+            labels = torch.full((text_len,), -100, dtype=torch.long)
+            labels[:-1] = ids[1:]
+            return {
+                "pixel_values": torch.randn(3, 16, 16, generator=gen),
+                "input_ids": ids,
+                "labels": labels,
+                "text_len": torch.tensor(text_len),
+            }
+
+        batches = [
+            pack_vlm_samples(
+                [doc(10, 1), doc(20, 2), doc(6, 3)], seq_len=64, tokens_per_image=8, pad_id=0
+            ),
+            pack_vlm_samples([doc(30, 4), doc(24, 5)], seq_len=64, tokens_per_image=8, pad_id=0),
+        ]
+        assert [b["input_ids"].shape[0] for b in batches] == [1, 2]
+        ckpt = _stub_entry(monkeypatch, model)
+        ckpt.apply_dataloader_state = lambda _loader: None
+        monkeypatch.setattr(
+            entry, "build_data_pipeline", lambda *_a, **_k: DataPipeline(dataloader=batches)
+        )
+        run_training(config)
+        assert not torch.equal(before, next(model.transformer.parameters()))
+
     def test_defaults_to_the_registry_selected_step_body(self, monkeypatch):
         from kempnerforge.training.entry import run_training
 
@@ -1800,6 +1842,78 @@ class TestDpSizeReachesTokenAccounting:
         _, tokens_seen = run_training_loop(session)
         per_step = config.train.batch_size * config.train.seq_len * config.train.grad_accum_steps
         assert tokens_seen == 2 * per_step * 8
+
+    def test_packed_counts_do_not_count_tensor_parallel_replicas(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        session = make_session(
+            make_config(),
+            data=DataPipeline(dp_size=2),
+            runtime=dataclasses.replace(_runtime(), world_size=8),
+        )
+        reductions: list[Any] = []
+
+        def reduce_counts(count: torch.Tensor, op: Any) -> None:
+            assert count.item() == 7
+            reductions.append(op)
+            count.fill_(4 * (7 + 11))
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(loop.dist, "all_reduce", reduce_counts)
+        result = loop.StepResult(loss=1.0, grad_norm=0.5, tokens=7)
+        assert loop._tokens_in_step(session, result) == 18
+        assert reductions == [loop.dist.ReduceOp.SUM]
+
+    def test_packed_counts_reach_tokens_seen_without_another_accumulation_factor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+        counts = iter((17, 23))
+
+        def step_fn(_session: TrainingSession, _step: int) -> loop.StepResult:
+            return loop.StepResult(loss=1.0, grad_norm=0.5, tokens=next(counts))
+
+        session = make_session(
+            make_config(max_steps=2, grad_accum_steps=3),
+            data=DataPipeline(dp_size=4),
+            step_fn=step_fn,
+        )
+        step, tokens_seen = run_training_loop(session)
+        assert (step, tokens_seen) == (2, (17 + 23) * 4)
+        assert session.checkpointer.saves[-1][1] == tokens_seen
+
+    def test_packed_count_is_reduced_before_the_optimizer_steps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+        events: list[str] = []
+        counted = loop._tokens_in_step
+
+        def recording(session: TrainingSession, result: loop.StepResult) -> int:
+            events.append("count")
+            return counted(session, result)
+
+        monkeypatch.setattr(loop, "_tokens_in_step", recording)
+        session = make_session(
+            make_config(max_steps=1),
+            step_fn=lambda _session, _step: loop.StepResult(loss=1.0, grad_norm=0.5, tokens=5),
+        )
+        stepped = session.optimizer.step
+
+        def stepping(*args, **kwargs):
+            events.append("optimizer")
+            return stepped(*args, **kwargs)
+
+        monkeypatch.setattr(session.optimizer, "step", stepping)
+        step, tokens_seen = run_training_loop(session)
+        assert events == ["count", "optimizer"]
+        assert (step, tokens_seen) == (1, 5)
 
     def test_default_dp_size_is_one_not_zero(self):
         assert DataPipeline().dp_size == 1
@@ -2875,6 +2989,58 @@ class TestVlmSourceBuilders:
         assert seen["image_collator"]["pad_id"] == 7
         assert "video_collator" not in seen
 
+    def test_packed_image_path_takes_the_model_token_count(self, monkeypatch):
+        import kempnerforge.data.vlm_dataset as vlmd
+
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        monkeypatch.setattr(vlmd, "PackedVLMCollator", lambda **k: seen.setdefault("packed", k))
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        data = dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        assert data.dataloader == "stateful_OBJ"
+        assert seen["packed"] == {
+            "pad_id": 7,
+            "seq_len": config.train.seq_len,
+            "tokens_per_image": 12,
+        }
+        assert "image_collator" not in seen
+        with pytest.raises(ValueError, match="built model's tokens per image"):
+            dp.build_data_pipeline(config, _runtime())
+        with pytest.raises(ValueError, match="cannot hold one packed document"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
+
+    def test_packed_fit_check_runs_before_the_dataset_loads(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        with pytest.raises(ValueError, match="cannot hold one packed document"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
+        with pytest.raises(ValueError, match="built model's tokens per image"):
+            dp.build_data_pipeline(config, _runtime())
+        assert "dataset" not in seen
+
+    def test_packed_tiled_image_budget_counts_every_view(self, monkeypatch):
+        import kempnerforge.data.vlm_dataset as vlmd
+
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        monkeypatch.setattr(vlmd, "PackedVLMCollator", lambda **k: seen.setdefault("packed", k))
+        config = self._vlm_data_config(tile_grid=2, tile_global=False)
+        config.data.pack_sequences = True
+        config.train.seq_len = 4 * 12 + config.vlm.max_text_len - 1
+        with pytest.raises(ValueError, match="48 image tokens"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        config.train.seq_len += 1
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        assert seen["packed"]["tokens_per_image"] == 12
+        assert seen["dataset"]["tile_grid"] == 2
+        assert seen["dataset"]["tile_global"] is False
+
     def test_image_path_hands_the_tiling_to_the_dataset(self, monkeypatch):
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
@@ -3107,9 +3273,11 @@ class TinyVlmModel(nn.Module):
         self.proj = nn.Linear(DIM, VOCAB)
         self.embed = nn.Embedding(VOCAB, DIM)
         self.seen_frame_mask: list = []
+        self.seen_packed: list = []
 
-    def forward(self, pixel_values, input_ids, labels, frame_mask=None):
+    def forward(self, pixel_values, input_ids, labels, frame_mask=None, **packed):
         self.seen_frame_mask.append(frame_mask)
+        self.seen_packed.append(packed)
         return self.proj(self.embed(input_ids)), labels
 
 
@@ -3147,6 +3315,61 @@ class TestVlmStep:
         session, model = self._session([self._batch(with_mask=True)])
         session.step_fn(session, 0)
         assert model.seen_frame_mask[0] is not None
+
+    def test_packed_keys_are_threaded_when_present(self):
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        batch["image_rows"] = torch.tensor([0, 1])
+        batch["image_starts"] = torch.tensor([0, 0])
+        batch["position_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        batch["image_tokens"] = torch.tensor(2)
+        session, model = self._session([batch])
+        session.step_fn(session, 0)
+        packed = model.seen_packed[0]
+        assert set(packed) == {
+            "doc_ids",
+            "position_ids",
+            "image_rows",
+            "image_starts",
+            "image_tokens",
+        }
+        assert packed["image_tokens"] == 2
+        assert packed["doc_ids"].shape == (2, 4)
+
+    def test_reports_tokens_only_for_packed_batches(self):
+        session, _ = self._session([self._batch()])
+        assert session.step_fn(session, 0).tokens is None
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        session, _ = self._session([batch])
+        assert session.step_fn(session, 0).tokens is None
+        batch["image_rows"] = torch.tensor([0, 1])
+        batch["image_starts"] = torch.tensor([0, 0])
+        batch["image_tokens"] = torch.tensor(2)
+        session, _ = self._session([batch])
+        assert session.step_fn(session, 0).tokens == 8
+
+    def test_packed_rows_are_marked_dynamic_for_compile(self, monkeypatch):
+        import torch._dynamo
+
+        marked: list = []
+        monkeypatch.setattr(torch._dynamo, "maybe_mark_dynamic", lambda t, d: marked.append(d))
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        batch["image_rows"] = torch.tensor([0, 1])
+        batch["image_starts"] = torch.tensor([0, 0])
+        batch["image_tokens"] = torch.tensor(2)
+        session, _ = self._session([batch])
+        session.step_fn(session, 0)
+        assert marked == []
+        session.config.train.compile_model = True
+        session.step_fn(session, 0)
+        assert marked == [0] * 6
+
+    def test_unpacked_batches_pass_no_packed_keys(self):
+        session, model = self._session([self._batch()])
+        session.step_fn(session, 0)
+        assert model.seen_packed[0] == {}
 
     def test_frame_mask_is_none_for_image_batches(self):
         session, model = self._session([self._batch()])
