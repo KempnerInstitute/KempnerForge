@@ -4,7 +4,9 @@
 Parses argv, clears the last ``results.json``, loads the training config and
 the task file, and hands off to ``evaluation.evaluator.evaluate_checkpoint``,
 which decodes each task's split with the checkpoint's model, scores the answers
-and writes the results.
+and writes the results. The config and the task file are read on every rank
+before the ranks join a process group, as the training entry point reads its
+config, so both must be readable wherever a rank runs.
 
 Usage:
     # One GPU

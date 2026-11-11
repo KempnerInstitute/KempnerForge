@@ -31,6 +31,7 @@ import torch
 import torch.distributed as dist
 from image_text.document import Document, Turn
 from image_text.render import ChatRenderer, DocumentSource
+from image_text.skip import NoUsableRowError
 from PIL import Image
 
 from kempnerforge.config.distributed import DistributedConfig
@@ -48,6 +49,7 @@ from .inputs import (
     ModelInputs,
     UnsupportedDocumentError,
     build_renderer,
+    check_renderer_config,
     document_inputs,
     prompt_token_ids,
 )
@@ -105,35 +107,32 @@ def check_token_budgets(renderer: ChatRenderer, tasks: Sequence[EvalTask]) -> No
 
 
 def read_row(reader: DocumentSource, index: int) -> Document | None:
-    """The document of row ``index``, or ``None`` when ``reader`` passed over that row.
+    """The document of row ``index``, or ``None`` when ``reader`` did not read that row.
 
     A reader passes over a row it cannot use and returns a later one, which is
     not the answer to this row. A reader that passes over rows must say so: it
     has ``read_with_index``, which returns the index of the row it read with the
     document, or a ``skipped`` count that moves whenever it passes over a row.
-    A reader with ``read_with_index`` is read through it; any other is read by
-    index, one read at a time across threads. Either way a row is ``None`` when
-    the reader read another row, or gave up after passing over a run of rows (a
-    ``RuntimeError`` after its ``skipped`` count moved); any other
-    ``RuntimeError`` is raised.
+    A reader with ``read_with_index`` is read through it, and its ``skipped``
+    count is not read; any other is read by index, one read at a time across
+    threads. A row is ``None`` when the reader read another row (its
+    ``read_with_index`` returned another index, or its ``skipped`` count moved
+    during the read of that row by index) or when the read raised
+    ``NoUsableRowError``, the reader's give-up after a run of unusable rows. Any
+    other exception is raised.
     """
     read_with_index = getattr(reader, "read_with_index", None)
     if read_with_index is not None:
-        skipped = getattr(reader, "skipped", None)
         try:
             actual, document = read_with_index(index)
-        except RuntimeError:
-            if getattr(reader, "skipped", None) == skipped:
-                raise
+        except NoUsableRowError:
             return None
         return document if actual == index else None
     with _ONE_READ_AT_A_TIME:
         skipped = getattr(reader, "skipped", None)
         try:
             document = reader[index]
-        except RuntimeError:
-            if getattr(reader, "skipped", None) == skipped:
-                raise
+        except NoUsableRowError:
             return None
         return document if getattr(reader, "skipped", None) == skipped else None
 
@@ -253,16 +252,16 @@ def evaluate_checkpoint(
 
     ``config`` is the config the checkpoint was trained with and ``checkpoint``
     a run directory, whose latest checkpoint is evaluated, or a step directory.
-    The arguments, the config and the tasks' token budgets are checked before a
-    process group or the model exists, as they come out the same on every rank.
-    Launched as several processes, this then joins them into a process group, or
-    uses the one already initialized. What can fail on one rank alone (removing
-    the last ``results.json``, opening the tasks' splits) is recorded or done in
-    a step the ranks agree on, before the model is built, so a failure on one
-    rank fails them all; a ``prior_failure`` the caller recorded is raised there
-    on every rank too. Each rank loads the model and decodes the batches
-    ``shard_batches`` gives it, reading their rows with ``data.num_workers``
-    threads.
+    The config, the tasks given and ``batch_size`` are checked before a process
+    group exists, as they come out the same on every rank. Launched as several
+    processes, this then joins them into a process group, or uses the one already
+    initialized. In the first step the ranks agree on, before the model is built,
+    a ``prior_failure`` the caller recorded (the failure to remove the last
+    ``results.json`` that ``clear_results`` returns) is raised, the tokenizer is
+    loaded, the tasks' token budgets (which need the tokenizer) are checked and
+    the tasks' splits are opened; so a failure on one rank fails them all. Each
+    rank then loads the model and decodes the batches ``shard_batches`` gives
+    it, reading their rows with ``data.num_workers`` threads.
 
     Rank 0 writes ``predictions/<task>.jsonl`` (one line per row, in row order),
     ``metrics.json`` (``<task>/<metric>`` to value) and last ``results.json``,
@@ -285,13 +284,12 @@ def evaluate_checkpoint(
     """
     prior_failure = prior_failure or clear_results(output)
     _check_arguments(config, tasks, batch_size)
-    prepared = _attempt(partial(_build_renderer, config, tasks))
 
     started_group, rank, world_size, device = _join_ranks(config)
     apply_matmul_precision(config.train)
     output = Path(output)
     renderer, readers = _on_every_rank(
-        partial(_open_splits, prepared, prior_failure, tasks), "Opening the splits"
+        partial(_prepare, config, tasks, prior_failure), "Preparing the evaluation"
     )
     resolved = _on_rank_zero(rank, partial(_start, output, checkpoint), "Starting the evaluation")
     step_dir = Path(_gather(resolved)[0])
@@ -379,38 +377,22 @@ def clear_results(output: str | Path) -> OSError | None:
 
 def _check_arguments(config: JobConfig, tasks: Sequence[EvalTask], batch_size: int) -> None:
     check_supported(config)
+    check_renderer_config(config)
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
     if not tasks:
         raise ValueError("no task to evaluate")
 
 
-def _attempt[T](action: Callable[[], T]) -> tuple[T | None, Exception | None]:
-    """``action()`` and no error, or no value and the error it raised."""
-    try:
-        return action(), None
-    except Exception as error:
-        return None, error
-
-
-def _build_renderer(config: JobConfig, tasks: Sequence[EvalTask]) -> ChatRenderer:
-    renderer = build_renderer(config)
-    check_token_budgets(renderer, tasks)
-    return renderer
-
-
-def _open_splits(
-    prepared: tuple[ChatRenderer | None, Exception | None],
-    prior_failure: Exception | None,
-    tasks: Sequence[EvalTask],
+def _prepare(
+    config: JobConfig, tasks: Sequence[EvalTask], prior_failure: Exception | None
 ) -> tuple[ChatRenderer, dict[str, DocumentSource]]:
-    """Raise what failed before the group existed, then open every split."""
-    renderer, failure = prepared
+    """Raise ``prior_failure``, then build the renderer, check the budgets and open every split."""
     if prior_failure is not None:
         raise prior_failure
-    if failure is not None:
-        raise failure
-    return cast(ChatRenderer, renderer), {task.name: _open_reader(task) for task in tasks}
+    renderer = build_renderer(config)
+    check_token_budgets(renderer, tasks)
+    return renderer, {task.name: _open_reader(task) for task in tasks}
 
 
 def _open_reader(task: EvalTask) -> DocumentSource:
