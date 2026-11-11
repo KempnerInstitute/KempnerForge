@@ -852,3 +852,13 @@ class TestSeveralRanks:
         assert first == "RuntimeError: Checking the tasks failed on ranks [1]"
         assert second == "OSError: the split is not on this node"
         assert not output.exists()
+
+    def test_a_marker_rank_zero_cannot_remove_fails_every_rank(
+        self, run: Run, write_task: Callable[..., Path], tmp_path: Path
+    ) -> None:
+        tasks = write_task(rows=8)
+        output = tmp_path / "ranks" / "results"
+        (output / "results.json").mkdir(parents=True)
+        first, second = _spawn_ranks(2, run, tasks, output)
+        assert first.split(":")[0] in {"IsADirectoryError", "PermissionError"}
+        assert second == "RuntimeError: Checking the tasks failed on ranks [0]"

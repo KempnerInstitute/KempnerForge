@@ -269,9 +269,8 @@ def evaluate_checkpoint(
         UnsupportedDocumentError: a row holds a document outside the limits.
         RuntimeError: on the other ranks, when a rank failed.
     """
-    _clear_results(output)
     renderer, readers = _on_every_rank(
-        partial(_preflight, config, tasks, batch_size), "Checking the tasks"
+        partial(_preflight, config, tasks, batch_size, output), "Checking the tasks"
     )
 
     started_group, rank, world_size, device = _join_ranks(config)
@@ -345,9 +344,13 @@ def _prepare_row(
 
 
 def _preflight(
-    config: JobConfig, tasks: Sequence[EvalTask], batch_size: int
+    config: JobConfig, tasks: Sequence[EvalTask], batch_size: int, output: str | Path
 ) -> tuple[ChatRenderer, dict[str, DocumentSource]]:
-    """The renderer and every task's reader, once the config, token budgets and splits check out."""
+    """Clear the last results, then build the renderer and every task's reader.
+
+    The config, the token budgets and the splits are checked on the way.
+    """
+    _clear_results(output)
     check_supported(config)
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
