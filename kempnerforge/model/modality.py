@@ -23,6 +23,21 @@ needs:
   inline_positions``: image tokens written over placeholder positions
   inside the token-embedded rows, so each document's images sit before
   its own text and ``doc_ids`` keeps attention inside the document.
+- A strategy that chooses the RoPE positions or the attention visibility
+  of the residual it lays out (an image's tokens seeing each other, crops
+  of one image sharing positions) fills ``position_ids`` and
+  ``attention_group_ids``. ``Transformer.forward`` reads them as its
+  arguments of the same names, which may not be passed alongside.
+- A strategy whose positions are not one integer per token (a 2-D or
+  multi-axis RoPE over image crops) fills ``rope_cos`` and ``rope_sin``
+  instead: the rotation itself, ``(batch, seq_len, head_dim // 2)`` or
+  ``(1, seq_len, head_dim // 2)`` shared by every row, which the
+  transformer applies in place of its own table. The strategy builds
+  them from ``precompute_rope_frequencies`` with the model's ``head_dim``
+  and ``rope_theta``, so the same code positions every forward, training
+  and inference alike. ``forward`` moves the rotation tensors to the
+  residual's device for each call; build them on that device to avoid
+  repeated host-to-device transfers.
 
 Cross-arg invariants involving ``kv_caches`` (a ``Transformer.forward``
 argument, not a ``ModalityContext`` field) are enforced at the top of
@@ -49,6 +64,10 @@ class ModalityContext:
       ``inline_positions``, both ``(M,)`` int64, and they require it:
       token ``m`` is written at ``[inline_rows[m], inline_positions[m]]``
       of the embedded rows.
+    - ``output_rows`` and ``output_positions`` come together, ``(M,)`` int64,
+      and exclude ``output_slice``: the head runs on ``h[output_rows,
+      output_positions]`` only, giving ``(1, M, vocab)`` logits, which is how
+      a packed row skips its image slots and padding tail.
     - ``image_mask`` requires ``image_features`` to be set (a
       free-standing ``image_mask`` with no features is a programming
       error).
@@ -59,6 +78,14 @@ class ModalityContext:
       ``inline_embeds`` to be set (it is a key-validity mask over the
       residual sequence; the Cross-Attention arch masks image K/V via
       ``image_mask`` instead).
+    - ``position_ids`` and ``attention_group_ids`` are ``(batch, seq_len)``
+      int64 over the residual stream, with the meaning of the
+      ``Transformer.forward`` arguments of those names; the dtype and rank
+      are checked here, the shape against the residual in ``forward``.
+    - ``rope_cos`` and ``rope_sin`` come together, as floating
+      ``(batch or 1, seq_len, head_dim // 2)`` tensors of one shape, dtype
+      and device, and exclude ``position_ids``; ``forward`` checks the shape
+      against the residual.
 
     ``output_slice`` composes with the ``tokens`` path AND with the
     ``inputs_embeds`` path; it is not constrained intra-context. The
@@ -76,6 +103,12 @@ class ModalityContext:
     inline_embeds: torch.Tensor | None = None
     inline_rows: torch.Tensor | None = None
     inline_positions: torch.Tensor | None = None
+    output_rows: torch.Tensor | None = None
+    output_positions: torch.Tensor | None = None
+    position_ids: torch.Tensor | None = None
+    attention_group_ids: torch.Tensor | None = None
+    rope_cos: torch.Tensor | None = None
+    rope_sin: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         residual_routes = sum(
@@ -94,6 +127,7 @@ class ModalityContext:
                 "residual-stream routes)"
             )
         self._check_inline()
+        self._check_output_gather()
         if self.image_mask is not None and self.image_features is None:
             raise ValueError("ModalityContext: image_mask requires image_features to be set")
         extends_residual = (
@@ -111,6 +145,46 @@ class ModalityContext:
                 "ModalityContext: key_padding_mask requires prefix_embeds, inputs_embeds OR "
                 "inline_embeds to be set (it masks the residual sequence; Cross-Attention "
                 "uses image_mask)"
+            )
+        for name, ids in (
+            ("position_ids", self.position_ids),
+            ("attention_group_ids", self.attention_group_ids),
+        ):
+            if ids is None:
+                continue
+            if ids.dtype != torch.long:
+                raise ValueError(
+                    f"ModalityContext: {name}.dtype must be torch.int64, got {ids.dtype}"
+                )
+            if ids.dim() != 2:
+                raise ValueError(
+                    f"ModalityContext: {name} must be (batch, seq_len), got {tuple(ids.shape)}"
+                )
+        self._check_rope()
+
+    def _check_output_gather(self) -> None:
+        if (self.output_rows is None) != (self.output_positions is None):
+            raise ValueError(
+                "ModalityContext: output_rows and output_positions must be given together"
+            )
+        if self.output_rows is None or self.output_positions is None:
+            return
+        if self.output_slice is not None:
+            raise ValueError("ModalityContext: output_rows and output_slice both trim the head")
+        for name, index in (
+            ("output_rows", self.output_rows),
+            ("output_positions", self.output_positions),
+        ):
+            if index.dtype != torch.long:
+                raise ValueError(
+                    f"ModalityContext: {name}.dtype must be torch.long, got {index.dtype}"
+                )
+            if index.dim() != 1:
+                raise ValueError(f"ModalityContext: {name} must be (M,), got {tuple(index.shape)}")
+        if self.output_rows.shape != self.output_positions.shape:
+            raise ValueError(
+                f"ModalityContext: output_rows {tuple(self.output_rows.shape)} and "
+                f"output_positions {tuple(self.output_positions.shape)} differ in length"
             )
 
     def _check_inline(self) -> None:
@@ -145,3 +219,39 @@ class ModalityContext:
                     f"ModalityContext: {name} must be ({m},) to match inline_embeds, got "
                     f"{tuple(index.shape)}"
                 )
+
+    def _check_rope(self) -> None:
+        if (self.rope_cos is None) != (self.rope_sin is None):
+            raise ValueError("ModalityContext: rope_cos and rope_sin must be given together")
+        if self.rope_cos is None or self.rope_sin is None:
+            return
+        if self.position_ids is not None:
+            raise ValueError(
+                "ModalityContext: rope_cos/rope_sin and position_ids both choose the "
+                "rotation; set one"
+            )
+        for name, table in (("rope_cos", self.rope_cos), ("rope_sin", self.rope_sin)):
+            if not table.is_floating_point():
+                raise ValueError(
+                    f"ModalityContext: {name} must be floating point, got {table.dtype}"
+                )
+            if table.dim() != 3:
+                raise ValueError(
+                    f"ModalityContext: {name} must be (batch, seq_len, head_dim // 2), got "
+                    f"{tuple(table.shape)}"
+                )
+        if self.rope_cos.shape != self.rope_sin.shape:
+            raise ValueError(
+                f"ModalityContext: rope_cos {tuple(self.rope_cos.shape)} and rope_sin "
+                f"{tuple(self.rope_sin.shape)} differ in shape"
+            )
+        if self.rope_cos.dtype != self.rope_sin.dtype:
+            raise ValueError(
+                f"ModalityContext: rope_cos {self.rope_cos.dtype} and rope_sin "
+                f"{self.rope_sin.dtype} differ in dtype"
+            )
+        if self.rope_cos.device != self.rope_sin.device:
+            raise ValueError(
+                f"ModalityContext: rope_cos {self.rope_cos.device} and rope_sin "
+                f"{self.rope_sin.device} differ in device"
+            )

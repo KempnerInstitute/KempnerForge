@@ -9,11 +9,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask
 
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
 from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
-from kempnerforge.model.attention import Attention
+from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
 from kempnerforge.model.mlp import StandardMLP, SwiGLUMLP, build_mlp
@@ -177,6 +178,67 @@ class TestAttention:
     def test_sdpa_backend_stored_on_module(self):
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend="math")
         assert attn.sdpa_backend == "math"
+
+    @pytest.mark.parametrize("capture", [False, True])
+    @pytest.mark.parametrize("past", [0, 4])
+    def test_a_visibility_mask_is_refused_before_writing_the_cache(self, capture, past):
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2)
+        attn.capture_attention_weights = capture
+        cos, sin = precompute_rope_frequencies(16, 16)
+        cache = KVCache(
+            batch_size=1,
+            max_seq_len=16,
+            n_kv_heads=2,
+            head_dim=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        with torch.no_grad():
+            if past:
+                attn(torch.randn(1, past, 64), cos[:past], sin[:past], kv_cache=cache)
+            x = torch.randn(1, 3, 64)
+            square = torch.ones(1, 1, 3, 3, dtype=torch.bool)
+            whole = torch.ones(7, 7, dtype=torch.bool)
+            for wrong in (square, whole):
+                with pytest.raises(ValueError, match="cannot be combined with kv_cache"):
+                    attn(
+                        x,
+                        cos[past : past + 3],
+                        sin[past : past + 3],
+                        kv_cache=cache,
+                        attn_mask=wrong,
+                    )
+                assert cache.seq_len == past
+            block = create_block_mask(lambda b, h, q, kv: q >= kv, 1, 1, 3, 3, device="cpu")
+            with pytest.raises(ValueError, match="cannot be combined with kv_cache"):
+                attn(x, cos[past : past + 3], sin[past : past + 3], kv_cache=cache, attn_mask=block)
+            assert cache.seq_len == past
+
+    @pytest.mark.parametrize("capture", [False, True])
+    def test_a_layer_on_its_own_appends_tokens_under_a_pinned_kernel(self, capture):
+        """Without a mask from the transformer, a layer derives the lower-right one itself."""
+        torch.manual_seed(0)
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2, sdpa_backend="math")
+        attn.capture_attention_weights = capture
+        cos, sin = precompute_rope_frequencies(16, 16)
+        x = torch.randn(1, 8, 64)
+        cache = KVCache(
+            batch_size=1,
+            max_seq_len=16,
+            n_kv_heads=2,
+            head_dim=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        with torch.no_grad():
+            full = attn(x, cos[:8], sin[:8])
+            prefill = attn(x[:, :4], cos[:4], sin[:4], kv_cache=cache)
+            appended = attn(x[:, 4:7], cos[4:7], sin[4:7], kv_cache=cache)
+            last = attn(x[:, 7:], cos[7:8], sin[7:8], kv_cache=cache)
+        torch.testing.assert_close(torch.cat([prefill, appended, last], dim=1), full)
+        if capture:
+            assert attn.last_attention_weights is not None
+            assert attn.last_attention_weights.shape == (1, 4, 1, 8)
 
 
 class TestMLP:
@@ -1477,6 +1539,29 @@ class TestInlineEmbeds:
         self._inline(model, tokens, rows, positions, embeds).sum().backward()
         assert embeds.grad is not None and torch.isfinite(embeds.grad).all()
         assert all(p.grad is not None for p in model.token_embedding.parameters())
+
+    def test_output_gather_runs_the_head_on_the_chosen_positions(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+        rows = torch.tensor([0, 1, 1], device=DEVICE)
+        positions = torch.tensor([5, 0, 15], device=DEVICE)
+        with torch.no_grad():
+            full = model(tokens)
+            picked = model(
+                tokens, modality=ModalityContext(output_rows=rows, output_positions=positions)
+            )
+        assert picked.shape == (1, 3, 256)
+        torch.testing.assert_close(picked[0], full[rows, positions])
+
+    def test_output_gather_rejects_a_slice_and_a_cache(self):
+        with pytest.raises(ValueError, match="both trim the head"):
+            ModalityContext(
+                output_rows=torch.zeros(1, dtype=torch.long),
+                output_positions=torch.zeros(1, dtype=torch.long),
+                output_slice=slice(1, None),
+            )
+        with pytest.raises(ValueError, match="must be given together"):
+            ModalityContext(output_rows=torch.zeros(1, dtype=torch.long))
 
     def test_width_mismatch_raises(self):
         model = Transformer(_KWARG_CONFIG).to(DEVICE)

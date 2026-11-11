@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
+import functools
+import inspect
 import math
+import re
 
 import pytest
 import torch
@@ -10,6 +14,7 @@ import torch.nn.functional as F
 
 import kempnerforge.model.adapter
 from kempnerforge.config.adapter import AdapterConfig
+from kempnerforge.config.loader import load_config
 from kempnerforge.config.registry import registry
 from kempnerforge.model.adapter import (
     POOLING_ADAPTER_TYPES,
@@ -121,6 +126,12 @@ class TestMLP2LayerAdapter:
         with pytest.raises(ValueError, match="must be positive"):
             MLP2LayerAdapter(in_dim=0, out_dim=8)
 
+    def test_rejects_negative_hidden_dim(self):
+        with pytest.raises(
+            ValueError, match=r"MLP2LayerAdapter hidden_dim must be non-negative \(got -4\)"
+        ):
+            MLP2LayerAdapter(in_dim=32, out_dim=16, hidden_dim=-4)
+
     def test_backward_grads_flow(self):
         adapter = MLP2LayerAdapter(in_dim=32, out_dim=16).to(DEVICE)
         x = torch.randn(1, 4, 32, device=DEVICE, requires_grad=True)
@@ -164,14 +175,19 @@ class TestLinearAdapter:
         assert adapter.proj.weight.shape == w1.shape
 
     def test_no_hidden_dim_or_activation(self):
-        """LinearAdapter has a single ``proj`` Linear; no hidden_dim or
-        activation parameters exist. The builder must ignore them."""
-        cfg = AdapterConfig(type="linear", hidden_dim=42, activation="silu")
-        adapter = build_adapter(cfg, in_dim=8, out_dim=4)
+        """LinearAdapter has a single ``proj`` Linear and no hidden layer, so
+        the config rejects the MLP fields rather than dropping them."""
+        adapter = build_adapter(AdapterConfig(type="linear"), in_dim=8, out_dim=4)
         assert isinstance(adapter, LinearAdapter)
         assert hasattr(adapter, "proj")
         assert not hasattr(adapter, "proj1")
         assert not hasattr(adapter, "proj2")
+        with pytest.raises(
+            ValueError,
+            match=r"adapter\.type = 'linear' does not use adapter\.hidden_dim = 42, "
+            r"adapter\.activation = 'silu'",
+        ):
+            AdapterConfig(type="linear", hidden_dim=42, activation="silu")
 
 
 class TestAdapterRegistry:
@@ -617,7 +633,7 @@ class TestAdapterConfigPooling:
             AdapterConfig(pool_heads=0)
 
     def test_extra_kwargs_includes_pool_fields(self):
-        kwargs = AdapterConfig(type="avgpool", pool_window=3, pool_heads=8).extra_kwargs()
+        kwargs = AdapterConfig(type="attentional_pool", pool_window=3, pool_heads=8).extra_kwargs()
         assert kwargs["pool_window"] == 3
         assert kwargs["pool_heads"] == 8
 
@@ -640,13 +656,22 @@ class TestAdapterConfigPooling:
     def test_output_num_tokens_passthrough_on_sentinel(self):
         assert AdapterConfig(type="avgpool").output_num_tokens(0) == 0
 
-    @pytest.mark.parametrize("adapter_type", ["avgpool", "attentional_pool"])
-    def test_config_count_matches_module_count(self, adapter_type):
+    @pytest.mark.parametrize(
+        ("adapter_type", "fields"),
+        [
+            ("avgpool", {}),
+            ("avgpool", {"hidden_dim": 24, "pre_norm": "rmsnorm"}),
+            ("attentional_pool", {"pool_heads": 4}),
+        ],
+        ids=["avgpool", "avgpool-mlp-head", "attentional_pool"],
+    )
+    def test_config_count_matches_module_count(self, adapter_type, fields):
         """Config-time estimate must equal the built module's count so the
         config-time seq-len check matches the build-time budget."""
-        cfg = AdapterConfig(type=adapter_type, pool_window=2, pool_heads=4)
+        cfg = AdapterConfig(type=adapter_type, pool_window=2, **fields)
         module = build_adapter(cfg, in_dim=32, out_dim=16)
         assert cfg.output_num_tokens(256) == module.output_num_tokens(256)
+        assert module(torch.randn(1, 256, 32)).shape[1] == cfg.output_num_tokens(256)
 
 
 class TestBuildAdapterPooling:
@@ -780,7 +805,7 @@ def plugin_norm():
     name = "adapter_pre_norm_test_plugin"
     registry.register("norm", name, _PluginNorm)
     yield name
-    registry._get_store("norm").pop(name)
+    registry.unregister("norm", name)
 
 
 class TestAdapterConfigPreNorm:
@@ -811,19 +836,505 @@ class TestAdapterConfigPreNorm:
             assert norm in str(info.value)
 
     @pytest.mark.parametrize("adapter_type", ["linear", "avgpool", "attentional_pool"])
-    def test_other_adapter_types_ignore_it(self, adapter_type):
-        """pre_norm changes neither the state nor the output of the adapters
-        that have no use for it; 25 tokens also takes the ragged pooling path."""
-        x = torch.randn(2, 25, 32) * 10.0
-        built = []
-        for pre_norm in ("", "rmsnorm"):
-            torch.manual_seed(0)
-            cfg = AdapterConfig(type=adapter_type, pre_norm=pre_norm, pool_heads=8)
-            built.append(build_adapter(cfg, in_dim=32, out_dim=16))
-        off, on = built
-        assert not isinstance(on, MLP2LayerAdapter)
-        if adapter_type != "linear":
-            assert _pad_grid_to_windows(x, off.pool_window)[2] is not None
-        assert list(on.state_dict()) == list(off.state_dict())
+    def test_adapters_without_a_norm_reject_it(self, adapter_type):
+        """An adapter that builds no norm rejects pre_norm instead of training
+        without it; avgpool builds one only for its MLP head."""
+        with pytest.raises(
+            ValueError,
+            match=rf"adapter\.type = '{adapter_type}' does not use adapter\.pre_norm = 'rmsnorm'",
+        ):
+            AdapterConfig(type=adapter_type, pre_norm="rmsnorm")
+
+
+_ACTIVATION_MODULES = {"gelu": torch.nn.GELU, "silu": torch.nn.SiLU, "relu": torch.nn.ReLU}
+_HEAD_KEYS = {
+    "proj.ln_q.weight",
+    "proj.proj1.weight",
+    "proj.proj1.bias",
+    "proj.proj2.weight",
+    "proj.proj2.bias",
+}
+
+
+def _reference_avg_pool(x: torch.Tensor, window: int) -> torch.Tensor:
+    """Window means over the real patches, computed independently of the module."""
+    windows = _reference_pool_windows(x.shape[1], window)
+    return torch.stack([x[:, idx].mean(dim=1) for idx in windows], dim=1)
+
+
+class TestAvgPoolNormMLPHead:
+    @pytest.mark.parametrize("hidden_dim", [None, 0])
+    def test_default_head_is_the_single_linear(self, hidden_dim):
+        """Without a hidden width the head is the ``proj`` Linear it always was:
+        the same module tree and state-dict keys, so existing checkpoints load."""
+        adapter = AvgPoolAdapter(in_dim=32, out_dim=16, hidden_dim=hidden_dim)
+        assert type(adapter.proj) is torch.nn.Linear
+        assert [name for name, _ in adapter.named_modules()] == ["", "proj"]
+        assert list(adapter.state_dict()) == ["proj.weight", "proj.bias"]
+
+    def test_default_head_draws_the_same_rng_as_a_bare_linear(self):
+        torch.manual_seed(5)
+        ref = torch.nn.Linear(32, 16)
+        torch.manual_seed(5)
+        adapter = build_adapter(AdapterConfig(type="avgpool"), in_dim=32, out_dim=16)
+        assert torch.equal(adapter.proj.weight, ref.weight)
+        assert torch.equal(adapter.proj.bias, ref.bias)
+
+    @pytest.mark.parametrize("activation", sorted(_ACTIVATION_MODULES))
+    @pytest.mark.parametrize("pre_norm", [None, *_REGISTERED_NORMS])
+    def test_positive_hidden_dim_builds_the_norm_mlp_head(self, pre_norm, activation):
+        adapter = AvgPoolAdapter(
+            in_dim=32,
+            out_dim=16,
+            hidden_dim=24,
+            activation=activation,
+            pre_norm=pre_norm,
+            norm_eps=1e-3,
+        )
+        head = adapter.proj
+        assert isinstance(head, MLP2LayerAdapter)
+        assert (head.proj1.in_features, head.proj1.out_features) == (32, 24)
+        assert (head.proj2.in_features, head.proj2.out_features) == (24, 16)
+        assert isinstance(head.act, _ACTIVATION_MODULES[activation])
+        if pre_norm is None:
+            assert head.ln_q is None
+        else:
+            assert head.ln_q.eps == 1e-3
+            assert all(p.shape == (32,) for p in head.ln_q.parameters())
+
+    def test_head_state_dict_keys(self):
+        adapter = AvgPoolAdapter(in_dim=32, out_dim=16, hidden_dim=24, pre_norm="rmsnorm")
+        assert set(adapter.state_dict()) == _HEAD_KEYS
+
+    def test_head_draws_the_same_init_as_an_mlp_2layer_adapter(self):
+        torch.manual_seed(7)
+        ref = MLP2LayerAdapter(in_dim=32, out_dim=16, hidden_dim=24, pre_norm="rmsnorm")
+        torch.manual_seed(7)
+        adapter = AvgPoolAdapter(in_dim=32, out_dim=16, hidden_dim=24, pre_norm="rmsnorm")
+        for key, value in ref.state_dict().items():
+            assert torch.equal(adapter.proj.state_dict()[key], value), key
+
+    @pytest.mark.parametrize("norm", _REGISTERED_NORMS)
+    @pytest.mark.parametrize(("n_in", "window"), [(16, 2), (25, 2), (49, 3)])
+    def test_forward_is_pool_then_norm_then_mlp(self, n_in, window, norm):
+        """The norm sees the pooled features, also on the ragged edge windows."""
+        torch.manual_seed(0)
+        adapter = AvgPoolAdapter(
+            in_dim=32, out_dim=16, pool_window=window, hidden_dim=24, pre_norm=norm
+        ).to(DEVICE)
+        head = adapter.proj
+        x = torch.randn(2, n_in, 32, device=DEVICE) * 10.0
         with torch.no_grad():
-            assert torch.equal(on(x), off(x))
+            expected = head.proj2(head.act(head.proj1(head.ln_q(_reference_avg_pool(x, window)))))
+            norm_first = head.proj2(head.act(head.proj1(_reference_avg_pool(head.ln_q(x), window))))
+            out = adapter(x)
+        assert out.shape == (2, adapter.output_num_tokens(n_in), 16)
+        assert torch.allclose(out, expected, atol=1e-5, rtol=1e-5)
+        assert not torch.allclose(out, norm_first, atol=1e-3)
+
+    def test_parameter_counts_follow_the_layer_shapes(self):
+        """At 1152 -> 1024 the bare head is one Linear, 1152 * 1024 + 1024; an
+        RMSNorm + MLP head of width 1152 adds 1152 norm weights and a
+        1152 -> 1152 Linear, 1152 + 1152 * 1152 + 1152."""
+        with torch.device("meta"):
+            bare = AvgPoolAdapter(in_dim=1152, out_dim=1024)
+            head = AvgPoolAdapter(in_dim=1152, out_dim=1024, hidden_dim=1152, pre_norm="rmsnorm")
+        assert sum(p.numel() for p in bare.parameters()) == 1_180_672
+        assert sum(p.numel() for p in head.parameters()) == 2_510_080
+
+    def test_reset_parameters_restores_the_head_after_a_meta_build(self):
+        fresh = AvgPoolAdapter(in_dim=32, out_dim=16, hidden_dim=24, pre_norm="rmsnorm")
+        with torch.device("meta"):
+            adapter = AvgPoolAdapter(in_dim=32, out_dim=16, hidden_dim=24, pre_norm="rmsnorm")
+        adapter.to_empty(device=torch.device("cpu"))
+        with torch.no_grad():
+            for p in adapter.parameters():
+                p.fill_(float("nan"))
+        adapter.reset_parameters()
+        assert torch.equal(adapter.proj.ln_q.weight, fresh.proj.ln_q.weight)
+        assert all(torch.isfinite(p).all() for p in adapter.parameters())
+
+    def test_every_head_parameter_receives_gradient(self):
+        adapter = AvgPoolAdapter(in_dim=32, out_dim=16, hidden_dim=24, pre_norm="rmsnorm").to(
+            DEVICE
+        )
+        adapter(torch.randn(2, 25, 32, device=DEVICE)).sum().backward()
+        for name, p in adapter.named_parameters():
+            assert p.grad is not None and torch.isfinite(p.grad).all(), name
+            assert (p.grad != 0).any(), name
+
+    def test_pool_window_override_keeps_the_head(self):
+        adapter = AvgPoolAdapter(in_dim=32, out_dim=16, pool_window=2, hidden_dim=24)
+        x = torch.randn(1, 16, 32)
+        assert adapter(x, pool_window=4).shape == (1, 1, 16)
+        assert adapter(x).shape == (1, 4, 16)
+
+    def test_rejects_negative_hidden_dim(self):
+        with pytest.raises(ValueError, match="hidden_dim must be non-negative"):
+            AvgPoolAdapter(in_dim=8, out_dim=4, hidden_dim=-1)
+
+    @pytest.mark.parametrize(
+        ("settings", "hidden_dim"),
+        [
+            ({"pre_norm": "rmsnorm"}, None),
+            ({"activation": "silu"}, 0),
+            ({"activation": "relu", "pre_norm": "layernorm"}, -4),
+        ],
+        ids=["pre_norm", "activation", "both-negative-width"],
+    )
+    def test_head_settings_need_a_positive_hidden_dim(self, settings, hidden_dim):
+        """activation and pre_norm configure the MLP head, so they are rejected
+        rather than dropped when hidden_dim leaves the head off."""
+        named = ", ".join(f"{key}={value!r}" for key, value in settings.items())
+        with pytest.raises(
+            ValueError,
+            match=rf"AvgPoolAdapter got {re.escape(named)} with hidden_dim={hidden_dim}: "
+            r"activation and pre_norm configure the MLP head, which needs a positive hidden_dim",
+        ):
+            AvgPoolAdapter(in_dim=32, out_dim=16, hidden_dim=hidden_dim, **settings)
+
+    @pytest.mark.parametrize("pre_norm", [None, ""])
+    def test_head_settings_at_their_defaults_keep_the_linear(self, pre_norm):
+        adapter = AvgPoolAdapter(in_dim=32, out_dim=16, activation="gelu", pre_norm=pre_norm)
+        assert type(adapter.proj) is torch.nn.Linear
+
+    def test_config_builds_the_head(self):
+        cfg = AdapterConfig(
+            type="avgpool", pool_window=3, hidden_dim=24, activation="silu", pre_norm="layernorm"
+        )
+        adapter = build_adapter(cfg, in_dim=32, out_dim=16, norm_eps=1e-3)
+        assert isinstance(adapter, AvgPoolAdapter)
+        assert adapter.pool_window == 3
+        head = adapter.proj
+        assert isinstance(head, MLP2LayerAdapter)
+        assert head.proj1.out_features == 24
+        assert isinstance(head.act, torch.nn.SiLU)
+        assert isinstance(head.ln_q, torch.nn.LayerNorm)
+        assert head.ln_q.eps == 1e-3
+
+
+_BUILTIN_ADAPTERS = ("mlp_2layer", "linear", "avgpool", "attentional_pool")
+_CONFIG_FIELDS = frozenset(f.name for f in dataclasses.fields(AdapterConfig)) - {"type"}
+
+
+def _keyword_fields(builder) -> set[str]:
+    """The config fields ``builder`` takes as parameters it can be passed by keyword."""
+    keyword_kinds = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    params = inspect.signature(builder).parameters.values()
+    return {p.name for p in params if p.kind in keyword_kinds} & _CONFIG_FIELDS
+
+
+def _pool_builder(in_dim, out_dim, pool_window=2, *, pool_heads=16, **_):
+    return AttentionalPoolAdapter(in_dim, out_dim, pool_window=pool_window, pool_heads=pool_heads)
+
+
+def _positional_only_width_builder(hidden_dim=None, /, in_dim=8, out_dim=4, pool_window=2, **_):
+    return AvgPoolAdapter(in_dim, out_dim, pool_window=pool_window, hidden_dim=hidden_dim)
+
+
+def _builder_naming_every_field(
+    in_dim,
+    out_dim,
+    hidden_dim=None,
+    activation="gelu",
+    pre_norm=None,
+    pool_window=2,
+    pool_heads=16,
+    norm_eps=1e-5,
+):
+    return MLP2LayerAdapter(
+        in_dim,
+        out_dim,
+        hidden_dim=hidden_dim,
+        activation=activation,
+        pre_norm=pre_norm,
+        norm_eps=norm_eps,
+    )
+
+
+def _reads_width_from_kwargs(builder):
+    @functools.wraps(builder)
+    def wrapper(in_dim, out_dim, **kwargs):
+        return MLP2LayerAdapter(in_dim, out_dim, hidden_dim=kwargs["hidden_dim"])
+
+    return wrapper
+
+
+@_reads_width_from_kwargs
+def _wrapped_linear_builder(in_dim, out_dim, **_):
+    return LinearAdapter(in_dim=in_dim, out_dim=out_dim)
+
+
+@pytest.fixture
+def plugin_adapter():
+    """Register throwaway adapters, removed after the test.
+
+    ``register(accepts=None, builder=None)`` returns ``(name, seen)``. Without a
+    ``builder`` the adapter's builder reads ``**kwargs`` and records them in
+    ``seen``.
+    """
+    names: list[str] = []
+
+    def register(accepts=None, builder=None):
+        name = f"adapter_accepts_test_{len(names)}"
+        seen: dict = {}
+
+        def _record(in_dim, out_dim, **kwargs):
+            seen.update(kwargs)
+            return LinearAdapter(in_dim=in_dim, out_dim=out_dim)
+
+        registry.register_adapter(name, accepts=accepts)(builder or _record)
+        names.append(name)
+        return name, seen
+
+    yield register
+    for name in names:
+        registry.unregister("adapter", name)
+
+
+class TestAdapterAccepts:
+    def test_only_avgpool_declares_its_fields(self):
+        """The other built-ins are checked from their builder signatures; the
+        fields avgpool uses depend on ``hidden_dim``, so it declares them."""
+        assert callable(registry.get_adapter_accepts("avgpool"))
+        for name in ("mlp_2layer", "linear", "attentional_pool"):
+            assert registry.get_adapter_accepts(name) is None, name
+
+    @pytest.mark.parametrize("hidden_dim", [0, 8])
+    def test_avgpool_declares_its_builder_parameters(self, hidden_dim):
+        """With the MLP head on, avgpool uses every field its builder takes; with
+        it off, all of them but the head's ``activation`` and ``pre_norm``."""
+        declared = registry.get_adapter_accepts("avgpool")
+        assert callable(declared)
+        used = set(declared(AdapterConfig(type="avgpool", hidden_dim=hidden_dim)))
+        named = _keyword_fields(registry.get_adapter("avgpool"))
+        assert used == (named if hidden_dim else named - {"activation", "pre_norm"})
+
+    def test_a_builder_ending_in_underscore_kwargs_is_checked_from_its_signature(
+        self, plugin_adapter
+    ):
+        """Positional-or-keyword and keyword-only parameters both count."""
+        name, _ = plugin_adapter(builder=_pool_builder)
+        cfg = AdapterConfig(type=name, pool_window=3, pool_heads=8)
+        assert build_adapter(cfg, in_dim=16, out_dim=4).pool_heads == 8
+        with pytest.raises(
+            ValueError,
+            match=rf"adapter\.type = '{name}' does not use adapter\.hidden_dim = 8; with these "
+            r"settings it uses pool_heads, pool_window\.",
+        ):
+            AdapterConfig(type=name, hidden_dim=8)
+
+    def test_a_positional_only_parameter_does_not_count(self, plugin_adapter):
+        """A keyword argument cannot reach a positional-only parameter, so
+        ``build_adapter`` would hand the field to ``**_``."""
+        name, _ = plugin_adapter(builder=_positional_only_width_builder)
+        with pytest.raises(
+            ValueError,
+            match=rf"adapter\.type = '{name}' does not use adapter\.hidden_dim = 8; with these "
+            r"settings it uses pool_window\.",
+        ):
+            AdapterConfig(type=name, hidden_dim=8)
+
+    def test_a_builder_without_var_keyword_uses_every_field_it_names(self, plugin_adapter):
+        name, _ = plugin_adapter(builder=_builder_naming_every_field)
+        settings = {
+            "hidden_dim": 8,
+            "activation": "silu",
+            "pre_norm": "rmsnorm",
+            "pool_window": 3,
+            "pool_heads": 8,
+        }
+        adapter = build_adapter(AdapterConfig(type=name, **settings), 16, 4, norm_eps=1e-3)
+        assert (adapter.proj1.out_features, adapter.ln_q.eps) == (8, 1e-3)
+        assert isinstance(adapter.act, torch.nn.SiLU)
+
+    def test_a_wrapper_is_read_by_its_own_signature(self, plugin_adapter):
+        """``functools.wraps`` copies the wrapped builder's ``**_`` signature onto
+        a wrapper that reads fields from its own ``**kwargs``, so the wrapper's
+        signature decides: it is not checked, and the field reaches it."""
+        name, _ = plugin_adapter(builder=_wrapped_linear_builder)
+        adapter = build_adapter(AdapterConfig(type=name, hidden_dim=8), in_dim=16, out_dim=4)
+        assert adapter.proj1.out_features == 8
+
+    def test_a_declaration_overrides_the_signature(self, plugin_adapter):
+        name, _ = plugin_adapter(accepts=("pool_window",), builder=_pool_builder)
+        with pytest.raises(
+            ValueError, match=rf"adapter\.type = '{name}' does not use adapter\.pool_heads = 8"
+        ):
+            AdapterConfig(type=name, pool_heads=8)
+
+    def test_a_string_declaration_is_rejected(self):
+        with pytest.raises(TypeError, match="collection of field names"):
+            registry.register_adapter("adapter_accepts_test_str", accepts="pool_window")
+        assert "adapter_accepts_test_str" not in registry.list_adapters()
+
+    def test_a_callable_returning_a_string_is_rejected(self, plugin_adapter):
+        """A bare string would be read letter by letter as field names."""
+        name, _ = plugin_adapter(accepts=lambda cfg: "pool_window")
+        with pytest.raises(
+            TypeError,
+            match=rf"accepts for adapter '{name}' must return a collection of field names, "
+            r"not the string 'pool_window'",
+        ):
+            AdapterConfig(type=name)
+
+    def test_a_declared_collection_is_enforced(self, plugin_adapter):
+        name, seen = plugin_adapter(accepts=("pool_window",))
+        build_adapter(AdapterConfig(type=name, pool_window=3), in_dim=8, out_dim=4)
+        assert seen["pool_window"] == 3
+        with pytest.raises(
+            ValueError, match=rf"adapter\.type = '{name}' does not use adapter\.hidden_dim = 8"
+        ):
+            AdapterConfig(type=name, hidden_dim=8)
+
+    def test_a_declared_callable_sees_the_config(self, plugin_adapter):
+        name, _ = plugin_adapter(
+            accepts=lambda cfg: ("hidden_dim", "activation") if cfg.hidden_dim else ("hidden_dim",)
+        )
+        assert AdapterConfig(type=name, hidden_dim=8, activation="silu").activation == "silu"
+        with pytest.raises(
+            ValueError, match=rf"adapter\.type = '{name}' does not use adapter\.activation = 'silu'"
+        ):
+            AdapterConfig(type=name, activation="silu")
+
+    def test_a_builder_reading_named_kwargs_accepts_every_field(self, plugin_adapter):
+        """A builder whose ``**`` parameter is not ``_`` may read any field from
+        it, so without a declaration no field is rejected and it receives them all."""
+        name, seen = plugin_adapter()
+        settings = {
+            "hidden_dim": 8,
+            "activation": "silu",
+            "pre_norm": "rmsnorm",
+            "pool_window": 3,
+            "pool_heads": 8,
+        }
+        build_adapter(AdapterConfig(type=name, **settings), in_dim=8, out_dim=4)
+        assert seen == {**settings, "norm_eps": 1e-5}
+
+    def test_a_declaration_naming_an_unknown_field_is_rejected(self, plugin_adapter):
+        name, _ = plugin_adapter(accepts=("hiden_dim",))
+        with pytest.raises(
+            ValueError, match=r"declares fields AdapterConfig does not have: \['hiden_dim'\]"
+        ):
+            AdapterConfig(type=name)
+
+
+_BUILTIN_USES = [
+    ("mlp_2layer", {}, {"hidden_dim", "activation", "pre_norm"}),
+    ("linear", {}, set()),
+    ("avgpool", {}, {"pool_window", "hidden_dim"}),
+    ("avgpool", {"hidden_dim": 8}, {"pool_window", "hidden_dim", "activation", "pre_norm"}),
+    ("attentional_pool", {}, {"pool_window", "pool_heads"}),
+]
+_NON_DEFAULT = {
+    "hidden_dim": 16,
+    "activation": "silu",
+    "pre_norm": "rmsnorm",
+    "pool_window": 3,
+    "pool_heads": 8,
+}
+
+
+class TestAdapterConfigRejectsUnusedFields:
+    @pytest.mark.parametrize("field", sorted(_NON_DEFAULT))
+    @pytest.mark.parametrize(
+        ("adapter_type", "base", "uses"),
+        _BUILTIN_USES,
+        ids=["mlp_2layer", "linear", "avgpool", "avgpool-mlp-head", "attentional_pool"],
+    )
+    def test_builtin_adapters_use_exactly_the_documented_fields(
+        self, adapter_type, base, uses, field
+    ):
+        """Each built-in takes the fields the docs list for it and rejects any
+        other field set away from its default."""
+        value = _NON_DEFAULT[field]
+        settings = {**base, field: value}
+        if field in uses:
+            assert getattr(AdapterConfig(type=adapter_type, **settings), field) == value
+            return
+        with pytest.raises(
+            ValueError,
+            match=rf"adapter\.type = '{adapter_type}' does not use "
+            rf"adapter\.{field} = {re.escape(repr(value))}",
+        ):
+            AdapterConfig(type=adapter_type, **settings)
+
+    @pytest.mark.parametrize("adapter_type", _BUILTIN_ADAPTERS)
+    def test_fields_at_their_defaults_never_raise(self, adapter_type):
+        defaults = {
+            f.name: f.default for f in dataclasses.fields(AdapterConfig) if f.name != "type"
+        }
+        assert AdapterConfig(type=adapter_type) == AdapterConfig(type=adapter_type, **defaults)
+
+    @pytest.mark.parametrize(
+        ("adapter_type", "settings"),
+        [
+            ("mlp_2layer", {"hidden_dim": 8, "activation": "silu", "pre_norm": "rmsnorm"}),
+            ("avgpool", {"pool_window": 3}),
+            (
+                "avgpool",
+                {"pool_window": 3, "hidden_dim": 8, "activation": "silu", "pre_norm": "rmsnorm"},
+            ),
+            ("attentional_pool", {"pool_window": 3, "pool_heads": 8}),
+        ],
+        ids=["mlp_2layer", "avgpool", "avgpool-mlp-head", "attentional_pool"],
+    )
+    def test_fields_the_adapter_uses_are_accepted(self, adapter_type, settings):
+        cfg = AdapterConfig(type=adapter_type, **settings)
+        assert {k: getattr(cfg, k) for k in settings} == settings
+
+    def test_every_unused_field_is_named_with_its_default(self):
+        with pytest.raises(ValueError) as info:
+            AdapterConfig(type="linear", hidden_dim=8, pool_heads=8)
+        message = str(info.value)
+        assert "adapter.hidden_dim = 8, adapter.pool_heads = 8" in message
+        assert "it uses no adapter fields" in message
+        assert "(hidden_dim = 0, pool_heads = 16)" in message
+
+    def test_avgpool_lists_hidden_dim_among_the_fields_it_uses(self):
+        with pytest.raises(ValueError, match="with these settings it uses hidden_dim, pool_window"):
+            AdapterConfig(type="avgpool", pre_norm="rmsnorm")
+
+    def test_load_config_rejects_it(self, tmp_path):
+        path = tmp_path / "adapter.toml"
+        path.write_text('[adapter]\ntype = "avgpool"\npool_heads = 8\n')
+        with pytest.raises(
+            ValueError, match=r"adapter\.type = 'avgpool' does not use adapter\.pool_heads = 8"
+        ):
+            load_config(path, cli_args=[])
+
+    def test_cli_overrides_turn_on_the_head(self, tmp_path):
+        path = tmp_path / "adapter.toml"
+        path.write_text('[adapter]\ntype = "avgpool"\n')
+        cfg = load_config(path, cli_args=["--adapter.hidden_dim=24", "--adapter.pre_norm=rmsnorm"])
+        assert cfg.adapter is not None
+        assert (cfg.adapter.hidden_dim, cfg.adapter.pre_norm) == (24, "rmsnorm")
+
+    def test_a_cli_type_switch_resets_the_toml_fields_the_new_type_does_not_use(self, tmp_path):
+        """An override sets a value and never restores a default, so the switch
+        fails until the same command resets those fields; an empty value sets
+        the empty string."""
+        path = tmp_path / "adapter.toml"
+        path.write_text('[adapter]\ntype = "mlp_2layer"\nhidden_dim = 2048\npre_norm = "rmsnorm"\n')
+        switch = ["--adapter.type=attentional_pool"]
+        with pytest.raises(
+            ValueError,
+            match=r"adapter\.type = 'attentional_pool' does not use adapter\.hidden_dim = 2048, "
+            r"adapter\.pre_norm = 'rmsnorm'",
+        ):
+            load_config(path, cli_args=switch)
+        cfg = load_config(path, cli_args=[*switch, "--adapter.hidden_dim=0", "--adapter.pre_norm="])
+        assert cfg.adapter is not None
+        assert (cfg.adapter.type, cfg.adapter.hidden_dim, cfg.adapter.pre_norm) == (
+            "attentional_pool",
+            0,
+            "",
+        )
+
+    def test_a_cli_override_of_an_unused_field_is_rejected(self, tmp_path):
+        path = tmp_path / "adapter.toml"
+        path.write_text('[adapter]\ntype = "mlp_2layer"\n')
+        with pytest.raises(
+            ValueError, match=r"adapter\.type = 'mlp_2layer' does not use adapter\.pool_window = 3"
+        ):
+            load_config(path, cli_args=["--adapter.pool_window=3"])

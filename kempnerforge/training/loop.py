@@ -13,7 +13,7 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.distributed as dist
@@ -32,7 +32,11 @@ from kempnerforge.training.eval import run_eval
 from kempnerforge.training.freeze import apply_freeze_specs, freeze_meta_at_step
 from kempnerforge.training.grad import maybe_no_sync
 from kempnerforge.training.hooks import HookRunner, StepContext
+from kempnerforge.training.optimizer import module_learning_rates
 from kempnerforge.training.runtime import PipelineBundle, RuntimeContext, pp_group
+
+if TYPE_CHECKING:
+    from kempnerforge.model.transformer import Transformer
 
 logger = get_logger(__name__)
 
@@ -141,17 +145,18 @@ class StepResult:
     The per-dataset fields stay empty for step bodies that don't produce
     them; ``text_tokens`` stays None, which a VLM run treats as an error
     rather than logging a zero. ``tokens`` is what this rank ran when the
-    batch decides it (packed VLM rows); None means ``batch_size × seq_len``
-    per micro-step.
+    batch decides it (packed VLM rows), counted as row slots like the unpacked
+    ``batch_size × seq_len``, image slots and padding included; None means
+    the configured batch per micro-step.
     """
 
     loss: float
     grad_norm: float
     text_tokens: int | None = None
-    tokens: int | None = None
     dataset_token_counts: dict[str, int] = field(default_factory=dict)
     dataset_loss_sums: dict[str, float] = field(default_factory=dict)
     dataset_loss_counts: dict[str, int] = field(default_factory=dict)
+    tokens: int | None = None
 
 
 StepFn = Callable[["TrainingSession", int], StepResult]
@@ -208,6 +213,40 @@ def add_moe_losses(loss: torch.Tensor, model: torch.nn.Module, mc: Any) -> torch
         z = inner_transformer(model).get_moe_router_z_loss()  # type: ignore[attr-defined]
         loss = loss + mc.moe_router_z_loss_weight * z
     return loss
+
+
+def _expert_balance(routers: list[tuple[str | None, torch.Tensor]]) -> dict[str, float]:
+    """``moe/expert_balance`` over every router, plus one value per MoT modality.
+
+    Each router's expert counts are divided by that router's own total before
+    taking min over max, so routers that see different token counts (a MoT
+    model's image and text routers) compare as loads. Every flat MoE router sees
+    the same tokens, so for a text model this equals min over max of the raw
+    counts. A router whose counts sum to zero is skipped.
+
+    Args:
+        routers: ``(modality, counts)`` per router; ``modality`` is ``None`` for
+            a flat MoE layer.
+
+    Returns:
+        ``moe/expert_balance``, and ``moe/expert_balance/<modality>`` for each
+        MoT modality; empty when no router saw a token.
+    """
+    loads: list[tuple[str | None, torch.Tensor]] = []
+    for modality, counts in routers:
+        total = counts.float().sum()
+        if total.item() > 0:
+            loads.append((modality, counts.float() / total))
+    if not loads:
+        return {}
+    groups = {"moe/expert_balance": [load for _, load in loads]}
+    for modality in sorted({m for m, _ in loads if m is not None}):
+        groups[f"moe/expert_balance/{modality}"] = [load for m, load in loads if m == modality]
+    balance = {}
+    for key, group in groups.items():
+        values = torch.cat(group)
+        balance[key] = (values.min() / values.max()).item()
+    return balance
 
 
 def pipeline_step(session: TrainingSession, step: int) -> StepResult:
@@ -270,13 +309,26 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     return StepResult(loss=loss_tensor.item(), grad_norm=grad_norm_val)
 
 
+_PACKED_BATCH_KEYS = (
+    "doc_ids",
+    "position_ids",
+    "attention_group_ids",
+    "image_rows",
+    "image_starts",
+    "text_rows",
+    "text_positions",
+)
+
+
 def vlm_step(session: TrainingSession, step: int) -> StepResult:
     """VLM step (no PP): pixel_values + input_ids forward, with a text-token count.
 
-    A packed batch also carries ``doc_ids``, ``position_ids`` and the image
-    placement (``image_rows``, ``image_starts``, ``image_tokens``), passed
-    through to the wrapper. Its row count varies, so the step reports the
-    tokens it ran and marks the leading dims dynamic for ``torch.compile``.
+    A packed batch (one with ``image_rows``) also carries ``doc_ids``,
+    ``position_ids``, the image placement (``image_starts``, ``image_tokens``)
+    and the text positions, all passed through to the wrapper, with
+    ``attention_group_ids`` when a collator emits them. Its row count varies,
+    so the step reports the tokens it ran and marks the leading dims dynamic
+    for ``torch.compile``.
     """
     config = session.config
     tc, mc = config.train, config.model
@@ -299,24 +351,22 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         frame_mask = batch["frame_mask"].to(device) if "frame_mask" in batch else None
-        packed: dict[str, Any] = {
-            key: batch[key].to(device)
-            for key in ("doc_ids", "position_ids", "image_rows", "image_starts")
-            if key in batch
+        extras: dict[str, Any] = {
+            key: batch[key].to(device) for key in _PACKED_BATCH_KEYS if key in batch
         }
         if "image_tokens" in batch:
-            packed["image_tokens"] = int(batch["image_tokens"])
-        if packed:
+            extras["image_tokens"] = int(batch["image_tokens"])
+        if "image_rows" in extras:
             packed_tokens = (packed_tokens or 0) + input_ids.numel()
             if tc.compile_model:
-                _mark_rows_dynamic(pixel_values, input_ids, labels, *packed.values())
+                _mark_rows_dynamic(pixel_values, input_ids, labels, *extras.values())
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
                 inner_transformer(model).set_moe_step(step, tc.max_steps)  # type: ignore[attr-defined]
             with session.autocast():
                 logits, labels_out = model(
-                    pixel_values, input_ids, labels, frame_mask=frame_mask, **packed
+                    pixel_values, input_ids, labels, frame_mask=frame_mask, **extras
                 )
                 loss = session.loss_fn(logits, labels_out)
 
@@ -457,20 +507,26 @@ def checkpoint_extra(config: JobConfig, step: int, phases: PhaseState) -> dict:
 
 
 def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: int) -> None:
-    """MoE / VLM-text-token / per-dataset series, on the main metrics interval."""
+    """Per-module LR / MoE / VLM-text-token / per-dataset series, on the main metrics interval."""
     config = session.config
     mc = config.model
     tracker = session.tracker
     model = session.model
 
+    module_lrs = module_learning_rates(session.optimizer)
+    if module_lrs:
+        tracker.log_eval(module_lrs, step)
+
     if mc.is_moe:
-        inner = inner_transformer(model)
-        moe_metrics = {"moe/aux_loss": inner.get_moe_aux_loss().item()}  # type: ignore[attr-defined]
-        moe_metrics["moe/router_z_loss"] = inner.get_moe_router_z_loss().item()  # type: ignore[attr-defined]
-        expert_counts = inner.get_expert_counts()  # type: ignore[attr-defined]
-        if expert_counts:
-            all_counts = torch.stack(list(expert_counts.values())).float()
-            moe_metrics["moe/expert_balance"] = (all_counts.min() / all_counts.max()).item()
+        inner = cast("Transformer", inner_transformer(model))
+        moe_metrics = {"moe/aux_loss": inner.get_moe_aux_loss().item()}
+        moe_metrics["moe/router_z_loss"] = inner.get_moe_router_z_loss().item()
+        routers: list[tuple[str | None, torch.Tensor]] = [
+            (None, counts) for counts in inner.get_expert_counts().values()
+        ]
+        for per_modality in getattr(inner, "get_mot_expert_counts", dict)().values():
+            routers.extend(per_modality.items())
+        moe_metrics.update(_expert_balance(routers))
         tracker.log_eval(moe_metrics, step)
 
     if config.is_vlm:
@@ -648,6 +704,7 @@ def run_training_loop(
 
             tracker.start_step()
             result = session.step_fn(session, step)
+            tokens_in_step = _tokens_in_step(session, result)
 
             if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
                 optimizer.zero_grad()
@@ -669,7 +726,6 @@ def run_training_loop(
             optimizer.zero_grad()
 
             step += 1
-            tokens_in_step = _tokens_in_step(session, result)
             tokens_seen += tokens_in_step
 
             _apply_step_transitions(session, step)

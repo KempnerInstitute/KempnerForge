@@ -124,6 +124,19 @@ def _build_vlm_pipeline(
             VLMCollator,
         )
 
+        if config.data.pack_sequences:
+            if tokens_per_image is None:
+                raise ValueError(
+                    "data.pack_sequences on a VLM run needs the built model's tokens per image; "
+                    "pass the wrapper's packed_tokens_per_image(model) as tokens_per_image"
+                )
+            visual_tokens = config.views_per_sample * tokens_per_image
+            if visual_tokens + vlm_cfg.max_text_len > tc.seq_len:
+                raise ValueError(
+                    f"train.seq_len ({tc.seq_len}) cannot hold one packed document: "
+                    f"{visual_tokens} image tokens + vlm.max_text_len ({vlm_cfg.max_text_len})"
+                )
+
         dataset = HuggingFaceVLMDataset(
             dataset_name=config.data.hf_dataset_name,
             split=config.data.hf_dataset_split,
@@ -135,14 +148,12 @@ def _build_vlm_pipeline(
             image_size=config.data.hf_image_size,
             dataset_config=config.data.hf_dataset_config,
             allow_text_only=config.data.hf_allow_text_only,
+            tile_grid=vlm_cfg.tile_grid,
+            tile_global=vlm_cfg.tile_global,
         )
         pad_id = _resolve_pad_id(config.data.tokenizer_path)
         if config.data.pack_sequences:
-            if tokens_per_image is None:
-                raise ValueError(
-                    "data.pack_sequences on a VLM run needs the built model's tokens per image; "
-                    "pass the wrapper's packed_tokens_per_image(model) as tokens_per_image"
-                )
+            assert tokens_per_image is not None
             collator = PackedVLMCollator(
                 pad_id=pad_id,
                 seq_len=tc.seq_len,

@@ -64,10 +64,10 @@ initializes the collaborators:
   — owns DCP async save/load, latest-symlink, step_N directories.
 - **`resolve_resume_path(config.checkpoint.dir)`** from
   [`kempnerforge.resilience.elastic`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)
-  — follows the `latest` symlink or picks the highest `step_N`. If
-  non-`None`, `ckpt_mgr.load(resume_path)` restores model, optimizer,
-  scheduler, dataloader position, and RNG state before the loop
-  starts.
+  — follows the `latest` symlink or picks the newest `step_N` whose
+  save completed. If non-`None`, `ckpt_mgr.load(resume_path)` restores
+  model, optimizer, scheduler, dataloader position, and RNG state
+  before the loop starts.
 - **`MetricsTracker`** from
   [`kempnerforge.metrics.tracker`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/tracker.py)
   — per-step metrics + EMA smoothing + WandB / TensorBoard backends.
@@ -99,7 +99,7 @@ useful for smoke-testing the parallelism stack without any corpus.
 
 `doc_ids` is optional: non-`None` only when the dataset packs multiple
 documents into one sequence. It triggers the block-diagonal attention
-mask path (see [Model § Three attention paths](model.md#three-attention-paths)).
+mask path (see [Model § Attention paths](model.md#attention-paths)).
 
 ### 2 · `maybe_no_sync`
 
@@ -148,7 +148,8 @@ if mc.is_moe:
     loss = loss + mc.moe_aux_loss_weight * aux_loss
 ```
 
-`get_moe_aux_loss()` sums the per-layer `MoEMLP.aux_loss` attributes.
+`get_moe_aux_loss()` sums the `MoEMLP.aux_loss` attributes of every
+router: one per MoE layer, or one per modality on a MoT layer.
 For dense runs it returns `0.0` and the line is a no-op.
 
 ### 6 · Backward with gradient accumulation
@@ -191,9 +192,10 @@ optimizer.zero_grad()
 
 `clip_grad_norm_` wraps PyTorch's utility so it works with FSDP2 sharded
 parameters. Under pipeline parallelism `pipeline_step` also passes the PP
-group, so the norm covers every stage rather than this rank's own. The NaN
-detector returns `False` on a NaN/Inf loss or gradient norm, and the loop
-zeroes the grads.
+group, so the norm covers every stage rather than this rank's own; under
+expert parallelism it reads the EP group from the model and covers every
+rank's experts. The NaN detector returns `False` on a NaN/Inf loss or
+gradient norm, and the loop zeroes the grads.
 After `max_consecutive` NaN steps in a row the detector sets
 `should_rollback` and the loop stops; rolling back to an earlier
 checkpoint is manual (see
@@ -241,7 +243,8 @@ hook_runner.on_step_end(StepContext(...))
 runs user-defined `TrainingHook` callbacks each step.
 
 MoE runs additionally log `moe/aux_loss` and `moe/expert_balance`
-(`min/max` of per-expert token counts) at the same cadence.
+(`min/max` of per-expert loads, each router's counts over its own
+total) at the same cadence, plus `moe/expert_balance/<modality>` on MoT.
 
 ### 11 · Periodic work
 

@@ -4,8 +4,10 @@
 produces the ``VLMSample`` contract:
 
 - ``pixel_values``: ``(3, H, W)`` float tensor, resized to ``image_size``
-  and normalized with the provided mean/std; ``(0, 3, H, W)`` for a row
-  without an image when ``allow_text_only`` is set.
+  and normalized with the provided mean/std; ``(V, 3, H, W)`` when
+  ``tile_grid`` cuts the image into ``V`` views (``tile_image``); an
+  empty tensor of that image shape (``(0, 3, H, W)`` or ``(0, V, 3, H,
+  W)``) for a row without an image when ``allow_text_only`` is set.
 - ``input_ids``: ``(T,)`` int64 tensor, right-padded to ``max_text_len``.
 - ``labels``: ``(T,)`` int64 next-token targets (``labels[i]`` = input
   token ``i+1``), right-padded to ``max_text_len``; pad, trailing, and
@@ -72,11 +74,7 @@ def pil_to_tensor(
     """
     from PIL import Image
 
-    if not isinstance(img, Image.Image):
-        raise TypeError(
-            f"Expected a PIL.Image, got {type(img).__name__}. "
-            "If the dataset returns raw bytes, decode with PIL first."
-        )
+    _require_pil(img)
     img = img.convert("RGB").resize((image_size, image_size), Image.Resampling.BILINEAR)
     import numpy as np
 
@@ -85,6 +83,66 @@ def pil_to_tensor(
     mean_t = torch.tensor(mean, dtype=t.dtype).view(3, 1, 1)
     std_t = torch.tensor(std, dtype=t.dtype).view(3, 1, 1)
     return (t - mean_t) / std_t
+
+
+def _require_pil(img: Any) -> None:
+    from PIL import Image
+
+    if not isinstance(img, Image.Image):
+        raise TypeError(
+            f"Expected a PIL.Image, got {type(img).__name__}. "
+            "If the dataset returns raw bytes, decode with PIL first."
+        )
+
+
+def tile_image(
+    img: Any,
+    image_size: int,
+    mean: tuple[float, float, float],
+    std: tuple[float, float, float],
+    *,
+    tile_grid: int,
+    tile_global: bool = True,
+) -> torch.Tensor:
+    """Cut an image into views: the whole image, then an ``n × n`` raster of crops.
+
+    The whole image, resized to ``image_size`` square exactly as ``pil_to_tensor``
+    does, comes first when ``tile_global``. The crops are cut from the image
+    resized to ``tile_grid * image_size`` square, so each is ``image_size`` px and
+    together they cover that canvas exactly; they follow in raster order (left
+    to right, then top to bottom). Returns ``(views, 3, image_size,
+    image_size)``, every view normalized like ``pil_to_tensor``.
+
+    Public for the same reason as ``pil_to_tensor``: an evaluation adapter must
+    tile a request's image exactly as training did.
+    """
+    if tile_grid < 2:
+        raise ValueError(f"tile_grid must be >= 2 (an n × n grid of crops), got {tile_grid}")
+    _require_pil(img)
+    views = []
+    if tile_global:
+        views.append(pil_to_tensor(img, image_size, mean, std).unsqueeze(0))
+    canvas = pil_to_tensor(img, tile_grid * image_size, mean, std)
+    crops = canvas.reshape(3, tile_grid, image_size, tile_grid, image_size)
+    views.append(
+        crops.permute(1, 3, 0, 2, 4).reshape(tile_grid * tile_grid, 3, image_size, image_size)
+    )
+    return torch.cat(views, dim=0)
+
+
+def image_to_views(
+    img: Any,
+    image_size: int,
+    mean: tuple[float, float, float],
+    std: tuple[float, float, float],
+    *,
+    tile_grid: int = 0,
+    tile_global: bool = True,
+) -> torch.Tensor:
+    """One ``(3, H, W)`` view, or the ``(V, 3, H, W)`` views of ``tile_image`` when tiling."""
+    if tile_grid:
+        return tile_image(img, image_size, mean, std, tile_grid=tile_grid, tile_global=tile_global)
+    return pil_to_tensor(img, image_size, mean, std)
 
 
 def frames_to_clip_tensor(
@@ -413,9 +471,13 @@ class HuggingFaceVLMDataset(Dataset):
             SigLIP's ``(0.5, 0.5, 0.5)``.
         dataset_config: HF dataset config name, if required.
         allow_text_only: Accept rows whose image field is ``None`` or an
-            empty list and return them with an empty ``(0, 3, H, W)``
-            ``pixel_values``. Off, a dataset with such a row is rejected
+            empty list and return them with an empty ``pixel_values`` of
+            the image shape. Off, a dataset with such a row is rejected
             here, before training starts.
+        tile_grid: ``0`` keeps one view per image; ``n`` cuts each image into
+            an ``n × n`` grid of ``image_size`` crops (``tile_image``), so
+            ``pixel_values`` is ``(views, 3, H, W)``.
+        tile_global: Whether a tiled image's views start with the whole image.
     """
 
     def __init__(
@@ -432,6 +494,8 @@ class HuggingFaceVLMDataset(Dataset):
         image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
         dataset_config: str | None = None,
         allow_text_only: bool = False,
+        tile_grid: int = 0,
+        tile_global: bool = True,
     ) -> None:
         import os
 
@@ -458,6 +522,10 @@ class HuggingFaceVLMDataset(Dataset):
         self._image_size = image_size
         self._image_mean = image_mean
         self._image_std = image_std
+        self._tile_grid = tile_grid
+        self._tile_global = tile_global
+        views = tile_grid * tile_grid + int(tile_global) if tile_grid else 0
+        self._view_shape = (*((views,) if views else ()), 3, image_size, image_size)
         self._max_text_len = max_text_len
         self._allow_text_only = allow_text_only
         self._tokenizer = build_tokenizer(tokenizer_path)
@@ -467,7 +535,7 @@ class HuggingFaceVLMDataset(Dataset):
             _check_prompt_column_has_room(ds, prompt_field, self._tokenizer, max_text_len)
         logger.info(
             f"HuggingFaceVLMDataset: {dataset_name} [{split}], {len(self._ds):,} samples, "
-            f"image_size={image_size}, max_text_len={max_text_len}"
+            f"image_size={image_size}, tile_grid={tile_grid}, max_text_len={max_text_len}"
         )
 
     def __len__(self) -> int:
@@ -482,14 +550,21 @@ class HuggingFaceVLMDataset(Dataset):
                     f"row {idx} has no image in field {self._image_field!r}; set "
                     "data.hf_allow_text_only = true to train on text-only rows"
                 )
-            pixels = torch.zeros(0, 3, self._image_size, self._image_size)
+            pixels = torch.zeros(0, *self._view_shape)
         elif len(images) > 1:
             raise ValueError(
                 f"row {idx} holds {len(images)} images in field {self._image_field!r}; "
                 "a document takes one image"
             )
         else:
-            pixels = pil_to_tensor(images[0], self._image_size, self._image_mean, self._image_std)
+            pixels = image_to_views(
+                images[0],
+                self._image_size,
+                self._image_mean,
+                self._image_std,
+                tile_grid=self._tile_grid,
+                tile_global=self._tile_global,
+            )
         text_val = row[self._text_field]
         if not isinstance(text_val, str):
             raise TypeError(
@@ -600,8 +675,12 @@ def pack_vlm_samples(
     A sample is one document: ``pixel_values`` ``(3, H, W)`` or ``(V, 3, H, W)``
     (``V`` views, each an encoder input; ``V = 0`` for a text-only document),
     ``input_ids`` and ``labels`` ``(T,)`` whose first ``text_len`` positions are
-    real (all of them when the key is absent). Its footprint is ``V *
-    tokens_per_image`` placeholder slots followed by ``text_len`` tokens.
+    real (``0`` packs the image alone with nothing to supervise, as the unpacked
+    path's all-masked row does). Its footprint is ``V * tokens_per_image``
+    placeholder slots followed by ``text_len`` tokens. The
+    last packed label is forced to ``-100`` as a guard for samples built outside
+    ``HuggingFaceVLMDataset`` (which already leaves it so): the token after a
+    trimmed ``text_len`` is not in the row.
     Documents go first-fit into rows in order: into the first open row with
     room, else a new row. A row's tail is padding that forms its own document.
 
@@ -615,12 +694,14 @@ def pack_vlm_samples(
         document's positions (and the tail's) restarting at ``0``;
         ``image_rows`` and ``image_starts`` ``(N,)``,
         the row and first slot of each image; ``image_tokens``, 0-d, the
-        ``tokens_per_image`` the slots were laid out with.
+        ``tokens_per_image`` the slots were laid out with; ``text_rows`` and
+        ``text_positions`` ``(M,)``, the row and position of every real text
+        token in document order, where the wrapper runs the LM head.
 
     Raises:
-        ValueError: ``samples`` is empty, a document has no image while
-            ``allow_text_only`` is off or a footprint over ``seq_len``, or
-            ``seq_len`` or ``tokens_per_image`` is not positive.
+        ValueError: ``samples`` is empty, a sample lacks ``text_len``, a document
+            has no image while ``allow_text_only`` is off or a footprint over
+            ``seq_len``, or ``seq_len`` or ``tokens_per_image`` is not positive.
     """
     if seq_len <= 0 or tokens_per_image <= 0:
         raise ValueError("seq_len and tokens_per_image must be positive")
@@ -632,6 +713,8 @@ def pack_vlm_samples(
     image_starts: list[int] = []
     image_shape: tuple[int, ...] = ()
     image_dtype = torch.float32
+    text_rows: list[int] = []
+    text_positions: list[int] = []
     for sample in samples:
         views = sample["pixel_values"]
         if views.dim() == 3:
@@ -644,7 +727,15 @@ def pack_vlm_samples(
                 "to train on text-only rows"
             )
         image_shape, image_dtype = tuple(views.shape[1:]), views.dtype
-        text_len = int(sample["text_len"]) if "text_len" in sample else sample["input_ids"].shape[0]
+        n_ids = sample["input_ids"].shape[0]
+        if "text_len" not in sample:
+            raise ValueError(
+                "pack_vlm_samples: every sample needs text_len, its count of real tokens; "
+                "a right-padded sample without it would pack its padding as text"
+            )
+        text_len = int(sample["text_len"])
+        if not 0 <= text_len <= n_ids:
+            raise ValueError(f"text_len ({text_len}) must lie within the {n_ids} input_ids")
         footprint = views.shape[0] * tokens_per_image + text_len
         if footprint > seq_len:
             raise ValueError(
@@ -671,8 +762,12 @@ def pack_vlm_samples(
             image_rows.append(row_index)
             image_starts.append(cursor)
             cursor += tokens_per_image
+        text_rows.extend([row_index] * text_len)
+        text_positions.extend(range(cursor, cursor + text_len))
         row["input_ids"][cursor : cursor + text_len] = sample["input_ids"][:text_len]
         row["labels"][cursor : cursor + text_len] = sample["labels"][:text_len]
+        if text_len:
+            row["labels"][cursor + text_len - 1] = -100
         row["doc_ids"][row["fill"] : cursor + text_len] = row["docs"]
         row["position_ids"][row["fill"] : cursor + text_len] = torch.arange(footprint)
         row["fill"] = cursor + text_len
@@ -692,6 +787,8 @@ def pack_vlm_samples(
         "image_rows": torch.tensor(image_rows, dtype=torch.long),
         "image_starts": torch.tensor(image_starts, dtype=torch.long),
         "image_tokens": torch.tensor(tokens_per_image, dtype=torch.long),
+        "text_rows": torch.tensor(text_rows, dtype=torch.long),
+        "text_positions": torch.tensor(text_positions, dtype=torch.long),
     }
 
 

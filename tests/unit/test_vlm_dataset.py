@@ -21,8 +21,10 @@ from kempnerforge.data.vlm_dataset import (
     _tokenize_and_mask,
     check_prompt_fits,
     frames_to_clip_tensor,
+    image_to_views,
     pack_vlm_samples,
     pil_to_tensor,
+    tile_image,
 )
 
 
@@ -36,6 +38,8 @@ def _dataset_over(
     image_size: int = 16,
     max_text_len: int = 8,
     allow_text_only: bool = False,
+    tile_grid: int = 0,
+    tile_global: bool = True,
     tokenizer_path: str = "gpt2",
 ) -> HuggingFaceVLMDataset:
     """A ``HuggingFaceVLMDataset`` over in-memory ``rows``, skipping ``__init__``'s loading."""
@@ -49,6 +53,10 @@ def _dataset_over(
     ds._image_size = image_size
     ds._image_mean = DEFAULT_IMAGE_MEAN
     ds._image_std = DEFAULT_IMAGE_STD
+    ds._tile_grid = tile_grid
+    ds._tile_global = tile_global
+    views = tile_grid * tile_grid + int(tile_global) if tile_grid else 0
+    ds._view_shape = (*((views,) if views else ()), 3, image_size, image_size)
     ds._max_text_len = max_text_len
     ds._allow_text_only = allow_text_only
     ds._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -82,6 +90,80 @@ class TestPILToTensor:
     def test_non_pil_raises(self):
         with pytest.raises(TypeError, match="Expected a PIL.Image"):
             pil_to_tensor(torch.randn(3, 16, 16), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+
+
+def _quadrant_image(size: int = 64) -> Image.Image:
+    """An image whose four quadrants are solid red, green, blue and white."""
+    img = Image.new("RGB", (size, size))
+    half = size // 2
+    corners = [(0, 0), (half, 0), (0, half), (half, half)]
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)]
+    for (left, top), color in zip(corners, colors, strict=True):
+        img.paste(color, (left, top, left + half, top + half))
+    return img
+
+
+class TestTileImage:
+    def test_global_view_then_crops_in_raster_order(self):
+        img = _quadrant_image(64)
+        views = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2)
+        assert views.shape == (5, 3, 16, 16)
+        assert torch.equal(views[0], pil_to_tensor(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD))
+        expected = [(1.0, -1.0, -1.0), (-1.0, 1.0, -1.0), (-1.0, -1.0, 1.0), (1.0, 1.0, 1.0)]
+        for view, color in zip(views[1:], expected, strict=True):
+            interior = view[:, 2:-2, 2:-2].mean(dim=(1, 2))
+            assert torch.allclose(interior, torch.tensor(color), atol=1e-6)
+
+    def test_crops_cover_the_canvas_exactly(self):
+        img = Image.effect_noise((48, 48), 64).convert("RGB")
+        views = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=3)
+        assert views.shape == (10, 3, 16, 16)
+        rows = [torch.cat(list(views[1 + 3 * r : 4 + 3 * r]), dim=2) for r in range(3)]
+        stitched = torch.cat(rows, dim=1)
+        assert torch.equal(stitched, pil_to_tensor(img, 48, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD))
+
+    def test_without_the_global_view(self):
+        img = _quadrant_image(64)
+        with_global = tile_image(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2)
+        crops = tile_image(
+            img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2, tile_global=False
+        )
+        assert crops.shape == (4, 3, 16, 16)
+        assert torch.equal(crops, with_global[1:])
+
+    def test_grayscale_promoted_to_rgb(self):
+        views = tile_image(
+            Image.new("L", (40, 40), color=128),
+            8,
+            DEFAULT_IMAGE_MEAN,
+            DEFAULT_IMAGE_STD,
+            tile_grid=2,
+        )
+        assert views.shape == (5, 3, 8, 8)
+        assert views.dtype == torch.float32
+
+    def test_non_pil_raises(self):
+        with pytest.raises(TypeError, match="Expected a PIL.Image"):
+            tile_image(
+                torch.randn(3, 16, 16), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2
+            )
+
+    @pytest.mark.parametrize("grid", [0, 1])
+    def test_grid_below_two_raises(self, grid):
+        with pytest.raises(ValueError, match="grid must be >= 2"):
+            tile_image(_make_image(), 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=grid)
+
+    def test_image_to_views_selects_by_grid(self):
+        img = _quadrant_image(64)
+        one = image_to_views(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD)
+        assert torch.equal(one, pil_to_tensor(img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD))
+        tiled = image_to_views(
+            img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2, tile_global=False
+        )
+        crops = tile_image(
+            img, 16, DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD, tile_grid=2, tile_global=False
+        )
+        assert torch.equal(tiled, crops)
 
 
 class _MockTokenizer:
@@ -673,6 +755,13 @@ class TestVLMCollator:
         batch = collator([self._sample(3, max_text_len=8) for _ in range(4)])
         assert batch["pixel_values"].shape == (4, 3, 32, 32)
 
+    def test_tiled_views_stack_like_frames(self):
+        collator = VLMCollator(pad_id=0, max_text_len=8)
+        samples = [self._sample(3, max_text_len=8) for _ in range(4)]
+        for sample in samples:
+            sample["pixel_values"] = torch.randn(5, 3, 32, 32)
+        assert collator(samples)["pixel_values"].shape == (4, 5, 3, 32, 32)
+
     def test_empty_batch_raises(self):
         collator = VLMCollator(pad_id=0, max_text_len=8)
         with pytest.raises(ValueError, match="empty batch"):
@@ -719,6 +808,32 @@ class TestHuggingFaceVLMDataset:
         assert 0 < text_len <= 16
         assert item["labels"][text_len - 1].item() == -100
         assert (item["labels"][: text_len - 1] == item["input_ids"][1:text_len]).all()
+
+    @pytest.mark.parametrize(("tile_global", "views"), [(True, 5), (False, 4)])
+    def test_tiling_yields_one_view_per_crop(self, tiny_hf_dataset, tile_global, views):
+        ds = HuggingFaceVLMDataset(
+            dataset_name=tiny_hf_dataset,
+            split="train",
+            image_field="image",
+            text_field="caption",
+            tokenizer_path="gpt2",
+            max_text_len=8,
+            image_size=16,
+            tile_grid=2,
+            tile_global=tile_global,
+        )
+        item = ds[1]
+        assert item["pixel_values"].shape == (views, 3, 16, 16)
+        expected = tile_image(
+            ds._ds[1]["image"],
+            16,
+            DEFAULT_IMAGE_MEAN,
+            DEFAULT_IMAGE_STD,
+            tile_grid=2,
+            tile_global=tile_global,
+        )
+        assert torch.equal(item["pixel_values"], expected)
+        assert item["input_ids"].shape == (8,)
 
     def test_init_load_from_disk_single_split(self, tiny_hf_dataset):
         """Real ``__init__`` on a dataset saved by ``save_to_disk`` (single
@@ -902,6 +1017,16 @@ class TestTextOnlyRows:
         ds = _dataset_over(rows, allow_text_only=True)
         assert ds[0]["pixel_values"].shape == (3, 16, 16)
 
+    @pytest.mark.parametrize(("tile_global", "views"), [(True, 5), (False, 4)])
+    def test_a_text_only_row_takes_the_tiled_view_shape(self, tile_global, views):
+        rows = [{"image": None, "caption": "a b"}, {"image": _make_image(8), "caption": "a b"}]
+        ds = _dataset_over(rows, allow_text_only=True, tile_grid=2, tile_global=tile_global)
+        assert ds[0]["pixel_values"].shape == (0, views, 3, 16, 16)
+        assert ds[1]["pixel_values"].shape == (views, 3, 16, 16)
+        batch = VLMCollator(pad_id=0, max_text_len=8, allow_text_only=True)([ds[0], ds[1]])
+        assert batch["pixel_values"].shape == (2, views, 3, 16, 16)
+        assert batch["frame_mask"].tolist() == [[False] * views, [True] * views]
+
     def test_a_list_of_nothing_is_text_only_and_a_list_of_several_raises(self):
         ds = _dataset_over([{"image": [None, None], "caption": "a b"}], allow_text_only=True)
         assert ds[0]["pixel_values"].shape == (0, 3, 16, 16)
@@ -1055,6 +1180,8 @@ class TestPackVLMSamples:
         assert batch["doc_ids"][1].tolist() == [0] * 7 + [1] * 5
         assert batch["position_ids"][0].tolist() == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 5, 0]
         assert batch["position_ids"][1].tolist() == list(range(7)) + list(range(5))
+        assert batch["text_rows"].tolist() == [0] * 7 + [1] * 5
+        assert batch["text_positions"].tolist() == [2, 3, 4, 7, 8, 9, 10, 2, 3, 4, 5, 6]
         assert batch["image_rows"].tolist() == [0, 0, 1]
         assert batch["image_starts"].tolist() == [0, 5, 0]
         assert batch["pixel_values"].shape == (3, 3, 4, 4)
@@ -1076,11 +1203,11 @@ class TestPackVLMSamples:
         assert batch["image_starts"].tolist() == [0, 2, 4]
         assert batch["input_ids"][0, 6:8].tolist() == [10, 11]
 
-    def test_without_text_len_every_position_is_real(self):
+    def test_without_text_len_raises(self):
         doc = _doc(3, 10)
         del doc["text_len"]
-        batch = pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)
-        assert batch["doc_ids"][0].tolist() == [0] * 10 + [1] * 2
+        with pytest.raises(ValueError, match="every sample needs text_len"):
+            pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)
 
     def test_oversize_document_raises(self):
         with pytest.raises(ValueError, match="does not fit a row"):
@@ -1127,6 +1254,29 @@ class TestPackVLMSamples:
         assert batch["input_ids"][0, 11].item() == 7
         with pytest.raises(ValueError, match="no samples"):
             collator([])
+
+    def test_a_document_without_text_packs_its_image_alone(self):
+        doc = _doc(3, 10)
+        doc["text_len"] = torch.tensor(0)
+        batch = pack_vlm_samples([doc, _doc(2, 20)], seq_len=12, tokens_per_image=2, pad_id=0)
+        assert batch["image_starts"].tolist() == [0, 2]
+        assert batch["doc_ids"][0].tolist() == [0, 0, 1, 1, 1, 1] + [2] * 6
+        assert batch["text_rows"].tolist() == [0, 0]
+        assert batch["text_positions"].tolist() == [4, 5]
+
+    def test_a_trimmed_document_leaves_its_last_label_unsupervised(self):
+        doc = _doc(5, 10)
+        doc["text_len"] = torch.tensor(3)
+        batch = pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)
+        assert batch["input_ids"][0, 2:5].tolist() == [10, 11, 12]
+        assert batch["labels"][0, 2:5].tolist() == [11, 12, -100]
+
+    @pytest.mark.parametrize("text_len", [40, -1])
+    def test_text_len_outside_the_ids_raises(self, text_len):
+        doc = _doc(3, 10)
+        doc["text_len"] = torch.tensor(text_len)
+        with pytest.raises(ValueError, match=f"text_len \\({text_len}\\) must lie within"):
+            pack_vlm_samples([doc], seq_len=64, tokens_per_image=2, pad_id=0)
 
     def test_a_text_only_document_needs_the_flag(self):
         doc = _doc(3, 10, views=0)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -12,6 +14,7 @@ from kempnerforge.config.model import FLEX_BLOCK_SIZE, ModelConfig
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import VLMConfig
 from kempnerforge.data.vlm_dataset import pack_vlm_samples
+from kempnerforge.model.masking import use_dynamic_flex_shapes
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 from kempnerforge.training.loop import _mark_rows_dynamic
 
@@ -62,6 +65,52 @@ def _batch(rows: int) -> dict[str, torch.Tensor]:
     return {name: tensor.to("cuda") for name, tensor in batch.items()}
 
 
+def _models() -> tuple[VLMWrapper, VLMWrapper]:
+    """A dense reference and a flex model with the same weights and an eager random encoder."""
+    torch.manual_seed(0)
+    dense = _model("sdpa")
+    sparse = _model("flex")
+    sparse.load_state_dict(dense.state_dict())
+    sparse.vision_encoder.forward = torch._dynamo.disable(sparse.vision_encoder.forward)
+    return dense, sparse
+
+
+def _step(
+    dense: VLMWrapper, sparse: VLMWrapper, run: Callable[..., tuple], rows: int, *, mark: bool
+) -> None:
+    """Run one packed batch through both models and compare logits, loss and gradients."""
+    batch = _batch(rows)
+    image_tokens = int(batch.pop("image_tokens"))
+    if mark:
+        _mark_rows_dynamic(*batch.values())
+    dense.zero_grad(set_to_none=True)
+    sparse.zero_grad(set_to_none=True)
+    reference, reference_labels = dense(**batch, image_tokens=image_tokens)
+    actual, _ = run(**batch, image_tokens=image_tokens)
+    torch.testing.assert_close(actual, reference, rtol=2e-5, atol=2e-5)
+    assert reference_labels is not None
+    labels = reference_labels.reshape(-1)
+    reference_loss = F.cross_entropy(reference.reshape(-1, 128), labels)
+    actual_loss = F.cross_entropy(actual.reshape(-1, 128), labels)
+    assert torch.isfinite(actual_loss)
+    torch.testing.assert_close(actual_loss, reference_loss, rtol=2e-5, atol=2e-5)
+    reference_loss.backward()
+    actual_loss.backward()
+    for (name, expected), (_, parameter) in zip(
+        dense.named_parameters(), sparse.named_parameters(), strict=True
+    ):
+        if not parameter.requires_grad:
+            continue
+        assert parameter.grad is not None, name
+        assert expected.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        torch.testing.assert_close(parameter.grad, expected.grad, rtol=1e-4, atol=1e-6)
+
+
+def _graphs() -> int:
+    return counters["stats"]["unique_graphs"]
+
+
 @pytest.mark.gpu
 def test_packed_flex_compile_tracks_varying_rows_and_images() -> None:
     """Keep dense parity and graph reuse while packed rows and image counts change.
@@ -78,51 +127,61 @@ def test_packed_flex_compile_tracks_varying_rows_and_images() -> None:
 
     torch._dynamo.reset()
     counters.clear()
-    torch.manual_seed(0)
-    dense = _model("sdpa")
-    sparse = _model("flex")
-    sparse.load_state_dict(dense.state_dict())
-    sparse.vision_encoder.forward = torch._dynamo.disable(sparse.vision_encoder.forward)
-    compiled = torch.compile(sparse)
-
-    def step(rows: int) -> None:
-        batch = _batch(rows)
-        image_tokens = int(batch.pop("image_tokens"))
-        _mark_rows_dynamic(*batch.values())
-        dense.zero_grad(set_to_none=True)
-        sparse.zero_grad(set_to_none=True)
-        reference, _ = dense(**batch, image_tokens=image_tokens)
-        actual, _ = compiled(**batch, image_tokens=image_tokens)
-        torch.testing.assert_close(actual, reference, rtol=2e-5, atol=2e-5)
-        labels = batch["labels"].reshape(-1)
-        reference_loss = F.cross_entropy(reference.reshape(-1, 128), labels)
-        actual_loss = F.cross_entropy(actual.reshape(-1, 128), labels)
-        assert torch.isfinite(actual_loss)
-        torch.testing.assert_close(actual_loss, reference_loss, rtol=2e-5, atol=2e-5)
-        reference_loss.backward()
-        actual_loss.backward()
-        for (name, expected), (_, parameter) in zip(
-            dense.named_parameters(), sparse.named_parameters(), strict=True
-        ):
-            if not parameter.requires_grad:
-                continue
-            assert parameter.grad is not None, name
-            assert expected.grad is not None, name
-            assert torch.isfinite(parameter.grad).all(), name
-            torch.testing.assert_close(parameter.grad, expected.grad, rtol=1e-4, atol=1e-6)
-
     try:
+        use_dynamic_flex_shapes(True)
+        dense, sparse = _models()
+        compiled = torch.compile(sparse)
         for rows in (1, 2, 3, 1):
-            step(rows)
-        after_warmup = counters["stats"]["unique_graphs"]
+            _step(dense, sparse, compiled, rows, mark=True)
+        after_warmup = _graphs()
         assert after_warmup > 0, "packed FlexAttention never compiled"
         for rows in (*range(4, 10), 1, 2, 3, 1):
-            step(rows)
-            assert counters["stats"]["unique_graphs"] == after_warmup, (
+            _step(dense, sparse, compiled, rows, mark=True)
+            assert _graphs() == after_warmup, (
                 f"packed row count {rows} caused recompilation after warmup: "
-                f"{after_warmup} -> {counters['stats']['unique_graphs']} graphs"
+                f"{after_warmup} -> {_graphs()} graphs"
             )
     finally:
+        use_dynamic_flex_shapes(False)
+        torch._dynamo.reset()
+
+
+@pytest.mark.gpu
+def test_eager_packed_flex_reuses_the_dynamic_pair() -> None:
+    """With compile_model off, the dynamic flex pair compiles once for the varying row count.
+
+    The model runs eagerly, so the compiled flex_attention and create_block_mask
+    are the only compiled code. After warming rows one through three, unseen
+    row counts reuse the dynamic pair's graphs; the pinned pair, run over row
+    counts it has not seen, compiles a graph for each.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch._dynamo.reset()
+    counters.clear()
+    try:
+        use_dynamic_flex_shapes(True)
+        dense, sparse = _models()
+        for rows in (1, 2, 3, 1):
+            _step(dense, sparse, sparse, rows, mark=False)
+        after_warmup = _graphs()
+        assert after_warmup > 0, "the dynamic flex pair never compiled"
+        for rows in (*range(4, 8), 1, 2, 3):
+            _step(dense, sparse, sparse, rows, mark=False)
+            assert _graphs() == after_warmup, (
+                f"row count {rows} recompiled the dynamic flex pair: "
+                f"{after_warmup} -> {_graphs()} graphs"
+            )
+        use_dynamic_flex_shapes(False)
+        pinned = _graphs()
+        for rows in (4, 5, 6):
+            _step(dense, sparse, sparse, rows, mark=False)
+        assert _graphs() >= pinned + 3, (
+            f"the pinned pair compiled {_graphs() - pinned} graphs for three new row counts"
+        )
+    finally:
+        use_dynamic_flex_shapes(False)
         torch._dynamo.reset()
 
 
@@ -133,39 +192,44 @@ def test_a_compiled_text_only_batch_keeps_the_visual_parameters_in_the_graph() -
         pytest.skip("CUDA required")
 
     torch._dynamo.reset()
-    torch.manual_seed(0)
-    dense = _model("sdpa")
-    sparse = _model("flex")
-    sparse.load_state_dict(dense.state_dict())
-    sparse.vision_encoder.forward = torch._dynamo.disable(sparse.vision_encoder.forward)
-    compiled = torch.compile(sparse)
-    ids = torch.arange(1, _TEXT_LEN + 1, dtype=torch.long)
-    labels = torch.full_like(ids, -100)
-    labels[:-1] = ids[1:]
-    doc = {
-        "pixel_values": torch.zeros(0, 3, 4, 4),
-        "input_ids": ids,
-        "labels": labels,
-        "text_len": torch.tensor(_TEXT_LEN),
-    }
-    batch = pack_vlm_samples(
-        [doc, doc], seq_len=_SEQ_LEN, tokens_per_image=_IMAGE_TOKENS, pad_id=0, allow_text_only=True
-    )
-    assert batch["pixel_values"].shape[0] == 0
-    batch = {name: tensor.to("cuda") for name, tensor in batch.items()}
-    image_tokens = int(batch.pop("image_tokens"))
-    _mark_rows_dynamic(*batch.values())
-    reference, _ = dense(**batch, image_tokens=image_tokens)
-    actual, _ = compiled(**batch, image_tokens=image_tokens)
-    torch.testing.assert_close(actual, reference, rtol=2e-5, atol=2e-5)
-    actual.float().sum().backward()
-    visual = [
-        (name, parameter)
-        for module in (sparse.vision_encoder, sparse.adapter)
-        for name, parameter in module.named_parameters()
-        if parameter.requires_grad
-    ]
-    assert visual
-    for name, parameter in visual:
-        assert parameter.grad is not None, name
-        assert torch.count_nonzero(parameter.grad) == 0, name
+    dense, sparse = _models()
+    use_dynamic_flex_shapes(True)
+    try:
+        compiled = torch.compile(sparse)
+        ids = torch.arange(1, _TEXT_LEN + 1, dtype=torch.long)
+        labels = torch.full_like(ids, -100)
+        labels[:-1] = ids[1:]
+        doc = {
+            "pixel_values": torch.zeros(0, 3, 4, 4),
+            "input_ids": ids,
+            "labels": labels,
+            "text_len": torch.tensor(_TEXT_LEN),
+        }
+        batch = pack_vlm_samples(
+            [doc, doc],
+            seq_len=_SEQ_LEN,
+            tokens_per_image=_IMAGE_TOKENS,
+            pad_id=0,
+            allow_text_only=True,
+        )
+        assert batch["pixel_values"].shape[0] == 0
+        batch = {name: tensor.to("cuda") for name, tensor in batch.items()}
+        image_tokens = int(batch.pop("image_tokens"))
+        _mark_rows_dynamic(*batch.values())
+        reference, _ = dense(**batch, image_tokens=image_tokens)
+        actual, _ = compiled(**batch, image_tokens=image_tokens)
+        torch.testing.assert_close(actual, reference, rtol=2e-5, atol=2e-5)
+        actual.float().sum().backward()
+        visual = [
+            (name, parameter)
+            for module in (sparse.vision_encoder, sparse.adapter)
+            for name, parameter in module.named_parameters()
+            if parameter.requires_grad
+        ]
+        assert visual
+        for name, parameter in visual:
+            assert parameter.grad is not None, name
+            assert torch.count_nonzero(parameter.grad) == 0, name
+    finally:
+        use_dynamic_flex_shapes(False)
+        torch._dynamo.reset()

@@ -25,6 +25,7 @@ import torch
 from torch.distributed._composable.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl,
+    CheckpointWrapper,
     apply_activation_checkpointing,
     checkpoint_wrapper,
 )
@@ -32,7 +33,10 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ActivationCheckpointing
-from kempnerforge.model.transformer import Transformer, TransformerBlock
+from kempnerforge.model.attention import Attention
+from kempnerforge.model.cross_attention import CrossAttention
+from kempnerforge.model.mot import MoTAttention
+from kempnerforge.model.transformer import Transformer
 
 if TYPE_CHECKING:
     from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
@@ -104,39 +108,96 @@ def autocast_dtype(
     return compute_dtype
 
 
-def apply_ac(model: Transformer, mode: ActivationCheckpointing) -> None:
-    """Apply activation checkpointing to the model.
+_ATTENTION_TYPES = (Attention, MoTAttention, CrossAttention)
+
+
+def _ac_blocks(model: torch.nn.Module) -> list[tuple[torch.nn.ModuleDict, str]]:
+    """``(container, key)`` of every child of ``layers`` and ``cross_attention_layers``.
+
+    A pipeline stage has no ``cross_attention_layers``, and a model without
+    cross-attention has an empty one.
+    """
+    blocks = []
+    for name in ("layers", "cross_attention_layers"):
+        container = getattr(model, name, None)
+        if container is not None:
+            blocks.extend((container, key) for key in container)
+    return blocks
+
+
+def _is_checkpointed(module: torch.nn.Module) -> bool:
+    """Whether ``module`` is, or holds, a ``CheckpointWrapper``."""
+    return any(isinstance(m, CheckpointWrapper) for m in module.modules())
+
+
+def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpointing | str) -> int:
+    """Apply activation checkpointing to the model's blocks.
 
     Must be called BEFORE apply_fsdp2.
 
+    The blocks are the children of ``model.layers`` and, when present,
+    ``model.cross_attention_layers``, selected by position, so every block
+    class is covered: ``TransformerBlock``, ``MoTBlock``, ``MoMaBlock`` and
+    ``CrossAttentionBlock`` alike. A block that already holds a
+    ``CheckpointWrapper`` is left as it is, so calling this twice wraps
+    nothing new.
+
     Args:
-        model: Transformer model.
-        mode: Checkpointing mode — "none", "full", or "selective".
-            full: checkpoint every TransformerBlock (maximum memory savings).
-            selective: checkpoint only Attention modules (balanced trade-off).
+        model: Transformer model or pipeline stage.
+        mode: Checkpointing mode, "none", "full", or "selective", as an
+            ``ActivationCheckpointing`` member or its string value. ``full``
+            checkpoints every block (maximum memory savings); ``selective``
+            checkpoints the ``Attention``, ``MoTAttention`` and
+            ``CrossAttention`` modules inside each block (balanced trade-off)
+            and warns, naming the class, about a block that holds none of them.
+
+    Returns:
+        The number of modules this call wrapped.
     """
+    mode = ActivationCheckpointing(mode)
     if mode == ActivationCheckpointing.none:
-        return
+        return 0
 
     wrapper_fn = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+    blocks = _ac_blocks(model)
+    wrapped: dict[str, int] = {}
+    for container, key in blocks:
+        if _is_checkpointed(container[key]):
+            continue
+        if mode == ActivationCheckpointing.full:
+            container[key] = wrapper_fn(container[key])
+        else:
+            apply_activation_checkpointing(
+                container[key],
+                checkpoint_wrapper_fn=wrapper_fn,
+                check_fn=lambda m: isinstance(m, _ATTENTION_TYPES),
+            )
+        for m in container[key].modules():
+            if isinstance(m, CheckpointWrapper):
+                name = type(m._checkpoint_wrapped_module).__name__
+                wrapped[name] = wrapped.get(name, 0) + 1
 
-    if mode == ActivationCheckpointing.full:
-        apply_activation_checkpointing(
-            model,
-            checkpoint_wrapper_fn=wrapper_fn,
-            check_fn=lambda m: isinstance(m, TransformerBlock),
+    uncovered = [type(c[k]).__name__ for c, k in blocks if not _is_checkpointed(c[k])]
+    if not blocks:
+        logger.warning(
+            f"activation_checkpointing={mode.value!r} checkpoints nothing: the model has no "
+            "blocks in layers or cross_attention_layers"
         )
-        logger.info("Applied full activation checkpointing (per TransformerBlock)")
-
-    elif mode == ActivationCheckpointing.selective:
-        from kempnerforge.model.attention import Attention
-
-        apply_activation_checkpointing(
-            model,
-            checkpoint_wrapper_fn=wrapper_fn,
-            check_fn=lambda m: isinstance(m, Attention),
+    elif uncovered:
+        logger.warning(
+            f"activation_checkpointing={mode.value!r} leaves {len(uncovered)} of {len(blocks)} "
+            f"blocks unwrapped ({', '.join(sorted(set(uncovered)))}): they hold no Attention, "
+            "MoTAttention or CrossAttention module. Use 'full' to checkpoint them whole."
         )
-        logger.info("Applied selective activation checkpointing (Attention only)")
+    if wrapped:
+        counts = ", ".join(f"{n} {name}" for name, n in wrapped.items())
+        logger.info(f"Applied {mode.value} activation checkpointing: wrapped {counts}")
+    elif blocks and not uncovered:
+        logger.info(
+            f"Activation checkpointing ({mode.value}) wrapped nothing new: every block "
+            "was already checkpointed"
+        )
+    return sum(wrapped.values())
 
 
 def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True) -> None:
@@ -325,6 +386,7 @@ def _apply_fsdp_vlm(
     mp_policy: MixedPrecisionPolicy | None,
     *,
     encoder_frozen: bool,
+    encoder_mp_policy: MixedPrecisionPolicy | None = None,
     reshard_after_forward: bool | int = True,
 ) -> None:
     """FSDP2 wrap policy for a ``VLMWrapper``.
@@ -335,9 +397,10 @@ def _apply_fsdp_vlm(
         and VLM+MoE cannot deadlock).
       - Transformer root (embedding + final norm + output head): own unit.
       - Adapter: own unit (small, but keeps grad-sync scheduling symmetric).
-      - Vision encoder: wrapped only when not fully frozen. A frozen encoder
-        stays as a full replica in eval mode; replication is fine because
-        requires_grad=False means no grad-reduce participation.
+      - Vision encoder: wrapped only when not fully frozen, with
+        ``encoder_mp_policy`` when given and the shared policy otherwise.
+        A frozen encoder stays as a full replica in eval mode; replication
+        is fine because requires_grad=False means no grad-reduce participation.
       - The ``VLMWrapper`` itself is not wrapped (no direct parameters).
     """
     if not has_dp_mesh(device_mesh):
@@ -367,13 +430,93 @@ def _apply_fsdp_vlm(
         fully_shard(
             wrapper.vision_encoder,
             mesh=dp_mesh,
-            mp_policy=policy,
+            mp_policy=encoder_mp_policy if encoder_mp_policy is not None else policy,
             reshard_after_forward=reshard_after_forward,
         )
     logger.info(
         f"Applied VLM FSDP2: dp_mesh={dp_mesh.mesh_dim_names}, "
         f"blocks={len(wrapper.transformer.layers)}, encoder_frozen={encoder_frozen}"
     )
+
+
+def _cast_floating(value: object, dtype: torch.dtype) -> object:
+    """``value`` cast to ``dtype`` if it is a floating-point tensor, else ``value`` unchanged."""
+    if isinstance(value, torch.Tensor) and value.is_floating_point():
+        return value.to(dtype)
+    return value
+
+
+class _ComputeInDtype:
+    """A module's forward that computes in ``dtype`` while its parameters keep their dtype.
+
+    Installed as the module's ``forward``. Each call puts a ``dtype`` copy in place of
+    every floating-point parameter of another dtype, one copy per parameter however many
+    names it has, casts the floating-point arguments, and runs the module's own forward
+    with autocast off on ``device_type``, so a surrounding ``torch.autocast`` does not
+    change the dtype it computes in. The parameters go back when the call returns or
+    raises. A nested call finds the copies in place and casts no parameter. Autograd
+    returns each copy's gradient to its parameter in the parameter's dtype, as with an
+    FSDP2 ``MixedPrecisionPolicy`` whose ``param_dtype`` is ``dtype``.
+
+    Under ``torch.compile`` the call itself runs eagerly, at a graph break, and the
+    module's forward compiles as its own graph, entered with autocast off. A compiled
+    graph's backward is traced under the autocast its forward was entered with, so this
+    keeps the backward in ``dtype`` too.
+    """
+
+    def __init__(self, module: torch.nn.Module, dtype: torch.dtype, device_type: str) -> None:
+        self._module = module
+        self._forward = module.forward
+        self.dtype = dtype
+        self.device_type = device_type
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        return _run_eagerly(self, *args, **kwargs)
+
+    def _run(self, *args: object, **kwargs: object) -> object:
+        swapped: list[tuple[torch.nn.Module, str, torch.nn.Parameter]] = []
+        try:
+            copies: dict[int, torch.Tensor] = {}
+            for owner in self._module.modules():
+                for name, param in list(owner._parameters.items()):
+                    if param is None or not param.is_floating_point() or param.dtype == self.dtype:
+                        continue
+                    if id(param) not in copies:
+                        copies[id(param)] = param.to(self.dtype)
+                    swapped.append((owner, name, param))
+                    owner._parameters[name] = copies[id(param)]  # type: ignore[assignment]
+            with torch.autocast(self.device_type, enabled=False):
+                return self._forward(
+                    *(_cast_floating(a, self.dtype) for a in args),
+                    **{k: _cast_floating(v, self.dtype) for k, v in kwargs.items()},
+                )
+        finally:
+            for owner, name, param in reversed(swapped):
+                owner._parameters[name] = param
+
+
+_run_eagerly = torch.compiler.disable(_ComputeInDtype._run, recursive=False)
+
+
+def _set_encoder_precision(
+    encoder: torch.nn.Module, dtype: torch.dtype, *, fsdp_wrapped: bool, device_type: str
+) -> None:
+    """Make the vision encoder compute in ``dtype`` while its parameters keep their dtype.
+
+    Its floating-point buffers are cast to ``dtype``, every registered name as
+    ``Module.to`` does, so they are also saved in it. A wrapped encoder's policy casts
+    its parameters and inputs for each forward. An unwrapped one gets
+    ``_ComputeInDtype`` as its ``forward``, which does the same and keeps the forward
+    out of any ``torch.autocast`` on ``device_type``. Either way its parameters,
+    gradients and optimizer state keep the dtype the encoder was loaded in.
+    """
+    for module in encoder.modules():
+        for name, buffer in module.named_buffers(recurse=False, remove_duplicate=False):
+            if buffer.is_floating_point():
+                setattr(module, name, buffer.to(dtype))
+    if fsdp_wrapped:
+        return
+    encoder.forward = _ComputeInDtype(encoder, dtype, device_type)
 
 
 def _build_vlm(
@@ -405,10 +548,14 @@ def _build_vlm(
       4. TP / EP / Float8 / AC are applied to the transformer only.
       5. FSDP2 is applied component-by-component (transformer blocks,
          transformer root, adapter, and vision encoder iff not frozen).
+         With ``vision_config.mixed_precision`` set, the encoder's unit
+         gets its own policy that computes in that dtype.
       6. Meta subtrees are materialized (transformer / adapter), the
          vision encoder is moved to ``device``, and the transformer and
-         adapter are cast to ``param_dtype``. The vision encoder stays in
-         its HF dtype (D16) to avoid ViT LayerNorm numerical drift.
+         adapter are cast to ``param_dtype``. The vision encoder's
+         parameters stay in its HF dtype (D16) to avoid ViT LayerNorm
+         numerical drift; with ``vision_config.mixed_precision`` set,
+         ``_set_encoder_precision`` makes it compute in that dtype.
       7. Freeze specs are applied via ``apply_freeze_specs`` and a fully
          frozen encoder is switched to ``eval()``.
     """
@@ -465,8 +612,17 @@ def _build_vlm(
     apply_ac(transformer, ac_mode)
 
     encoder_frozen = _is_encoder_frozen(vlm_config.freeze)
+    encoder_dtype = vision_config.compute_dtype
     if device_mesh is not None:
-        _apply_fsdp_vlm(wrapper, device_mesh, mp_policy, encoder_frozen=encoder_frozen)
+        _apply_fsdp_vlm(
+            wrapper,
+            device_mesh,
+            mp_policy,
+            encoder_frozen=encoder_frozen,
+            encoder_mp_policy=(
+                default_mp_policy(encoder_dtype) if encoder_dtype is not None else None
+            ),
+        )
 
     if tp_enabled:
         transformer.to_empty(device=device)
@@ -477,6 +633,13 @@ def _build_vlm(
         transformer.to(device=device)
         adapter.to(device=device)
     encoder.to(device)
+    if encoder_dtype is not None:
+        _set_encoder_precision(
+            encoder,
+            encoder_dtype,
+            fsdp_wrapped=isinstance(wrapper.vision_encoder, FSDPModule),
+            device_type=device.type,
+        )
     transformer.to(dtype=param_dtype)
     adapter.to(dtype=param_dtype)
 
