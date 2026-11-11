@@ -3122,9 +3122,7 @@ class TestVlmSourceBuilders:
         assert seen["dataset"]["tile_grid"] == 2
         assert seen["dataset"]["tile_global"] is False
 
-    def test_tiled_documents_with_several_images_count_every_view_of_every_image(
-        self, monkeypatch
-    ):
+    def test_tiled_documents_with_several_images_count_every_view_of_every_image(self, monkeypatch):
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
         self._stub_vlm_modules(monkeypatch, seen)
