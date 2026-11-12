@@ -387,37 +387,47 @@ def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
     return np.concatenate(counts)
 
 
-def _check_image_counts(rows: Any, image_field: str, allow_text_only: bool, max_images: int) -> int:
-    """Check every row's image count against the dataset's settings before training.
+def _usable_rows(
+    rows: Any, image_field: str, allow_text_only: bool, max_images: int
+) -> tuple[np.ndarray, int]:
+    """Pick the rows a run can train, counting the rest in one warning.
 
-    Returns the number of rows without an image.
+    A row with no image is kept when ``allow_text_only`` is on and skipped
+    otherwise. Rows holding more than ``max_images`` images are kept, each
+    with its first ``max_images``, and counted in one warning.
 
-    Rows holding more than ``max_images`` images are kept, each with its
-    first ``max_images``, and counted in one warning.
+    Returns:
+        The indices of the kept rows, and how many of them have no image.
 
     Raises:
-        ValueError: Some rows hold no image and ``allow_text_only`` is off; the
-            message counts them and names the setting that admits them.
+        ValueError: The dataset has rows and every one of them is skipped.
     """
     counts = _images_per_row(rows, image_field)
-    missing = int((counts == 0).sum())
-    if missing and not allow_text_only:
-        raise ValueError(
-            f"{missing:,} of {len(rows):,} rows have no image in field {image_field!r}; set "
-            "data.hf_allow_text_only = true to train them as text-only documents"
+    missing = counts == 0
+    total = f"{len(counts):,}"
+    if not allow_text_only and missing.any():
+        logger.warning(
+            "Skipping %s of %s rows with no image in field %r; set data.hf_allow_text_only = "
+            "true to train them as text-only documents",
+            f"{int(missing.sum()):,}",
+            total,
+            image_field,
         )
+        if missing.all():
+            raise ValueError(f"Every one of the {total} rows has no image in field {image_field!r}")
     over = int((counts > max_images).sum())
     if over:
         logger.warning(
             "%s of %s rows hold more than data.hf_max_images=%d images in field %r; each keeps "
             "its first %d",
             f"{over:,}",
-            f"{len(rows):,}",
+            total,
             max_images,
             image_field,
             max_images,
         )
-    return missing
+    keep = np.flatnonzero(~missing) if not allow_text_only else np.arange(len(counts))
+    return keep, int(missing[keep].sum())
 
 
 def _tokenize_and_mask(
@@ -508,8 +518,8 @@ class HuggingFaceVLMDataset(Dataset):
         dataset_config: HF dataset config name, if required.
         allow_text_only: Accept rows whose image field is ``None`` or an
             empty list and return them with an empty ``pixel_values`` of
-            the image shape. Off, a dataset with such a row is rejected
-            here, before training starts.
+            the image shape. Off, such rows are skipped when the dataset is
+            loaded, and one warning counts them.
         max_images: Images a row may hold; a longer list keeps its first
             ``max_images``, and the dataset warns once, when it is loaded, how
             many rows that trims. ``1`` (default) returns the one image as
@@ -557,6 +567,9 @@ class HuggingFaceVLMDataset(Dataset):
                 "Streaming or split-dict outputs are not supported by "
                 "HuggingFaceVLMDataset (use `split=` to resolve a single split)."
             )
+        keep, text_only = _usable_rows(ds, image_field, allow_text_only, max_images)
+        if len(keep) < len(ds):
+            ds = ds.select(keep)
         self._ds: HFDataset = ds
         self._text_rows: Any = ds.remove_columns([image_field])
         self._image_rows: Any = ds.select_columns([image_field]).with_format("arrow")
@@ -575,9 +588,7 @@ class HuggingFaceVLMDataset(Dataset):
         self._allow_text_only = allow_text_only
         self._max_images = max_images
         self._tokenizer = build_tokenizer(tokenizer_path)
-        self.has_text_only_rows = (
-            _check_image_counts(ds, image_field, allow_text_only, max_images) > 0
-        )
+        self.has_text_only_rows = text_only > 0
         if prompt_field is not None:
             _check_prompt_column_is_string(ds, prompt_field)
             _check_prompt_column_has_room(ds, prompt_field, self._tokenizer, max_text_len)

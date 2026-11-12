@@ -165,7 +165,8 @@ flips between the two. The flag needs an
 image-prefix arch or packing, not `cross_attention`, whose image K/V cannot
 hide a blank image. On `mot` and `moma` the hidden blank image's tokens still
 pass through the image experts and count in the load-balance loss. Without the
-flag a dataset with such a row is rejected when it is loaded.
+flag such rows are skipped when the dataset is loaded, and one warning counts
+them.
 
 ## Documents with several images
 
