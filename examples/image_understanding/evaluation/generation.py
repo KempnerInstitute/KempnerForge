@@ -2,7 +2,9 @@
 
 A row is laid out the way training lays it out: the image tokens, then the
 text, padding last. Attention is causal, so nothing after a row's last token
-reaches it, and a row decodes to the same tokens alone or in any batch.
+reaches it. In exact arithmetic a row therefore decodes to the same tokens alone
+or in any batch; across batch sizes the tokens match up to floating-point (bf16)
+numerics, which can flip a close argmax.
 """
 
 from __future__ import annotations
