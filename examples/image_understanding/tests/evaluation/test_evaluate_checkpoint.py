@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from evaluation import evaluator
 
 from kempnerforge.config.loader import load_config
 
@@ -173,10 +174,10 @@ def test_a_marker_that_cannot_be_removed_is_handed_to_the_evaluation(
         "--output",
         str(output),
     )
-    assert isinstance(seen["prior_failure"], OSError)
+    assert isinstance(seen["cleared"].failure, OSError)
 
 
-def test_a_marker_that_is_removed_leaves_no_prior_failure(
+def test_a_marker_that_is_removed_leaves_no_failure(
     config_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     output = _stale_results(tmp_path)
@@ -190,7 +191,7 @@ def test_a_marker_that_is_removed_leaves_no_prior_failure(
         "--output",
         str(output),
     )
-    assert seen["prior_failure"] is None
+    assert seen["cleared"].failure is None
     assert not (output / "results.json").exists()
 
 
@@ -225,3 +226,42 @@ def test_the_script_evaluates_a_checkpoint(
     assert (results["checkpoint"], results["step"]) == (str(step_dir.resolve()), 3)
     assert results["tasks"]["docvqa"]["samples"] == 3
     assert "not published" not in finished.stdout + finished.stderr
+
+
+def test_the_command_line_clears_the_output_once(
+    write_config: Callable[..., Path],
+    save_checkpoint: Callable[..., Path],
+    write_task: Callable[..., Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = write_config()
+    step_dir = save_checkpoint(load_config(config, cli_args=[]))
+    calls: list[Path] = []
+    clear = evaluator.clear_results
+
+    def counted(output: str | Path) -> Any:
+        calls.append(Path(output))
+        return clear(output)
+
+    monkeypatch.setattr(evaluator, "clear_results", counted)
+    module = _load_entry_point()
+    output = tmp_path / "results"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_checkpoint.py",
+            str(config),
+            "--checkpoint",
+            str(step_dir),
+            "--tasks",
+            str(write_task(rows=2)),
+            "--output",
+            str(output),
+            "--no-publish",
+        ],
+    )
+    module.main()
+    assert calls == [output]
+    assert (output / "results.json").exists()

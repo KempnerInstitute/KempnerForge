@@ -11,6 +11,8 @@ A row is scored as it is or counted under a reason, never changed to fit:
 - ``unreadable_row``: the reader could not use the row and passed over it.
 - ``prompt_too_long``: the prompt and the task's ``max_new_tokens`` do not fit
   ``vlm.max_text_len``, the text length training lays out.
+- ``unrenderable_row``: the chat template does not lay the row out as training
+  does, so training passes over it too.
 """
 
 from __future__ import annotations
@@ -21,7 +23,8 @@ import re
 import threading
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor, ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -30,7 +33,7 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 from image_text.document import Document, Turn
-from image_text.render import ChatRenderer, DocumentSource
+from image_text.render import ChatRenderer, DocumentSource, UnrenderableDocumentError
 from image_text.skip import NoUsableRowError
 from PIL import Image
 
@@ -64,6 +67,7 @@ PREDICTIONS_DIR = "predictions"
 
 UNREADABLE_ROW = "unreadable_row"
 PROMPT_TOO_LONG = "prompt_too_long"
+UNRENDERABLE_ROW = "unrenderable_row"
 
 _PROGRESS_LINES = 10
 _URL = re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s'\"<>]+")
@@ -73,12 +77,20 @@ Record = dict[str, Any]
 
 
 @dataclass(frozen=True)
+class ClearedResults:
+    """What ``clear_results`` did: ``failure`` is the removal that failed, if one did."""
+
+    failure: OSError | None
+
+
+@dataclass(frozen=True)
 class Decoder:
     """The checkpoint's model with what a row is rendered, budgeted and ended by.
 
     The renderer's ``max_text_len`` is the text length training lays out, which
     a prompt and its answer must fit, and ``stop_ids`` holds the tokens that end
-    a reply. The rows of a batch are read and rendered by ``threads`` threads.
+    a reply. The rows of a task's batches are read and rendered by ``threads``
+    threads.
     """
 
     model: VLMWrapper
@@ -149,7 +161,12 @@ def shard_batches(rows: int, batch_size: int, rank: int, world_size: int) -> lis
 
 
 def evaluate_batch(
-    decoder: Decoder, task: EvalTask, reader: DocumentSource, batch: range
+    decoder: Decoder,
+    task: EvalTask,
+    reader: DocumentSource,
+    batch: range,
+    *,
+    pool: Executor | None = None,
 ) -> list[Record]:
     """One record for each row of ``batch``: its scored prediction, or why it was skipped.
 
@@ -158,14 +175,14 @@ def evaluate_batch(
     ``prediction`` that was scored (the generation with special tokens skipped),
     whether the decode ``stopped`` on a stop
     token, and its ``score``. A skipped row records the reason under ``skipped``.
+    The rows are read and rendered by ``pool``, or by the calling thread without one.
 
     Raises:
         UnsupportedDocumentError: a row holds a document ``document_inputs`` refuses.
     """
     prepare = partial(_prepare_row, decoder.renderer, task, reader)
-    if decoder.threads > 1:
-        with ThreadPoolExecutor(decoder.threads) as pool:
-            prepared = list(pool.map(prepare, batch))
+    if pool is not None:
+        prepared = list(pool.map(prepare, batch))
     else:
         prepared = [prepare(row) for row in batch]
     records = [row for row in prepared if isinstance(row, dict)]
@@ -246,7 +263,7 @@ def evaluate_checkpoint(
     *,
     batch_size: int = 32,
     publish: bool = True,
-    prior_failure: Exception | None = None,
+    cleared: ClearedResults | None = None,
 ) -> Record | None:
     """Evaluate ``checkpoint`` on ``tasks`` and write the results under ``output``.
 
@@ -255,18 +272,22 @@ def evaluate_checkpoint(
     The config, the tasks given and ``batch_size`` are checked before a process
     group exists, as they come out the same on every rank. Launched as several
     processes, this then joins them into a process group, or uses the one already
-    initialized. In the first step the ranks agree on, before the model is built,
-    a ``prior_failure`` the caller recorded (the failure to remove the last
-    ``results.json`` that ``clear_results`` returns) is raised, the tokenizer is
+    initialized. ``cleared`` is what the caller's ``clear_results`` did, or
+    ``None`` when the caller has not cleared, which this then does. In the first
+    step the ranks agree on, before the model is built, a failure that
+    ``cleared`` records (a file of an earlier evaluation that could not be
+    removed) is raised, the tokenizer is
     loaded, the tasks' token budgets (which need the tokenizer) are checked and
     the tasks' splits are opened; so a failure on one rank fails them all. Each
     rank then loads the model and decodes the batches ``shard_batches`` gives
     it, reading their rows with ``data.num_workers`` threads.
 
     Rank 0 writes ``predictions/<task>.jsonl`` (one line per row, in row order),
-    ``metrics.json`` (``<task>/<metric>`` to value) and last ``results.json``,
-    which is removed when an evaluation starts and so exists only once one has
-    finished; ``clear_results`` removes it before a caller loads its inputs.
+    ``metrics.json`` (``<task>/<metric>`` to value) and last ``results.json``.
+    These files of an earlier evaluation are removed when an evaluation starts,
+    ``results.json`` first, so those that exist are the files of this evaluation
+    and ``results.json`` exists only once it has finished; ``clear_results``
+    removes them before a caller loads its inputs.
     With ``publish``, rank 0 then appends the metrics as
     ``eval/<task>/<metric>`` to the MLflow run the checkpoint was trained under;
     a failure there is logged and never raised.
@@ -282,14 +303,15 @@ def evaluate_checkpoint(
         UnsupportedDocumentError: a row holds a document outside the limits.
         RuntimeError: on the other ranks, when a rank failed.
     """
-    prior_failure = prior_failure or clear_results(output)
+    if cleared is None:
+        cleared = clear_results(output)
     _check_arguments(config, tasks, batch_size)
 
     started_group, rank, world_size, device = _join_ranks(config)
     apply_matmul_precision(config.train)
     output = Path(output)
     renderer, readers = _on_every_rank(
-        partial(_prepare, config, tasks, prior_failure), "Preparing the evaluation"
+        partial(_prepare, config, tasks, cleared.failure), "Preparing the evaluation"
     )
     resolved = _on_rank_zero(rank, partial(_start, output, checkpoint), "Starting the evaluation")
     step_dir = Path(_gather(resolved)[0])
@@ -347,6 +369,13 @@ def _prepare_row(
         inputs = document_inputs(renderer, document)
     except UnsupportedDocumentError as exc:
         raise UnsupportedDocumentError(f"task {task.name!r}, row {row}: {exc}") from exc
+    except UnrenderableDocumentError as exc:
+        return {
+            "row": row,
+            "question": document.turns[0].user,
+            "skipped": UNRENDERABLE_ROW,
+            "error": str(exc),
+        }
     turn = document.turns[0]
     if len(inputs.prompt_ids) + task.max_new_tokens > renderer.max_text_len:
         return {
@@ -358,21 +387,28 @@ def _prepare_row(
     return row, turn, inputs
 
 
-def clear_results(output: str | Path) -> OSError | None:
-    """Remove the last evaluation's ``results.json``, so a failed run leaves no finished marker.
+def clear_results(output: str | Path) -> ClearedResults:
+    """Remove the files of the last evaluation from ``output``, so a failed run leaves none.
 
-    Only rank 0 removes it. A removal that fails is returned, not raised, so
-    that it can be raised on every rank together, as ``prior_failure`` of
-    ``evaluate_checkpoint`` does.
+    Only rank 0 removes them: ``results.json`` first, as it marks an evaluation
+    as finished, then ``metrics.json`` and every ``*.jsonl`` of ``predictions/``.
+    Nothing else in ``output`` is touched. A removal that fails is returned in
+    the ``ClearedResults``, not raised, so that it can be raised on every rank
+    together, as ``cleared`` of ``evaluate_checkpoint`` does.
     """
     rank = dist.get_rank() if dist.is_initialized() else get_world_info()[0]
     if rank != 0:
-        return None
-    try:
-        (Path(output) / RESULTS_FILE).unlink(missing_ok=True)
-    except OSError as error:
-        return error
-    return None
+        return ClearedResults(None)
+    output = Path(output)
+    earlier = [output / RESULTS_FILE, output / METRICS_FILE]
+    earlier.extend(sorted((output / PREDICTIONS_DIR).glob("*.jsonl")))
+    failure: OSError | None = None
+    for path in earlier:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            failure = failure or error
+    return ClearedResults(failure)
 
 
 def _check_arguments(config: JobConfig, tasks: Sequence[EvalTask], batch_size: int) -> None:
@@ -455,10 +491,16 @@ def _evaluate_batches(
 ) -> list[Record]:
     records: list[Record] = []
     every = max(1, len(batches) // _PROGRESS_LINES)
-    for done, batch in enumerate(batches, start=1):
-        records.extend(evaluate_batch(decoder, task, reader, batch))
-        if done % every == 0:
-            logger.info(f"{task.name}: {done} of this rank's {len(batches)} batches decoded")
+    with ExitStack() as stack:
+        pool = (
+            stack.enter_context(ThreadPoolExecutor(decoder.threads))
+            if decoder.threads > 1
+            else None
+        )
+        for done, batch in enumerate(batches, start=1):
+            records.extend(evaluate_batch(decoder, task, reader, batch, pool=pool))
+            if done % every == 0:
+                logger.info(f"{task.name}: {done} of this rank's {len(batches)} batches decoded")
     return records
 
 

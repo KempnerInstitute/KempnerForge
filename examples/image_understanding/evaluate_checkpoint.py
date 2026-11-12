@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Evaluation entry point for the image-understanding example.
 
-Parses argv, clears the last ``results.json``, loads the training config and
+Parses argv, clears the files of the last evaluation, loads the training config and
 the task file, and hands off to ``evaluation.evaluator.evaluate_checkpoint``,
 which decodes each task's split with the checkpoint's model, scores the answers
 and writes the results. The config and the task file are read on every rank
@@ -61,7 +61,7 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     args, overrides = _parse_args()
-    prior_failure = clear_results(args.output)
+    cleared = clear_results(args.output)
     config = load_config(args.config, cli_args=overrides)
     evaluate_checkpoint(
         config,
@@ -70,7 +70,7 @@ def main() -> None:
         output=args.output,
         batch_size=args.batch_size,
         publish=not args.no_publish,
-        prior_failure=prior_failure,
+        cleared=cleared,
     )
 
 
