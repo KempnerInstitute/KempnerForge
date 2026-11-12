@@ -161,10 +161,11 @@ such a micro-batch is a second compiled graph. When the loaded dataset holds
 text-only rows, every unpacked batch carries a `frame_mask`, so the prefix
 route's attention takes an explicit dense mask rather than the unmasked causal
 fast path (or the flex backend's block-sparse mask) for that run, and never
-flips between the two. Text-only rows need an image-prefix arch or packing;
-a `cross_attention` run whose dataset holds one is rejected when the data
-loads. On `mot` and `moma` the hidden blank image's tokens still pass through
-the image experts and count in the load-balance loss.
+flips between the two. On `cross_attention` a text-only row skips the
+cross-attention blocks: their attention and MLP updates are zeroed for that
+row, so its text runs through the backbone alone. On `mot` and `moma` the
+hidden blank image's tokens still pass through the image experts and count in
+the load-balance loss.
 
 ## Documents with several images
 
