@@ -345,8 +345,9 @@ and records the ones that exit 0. A command still running after that, as a local
 evaluation usually is, gets a warning that its launch is not recorded: a later run
 launches the step again unless a `results.json` exists by then. A crash before a
 command's exit status is read can likewise make a later run launch a step a second
-time. That is safe: an evaluation removes the last `results.json` when it starts and
-rewrites its output directory.
+time. That is safe: an evaluation removes the files of the last one when it starts
+and writes each file whole, so two evaluations of a checkpoint that overlap leave
+whole files from one or the other.
 
 When training begins, the hook finds the step the run resumed from, as the run
 found it. The run may save a step above it again, over that step's directory: with
@@ -357,7 +358,9 @@ the end of training, never while it may be half rewritten. If the run does save 
 again, it holds new weights, so its earlier `results.json` and `launched.json` are
 removed, with a warning, and it is evaluated again. A run that resumes from step 0
 of a dynamic checkpoint window saves step 0 again with the weights it loaded, so
-that step is deferred too, and its records still count.
+that step is deferred too, and its records still count. If the step directories
+cannot be looked at when training begins, which ones exist is unknown, so every step
+the run saves is treated as one it saves again, with a warning.
 
 The evaluator reads a step directory while the run goes on, and the run removes old
 ones (`checkpoint.keep_last_n`). Keep as many as the evaluations in flight need,

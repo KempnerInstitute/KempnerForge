@@ -1337,3 +1337,81 @@ def test_a_record_of_a_step_saved_again_that_cannot_be_removed_is_a_failed_launc
     launcher.finish(run)
     assert launched_steps(popen) == ["step_6", "step_5"]
     assert not results.exists()
+
+
+def test_a_first_look_that_fails_defers_every_step_the_run_saves_and_evaluates_it_anew(
+    tmp_path: Path, run: Path, messages: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 100)
+    step_200 = save_step(run, 200)
+    results = write_record(launcher.settings.step_output(200), "results.json", step_200.resolve())
+
+    def unreadable(checkpoint_dir: Any) -> Any:
+        raise OSError(errno.EIO, "input/output error", str(checkpoint_dir))
+
+    monkeypatch.setattr(periodic, "_step_directories", unreadable)
+    launcher.begin(run, 100)
+    monkeypatch.undo()
+    assert popen.calls == []
+    assert "could not look at the step directories" in text(messages)
+    launcher.saved(200, run)
+    launcher.check()
+    assert popen.calls == []
+    save_step(run, 300)
+    launcher.saved(300, run)
+    assert launched_steps(popen) == ["step_200"]
+    assert not results.exists()
+    launcher.finish(run)
+    assert launched_steps(popen) == ["step_200", "step_100", "step_300"]
+
+
+def test_a_first_look_that_fails_on_one_directory_treats_the_rest_as_unknown(
+    tmp_path: Path, run: Path, messages: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 50)
+    save_step(run, 100)
+    step_200 = save_step(run, 200)
+    results = write_record(launcher.settings.step_output(200), "results.json", step_200.resolve())
+    complete = periodic.step_dir_complete
+
+    def unreadable(step_dir: Path) -> bool:
+        if step_dir.name == "step_50":
+            raise PermissionError(errno.EACCES, "permission denied", str(step_dir))
+        return complete(step_dir)
+
+    monkeypatch.setattr(periodic, "step_dir_complete", unreadable)
+    launcher.begin(run, 100)
+    monkeypatch.undo()
+    assert "could not look at the step directories" in text(messages)
+    launcher.saved(200, run)
+    save_step(run, 300)
+    launcher.saved(300, run)
+    assert "step_200" in launched_steps(popen)
+    assert not results.exists()
+
+
+def test_a_resumed_step_zero_saved_again_after_a_failed_first_look_keeps_its_record(
+    tmp_path: Path, run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    step_0 = save_step(run, 0)
+    results = write_record(launcher.settings.step_output(0), "results.json", step_0.resolve())
+
+    def unreadable(checkpoint_dir: Any) -> Any:
+        raise OSError(errno.EIO, "input/output error", str(checkpoint_dir))
+
+    monkeypatch.setattr(periodic, "_step_directories", unreadable)
+    launcher.begin(run, 0, saves_resumed_step=True)
+    monkeypatch.undo()
+    launcher.saved(0, run)
+    assert popen.calls == []
+    save_step(run, 2)
+    launcher.saved(2, run)
+    launcher.finish(run)
+    assert launched_steps(popen) == ["step_2"]
+    assert results.exists()

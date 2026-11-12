@@ -373,6 +373,7 @@ class EvaluationLauncher:
         self._finished = False
         self._resumed_step: int | None = None
         self._saved_again: set[int] = set()
+        self._existing_unknown = False
 
     @property
     def waiting(self) -> bool:
@@ -397,14 +398,26 @@ class EvaluationLauncher:
         itself when ``saves_resumed_step``, though a save of it holds the weights the run
         loaded, so its records still count. A deferred step is neither pending nor logged
         as incomplete. The other steps are taken up as ``scan`` takes them up.
+
+        When the step directories cannot be looked at, which of them exist stays unknown:
+        the failure is a warning, and every step the run then saves is deferred and, unless
+        it is ``resumed_step``, evaluated anew, as a step the run may have saved again.
         """
         self._resumed_step = resumed_step
-        for step, entry in _step_directories(checkpoint_dir):
-            above = resumed_step is None or step > resumed_step
-            if above or (saves_resumed_step and step == resumed_step):
-                self._deferred[step] = entry.resolve()
-            else:
-                self._take_up(step, entry)
+        try:
+            for step, entry in _step_directories(checkpoint_dir):
+                above = resumed_step is None or step > resumed_step
+                if above or (saves_resumed_step and step == resumed_step):
+                    self._deferred[step] = entry.resolve()
+                else:
+                    self._take_up(step, entry)
+        except Exception as exc:
+            self._existing_unknown = True
+            logger.warning(
+                f"Periodic evaluation could not look at the step directories under "
+                f"{checkpoint_dir} ({type(exc).__name__}: {exc}); each step the run saves is "
+                "evaluated once a later step is saved, and anew, as one it may have saved again"
+            )
         self.check()
 
     def saved(self, step: int, checkpoint_dir: str | Path) -> None:
@@ -416,15 +429,18 @@ class EvaluationLauncher:
         starts, so once a later step is announced every earlier directory is whole. A
         deferred step stays deferred when its own save is announced, since that save may
         still be writing, and is marked as saved again unless it is the step the run
-        resumed from.
+        resumed from. After a first look that failed, every step saved is such a step.
         """
         self._retry()
         for earlier in [deferred for deferred in self._deferred if deferred < step]:
             self._pending[earlier] = self._deferred.pop(earlier)
-        if step not in self._deferred:
-            self._pending[step] = Path(checkpoint_dir).resolve() / f"{_STEP_PREFIX}{step}"
-        elif step != self._resumed_step:
-            self._saved_again.add(step)
+        step_dir = Path(checkpoint_dir).resolve() / f"{_STEP_PREFIX}{step}"
+        if step in self._deferred or self._existing_unknown:
+            self._deferred.setdefault(step, step_dir)
+            if step != self._resumed_step:
+                self._saved_again.add(step)
+        else:
+            self._pending[step] = step_dir
         self.check()
 
     def scan(self, checkpoint_dir: str | Path) -> None:
