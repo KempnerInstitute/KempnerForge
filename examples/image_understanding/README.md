@@ -148,8 +148,8 @@ core's attention groups. A `[video]` run and the other arches do not pack.
 ## Mix in text-only documents
 
 Image-text mixes often carry documents without an image, such as FineVision's
-`text_*` subsets. With `data.hf_allow_text_only = true`, a row whose image
-column is `None` or an empty list is a text-only document. Without packing it
+`text_*` subsets. A row whose image column is `None` or an empty list is a
+text-only document; no setting turns this on. Without packing it
 takes a blank image and a `frame_mask` entry of `False`, so its image tokens
 are hidden from attention; the document still occupies the image positions,
 so its text sits after them in the row and in the position encoding, as a
@@ -161,12 +161,11 @@ such a micro-batch is a second compiled graph. When the loaded dataset holds
 text-only rows, every unpacked batch carries a `frame_mask`, so the prefix
 route's attention takes an explicit dense mask rather than the unmasked causal
 fast path (or the flex backend's block-sparse mask) for that run, and never
-flips between the two. The flag needs an
-image-prefix arch or packing, not `cross_attention`, whose image K/V cannot
-hide a blank image. On `mot` and `moma` the hidden blank image's tokens still
-pass through the image experts and count in the load-balance loss. Without the
-flag such rows are skipped when the dataset is loaded, and one warning counts
-them; so are rows that hold several images.
+flips between the two. Text-only rows need an image-prefix arch or packing;
+a `cross_attention` run whose dataset holds one is rejected when the data
+loads. On `mot` and `moma` the hidden blank image's tokens still pass through
+the image experts and count in the load-balance loss. Rows that hold several
+images are skipped when the dataset is loaded, and one warning counts them.
 
 ## Start from the pretrained backbone
 

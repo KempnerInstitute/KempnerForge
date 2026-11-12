@@ -121,17 +121,6 @@ class JobConfig:
                         f"vlm.max_text_len ({self.vlm.max_text_len}) = {required}"
                     )
 
-        if self.data.hf_allow_text_only:
-            if self.vlm is None:
-                raise ValueError(
-                    "data.hf_allow_text_only applies to VLM image runs; add a [vlm] section"
-                )
-            if self.video is not None:
-                raise ValueError("data.hf_allow_text_only applies to image datasets, not [video]")
-            if self.vlm.arch == "cross_attention":
-                raise ValueError(
-                    "data.hf_allow_text_only is not supported with vlm.arch='cross_attention'"
-                )
         if self.data.pack_sequences and self.vlm is not None:
             if self.video is not None:
                 raise ValueError("data.pack_sequences is not supported with [video]")

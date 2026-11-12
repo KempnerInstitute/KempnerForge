@@ -685,7 +685,7 @@ class TestTextOnlyPrefixRows:
     def test_the_text_logits_ignore_the_blank_image(self):
         torch.manual_seed(0)
         wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
-        collator = VLMCollator(pad_id=0, max_text_len=12, allow_text_only=True)
+        collator = VLMCollator(pad_id=0, max_text_len=12, frame_mask=True)
         text_only = {
             "pixel_values": torch.zeros(0, 3, 16, 16),
             "input_ids": torch.arange(1, 13),

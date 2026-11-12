@@ -86,7 +86,6 @@ class DataConfig:
     hf_dataset_image_field: str = "image"
     hf_dataset_prompt_field: str = ""
     hf_image_size: int = 224
-    hf_allow_text_only: bool = False
     hf_streaming: bool = False
     pack_sequences: bool = False
     datasets: list[DatasetSource] = field(default_factory=list)
