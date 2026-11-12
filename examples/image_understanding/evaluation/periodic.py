@@ -29,7 +29,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,7 @@ from evaluation.evaluator import RESULTS_FILE
 from evaluation.tasks import load_tasks
 from kempnerforge.config.job import JobConfig
 from kempnerforge.metrics.logger import get_logger
+from kempnerforge.resilience.elastic import resolve_resume_path
 from kempnerforge.training.hooks import HookRunner, TrainingHook
 
 logger = get_logger(__name__)
@@ -75,6 +76,7 @@ _DISTRIBUTED_VARIABLES = frozenset(
 )
 _DISTRIBUTED_PREFIXES = ("TORCHELASTIC_",)
 _STEP_PREFIX = "step_"
+_RECORD_FILES = (RESULTS_FILE, LAUNCHED_FILE)
 
 
 @dataclass(frozen=True)
@@ -188,18 +190,110 @@ def _check_command(command: str) -> None:
         raise ValueError(f"the evaluation command's program {tokens[0]!r} was not found")
 
 
-def _steps_the_run_may_save_again(config: JobConfig) -> frozenset[int]:
-    """The steps the run may save over a directory that already exists: step 0 or none.
+def _step_of(name: str) -> int | None:
+    """The ``N`` of a directory named ``step_N``, or None for any other name."""
+    suffix = name[len(_STEP_PREFIX) :]
+    return int(suffix) if name.startswith(_STEP_PREFIX) and suffix.isdigit() else None
 
-    An error while looking counts as the directory existing. Never raises.
+
+def _step_directories(checkpoint_dir: str | Path) -> list[tuple[int, Path]]:
+    """Every ``step_N`` directory under ``checkpoint_dir`` with its ``N``; none without one."""
+    directory = Path(checkpoint_dir)
+    if not directory.is_dir():
+        return []
+    found = []
+    for entry in directory.iterdir():
+        step = _step_of(entry.name)
+        if step is not None and entry.is_dir():
+            found.append((step, entry))
+    return found
+
+
+def _resume_of(config: JobConfig) -> tuple[int | None, bool]:
+    """The step the run resumed from, and whether the run saves that step again.
+
+    The step is found as the run found it, with ``resolve_resume_path`` on
+    ``checkpoint.dir``. It is None for a fresh start, and when it cannot be told: the
+    look raised, or found a directory not named ``step_N``. The run saves it again when it
+    is step 0 and a dynamic checkpoint milestone, as the loop then saves step 0 before its
+    first step. Never raises.
     """
-    if not config.checkpoint.is_dynamic_milestone(0):
-        return frozenset()
     try:
-        exists = (Path(config.checkpoint.dir) / f"{_STEP_PREFIX}0").exists()
-    except OSError:
-        exists = True
-    return frozenset({0}) if exists else frozenset()
+        path = resolve_resume_path(config.checkpoint.dir)
+        step = None if path is None else _step_of(path.name)
+        return step, step == 0 and config.checkpoint.is_dynamic_milestone(0)
+    except Exception:
+        return None, False
+
+
+def _recorded_checkpoint(record: Path) -> str | None:
+    """The checkpoint the record file ``record`` names; None when it cannot be read or names none.
+
+    Raises:
+        FileNotFoundError: there is no ``record``.
+    """
+    try:
+        checkpoint = json.loads(record.read_text(encoding="utf-8")).get("checkpoint")
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError, AttributeError):
+        return None
+    return checkpoint if isinstance(checkpoint, str) else None
+
+
+def _same_directory(path: str, step_dir: Path) -> bool:
+    """Whether ``path`` is ``step_dir``, through a symlink too; False when either is missing."""
+    try:
+        return os.path.samefile(path, step_dir)
+    except (OSError, ValueError):
+        return False
+
+
+def _counted_record(step: int, step_dir: Path, output: Path) -> bool:
+    """Whether a record in ``output`` counts for the checkpoint ``step_dir`` of step ``step``.
+
+    A ``results.json`` or a ``launched.json`` counts when it names ``step_dir`` or cannot be
+    read; one of another checkpoint does not, so that step is evaluated again. Each is
+    logged.
+    """
+    others: list[tuple[Path, str]] = []
+    for record in (output / name for name in _RECORD_FILES):
+        try:
+            checkpoint = _recorded_checkpoint(record)
+        except FileNotFoundError:
+            continue
+        if checkpoint is None:
+            logger.warning(
+                f"Periodic evaluation skips step {step}: {record} cannot be read, so it counts "
+                f"as a launch of {step_dir}; delete it to evaluate the step again"
+            )
+            return True
+        if _same_directory(checkpoint, step_dir):
+            logger.info(f"Periodic evaluation skips step {step}: already started or finished")
+            return True
+        others.append((record, checkpoint))
+    for record, checkpoint in others:
+        logger.warning(
+            f"Periodic evaluation evaluates step {step} again: {record} is a record of "
+            f"{checkpoint}, not of {step_dir}"
+        )
+    return False
+
+
+def _remove_records(step: int, output: Path) -> None:
+    """Remove the records in ``output`` of what step ``step`` held before the run saved it again.
+
+    Raises:
+        OSError: a record exists and could not be removed.
+    """
+    stale = [output / name for name in _RECORD_FILES if (output / name).exists()]
+    for record in stale:
+        record.unlink(missing_ok=True)
+    if stale:
+        logger.warning(
+            f"Periodic evaluation evaluates step {step} again since the run saved it again; "
+            f"removed {', '.join(str(record) for record in stale)}"
+        )
 
 
 def _is_rank_zero() -> bool:
@@ -232,11 +326,13 @@ class _Launch:
 class EvaluationLauncher:
     """Decides which saved steps to start and starts them; every call is synchronous.
 
-    A saved step is pending until its directory is complete, then it is started unless its
-    output directory holds a ``results.json`` or a ``launched.json``, so a resumed run
-    starts only what no run recorded. A step whose directory is gone (pruned) or never
-    completed is skipped with a log line. Which steps are running and which are done is
-    kept in memory, so a run never starts a step twice at once.
+    A saved step is pending until its directory is complete, then it is started unless a
+    record of it counts: a ``results.json`` or a ``launched.json`` in its output directory
+    that names its step directory, or that cannot be read. A record of another checkpoint,
+    as after a rollback to a new ``checkpoint.dir`` with the same output root, does not
+    count. So a resumed run starts only what no run recorded. A step whose directory is
+    gone (pruned) or never completed is skipped with a log line. Which steps are running
+    and which are done is kept in memory, so a run never starts a step twice at once.
 
     A launched command's exit status is read when the launcher checks, without waiting,
     and by ``wait`` at the end of training. Status 0 writes ``launched.json`` (for
@@ -246,10 +342,11 @@ class EvaluationLauncher:
     try it is left to a later run, which tries it again since nothing records it. Nothing
     here raises.
 
-    A step the run may save again over a directory that already exists (step 0 of a
-    dynamic checkpoint window, on a run that resumes from it) is deferred: its directory
-    may be half rewritten, so it is not started until a later step is saved, since the
-    checkpoint manager finishes one save before it starts the next, or until ``finish``.
+    A step the run may save again over a directory that already exists is deferred (see
+    ``begin``): its directory may be half rewritten, so it is not started until a later
+    step is saved, since the checkpoint manager finishes one save before it starts the
+    next, or until ``finish``. If the run saves it again, it holds new weights, so its
+    records from before the run are removed when it is started and it is evaluated again.
     """
 
     def __init__(
@@ -267,6 +364,8 @@ class EvaluationLauncher:
         self._running: dict[int, _Launch] = {}
         self._done: set[int] = set()
         self._finished = False
+        self._resumed_step: int | None = None
+        self._saved_again: set[int] = set()
 
     @property
     def waiting(self) -> bool:
@@ -277,43 +376,57 @@ class EvaluationLauncher:
         """
         return bool(self._pending or self._running)
 
+    def begin(
+        self,
+        checkpoint_dir: str | Path,
+        resumed_step: int | None,
+        saves_resumed_step: bool = False,
+    ) -> None:
+        """Take up the step directories already under ``checkpoint_dir`` when training begins.
+
+        ``resumed_step`` is the step the run resumed from, None for a fresh start or when it
+        cannot be told. Every step directory above it, every one when it is None, is
+        deferred, since the run may save that step again over it; so is ``resumed_step``
+        itself when ``saves_resumed_step``, though a save of it holds the weights the run
+        loaded, so its records still count. A deferred step is neither pending nor logged
+        as incomplete. The other steps are taken up as ``scan`` takes them up.
+        """
+        self._resumed_step = resumed_step
+        for step, entry in _step_directories(checkpoint_dir):
+            above = resumed_step is None or step > resumed_step
+            if above or (saves_resumed_step and step == resumed_step):
+                self._deferred[step] = entry.resolve()
+            else:
+                self._take_up(step, entry)
+        self.check()
+
     def saved(self, step: int, checkpoint_dir: str | Path) -> None:
         """Note that step ``step`` was saved under ``checkpoint_dir`` and start it if complete.
 
-        The steps whose launch failed are tried again. A deferred step is left as it is,
-        since its save may still be writing. Any other step first releases every deferred
-        one: the checkpoint manager finishes the previous save and writes ``train_state.pt``
-        and ``metadata.json`` inside ``save()`` before the next one starts, so once a later
-        step is announced every earlier directory is whole.
+        The steps whose launch failed are tried again, and every deferred step below
+        ``step`` is released: the checkpoint manager finishes the previous save and writes
+        ``train_state.pt`` and ``metadata.json`` inside ``save()`` before the next one
+        starts, so once a later step is announced every earlier directory is whole. A
+        deferred step stays deferred when its own save is announced, since that save may
+        still be writing, and is marked as saved again unless it is the step the run
+        resumed from.
         """
         self._retry()
+        for earlier in [deferred for deferred in self._deferred if deferred < step]:
+            self._pending[earlier] = self._deferred.pop(earlier)
         if step not in self._deferred:
-            self._pending.update(self._deferred)
-            self._deferred.clear()
             self._pending[step] = Path(checkpoint_dir).resolve() / f"{_STEP_PREFIX}{step}"
+        elif step != self._resumed_step:
+            self._saved_again.add(step)
         self.check()
 
-    def scan(self, checkpoint_dir: str | Path, rewritten: Collection[int] = ()) -> None:
+    def scan(self, checkpoint_dir: str | Path) -> None:
         """Take up every complete step directory already under ``checkpoint_dir``.
 
-        A step in ``rewritten`` is one the run may save again over its existing directory.
-        Complete or not, it is deferred: recorded, neither pending nor logged as incomplete,
-        and released by the save of a later step or by ``finish``.
+        An incomplete one is skipped with a log line.
         """
-        directory = Path(checkpoint_dir)
-        if directory.is_dir():
-            for entry in directory.iterdir():
-                suffix = entry.name[len(_STEP_PREFIX) :]
-                is_step = entry.name.startswith(_STEP_PREFIX) and suffix.isdigit()
-                if not is_step or not entry.is_dir():
-                    continue
-                step = int(suffix)
-                if step in rewritten:
-                    self._deferred[step] = entry.resolve()
-                elif not step_dir_complete(entry):
-                    logger.info(f"Periodic evaluation skips step {step}: {entry} is not complete")
-                else:
-                    self._pending[step] = entry.resolve()
+        for step, entry in _step_directories(checkpoint_dir):
+            self._take_up(step, entry)
         self.check()
 
     def check(self) -> None:
@@ -379,6 +492,12 @@ class EvaluationLauncher:
                 f"again unless {results} exists by then"
             )
 
+    def _take_up(self, step: int, entry: Path) -> None:
+        if step_dir_complete(entry):
+            self._pending[step] = entry.resolve()
+        else:
+            logger.info(f"Periodic evaluation skips step {step}: {entry} is not complete")
+
     def _retry(self) -> None:
         self._reap()
         self._pending.update(self._failed)
@@ -388,8 +507,7 @@ class EvaluationLauncher:
         if step in self._running or step in self._done:
             return
         output = self.settings.step_output(step)
-        if (output / RESULTS_FILE).exists() or (output / LAUNCHED_FILE).exists():
-            logger.info(f"Periodic evaluation skips step {step}: already started or finished")
+        if step not in self._saved_again and _counted_record(step, step_dir, output):
             self._done.add(step)
             return
         argv = self.settings.argv(step_dir, step)
@@ -404,11 +522,14 @@ class EvaluationLauncher:
     ) -> subprocess.Popen | None:
         """Start the command of step ``step``; None, once the failure is handled, if it did not.
 
-        Once the command has started, an error such as one on closing the launch log is a
-        warning only: the step is running.
+        The records of a step the run saved again are removed first. Once the command has
+        started, an error such as one on closing the launch log is a warning only: the step
+        is running.
         """
         child = None
         try:
+            if step in self._saved_again:
+                _remove_records(step, output)
             output.mkdir(parents=True, exist_ok=True)
             with open(output / LAUNCH_LOG_FILE, "ab") as log:
                 child = self._launch(
@@ -495,9 +616,9 @@ class PeriodicEvaluationHook(TrainingHook):
     never raised into training.
 
     At train begin the hook looks once, on the training thread and before the loop can
-    save, whether step 0 is a dynamic checkpoint milestone whose directory already exists;
-    if so the launcher defers it, so a step the run saves again is never evaluated while it
-    may be half rewritten. That look never raises.
+    save, for the step the run resumed from, and whether the run saves that step again
+    (step 0 of a dynamic checkpoint window); the launcher defers the steps the run may save
+    again, so none is evaluated while it may be half rewritten. That look never raises.
     """
 
     def __init__(
@@ -524,7 +645,7 @@ class PeriodicEvaluationHook(TrainingHook):
         if not _is_rank_zero() or self._worker is not None:
             return
         self._checkpoint_dir = config.checkpoint.dir
-        rewritten = _steps_the_run_may_save_again(config)
+        resumed_step, saves_resumed_step = _resume_of(config)
         worker = threading.Thread(target=self._work, name="periodic-evaluation", daemon=True)
         try:
             worker.start()
@@ -535,7 +656,7 @@ class PeriodicEvaluationHook(TrainingHook):
             )
             return
         self._worker = worker
-        self._messages.put(("scan", (config.checkpoint.dir, rewritten)))
+        self._messages.put(("begin", (config.checkpoint.dir, resumed_step, saves_resumed_step)))
 
     def on_checkpoint_save(self, step: int, path: str) -> None:
         if self._worker is not None:
@@ -571,8 +692,8 @@ class PeriodicEvaluationHook(TrainingHook):
             except queue.Empty:
                 kind, payload = "check", None
             try:
-                if kind == "scan":
-                    self._launcher.scan(*payload)
+                if kind == "begin":
+                    self._launcher.begin(*payload)
                 elif kind == "saved":
                     self._launcher.saved(*payload)
                 elif kind == "check":

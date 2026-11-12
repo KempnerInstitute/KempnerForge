@@ -115,6 +115,13 @@ def finish_flush(step_dir: Path) -> None:
     (step_dir / "metadata.json").write_text("")
 
 
+def write_record(output: Path, name: str, checkpoint: str | Path) -> Path:
+    output.mkdir(parents=True, exist_ok=True)
+    record = output / name
+    record.write_text(json.dumps({"checkpoint": str(checkpoint)}))
+    return record
+
+
 class Messages(list):
     def warning(self, message: str) -> None:
         self.append(message)
@@ -387,27 +394,100 @@ def test_a_resumed_run_launches_only_what_no_run_launched(tmp_path: Path, run: P
     assert [argv[3] for argv, _ in resumed.calls] == [str((run / "step_10").resolve())]
 
 
-def test_a_step_with_results_is_not_launched_again(tmp_path: Path, run: Path) -> None:
+@pytest.mark.parametrize("name", ["results.json", LAUNCHED_FILE])
+def test_a_step_with_a_record_of_its_checkpoint_is_not_launched_again(
+    tmp_path: Path, run: Path, name: str
+) -> None:
     popen = Launcher()
     launcher = make_launcher(tmp_path, popen)
-    save_step(run, 5)
+    step_dir = save_step(run, 5)
+    record = write_record(launcher.settings.step_output(5), name, step_dir.resolve())
+    launcher.saved(5, run)
+    launcher.finish(run)
+    assert popen.calls == []
+    assert record.exists()
+
+
+@pytest.mark.parametrize("name", ["results.json", LAUNCHED_FILE])
+def test_a_record_of_another_checkpoint_does_not_count(
+    tmp_path: Path, run: Path, messages: list[str], name: str
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    step_dir = save_step(run, 5)
+    other = save_step(tmp_path / "earlier run", 5)
     output = launcher.settings.step_output(5)
-    output.mkdir(parents=True)
-    (output / "results.json").write_text("{}")
+    record = write_record(output, name, other.resolve())
     launcher.saved(5, run)
-    assert popen.calls == []
+    assert launched_steps(popen) == ["step_5"]
+    assert f"{record} is a record of {other.resolve()}, not of {step_dir.resolve()}" in text(
+        messages
+    )
+    launcher.check()
+    assert json.loads((output / LAUNCHED_FILE).read_text())["checkpoint"] == str(step_dir.resolve())
 
 
-def test_a_claimed_step_is_not_launched_by_another_run(tmp_path: Path, run: Path) -> None:
+def test_a_record_naming_the_step_directory_through_a_symlink_counts(
+    tmp_path: Path, run: Path
+) -> None:
     popen = Launcher()
     launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
-    claimed = launcher.settings.step_output(5) / LAUNCHED_FILE
-    claimed.parent.mkdir(parents=True)
-    claimed.write_text("{}")
+    link = tmp_path / "link"
+    link.symlink_to(run, target_is_directory=True)
+    write_record(launcher.settings.step_output(5), "results.json", link / "step_5")
     launcher.saved(5, run)
     assert popen.calls == []
-    assert claimed.exists()
+
+
+def test_a_record_naming_a_missing_checkpoint_does_not_count(
+    tmp_path: Path, run: Path, messages: list[str]
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 5)
+    gone = tmp_path / "removed run" / "step_5"
+    write_record(launcher.settings.step_output(5), "results.json", gone)
+    launcher.saved(5, run)
+    assert launched_steps(popen) == ["step_5"]
+    assert f"is a record of {gone}" in text(messages)
+
+
+def test_a_record_of_another_checkpoint_beside_one_of_this_checkpoint_counts(
+    tmp_path: Path, run: Path
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    step_dir = save_step(run, 5)
+    output = launcher.settings.step_output(5)
+    write_record(output, "results.json", tmp_path / "earlier run" / "step_5")
+    write_record(output, LAUNCHED_FILE, step_dir.resolve())
+    launcher.saved(5, run)
+    assert popen.calls == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["{", "[1]", '{"argv": ["sbatch", "job.sh"]}', '{"checkpoint": 5}', None],
+    ids=["truncated", "not-an-object", "no-checkpoint", "not-a-path", "a-directory"],
+)
+def test_a_record_that_cannot_be_read_counts_and_names_the_file_to_delete(
+    tmp_path: Path, run: Path, messages: list[str], content: str | None
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 5)
+    record = launcher.settings.step_output(5) / LAUNCHED_FILE
+    if content is None:
+        record.mkdir(parents=True)
+    else:
+        record.parent.mkdir(parents=True)
+        record.write_text(content)
+    launcher.saved(5, run)
+    launcher.finish(run)
+    assert popen.calls == []
+    assert f"{record} cannot be read" in text(messages)
+    assert "delete it to evaluate the step again" in text(messages)
 
 
 def test_the_scan_takes_up_only_complete_steps(tmp_path: Path, run: Path) -> None:
@@ -635,8 +715,10 @@ class RecordingLauncher:
         if kind == self.fail_on:
             raise RuntimeError("boom")
 
-    def scan(self, directory: str, rewritten: frozenset[int] = frozenset()) -> None:
-        self._record("scan", (directory, rewritten))
+    def begin(
+        self, directory: str, resumed_step: int | None, saves_resumed_step: bool = False
+    ) -> None:
+        self._record("begin", (directory, resumed_step, saves_resumed_step))
 
     def saved(self, step: int, directory: str) -> None:
         self._record("saved", (step, directory))
@@ -680,7 +762,7 @@ def test_the_hook_hands_a_run_to_its_worker_in_order(
     runner.on_train_end(4, 0)
     after = time.monotonic()
     assert recorder.calls == [
-        ("scan", (str(run), frozenset())),
+        ("begin", (str(run), None, False)),
         ("saved", (2, str(run))),
         ("saved", (4, str(run))),
         ("finish", str(run)),
@@ -721,7 +803,7 @@ def test_a_worker_error_is_a_warning_and_the_worker_goes_on(
     hook.on_checkpoint_save(2, str(run))
     hook.on_checkpoint_save(4, str(run))
     hook.on_train_end(4, 0)
-    assert [kind for kind, _ in recorder.calls] == ["scan", "saved", "saved", "finish"]
+    assert [kind for kind, _ in recorder.calls] == ["begin", "saved", "saved", "finish"]
     assert "RuntimeError: boom" in text(messages)
 
 
@@ -944,13 +1026,13 @@ def alternate_metadata_stat(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(Path, "stat", stat)
 
 
-def test_a_step_handed_to_the_scan_as_rewritten_is_not_launched_while_its_metadata_is_missing(
+def test_a_resumed_step_the_run_saves_again_is_not_launched_while_its_metadata_is_missing(
     tmp_path: Path, run: Path
 ) -> None:
     popen = Launcher()
     launcher = make_launcher(tmp_path, popen)
     step_dir = save_step(run, 0)
-    launcher.scan(run, frozenset({0}))
+    launcher.begin(run, 0, saves_resumed_step=True)
     launcher.saved(0, run)
     (step_dir / ".metadata").unlink()
     launcher.check()
@@ -959,13 +1041,13 @@ def test_a_step_handed_to_the_scan_as_rewritten_is_not_launched_while_its_metada
     assert popen.calls == []
 
 
-def test_a_step_handed_to_the_scan_as_rewritten_is_not_launched_when_its_metadata_cannot_be_read(
+def test_a_resumed_step_the_run_saves_again_is_not_launched_when_its_metadata_cannot_be_read(
     tmp_path: Path, run: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     popen = Launcher()
     launcher = make_launcher(tmp_path, popen)
     save_step(run, 0)
-    launcher.scan(run, frozenset({0}))
+    launcher.begin(run, 0, saves_resumed_step=True)
     alternate_metadata_stat(monkeypatch)
     launcher.saved(0, run)
     launcher.check()
@@ -973,13 +1055,13 @@ def test_a_step_handed_to_the_scan_as_rewritten_is_not_launched_when_its_metadat
     assert popen.calls == []
 
 
-def test_a_deferred_step_is_not_launched_by_the_scan_a_check_or_its_own_save(
+def test_a_deferred_step_is_not_launched_by_the_first_look_a_check_or_its_own_save(
     tmp_path: Path, run: Path, messages: list[str]
 ) -> None:
     popen = Launcher()
     launcher = make_launcher(tmp_path, popen)
     save_step(run, 0)
-    launcher.scan(run, frozenset({0}))
+    launcher.begin(run, 0, saves_resumed_step=True)
     launcher.check()
     launcher.saved(0, run)
     launcher.check()
@@ -994,7 +1076,7 @@ def test_an_incomplete_deferred_step_is_not_logged_as_incomplete(
     popen = Launcher()
     launcher = make_launcher(tmp_path, popen)
     save_step(run, 0, complete=False)
-    launcher.scan(run, frozenset({0}))
+    launcher.begin(run, 0, saves_resumed_step=True)
     assert popen.calls == [] and "skips step 0" not in text(messages)
 
 
@@ -1004,7 +1086,7 @@ def test_a_deferred_step_is_launched_once_when_a_later_step_is_saved(
     popen = Launcher()
     launcher = make_launcher(tmp_path, popen)
     save_step(run, 0)
-    launcher.scan(run, frozenset({0}))
+    launcher.begin(run, 0, saves_resumed_step=True)
     save_step(run, 2)
     launcher.saved(2, run)
     assert sorted(Path(argv[3]).name for argv, _ in popen.calls) == ["step_0", "step_2"]
@@ -1019,7 +1101,7 @@ def test_a_deferred_step_is_launched_once_by_the_last_look_when_no_later_step_is
     popen = Launcher()
     launcher = make_launcher(tmp_path, popen)
     save_step(run, 0)
-    launcher.scan(run, frozenset({0}))
+    launcher.begin(run, 0, saves_resumed_step=True)
     launcher.saved(0, run)
     launcher.finish(run)
     assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_0"]
@@ -1033,7 +1115,7 @@ def test_a_deferred_step_is_released_by_the_last_look_without_a_checkpoint_direc
     popen = Launcher()
     launcher = make_launcher(tmp_path, popen)
     save_step(run, 0)
-    launcher.scan(run, frozenset({0}))
+    launcher.begin(run, 0, saves_resumed_step=True)
     launcher.finish(None)
     assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_0"]
 
@@ -1043,7 +1125,7 @@ def test_a_step_zero_that_did_not_exist_at_the_start_is_launched_as_soon_as_it_i
 ) -> None:
     popen = Launcher()
     launcher = make_launcher(tmp_path, popen)
-    launcher.scan(run, frozenset())
+    launcher.begin(run, None)
     save_step(run, 0)
     launcher.saved(0, run)
     assert [Path(argv[3]).name for argv, _ in popen.calls] == ["step_0"]
@@ -1057,48 +1139,198 @@ def dynamic_config(run: Path) -> JobConfig:
     return config
 
 
-def test_the_hook_defers_step_zero_when_it_is_a_dynamic_milestone_and_its_directory_exists(
+def first_look(tmp_path: Path, config: JobConfig) -> tuple[str, Any]:
+    recorder = RecordingLauncher()
+    hook = make_hook(tmp_path, recorder)
+    hook.on_train_begin(config)
+    hook.on_train_end(1, 0)
+    return recorder.calls[0]
+
+
+def test_the_hook_hands_the_worker_the_step_the_run_resumed_from(
+    tmp_path: Path, run: Path, rank_zero: None
+) -> None:
+    for step in (50, 100, 200):
+        save_step(run, step)
+    (run / "latest").symlink_to("step_100")
+    assert first_look(tmp_path, dynamic_config(run)) == ("begin", (str(run), 100, False))
+
+
+def test_the_hook_finds_the_resumed_step_without_a_latest_link(
+    tmp_path: Path, run: Path, rank_zero: None
+) -> None:
+    save_step(run, 100)
+    save_step(run, 200, complete=False)
+    assert first_look(tmp_path, config_for(run)) == ("begin", (str(run), 100, False))
+
+
+def test_the_hook_says_the_run_saves_step_zero_again_when_it_resumes_from_a_dynamic_milestone(
     tmp_path: Path, run: Path, rank_zero: None
 ) -> None:
     save_step(run, 0)
-    recorder = RecordingLauncher()
-    hook = make_hook(tmp_path, recorder)
-    hook.on_train_begin(dynamic_config(run))
-    hook.on_train_end(1, 0)
-    assert recorder.calls[0] == ("scan", (str(run), frozenset({0})))
+    assert first_look(tmp_path, dynamic_config(run)) == ("begin", (str(run), 0, True))
 
 
-def test_the_hook_defers_nothing_when_the_step_zero_directory_does_not_exist(
-    tmp_path: Path, run: Path, rank_zero: None
-) -> None:
-    recorder = RecordingLauncher()
-    hook = make_hook(tmp_path, recorder)
-    hook.on_train_begin(dynamic_config(run))
-    hook.on_train_end(1, 0)
-    assert recorder.calls[0] == ("scan", (str(run), frozenset()))
-
-
-def test_the_hook_defers_nothing_when_step_zero_is_not_a_dynamic_milestone(
+def test_the_hook_says_step_zero_is_not_saved_again_when_it_is_not_a_dynamic_milestone(
     tmp_path: Path, run: Path, rank_zero: None
 ) -> None:
     save_step(run, 0)
-    recorder = RecordingLauncher()
-    hook = make_hook(tmp_path, recorder)
-    hook.on_train_begin(config_for(run))
-    hook.on_train_end(1, 0)
-    assert recorder.calls[0] == ("scan", (str(run), frozenset()))
+    assert first_look(tmp_path, config_for(run)) == ("begin", (str(run), 0, False))
 
 
-def test_an_error_while_looking_for_step_zero_counts_as_existing_and_never_raises(
+def test_a_fresh_start_has_no_resumed_step(tmp_path: Path, run: Path, rank_zero: None) -> None:
+    save_step(run, 0, complete=False)
+    assert first_look(tmp_path, dynamic_config(run)) == ("begin", (str(run), None, False))
+    assert first_look(tmp_path, config_for(tmp_path / "none")) == (
+        "begin",
+        (str(tmp_path / "none"), None, False),
+    )
+
+
+def test_a_resumed_checkpoint_not_named_by_its_step_has_no_resumed_step(
+    tmp_path: Path, run: Path, rank_zero: None
+) -> None:
+    save_step(run, 100)
+    (tmp_path / "imported").mkdir()
+    (run / "latest").symlink_to(tmp_path / "imported")
+    assert first_look(tmp_path, config_for(run)) == ("begin", (str(run), None, False))
+
+
+def test_an_error_while_looking_for_the_resumed_step_counts_as_a_fresh_start_and_never_raises(
     tmp_path: Path, run: Path, rank_zero: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def refuse(self: Path) -> bool:
         raise OSError(5, "input/output error")
 
+    save_step(run, 0)
     recorder = RecordingLauncher()
     hook = make_hook(tmp_path, recorder)
     monkeypatch.setattr(Path, "exists", refuse)
     hook.on_train_begin(dynamic_config(run))
     monkeypatch.undo()
     hook.on_train_end(1, 0)
-    assert recorder.calls[0] == ("scan", (str(run), frozenset({0})))
+    assert recorder.calls[0] == ("begin", (str(run), None, False))
+
+
+def test_a_resume_defers_the_steps_above_it_and_evaluates_again_a_step_it_saves_again(
+    tmp_path: Path, run: Path, messages: list[str]
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 100)
+    step_200 = save_step(run, 200)
+    output = launcher.settings.step_output(200)
+    results = write_record(output, "results.json", step_200.resolve())
+    write_record(output, LAUNCHED_FILE, step_200.resolve())
+    launcher.begin(run, 100)
+    assert launched_steps(popen) == ["step_100"]
+    launcher.saved(200, run)
+    launcher.check()
+    assert launched_steps(popen) == ["step_100"]
+    save_step(run, 300)
+    launcher.saved(300, run)
+    assert launched_steps(popen) == ["step_100", "step_200", "step_300"]
+    assert not results.exists()
+    assert "evaluates step 200 again since the run saved it again" in text(messages)
+    launcher.check()
+    record = json.loads((output / LAUNCHED_FILE).read_text())
+    assert record == {"checkpoint": str(step_200.resolve()), "argv": popen.calls[1][0]}
+    launcher.finish(run)
+    assert launched_steps(popen) == ["step_100", "step_200", "step_300"]
+
+
+def test_a_save_releases_only_the_deferred_steps_below_it(tmp_path: Path, run: Path) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    for step in (100, 200, 300):
+        save_step(run, step)
+    launcher.begin(run, 100)
+    save_step(run, 150)
+    launcher.saved(150, run)
+    assert launched_steps(popen) == ["step_100", "step_150"]
+    launcher.saved(200, run)
+    assert launched_steps(popen) == ["step_100", "step_150"]
+    launcher.saved(300, run)
+    assert launched_steps(popen) == ["step_100", "step_150", "step_200"]
+    launcher.finish(run)
+    assert launched_steps(popen) == ["step_100", "step_150", "step_200", "step_300"]
+
+
+def test_a_deferred_step_the_run_does_not_save_again_keeps_its_record(
+    tmp_path: Path, run: Path
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 100)
+    step_200 = save_step(run, 200)
+    results = write_record(launcher.settings.step_output(200), "results.json", step_200.resolve())
+    launcher.begin(run, 100)
+    save_step(run, 250)
+    launcher.saved(250, run)
+    launcher.finish(run)
+    assert launched_steps(popen) == ["step_100", "step_250"]
+    assert results.exists()
+
+
+def test_a_resume_from_step_zero_that_saves_it_again_keeps_its_earlier_record(
+    tmp_path: Path, run: Path
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    step_0 = save_step(run, 0)
+    results = write_record(launcher.settings.step_output(0), "results.json", step_0.resolve())
+    launcher.begin(run, 0, saves_resumed_step=True)
+    launcher.saved(0, run)
+    assert popen.calls == []
+    save_step(run, 2)
+    launcher.saved(2, run)
+    launcher.finish(run)
+    assert launched_steps(popen) == ["step_2"]
+    assert results.exists()
+
+
+def test_a_fresh_start_defers_every_step_directory_on_disk(
+    tmp_path: Path, run: Path, messages: list[str]
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    step_5 = save_step(run, 5)
+    step_10 = save_step(run, 10, complete=False)
+    results = write_record(launcher.settings.step_output(5), "results.json", step_5.resolve())
+    launcher.begin(run, None)
+    launcher.check()
+    assert popen.calls == [] and "skips step" not in text(messages)
+    launcher.saved(5, run)
+    assert popen.calls == []
+    finish_flush(step_10)
+    launcher.saved(10, run)
+    assert launched_steps(popen) == ["step_5"]
+    assert not results.exists()
+    launcher.finish(run)
+    assert launched_steps(popen) == ["step_5", "step_10"]
+    assert text(messages).count("since the run saved it again") == 1
+
+
+def test_a_record_of_a_step_saved_again_that_cannot_be_removed_is_a_failed_launch(
+    tmp_path: Path, run: Path, messages: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    step_5 = save_step(run, 5)
+    results = write_record(launcher.settings.step_output(5), "results.json", step_5.resolve())
+    launcher.begin(run, None)
+    launcher.saved(5, run)
+    original = Path.unlink
+
+    def refuse(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(errno.EACCES, "permission denied", str(self))
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    save_step(run, 6)
+    launcher.saved(6, run)
+    monkeypatch.setattr(Path, "unlink", original)
+    assert launched_steps(popen) == ["step_6"]
+    assert "could not launch step 5: PermissionError" in text(messages)
+    launcher.finish(run)
+    assert launched_steps(popen) == ["step_6", "step_5"]
+    assert not results.exists()
