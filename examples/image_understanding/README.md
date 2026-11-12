@@ -193,7 +193,9 @@ encoder in `vision_encoder.mixed_precision` when that is set and otherwise in
 the dtype it loads in. The decode takes a `joint_decoder` that sees one view of
 one image, so another arch, a `[video]` config or `vlm.tile_grid` is refused
 before anything is built. So is `model.moe_capacity_factor > 0`, which drops
-tokens by what else is in the batch.
+tokens by what else is in the batch. A save from pipeline parallelism
+(`distributed.pp > 1`) is refused too: it holds one set of shards per stage, and
+every rank here loads the whole model from one set.
 
 The inputs are training's. Each document goes through the training
 `ChatRenderer`: the prompt is the text it puts before the assistant's reply, and
@@ -203,10 +205,13 @@ and one turn; any other stops the run with the limit named
 
 Decoding is greedy. A batch is laid out like a training row (image tokens, then
 text, padding last), each image is encoded once, and a row ends at the turn end
-or EOS, or after the task's `max_new_tokens`. Attention is causal, so an answer
-does not depend on the rows decoded with it: the scores are the same for any
-`--batch-size` and any number of GPUs. A split is cut into consecutive batches,
-the ranks take them in turn, and rank 0 merges the rows, each scored once.
+or EOS, or after the task's `max_new_tokens`. A split is cut into consecutive
+batches, the ranks take them in turn, and rank 0 merges the rows, each scored
+once. Every batch holds the same rows whatever the number of ranks, so with one
+`--batch-size` the scores are the same on any number of GPUs of one kind. Causal
+attention keeps a row independent of its batch in exact arithmetic; across batch
+sizes the scores match up to floating-point (bf16) numerics, which can flip a
+close argmax.
 
 A row is scored as it is or counted under a reason, never changed to fit:
 
@@ -214,6 +219,9 @@ A row is scored as it is or counted under a reason, never changed to fit:
   decode. The row it moved on to is not scored in its place.
 - `prompt_too_long`: the prompt and `max_new_tokens` do not fit
   `vlm.max_text_len`, the text length training lays out.
+- `unrenderable_row`: the chat template does not lay the row out as training
+  does (a `conversation` document whose turn the template mangles), so training
+  passes over it too. Its record holds the error text.
 
 A task's rows are the rows its reader yields: a reader that drops rows when it
 loads a split (a row with no question or no answer, for one) does so before the
@@ -239,10 +247,12 @@ with no scored row fails the run.
 └── results.json               # per task: metrics, rows (its reader's), samples, skips by reason
 ```
 
-`results.json` is removed when an evaluation starts, before the config and the
-task file are loaded, and written last, so it is there only for an evaluation
-that finished; it names the step directory it
-evaluated. When that checkpoint's `metadata.json` records an MLflow run, rank 0
+When an evaluation starts, before the config and the task file are loaded, the
+files of the last one are removed from the output directory: `results.json`
+first, then `metrics.json` and the `predictions/*.jsonl` files; nothing else
+there is touched. `results.json` is written last, so it is there only for an
+evaluation that finished, and a failed one leaves no file of an earlier one; it
+names the step directory it evaluated. When that checkpoint's `metadata.json` records an MLflow run, rank 0
 then appends the metrics to it as `eval/<task>/<metric>` at the checkpoint's
 step. `--no-publish` turns that off, and a failure to publish is a warning with
 the command that publishes `metrics.json` later, never a failed evaluation.
@@ -425,7 +435,7 @@ or in core where it belongs:
 - Documents with several images
 - Per-module learning rates and schedules
 - Evaluation: PixMo point and count scorers, documents with several images or
-  none, and image attention when decoding
+  none, image attention when decoding, and a KV cache for decoding
 - Run-comparison metrics: documents seen, token counts, MFU with the encoder
 
 ## Tests

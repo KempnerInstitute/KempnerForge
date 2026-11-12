@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import statistics
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,8 @@ from evaluation.checkpoint import load_model
 from evaluation.evaluator import (
     PROMPT_TOO_LONG,
     UNREADABLE_ROW,
+    UNRENDERABLE_ROW,
+    ClearedResults,
     Decoder,
     check_token_budgets,
     clear_results,
@@ -37,6 +40,7 @@ from evaluation.inputs import UnsupportedDocumentError, build_renderer
 from evaluation.scorers import SCORERS, Scorer, anls
 from evaluation.tasks import READERS, EvalTask, build_reader, load_tasks
 from image_text.document import Document, Turn
+from image_text.render import ChatRenderer, UnrenderableDocumentError
 from image_text.skip import NoUsableRowError
 from PIL import Image
 
@@ -356,6 +360,30 @@ class TestEvaluateBatch:
         assert records[0] == {"row": 1, "skipped": UNREADABLE_ROW}
         assert records[1:] == [clean[0], clean[2], clean[3]]
 
+    def test_a_row_the_chat_template_cannot_lay_out_is_counted_and_the_others_are_scored(
+        self, run: Run, write_task: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tasks = write_task(rows=4)
+        clean = _batch_records(run, tasks, range(4))
+        refused = _questions(tasks)[2]
+        text_and_reply_spans = ChatRenderer.text_and_reply_spans
+
+        def lay_out(self: ChatRenderer, document: Document, answers: Any) -> Any:
+            if document.turns[0].user == refused:
+                raise UnrenderableDocumentError("a reply carries template text")
+            return text_and_reply_spans(self, document, answers)
+
+        monkeypatch.setattr(ChatRenderer, "text_and_reply_spans", lay_out)
+        records = _batch_records(run, tasks, range(4))
+        assert records[0] == {
+            "row": 2,
+            "question": refused,
+            "skipped": UNRENDERABLE_ROW,
+            "error": "a reply carries template text",
+        }
+        assert UNRENDERABLE_ROW == "unrenderable_row"
+        assert records[1:] == [clean[0], clean[1], clean[3]]
+
     def test_a_batch_with_nothing_to_decode_only_counts(
         self, run: Run, write_task: Callable[..., Path], monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -407,9 +435,8 @@ class TestEvaluateBatch:
         _corrupt(tasks, 6)
         (task,) = load_tasks(tasks)
         one = _batch_records(run, tasks, range(12))
-        several = evaluate_batch(
-            replace(_decoder(run), threads=threads), task, build_reader(task), range(12)
-        )
+        with ThreadPoolExecutor(threads) as pool:
+            several = evaluate_batch(_decoder(run), task, build_reader(task), range(12), pool=pool)
         assert several == one
         assert sorted(record["skipped"] for record in one if "skipped" in record) == [
             PROMPT_TOO_LONG,
@@ -423,8 +450,8 @@ class TestEvaluateBatch:
         tasks = write_task(rows=6)
         (tasks.parent / tasks.stem / "4.png").unlink()
         (task,) = load_tasks(tasks)
-        with pytest.raises(FileNotFoundError):
-            evaluate_batch(replace(_decoder(run), threads=4), task, build_reader(task), range(6))
+        with ThreadPoolExecutor(4) as pool, pytest.raises(FileNotFoundError):
+            evaluate_batch(_decoder(run), task, build_reader(task), range(6), pool=pool)
 
 
 class TestMergeRecords:
@@ -490,16 +517,86 @@ class TestClearResults:
     ) -> None:
         (tmp_path / "results.json").write_text("{}")
         monkeypatch.setattr(evaluator, "get_world_info", lambda: (1, 1, 2))
-        assert clear_results(tmp_path) is None
+        assert clear_results(tmp_path) == ClearedResults(None)
         assert (tmp_path / "results.json").exists()
         monkeypatch.setattr(evaluator, "get_world_info", lambda: (0, 0, 2))
-        assert clear_results(tmp_path) is None
+        assert clear_results(tmp_path) == ClearedResults(None)
         assert not (tmp_path / "results.json").exists()
-        assert clear_results(tmp_path / "missing") is None
+        assert clear_results(tmp_path / "missing") == ClearedResults(None)
 
     def test_a_removal_that_fails_is_returned(self, tmp_path: Path) -> None:
         (tmp_path / "results.json").mkdir()
-        assert isinstance(clear_results(tmp_path), OSError)
+        cleared = clear_results(tmp_path)
+        assert isinstance(cleared, ClearedResults)
+        assert isinstance(cleared.failure, OSError)
+
+    def test_every_file_of_an_earlier_evaluation_goes_and_nothing_else(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "predictions").mkdir()
+        earlier = [
+            tmp_path / "results.json",
+            tmp_path / "metrics.json",
+            tmp_path / "predictions" / "docvqa.jsonl",
+            tmp_path / "predictions" / "vqav2.jsonl",
+        ]
+        kept = [
+            tmp_path / "launched.json",
+            tmp_path / "launch.log",
+            tmp_path / "predictions" / "notes.txt",
+        ]
+        for path in (*earlier, *kept):
+            path.write_text("x")
+        assert clear_results(tmp_path) == ClearedResults(None)
+        assert not any(path.exists() for path in earlier)
+        assert all(path.exists() for path in kept)
+
+    def test_the_marker_goes_before_the_other_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "predictions").mkdir()
+        names = ["results.json", "metrics.json", "predictions/a.jsonl"]
+        for name in names:
+            (tmp_path / name).write_text("x")
+        removed: list[str] = []
+        unlink = Path.unlink
+
+        def record(path: Path, missing_ok: bool = False) -> None:
+            removed.append(str(path.relative_to(tmp_path)))
+            unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", record)
+        clear_results(tmp_path)
+        assert removed == names
+
+    def test_a_failed_removal_does_not_stop_the_others(self, tmp_path: Path) -> None:
+        (tmp_path / "predictions").mkdir()
+        (tmp_path / "results.json").mkdir()
+        (tmp_path / "metrics.json").write_text("x")
+        (tmp_path / "predictions" / "a.jsonl").write_text("x")
+        cleared = clear_results(tmp_path)
+        assert isinstance(cleared.failure, OSError)
+        assert not (tmp_path / "metrics.json").exists()
+        assert not (tmp_path / "predictions" / "a.jsonl").exists()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root lists a directory it cannot read")
+    def test_a_predictions_directory_that_cannot_be_listed_is_returned_not_raised(
+        self, tmp_path: Path
+    ) -> None:
+        predictions = tmp_path / "predictions"
+        predictions.mkdir()
+        (predictions / "a.jsonl").write_text("x")
+        (tmp_path / "results.json").write_text("x")
+        (tmp_path / "metrics.json").write_text("x")
+        predictions.chmod(0)
+        try:
+            cleared = clear_results(tmp_path)
+        finally:
+            predictions.chmod(0o700)
+        assert isinstance(cleared.failure, PermissionError)
+        assert not (tmp_path / "results.json").exists()
+        assert not (tmp_path / "metrics.json").exists()
+        assert (predictions / "a.jsonl").exists()
 
 
 class TestEvaluateCheckpoint:
@@ -703,9 +800,90 @@ class TestEvaluateCheckpoint:
                 run.step_dir,
                 tmp_path / "results",
                 publish=False,
-                prior_failure=OSError("cannot clear"),
+                cleared=ClearedResults(OSError("cannot clear")),
             )
         assert not (tmp_path / "results").exists()
+
+    def test_a_recorded_failure_fails_every_rank_in_the_first_agreed_step(
+        self,
+        run: Run,
+        write_task: Callable[..., Path],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        steps: list[str] = []
+        agree = evaluator.agree_across_ranks
+
+        def agreed(failure: Exception | None, what: str) -> None:
+            steps.append(what)
+            agree(failure, what)
+
+        monkeypatch.setattr(evaluator, "agree_across_ranks", agreed)
+        tasks = load_tasks(write_task(rows=3))
+        with pytest.raises(OSError, match="cannot clear"):
+            evaluate_checkpoint(
+                run.config,
+                tasks,
+                run.step_dir,
+                tmp_path / "results",
+                publish=False,
+                cleared=ClearedResults(OSError("cannot clear")),
+            )
+        assert steps == ["Preparing the evaluation"]
+
+    def test_the_evaluation_clears_unless_the_caller_did(
+        self,
+        run: Run,
+        write_task: Callable[..., Path],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[Path] = []
+        clear = evaluator.clear_results
+
+        def counted(output: str | Path) -> ClearedResults:
+            calls.append(Path(output))
+            return clear(output)
+
+        monkeypatch.setattr(evaluator, "clear_results", counted)
+        tasks = write_task(rows=2)
+        _evaluate(run, tasks, tmp_path / "a")
+        assert calls == [tmp_path / "a"]
+        _evaluate(run, tasks, tmp_path / "b", cleared=ClearedResults(None))
+        assert calls == [tmp_path / "a"]
+
+    def test_a_failed_evaluation_leaves_no_file_of_an_earlier_one(
+        self, run: Run, write_task: Callable[..., Path], tmp_path: Path
+    ) -> None:
+        output = tmp_path / "results"
+        tasks = write_task(rows=3)
+        _evaluate(run, tasks, output)
+        assert (output / "metrics.json").exists()
+        assert (output / "predictions" / "docvqa.jsonl").exists()
+        (tasks.parent / tasks.stem / "1.png").unlink()
+        with pytest.raises(FileNotFoundError):
+            _evaluate(run, tasks, output)
+        assert not (output / "results.json").exists()
+        assert not (output / "metrics.json").exists()
+        assert list((output / "predictions").glob("*.jsonl")) == []
+
+    def test_one_pool_reads_the_rows_of_every_batch_of_a_task(
+        self,
+        run: Run,
+        write_task: Callable[..., Path],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        created: list[int] = []
+
+        class Counted(ThreadPoolExecutor):
+            def __init__(self, workers: int) -> None:
+                created.append(workers)
+                super().__init__(workers)
+
+        monkeypatch.setattr(evaluator, "ThreadPoolExecutor", Counted)
+        _evaluate(run, write_task(rows=6), tmp_path / "results", batch_size=2)
+        assert created == [4]
 
     def test_a_task_whose_every_prompt_is_too_long_fails_without_results(
         self, run: Run, write_task: Callable[..., Path], tmp_path: Path
