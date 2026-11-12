@@ -401,8 +401,11 @@ def clear_results(output: str | Path) -> ClearedResults:
         return ClearedResults(None)
     output = Path(output)
     earlier = [output / RESULTS_FILE, output / METRICS_FILE]
-    earlier.extend(sorted((output / PREDICTIONS_DIR).glob("*.jsonl")))
     failure: OSError | None = None
+    try:
+        earlier.extend(sorted((output / PREDICTIONS_DIR).glob("*.jsonl")))
+    except OSError as error:
+        failure = error
     for path in earlier:
         try:
             path.unlink(missing_ok=True)

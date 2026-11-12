@@ -578,6 +578,23 @@ class TestClearResults:
         assert not (tmp_path / "metrics.json").exists()
         assert not (tmp_path / "predictions" / "a.jsonl").exists()
 
+    def test_a_predictions_directory_that_cannot_be_listed_is_returned_not_raised(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "predictions").mkdir()
+        (tmp_path / "results.json").write_text("x")
+        (tmp_path / "metrics.json").write_text("x")
+
+        def unreadable(path: Path, pattern: str) -> Any:
+            raise OSError(5, "Input/output error", str(path))
+
+        monkeypatch.setattr(Path, "glob", unreadable)
+        cleared = clear_results(tmp_path)
+        assert isinstance(cleared.failure, OSError)
+        assert cleared.failure.errno == 5
+        assert not (tmp_path / "results.json").exists()
+        assert not (tmp_path / "metrics.json").exists()
+
 
 class TestEvaluateCheckpoint:
     def test_results_metrics_and_predictions_are_written(
