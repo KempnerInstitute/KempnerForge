@@ -33,8 +33,11 @@ def _jsonl(path: str | Path) -> Iterator[dict[str, Any]]:
 
 
 def _parallel(row: dict[str, Any], *keys: str) -> Iterator[tuple[Any, ...]]:
-    """The row's ``keys`` zipped, refusing values that are not lists of one length."""
-    lists = [row.get(key, []) for key in keys]
+    """The row's ``keys`` zipped; each must be present and all lists of one length."""
+    missing = [key for key in keys if key not in row]
+    if missing:
+        raise ValueError(f"row for {row['image']}: missing {', '.join(missing)}")
+    lists = [row[key] for key in keys]
     if not all(isinstance(values, list) for values in lists):
         raise ValueError(f"row for {row['image']}: {', '.join(keys)} must be lists")
     if len({len(values) for values in lists}) > 1:
@@ -346,7 +349,7 @@ def pixmo_pointing(
     max_points: int = MAX_POINTS,
     max_attempts: int = MAX_ATTEMPTS,
 ) -> PixmoPointing:
-    """PixMo-Points pointing, one example per labelled object kind."""
+    """PixMo-Points pointing, one example per labeled object kind."""
     columns: dict[str, list[Any]] = {"image": [], "label": [], "xs": [], "ys": []}
     for row in _jsonl(annotation_file):
         for label, points in _parallel(row, "label", "points"):

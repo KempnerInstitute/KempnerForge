@@ -142,6 +142,7 @@ are shared (AdamW/Lion) or optimizer-specific.
 | `muon_router` | `bool` | `False` | Orthogonalize MoE router gates with Muon instead of its AdamW fallback |
 | `schedule_free_warmup_steps` | `int` | `0` | internal warmup for schedule-free |
 | `weight_decay_scope` | `"exclude_norms_and_biases" \| "all"` | `"exclude_norms_and_biases"` | which parameters are decayed; `"all"` decays every parameter, as `torch.optim.AdamW` does by default. A resume that restores optimizer state saved under the other scope is refused |
+| `lr_multipliers` | `dict[str, float]` | `{}` | per-module learning rates: each `vlm.module_patterns` module listed trains at `lr` times its multiplier, in its own param groups (see [Optimizers § Per-module learning rates](../training/optimizers.md#per-module-learning-rates)). A resume that restores optimizer or scheduler state saved with other multipliers, or other patterns for their modules, is refused |
 
 ## `[scheduler]` — `SchedulerConfig`
 
@@ -181,7 +182,7 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `hf_dataset_prompt_field` | `str` | `""` | VLM only: prompt column (`""` = no prompt mask) |
 | `hf_image_size` | `int` | `224` | VLM only: target square image size |
 | `hf_streaming` | `bool` | `False` | use `IterableDataset` for large corpora |
-| `pack_sequences` | `bool` | `False` | document-aware packing with cross-doc isolation (feeds `doc_ids` to attention) |
+| `pack_sequences` | `bool` | `False` | document-aware packing with cross-doc isolation (feeds `doc_ids` to attention); on a Joint-Decoder VLM run, packs `train.batch_size` image-text documents per micro-batch into rows of `train.seq_len`, each document's image tokens before its text, positions restarting per document |
 | `datasets` | `list[DatasetSource]` | `[]` | multi-dataset mixture (overrides `dataset_path`/`hf_dataset_name` when non-empty) |
 | `mix_temperature` | `float` | `1.0` | weight scaling; `1.0` → as-is, larger → more uniform |
 | `phases` | `list[TrainingPhase]` | `[]` | multi-phase schedule with weight/LR transitions |
@@ -268,6 +269,7 @@ DCP-based checkpointing.
 | `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py dcp-to-hf` when its `--dtype` flag is not given; the flag wins and also takes `float16` (see [HuggingFace conversion](../checkpointing/hf-conversion.md#dtypes)) |
 | `exclude_from_loading` | `list[str]` | `[]` | state to skip when warm-starting from `load_path`: `"model"` and/or `"optimizer"`, or exactly `["optimizer", "train_state"]` for a weights-only warm start that loads the model alone and skips `train_state.pt` (step, scheduler, dataloader position, RNG) and the saved freeze comparison, so a new stage starts fresh from the weights; ignored on a resume, which always restores full state |
 | `ignore_freeze_mismatch` | `bool` | `False` | load a checkpoint whose VLM freeze metadata disagrees with the configured freeze specs, downgrading the error to a warning |
+| `ignore_rank_state_mismatch` | `bool` | `False` | resume when the saved per-rank dataloader/RNG state does not fit this run (changed world size or data-parallel layout, unreadable or incomplete envelope): discard that state on every rank with a warning instead of raising, so data order and random streams restart fresh while step, model, optimizer and scheduler continue (see [Resharding](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)) |
 
 ### `[checkpoint.dyn_ckpt_window]` — `DynamicCheckpointWindow`
 

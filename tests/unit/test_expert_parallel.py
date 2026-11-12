@@ -2,7 +2,8 @@
 
 With one rank every expert is local and ``all_to_all_single`` is the identity, so
 ``ep_dispatch_and_compute`` must reproduce ``MoEMLP._local_forward`` exactly. Multi-rank
-behaviour is covered by ``tests/distributed/test_ep.py``.
+gradients and clipping are checked on CPU in ``tests/unit/test_ep_gradients.py``, and
+the multi-GPU forward in ``tests/distributed/test_ep.py``.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from kempnerforge.distributed.expert_parallel import ep_dispatch_and_compute
+from kempnerforge.distributed.expert_parallel import ep_dispatch_and_compute, expert_parallel_params
 from kempnerforge.model.moe import _HAS_GROUPED_MM, MoEMLP, build_moe
 
 pytestmark = pytest.mark.skipif(not _HAS_GROUPED_MM, reason="torch._grouped_mm not available")
@@ -121,3 +122,45 @@ class TestSingleRankDispatch:
         torch.manual_seed(2)
         x = torch.randn(2, 16, DIM, dtype=DTYPE)
         assert torch.equal(moe(x), reference(x))
+
+
+class TestExpertParallelParams:
+    """``expert_parallel_params`` finds the routed experts and the one EP group."""
+
+    @staticmethod
+    def _model(groups: list[object], packed: bool = False, **kwargs) -> torch.nn.Sequential:
+        """MoE layers marked as split over two EP ranks, each with the given group."""
+        layers = []
+        for group in groups:
+            moe = _moe(packed, **kwargs)
+            moe.ep_world_size = 2
+            moe.ep_group = group
+            layers.append(moe)
+        return torch.nn.Sequential(*layers)
+
+    def test_layers_sharing_a_group_return_it_with_their_experts(self):
+        group = object()
+        model = self._model([group, group])
+        params, found = expert_parallel_params(model)
+        experts = [p for layer in model for p in layer.experts.parameters()]
+        assert found is group
+        assert [id(p) for p in params] == [id(p) for p in experts]
+
+    @pytest.mark.parametrize(
+        ("activation", "names"),
+        [("silu", ("up_w", "down_w", "gate_w")), ("gelu", ("up_w", "down_w"))],
+        ids=["swiglu", "gelu"],
+    )
+    def test_packed_layers_return_their_weights(self, activation, names):
+        """Packed layers give their up and down weights, and their gate under SwiGLU only."""
+        group = object()
+        model = self._model([group, group], packed=True, activation=activation)
+        params, found = expert_parallel_params(model)
+        weights = [getattr(layer, name) for layer in model for name in names]
+        assert found is group
+        assert [id(p) for p in params] == [id(p) for p in weights]
+
+    def test_layers_with_different_groups_are_rejected(self):
+        """One norm all-reduce covers one group, so a second group must not pass silently."""
+        with pytest.raises(ValueError, match="different expert-parallel groups"):
+            expert_parallel_params(self._model([object(), object()]))

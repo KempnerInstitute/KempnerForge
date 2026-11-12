@@ -80,6 +80,14 @@ File:
 - `muon_adjust_lr ∈ {"original", "match_rms_adamw", "spectral_unclamped"}`.
 - `muon_orthogonalize ∈ {"local", "exact"}`.
 - `schedule_free_warmup_steps ≥ 0`.
+- `lr_multipliers` maps non-empty module names without `/` to finite numbers `> 0`. A non-empty one
+  needs a `[vlm]` section whose `module_patterns` names every listed module; this is checked
+  when `JobConfig` is built. When the optimizer is built, a listed module that matches no
+  parameter raises `ValueError`, and so do two listed modules that match the same parameters
+  or parameters that partly overlap; a module whose parameters another's strictly contain
+  keeps them (see [Optimizers](../training/optimizers.md#per-module-learning-rates)). Which
+  parameters the modules share depends on the model's parameter names, so only the build
+  can tell.
 
 ### `SchedulerConfig`
 
@@ -321,6 +329,21 @@ train.is_fp8 && distributed.tp > 1  →  ValueError
 Rationale in the error message: `torchao.Float8Linear` does not compose
 with DTensor sharding today.
 
+### Sigmoid MoE router + full activation checkpointing
+
+```
+model.is_moe && model.moe_router == "sigmoid_topk"
+    && train.activation_checkpointing == "full"  →  ValueError
+```
+
+The sigmoid router updates its expert bias in place in every training
+forward. Under `"full"` the backward replays each checkpointed block's
+forward, so the replay routes with a moved bias, can send tokens to other
+experts than the forward did, and then raises `CheckpointError`. Checked
+for every arch with MoE layers, text models included. Use
+`activation_checkpointing = "selective"`, which checkpoints attention only
+and leaves the MoE layers out of the replay.
+
 ### MoE + PP
 
 ```
@@ -340,9 +363,7 @@ When `distributed.ep > 1`:
   - `mot`: the FSDP2 wrap for expert-parallel blocks expects
     `layer.attention` and `layer.mlp`, and `MoTBlock` names its attention
     `attn` and keeps its experts per modality, so the model build fails. MoT
-    with MoE trains with `ep = 1`, but without its load-balancing loss,
-    router z-loss, bias schedule or balance metric
-    ([#308](https://github.com/KempnerInstitute/KempnerForge/issues/308)).
+    with MoE trains with `ep = 1`.
   - `moma`: `apply_expert_parallel` partitions `MoEMLP` experts only, and
     MoMa's per-modality expert groups need an EP-aware dispatch that is not
     wired yet. MoMa also requires `model.num_experts = 0`, which the next

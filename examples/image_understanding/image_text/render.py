@@ -247,6 +247,7 @@ class RenderedDataset(Dataset):
 
         def render(row: int) -> dict[str, torch.Tensor]:
             nonlocal next_index
+            next_index = row + 1
             read_with_index = getattr(self.reader, "read_with_index", None)
             actual, document = (
                 read_with_index(row) if read_with_index is not None else (row, self.reader[row])
