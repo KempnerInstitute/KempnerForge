@@ -11,10 +11,10 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import evaluation.periodic as periodic
 import pytest
-from evaluation import periodic
 from evaluation.periodic import (
     LAUNCH_LOG_FILE,
     LAUNCHED_FILE,
@@ -739,7 +739,9 @@ class RecordingLauncher:
 def make_hook(
     tmp_path: Path, recorder: RecordingLauncher, **options: Any
 ) -> PeriodicEvaluationHook:
-    return PeriodicEvaluationHook(make_settings(tmp_path), launcher=recorder, **options)
+    return PeriodicEvaluationHook(
+        make_settings(tmp_path), launcher=cast(EvaluationLauncher, recorder), **options
+    )
 
 
 def config_for(run: Path) -> JobConfig:
@@ -767,7 +769,7 @@ def test_the_hook_hands_a_run_to_its_worker_in_order(
         ("saved", (4, str(run))),
         ("finish", str(run)),
     ]
-    assert not hook._worker.is_alive()
+    assert hook._worker is not None and not hook._worker.is_alive()
     ((deadline, thread, finished),) = recorder.waited
     timeout = periodic.FINISH_TIMEOUT_SECONDS
     assert before + timeout <= deadline <= after + timeout
@@ -814,7 +816,7 @@ def test_a_failing_last_look_still_ends_the_worker(
     hook = make_hook(tmp_path, recorder)
     hook.on_train_begin(config_for(run))
     hook.on_train_end(1, 0)
-    assert not hook._worker.is_alive()
+    assert hook._worker is not None and not hook._worker.is_alive()
     assert "could not handle finish" in text(messages)
 
 
@@ -848,6 +850,7 @@ def test_a_worker_that_does_not_finish_is_reported_and_not_waited_for(
     assert "did not finish its last check" in text(messages)
     assert slow.waited == []
     release.set()
+    assert hook._worker is not None
     hook._worker.join(30)
 
 

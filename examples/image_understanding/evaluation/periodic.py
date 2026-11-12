@@ -684,6 +684,7 @@ class PeriodicEvaluationHook(TrainingHook):
             )
 
     def _work(self) -> None:
+        payload: Any
         while True:
             try:
                 kind, payload = self._messages.get(
