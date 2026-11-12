@@ -87,6 +87,23 @@ def read_step(step_dir: Path) -> int | None:
     return step if type(step) is int else None
 
 
+_TRAIN_STATE_FILE = "train_state.pt"
+
+
+def step_dir_complete(step_dir: Path) -> bool:
+    """Whether the checkpoint in ``step_dir`` is complete and its evaluation can start.
+
+    The DCP ``.metadata`` is written once every shard is durable, after which the
+    checkpoint is readable whether or not the manager has pointed ``latest`` at it yet;
+    ``train_state.pt`` and ``metadata.json`` are rank 0's other files of a save.
+    Three ``stat`` calls, so cheap enough for the training thread.
+    """
+    return all(
+        (step_dir / name).exists()
+        for name in (_DCP_METADATA_FILE, _TRAIN_STATE_FILE, _SIDECAR_FILE)
+    )
+
+
 def load_model(config: JobConfig, step_dir: Path, device: torch.device) -> VLMWrapper:
     """The model ``config`` describes with the weights saved in ``step_dir``, in eval mode.
 

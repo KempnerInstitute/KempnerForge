@@ -14,6 +14,7 @@ from evaluation.checkpoint import (
     load_model,
     read_step,
     resolve_checkpoint,
+    step_dir_complete,
 )
 
 from kempnerforge.config.job import JobConfig
@@ -149,6 +150,28 @@ class TestReadStep:
         if text is not None:
             (tmp_path / "metadata.json").write_text(text)
         assert read_step(tmp_path) is None
+
+
+class TestStepDirComplete:
+    @pytest.mark.parametrize(
+        ("present", "expected"),
+        [
+            ((".metadata", "train_state.pt", "metadata.json"), True),
+            ((".metadata", "train_state.pt"), False),
+            (("train_state.pt", "metadata.json"), False),
+            ((".metadata", "metadata.json"), False),
+            ((), False),
+        ],
+    )
+    def test_a_step_directory_is_complete_only_with_every_file(
+        self, tmp_path: Path, present: tuple[str, ...], expected: bool
+    ) -> None:
+        step_dir = tmp_path / "step_1"
+        step_dir.mkdir()
+        for name in present:
+            (step_dir / name).write_text("")
+        assert step_dir_complete(step_dir) is expected
+        assert step_dir_complete(tmp_path / "missing") is False
 
 
 class TestLoadModel:

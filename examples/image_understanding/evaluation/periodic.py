@@ -32,6 +32,7 @@ from typing import Any, BinaryIO
 
 import torch.distributed as dist
 
+from evaluation.checkpoint import step_dir_complete
 from evaluation.evaluator import RESULTS_FILE
 from evaluation.tasks import load_tasks
 from kempnerforge.config.job import JobConfig
@@ -69,10 +70,6 @@ _DISTRIBUTED_VARIABLES = frozenset(
 )
 _DISTRIBUTED_PREFIXES = ("TORCHELASTIC_",)
 _STEP_PREFIX = "step_"
-_DCP_METADATA_FILE = ".metadata"
-_TRAIN_STATE_FILE = "train_state.pt"
-_SIDECAR_FILE = "metadata.json"
-_COMPLETE_FILES = (_DCP_METADATA_FILE, _TRAIN_STATE_FILE, _SIDECAR_FILE)
 
 
 @dataclass(frozen=True)
@@ -179,17 +176,6 @@ def _check_command(command: str) -> None:
         )
     if shutil.which(tokens[0]) is None:
         raise ValueError(f"the evaluation command's program {tokens[0]!r} was not found")
-
-
-def step_dir_complete(step_dir: Path) -> bool:
-    """Whether the checkpoint in ``step_dir`` is complete and its evaluation can start.
-
-    The DCP ``.metadata`` is written once every shard is durable, after which the
-    checkpoint is readable whether or not the manager has pointed ``latest`` at it yet;
-    ``train_state.pt`` and ``metadata.json`` are rank 0's other files of a save.
-    Three ``stat`` calls, so cheap enough for the training thread.
-    """
-    return all((step_dir / name).exists() for name in _COMPLETE_FILES)
 
 
 def _claim(output: Path, argv: Sequence[str]) -> bool:

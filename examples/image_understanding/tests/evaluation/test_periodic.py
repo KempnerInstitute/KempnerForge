@@ -21,7 +21,6 @@ from evaluation.periodic import (
     PeriodicEvaluation,
     PeriodicEvaluationHook,
     child_environment,
-    step_dir_complete,
 )
 
 from kempnerforge.config.job import JobConfig
@@ -198,27 +197,6 @@ def test_the_command_is_split_before_the_placeholders_are_filled(tmp_path: Path)
 def test_an_empty_overrides_placeholder_adds_no_argument(tmp_path: Path) -> None:
     argv = make_settings(tmp_path).argv(tmp_path / "step_1", 1)
     assert argv[-1] == str(make_settings(tmp_path).step_output(1))
-
-
-@pytest.mark.parametrize(
-    ("present", "expected"),
-    [
-        ((".metadata", "train_state.pt", "metadata.json"), True),
-        ((".metadata", "train_state.pt"), False),
-        (("train_state.pt", "metadata.json"), False),
-        ((".metadata", "metadata.json"), False),
-        ((), False),
-    ],
-)
-def test_a_step_directory_is_complete_only_with_every_file(
-    tmp_path: Path, present: tuple[str, ...], expected: bool
-) -> None:
-    step_dir = tmp_path / "step_1"
-    step_dir.mkdir()
-    for name in present:
-        (step_dir / name).write_text("")
-    assert step_dir_complete(step_dir) is expected
-    assert step_dir_complete(tmp_path / "missing") is False
 
 
 def test_a_complete_save_is_launched_detached_without_the_distributed_environment(
