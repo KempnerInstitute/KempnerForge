@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import random
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any, Protocol
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
@@ -30,6 +30,16 @@ class DocumentSource(Protocol):
     def __len__(self) -> int: ...
 
     def __getitem__(self, index: int) -> Document: ...
+
+
+class DocumentStream(Protocol):
+    """A resumable stream of documents."""
+
+    def __iter__(self) -> Iterator[Document]: ...
+
+    def state_dict(self) -> dict[str, Any]: ...
+
+    def load_state_dict(self, state: dict[str, Any]) -> None: ...
 
 
 Span = tuple[int, int]
@@ -263,3 +273,54 @@ class RenderedDataset(Dataset):
             self._skips,
             lambda row, error: next_index,
         )
+
+
+class RenderedStream(IterableDataset):
+    """Renders a stream of documents, passing over the ones the renderer refuses.
+
+    Replies are drawn from a generator seeded by ``seed`` and the loader worker, so
+    a stream's draws do not follow a resume. ``max_attempts`` refusals in a row
+    raise; ``skipped`` counts them with the stream's own skips, and
+    ``state_dict`` and ``load_state_dict`` are the stream's.
+    """
+
+    def __init__(
+        self,
+        documents: DocumentStream,
+        renderer: ChatRenderer,
+        seed: int | str = 0,
+        max_attempts: int = MAX_ATTEMPTS,
+    ) -> None:
+        self.documents = documents
+        self.renderer = renderer
+        self.seed = seed
+        self.max_attempts = check_max_attempts(max_attempts)
+        self._skips = SkipLog("streamed document")
+
+    @property
+    def skipped(self) -> int:
+        return self._skips.count + getattr(self.documents, "skipped", 0)
+
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        info = get_worker_info()
+        rng = random.Random(f"{self.seed}:{0 if info is None else info.id}")
+        in_a_row = 0
+        for position, document in enumerate(self.documents):
+            try:
+                sample = self.renderer(document, rng)
+            except UnusableRowError as exc:
+                self._skips(position, exc)
+                in_a_row += 1
+                if in_a_row >= self.max_attempts:
+                    raise RuntimeError(
+                        f"{self.max_attempts} streamed documents in a row cannot be rendered"
+                    ) from exc
+                continue
+            in_a_row = 0
+            yield sample
+
+    def state_dict(self) -> dict[str, Any]:
+        return self.documents.state_dict()
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.documents.load_state_dict(state)
