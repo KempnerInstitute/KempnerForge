@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import statistics
 import threading
@@ -578,22 +579,24 @@ class TestClearResults:
         assert not (tmp_path / "metrics.json").exists()
         assert not (tmp_path / "predictions" / "a.jsonl").exists()
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root lists a directory it cannot read")
     def test_a_predictions_directory_that_cannot_be_listed_is_returned_not_raised(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path
     ) -> None:
-        (tmp_path / "predictions").mkdir()
+        predictions = tmp_path / "predictions"
+        predictions.mkdir()
+        (predictions / "a.jsonl").write_text("x")
         (tmp_path / "results.json").write_text("x")
         (tmp_path / "metrics.json").write_text("x")
-
-        def unreadable(path: Path, pattern: str) -> Any:
-            raise OSError(5, "Input/output error", str(path))
-
-        monkeypatch.setattr(Path, "glob", unreadable)
-        cleared = clear_results(tmp_path)
-        assert isinstance(cleared.failure, OSError)
-        assert cleared.failure.errno == 5
+        predictions.chmod(0)
+        try:
+            cleared = clear_results(tmp_path)
+        finally:
+            predictions.chmod(0o700)
+        assert isinstance(cleared.failure, PermissionError)
         assert not (tmp_path / "results.json").exists()
         assert not (tmp_path / "metrics.json").exists()
+        assert (predictions / "a.jsonl").exists()
 
 
 class TestEvaluateCheckpoint:

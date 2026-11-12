@@ -403,7 +403,11 @@ def clear_results(output: str | Path) -> ClearedResults:
     earlier = [output / RESULTS_FILE, output / METRICS_FILE]
     failure: OSError | None = None
     try:
-        earlier.extend(sorted((output / PREDICTIONS_DIR).glob("*.jsonl")))
+        earlier.extend(
+            sorted(path for path in (output / PREDICTIONS_DIR).iterdir() if path.suffix == ".jsonl")
+        )
+    except FileNotFoundError:
+        pass
     except OSError as error:
         failure = error
     for path in earlier:
