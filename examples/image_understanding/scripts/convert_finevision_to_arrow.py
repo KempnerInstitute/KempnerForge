@@ -32,6 +32,7 @@ import time
 from collections.abc import Callable
 from multiprocessing import Pool
 from pathlib import Path
+from typing import BinaryIO
 
 import numpy as np
 import pyarrow as pa
@@ -105,7 +106,8 @@ def convert_file(
     tmp = dst_file.with_name(f"{dst_file.name}.{tag}.tmp")
     meta_tmp = dst_file.with_name(f"{dst_file.stem}.meta.{tag}.tmp.npz")
     try:
-        return _convert_file(src_file, dst_file, tmp, meta_tmp, heartbeat)
+        with open(src_file, "rb") as source:
+            return _convert_file(source, src_file, dst_file, tmp, meta_tmp, heartbeat)
     except BaseException:
         tmp.unlink(missing_ok=True)
         meta_tmp.unlink(missing_ok=True)
@@ -113,9 +115,15 @@ def convert_file(
 
 
 def _convert_file(
-    src_file: Path, dst_file: Path, tmp: Path, meta_tmp: Path, heartbeat: Callable[[], None] | None
+    source: BinaryIO,
+    src_file: Path,
+    dst_file: Path,
+    tmp: Path,
+    meta_tmp: Path,
+    heartbeat: Callable[[], None] | None,
 ) -> int:
-    parquet = pq.ParquetFile(src_file)
+    source_size = os.fstat(source.fileno()).st_size
+    parquet = pq.ParquetFile(source)
     batch_rows: list[int] = []
     keep: list[np.ndarray] = []
     images: list[np.ndarray] = []
@@ -152,7 +160,7 @@ def _convert_file(
         batch_rows=np.asarray(batch_rows, dtype=np.int64),
         keep=np.concatenate(keep) if keep else np.zeros(0, dtype=bool),
         num_images=np.concatenate(images) if images else np.zeros(0, dtype=np.int16),
-        source_size=np.int64(src_file.stat().st_size),
+        source_size=np.int64(source_size),
         **{
             name: np.concatenate(values) if values else np.zeros(0, dtype=np.int16)
             for name, values in ratings.items()
@@ -177,16 +185,12 @@ def _touch_claim(claim: Path, tag: str) -> None:
 
 
 def _release_claim(claim: Path, tag: str) -> None:
-    """Remove ``claim`` when it is still this process's, by renaming it aside first."""
-    held = claim.with_name(f"{claim.name}.releasing-{tag}")
+    """Remove ``claim`` when it is still this process's, leaving another's untouched."""
     try:
-        os.rename(claim, held)
+        if claim.read_text().startswith(f"{tag} "):
+            claim.unlink()
     except FileNotFoundError:
-        return
-    if held.read_text().startswith(f"{tag} "):
-        held.unlink()
-    else:
-        os.rename(held, claim)
+        pass
 
 
 def _convert_job(job: tuple[Path, Path, float]) -> int | str:
@@ -194,7 +198,7 @@ def _convert_job(job: tuple[Path, Path, float]) -> int | str:
 
     A stale claim is taken over by renaming it, which only one process can do; a
     process whose claim was taken over stops at its next row group and leaves the
-    file to the taker.
+    file and its claim to the taker. An error while claiming is this file's failure.
     """
     src_file, dst_file, stale_seconds = job
     claim = dst_file.with_name(dst_file.name + ".claim")
@@ -203,25 +207,32 @@ def _convert_job(job: tuple[Path, Path, float]) -> int | str:
         return 0
     stale = claim.with_name(f"{claim.name}.stale-{tag}")
     try:
-        if time.time() - claim.stat().st_mtime > stale_seconds:
-            os.rename(claim, stale)
-            stale.unlink()
-    except FileNotFoundError:
-        pass
-    try:
+        try:
+            if time.time() - claim.stat().st_mtime > stale_seconds:
+                os.rename(claim, stale)
+                stale.unlink()
+        except FileNotFoundError:
+            pass
         fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         return 0
-    os.write(fd, f"{tag} {time.time():.0f}\n".encode())
-    os.close(fd)
+    except OSError as exc:
+        return f"{src_file}: {type(exc).__name__}: {exc}"
+    lost = False
     try:
+        try:
+            os.write(fd, f"{tag} {time.time():.0f}\n".encode())
+        finally:
+            os.close(fd)
         return convert_file(src_file, dst_file, tag, heartbeat=lambda: _touch_claim(claim, tag))
     except ClaimLostError:
+        lost = True
         return 0
     except Exception as exc:
         return f"{src_file}: {type(exc).__name__}: {exc}"
     finally:
-        _release_claim(claim, tag)
+        if not lost:
+            _release_claim(claim, tag)
 
 
 def convert(args: argparse.Namespace) -> None:

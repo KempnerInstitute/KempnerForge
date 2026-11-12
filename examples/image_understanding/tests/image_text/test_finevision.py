@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from image_text.finevision import FineVisionArrow
+from image_text.render import ChatRenderer, RenderedDataset
 from PIL import Image
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "convert_finevision_to_arrow.py"
@@ -246,6 +247,75 @@ class TestConversion:
         assert not claim.exists()
         converter._release_claim(claim, "otherhost-1")
 
+    def test_a_release_by_another_process_never_moves_the_claim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The holder's heartbeat finds its claim however another's release interleaves."""
+        converter = _converter()
+        claim = tmp_path / "x.arrow.claim"
+        claim.write_text("holder-1 0\n")
+        moves: list[Any] = []
+        monkeypatch.setattr(converter.os, "rename", lambda *args: moves.append(args))
+        monkeypatch.setattr(Path, "unlink", lambda *args, **kwargs: moves.append(args))
+        converter._release_claim(claim, "other-2")
+        assert moves == []
+
+    def test_a_lost_claim_is_left_to_its_taker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        parquet = src / "demo" / "train-00000-of-00001.parquet"
+        _write_parquet(parquet, [[_row(1, [("Q0", "A0")], 5)]])
+        (dst / "demo").mkdir(parents=True)
+        arrow = dst / "demo" / "train-00000-of-00001.arrow"
+        claim = arrow.with_name(arrow.name + ".claim")
+        converter = _converter()
+
+        def taken_over(*args: Any, **kwargs: Any) -> int:
+            claim.write_text("taker-9 0\n")
+            raise converter.ClaimLostError("taken over")
+
+        monkeypatch.setattr(converter, "convert_file", taken_over)
+        assert converter._convert_job((parquet, arrow, 3600.0)) == 0
+        assert claim.read_text() == "taker-9 0\n"
+
+    def test_an_unwritable_subset_fails_alone(self, tmp_path: Path) -> None:
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        for name in ("demo", "locked"):
+            _write_parquet(
+                src / name / "train-00000-of-00001.parquet", [[_row(1, [("Q0", "A0")], 5)]]
+            )
+        (dst / "locked").mkdir(parents=True)
+        (dst / "locked").chmod(0o555)
+        try:
+            stderr = _run_failing("convert", "--src", str(src), "--dst", str(dst), "--procs", "1")
+        finally:
+            (dst / "locked").chmod(0o755)
+        assert "PermissionError" in stderr and "1 files failed" in stderr
+        assert sorted(p.name for p in (dst / "demo").iterdir()) == [
+            "train-00000-of-00001.arrow",
+            "train-00000-of-00001.meta.npz",
+        ]
+        assert list((dst / "locked").iterdir()) == []
+
+    def test_the_recorded_source_size_is_the_converted_file(self, tmp_path: Path) -> None:
+        src = tmp_path / "parquet" / "demo" / "train-00000-of-00001.parquet"
+        _write_parquet(src, [[_row(1, [("Q0", "A0")], 5)]])
+        size = src.stat().st_size
+        replacement = tmp_path / "replacement.parquet"
+        _write_parquet(replacement, [[_row(1, [(f"Q{i}", "A")], 5) for i in range(4)]])
+        assert replacement.stat().st_size != size
+        arrow = tmp_path / "arrow" / "demo" / "train-00000-of-00001.arrow"
+        arrow.parent.mkdir(parents=True)
+
+        def replace_source() -> None:
+            if replacement.exists():
+                os.replace(replacement, src)
+
+        _converter().convert_file(src, arrow, "t", heartbeat=replace_source)
+        meta = np.load(arrow.with_name(arrow.stem + ".meta.npz"))
+        assert int(meta["source_size"]) == size and meta["batch_rows"].tolist() == [1]
+
 
 class TestFineVisionArrow:
     def test_reads_kept_rows_across_files_and_batches(self, subset: Path) -> None:
@@ -372,3 +442,20 @@ class TestFineVisionArrow:
         reader = FineVisionArrow(dst / "demo")
         assert reader[0].turns[0].user == "Good"
         assert reader.skipped == 1
+
+    def test_rendering_continues_after_the_row_the_reader_reached(
+        self, tmp_path: Path, tokenizer: Any
+    ) -> None:
+        """A refused row after a run of undecodable ones steps on from where the reader got to."""
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        broken = _row(1, [("Bad", "x")], 5)
+        broken["images"][0]["bytes"] = b"junk"
+        rows = [broken] * 15 + [_row(1, [("long " * 300, "x")], 5), _row(1, [("Good", "y")], 5)]
+        _write_parquet(src / "demo" / "train-00000-of-00001.parquet", [rows])
+        _run("convert", "--src", str(src), "--dst", str(dst))
+        _run("index", "--src", str(src), "--dst", str(dst))
+        renderer = ChatRenderer(tokenizer, max_text_len=256, image_size=8, answer_only=True)
+        dataset = RenderedDataset(FineVisionArrow(dst / "demo"), renderer)
+        labels = dataset[0]["labels"]
+        assert tokenizer.decode(labels[labels != -100]) == "y<|im_end|>"
+        assert dataset.skipped == 16
