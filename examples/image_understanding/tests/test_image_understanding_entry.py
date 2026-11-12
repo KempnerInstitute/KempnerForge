@@ -154,6 +154,37 @@ def test_a_bad_command_stops_the_run_before_training_starts(
     assert ran == []
 
 
+@pytest.mark.parametrize(
+    ("arguments", "stray"),
+    [
+        (["--train.max_steps", "3"], "3"),
+        (["extra.toml"], "extra.toml"),
+        (["-x", "--train.tf32"], "-x"),
+    ],
+)
+def test_an_argument_that_is_not_an_override_stops_a_run_with_periodic_evaluation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evaluation_flags: list[str],
+    capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+    stray: str,
+) -> None:
+    config_path = tmp_path / "run.toml"
+    config_path.write_text(VLM_CONFIG)
+    module = _load_entry_point()
+    ran: list[bool] = []
+    monkeypatch.setattr(module, "run_training", lambda *args, **options: ran.append(True))
+    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path), *arguments, *evaluation_flags])
+    with pytest.raises(SystemExit) as exc:
+        module.main()
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert f"unrecognized arguments: {stray};" in error
+    assert "--section.key=value" in error
+    assert ran == []
+
+
 def test_a_config_the_evaluator_cannot_decode_stops_the_run_before_training_starts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -8,7 +8,9 @@ The VLM step body still lives in core, so ``run_training`` selects it from
 Periodic evaluation is off by default. With ``--eval-tasks``, ``--eval-command`` and
 ``--eval-output`` every checkpoint the run saves is evaluated: the command is a template
 started once the checkpoint is complete and never waited for, and the output is the
-directory that gets one results directory per step.
+directory that gets one results directory per step. Every other argument must then be a
+``--section.key=value`` override: the evaluations receive the same overrides and refuse
+any other argument.
 
 Usage:
     # Multi-GPU (single node, via torchrun)
@@ -36,7 +38,11 @@ EVAL_FLAG_PREFIX = "--eval-"
 
 
 def _parse_args(argv: list[str]) -> tuple[argparse.ArgumentParser, argparse.Namespace, list[str]]:
-    """The periodic-evaluation flags among ``argv`` and the config overrides that remain."""
+    """The periodic-evaluation flags among ``argv`` and the config overrides that remain.
+
+    An argument that is neither, which the config loader would drop, stops the run through
+    ``parser.error``.
+    """
     parser = argparse.ArgumentParser(
         prog="train.py",
         usage="train.py <config.toml> [--section.key=value ...] "
@@ -53,6 +59,12 @@ def _parse_args(argv: list[str]) -> tuple[argparse.ArgumentParser, argparse.Name
     )
     parser.add_argument("--eval-output", help="directory that gets one results directory per step")
     args, overrides = parser.parse_known_args(argv)
+    stray = [argument for argument in overrides if not argument.startswith("--")]
+    if stray:
+        parser.error(
+            f"unrecognized arguments: {' '.join(stray)}; config overrides take the form "
+            "--section.key=value"
+        )
     return parser, args, overrides
 
 
