@@ -1039,35 +1039,62 @@ class TestTextOnlyRows:
         with pytest.raises(ValueError, match="hf_allow_text_only"):
             ds[0]
 
-    def test_a_dataset_with_an_imageless_row_is_rejected_when_loaded(self, tmp_path):
+    _LOAD = dict(split="train", image_field="image", text_field="caption", tokenizer_path="gpt2")
+
+    def test_imageless_rows_are_skipped_when_loaded_without_the_flag(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        path = _mixed_image_dataset(tmp_path, [_make_image(8), None, _make_image(8, 9), None])
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
+            ds = HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
+        assert len(ds) == 2
+        assert not ds.has_text_only_rows
+        assert [r.getMessage() for r in caplog.records] == [
+            "Skipping 2 of 4 rows with no image in field 'image'; set data.hf_allow_text_only "
+            "= true to train them as text-only documents"
+        ]
+        assert ds[1]["pixel_values"].shape == (3, 224, 224)
+        assert not torch.equal(ds[0]["pixel_values"], ds[1]["pixel_values"])
+
+    def test_imageless_rows_are_kept_as_text_only_with_the_flag(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
         path = _mixed_image_dataset(tmp_path, [_make_image(8), None, _make_image(8), None])
-        kwargs = dict(
-            split="train", image_field="image", text_field="caption", tokenizer_path="gpt2"
-        )
-        with pytest.raises(ValueError, match="2 of 4 rows have no image.*hf_allow_text_only"):
-            HuggingFaceVLMDataset(path, max_text_len=8, **kwargs)
-        ds = HuggingFaceVLMDataset(path, max_text_len=8, allow_text_only=True, **kwargs)
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
+            ds = HuggingFaceVLMDataset(path, max_text_len=8, allow_text_only=True, **self._LOAD)
+        assert caplog.records == []
+        assert len(ds) == 4
         assert ds.has_text_only_rows
         assert ds[1]["pixel_values"].shape == (0, 3, 224, 224)
         assert ds[0]["pixel_values"].shape == (3, 224, 224)
 
     def test_a_dataset_whose_rows_all_have_images_reports_no_text_only_rows(self, tmp_path):
         path = _mixed_image_dataset(tmp_path, [[_make_image(8)], [_make_image(8)]])
-        kwargs = dict(
-            split="train", image_field="image", text_field="caption", tokenizer_path="gpt2"
-        )
-        ds = HuggingFaceVLMDataset(path, max_text_len=8, allow_text_only=True, **kwargs)
+        ds = HuggingFaceVLMDataset(path, max_text_len=8, allow_text_only=True, **self._LOAD)
         assert not ds.has_text_only_rows
 
-    def test_a_dataset_with_several_images_in_a_row_is_rejected_when_loaded(self, tmp_path):
+    @pytest.mark.parametrize("allow_text_only", [False, True])
+    def test_rows_with_several_images_are_skipped_when_loaded(
+        self, tmp_path, caplog, monkeypatch, allow_text_only
+    ):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
         path = _mixed_image_dataset(tmp_path, [[_make_image(8)] * 2, [_make_image(8)]])
-        kwargs = dict(
-            split="train", image_field="image", text_field="caption", tokenizer_path="gpt2"
-        )
-        with pytest.raises(ValueError, match="1 of 2 rows hold several images"):
-            HuggingFaceVLMDataset(path, max_text_len=8, **kwargs)
-        with pytest.raises(ValueError, match="1 of 2 rows hold several images"):
-            HuggingFaceVLMDataset(path, max_text_len=8, allow_text_only=True, **kwargs)
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
+            ds = HuggingFaceVLMDataset(
+                path, max_text_len=8, allow_text_only=allow_text_only, **self._LOAD
+            )
+        assert len(ds) == 1
+        assert [r.getMessage() for r in caplog.records] == [
+            "Skipping 1 of 2 rows that hold several images in field 'image'; a document "
+            "takes one image"
+        ]
+
+    def test_a_dataset_with_no_usable_row_is_rejected(self, tmp_path):
+        path = _mixed_image_dataset(tmp_path, [None, [_make_image(8)] * 2])
+        with pytest.raises(ValueError, match="Every one of the 2 rows was skipped: 1 have no"):
+            HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
 
     def test_images_per_row_counts_lists_and_single_images(self):
         from datasets import Dataset, Features, Image, Sequence
