@@ -27,7 +27,8 @@ def check_supported(config: JobConfig) -> None:
 
     Raises:
         ValueError: the config has no ``[vlm]`` section, names another arch, has
-            a ``[video]`` section, tiles images, or caps MoE expert capacity.
+            a ``[video]`` section, tiles images, caps MoE expert capacity or
+            trains with pipeline parallelism.
     """
     vlm = config.vlm
     if vlm is None:
@@ -52,6 +53,12 @@ def check_supported(config: JobConfig) -> None:
             f"model.moe_capacity_factor={config.model.moe_capacity_factor} is not supported: a "
             "capped expert drops tokens by what else is in the batch, so an answer would depend "
             "on its batch; evaluate with --model.moe_capacity_factor=0"
+        )
+    if config.distributed.pp > 1:
+        raise ValueError(
+            f"distributed.pp={config.distributed.pp} is not supported: the evaluator loads the "
+            "whole model in each process from one set of DCP shards, while a pipeline-parallel "
+            "save holds one set per stage"
         )
 
 
@@ -114,5 +121,4 @@ def load_model(config: JobConfig, step_dir: Path, device: torch.device) -> VLMWr
         raise RuntimeError(
             f"{step_dir} does not load into the model this config builds: {causes}"
         ) from exc
-    model.load_state_dict(state["model"])
     return model.eval()

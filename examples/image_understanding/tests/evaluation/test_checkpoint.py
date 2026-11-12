@@ -87,6 +87,15 @@ class TestCheckSupported:
             "model.moe_capacity_factor=1.5 is not supported",
         )
 
+    def test_pipeline_parallelism_is_refused(self, load: Callable[..., JobConfig]) -> None:
+        check_supported(load("--model.tie_embeddings=false"))
+        _refused(
+            load("--model.tie_embeddings=false", "--distributed.pp=2"),
+            "distributed.pp=2 is not supported: the evaluator loads the whole model in each "
+            "process from one set of DCP shards, while a pipeline-parallel save holds one set "
+            "per stage",
+        )
+
 
 class TestResolveCheckpoint:
     def test_a_run_directory_resolves_to_its_latest_step(
@@ -165,6 +174,25 @@ class TestLoadModel:
         assert loaded.keys() == saved.state_dict().keys()
         assert all(torch.equal(loaded[name], value) for name, value in saved.state_dict().items())
         assert not model.training
+
+    def test_the_loaded_state_is_not_copied_a_second_time(
+        self,
+        load: Callable[..., JobConfig],
+        save_checkpoint: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config = load()
+        step_dir = save_checkpoint(config, seed=5)
+
+        def refuse(self: VLMWrapper, *args: object, **kwargs: object) -> None:
+            pytest.fail("load_state_dict copies what dcp.load already wrote in place")
+
+        monkeypatch.setattr(VLMWrapper, "load_state_dict", refuse)
+        torch.manual_seed(5)
+        saved = _fresh_model(config)
+        torch.manual_seed(6)
+        loaded = load_model(config, step_dir, CPU).state_dict()
+        assert all(torch.equal(loaded[name], value) for name, value in saved.state_dict().items())
 
     def test_the_model_computes_in_the_training_dtype(
         self, load: Callable[..., JobConfig], save_checkpoint: Callable[..., Path]
