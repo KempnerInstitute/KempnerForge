@@ -677,9 +677,7 @@ class TestPackedForward:
 class TestMultiImageDocuments:
     @staticmethod
     def _collate(docs):
-        collator = PackedVLMCollator(
-            pad_id=0, seq_len=28, tokens_per_image=8, max_docs_per_row=1
-        )
+        collator = PackedVLMCollator(pad_id=0, seq_len=28, tokens_per_image=8, max_docs_per_row=1)
         return collator(docs)
 
     def _forward(self, wrapper, batch):

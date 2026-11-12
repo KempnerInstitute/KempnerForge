@@ -1153,9 +1153,7 @@ class TestMultiImageRows:
 
 class TestOneDocumentPerRow:
     def test_one_document_per_fixed_row(self):
-        collator = PackedVLMCollator(
-            pad_id=0, seq_len=12, tokens_per_image=2, max_docs_per_row=1
-        )
+        collator = PackedVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2, max_docs_per_row=1)
         batch = collator([_doc(3, 10, views=2), _doc(4, 20), _doc(2, 30, views=0)])
         assert batch["input_ids"].shape == (3, 12)
         assert batch["pixel_values"].shape == (3, 3, 4, 4)
