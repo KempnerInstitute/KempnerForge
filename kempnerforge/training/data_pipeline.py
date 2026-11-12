@@ -150,8 +150,6 @@ def _build_vlm_pipeline(
             tile_grid=vlm_cfg.tile_grid,
             tile_global=vlm_cfg.tile_global,
         )
-        if dataset.has_text_only_rows and vlm_cfg.arch == "cross_attention":
-            raise ValueError("Text-only rows are not supported with vlm.arch='cross_attention'")
         pad_id = _resolve_pad_id(config.data.tokenizer_path)
         if config.data.pack_sequences:
             assert tokens_per_image is not None

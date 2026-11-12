@@ -258,6 +258,39 @@ class TestCrossAttentionBlock:
             out_after = block(x, img)
         assert not torch.equal(out_after, x)
 
+    def _trained_block(self) -> CrossAttentionBlock:
+        """A block whose output projections are no longer zero, so it changes its input."""
+        block = self._block()
+        with torch.no_grad():
+            block.attn.o_proj.weight.normal_(std=0.2)
+            block.mlp.down_proj.weight.normal_(std=0.2)  # type: ignore[union-attr]
+        return block
+
+    def test_a_row_without_an_image_skips_the_block(self):
+        block = self._trained_block().eval()
+        x = torch.randn(2, 6, 32, device=DEVICE)
+        img = torch.randn(2, 8, 32, device=DEVICE)
+        mask = torch.ones(2, 8, dtype=torch.bool, device=DEVICE)
+        mask[1] = False
+        with torch.no_grad():
+            out = block(x, img, mask)
+            alone = block(x[:1], img[:1], mask[:1])
+        torch.testing.assert_close(out[1], x[1], atol=0.0, rtol=0.0)
+        torch.testing.assert_close(out[0], alone[0])
+        assert not torch.allclose(out[0], x[0])
+
+    def test_a_skipped_row_keeps_the_parameters_in_the_graph(self):
+        """Zero gradients, not none: FSDP2's reduce-scatter still runs on a rank of text."""
+        block = self._trained_block()
+        x = torch.randn(1, 6, 32, device=DEVICE, requires_grad=True)
+        img = torch.randn(1, 8, 32, device=DEVICE)
+        out = block(x, img, torch.zeros(1, 8, dtype=torch.bool, device=DEVICE))
+        out.sum().backward()
+        for name, p in block.named_parameters():
+            assert p.grad is not None, name
+            assert torch.count_nonzero(p.grad) == 0, name
+        torch.testing.assert_close(x.grad, torch.ones_like(x))
+
     def test_block_frozen_no_grad(self):
         """With all block params requires_grad=False, backward populates
         no grads on block params."""

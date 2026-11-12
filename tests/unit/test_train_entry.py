@@ -2999,10 +2999,6 @@ class TestVlmSourceBuilders:
         monkeypatch.setattr(FakeDataset, "has_text_only_rows", True)
         dp.build_data_pipeline(self._vlm_data_config(), _runtime())
         assert seen["image_collator"]["frame_mask"] is True
-        config = self._vlm_data_config()
-        config.vlm.arch = "cross_attention"
-        with pytest.raises(ValueError, match="not supported with vlm.arch='cross_attention'"):
-            dp.build_data_pipeline(config, _runtime())
 
     def test_packed_image_path_takes_the_model_token_count(self, monkeypatch):
         import kempnerforge.data.vlm_dataset as vlmd

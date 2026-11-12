@@ -698,6 +698,45 @@ class TestTextOnlyPrefixRows:
         assert torch.isfinite(blank).all()
 
 
+class TestTextOnlyCrossAttentionRows:
+    """On ``cross_attention`` a text-only row skips the cross-attention blocks."""
+
+    def test_a_text_only_row_runs_through_the_backbone_alone(self):
+        import copy
+
+        torch.manual_seed(0)
+        mc, vc, ac, _ = _tiny_configs(num_image_tokens=8)
+        lc = CrossAttentionConfig(max_text_len=12, cross_attention_every_n_layers=1)
+        wrapper = build_vlm_wrapper(mc, vc, ac, lc).eval()
+        backbone_only = copy.deepcopy(wrapper)
+        with torch.no_grad():
+            for trained, identity in zip(
+                wrapper.transformer.cross_attention_layers.values(),
+                backbone_only.transformer.cross_attention_layers.values(),
+                strict=True,
+            ):
+                trained.attn.o_proj.weight.normal_(std=0.2)
+                trained.mlp.down_proj.weight.normal_(std=0.2)
+                identity.attn.o_proj.weight.zero_()
+                identity.mlp.down_proj.weight.zero_()
+        image = {
+            "pixel_values": torch.randn(3, 16, 16),
+            "input_ids": torch.arange(1, 13),
+            "labels": torch.arange(2, 14),
+        }
+        text_only = {**image, "pixel_values": torch.zeros(0, 3, 16, 16)}
+        batch = VLMCollator(pad_id=0, max_text_len=12, frame_mask=True)([image, text_only])
+        with torch.no_grad():
+            logits, _ = wrapper(
+                batch["pixel_values"], batch["input_ids"], frame_mask=batch["frame_mask"]
+            )
+            plain, _ = backbone_only(
+                batch["pixel_values"], batch["input_ids"], frame_mask=batch["frame_mask"]
+            )
+        torch.testing.assert_close(logits[1], plain[1])
+        assert not torch.allclose(logits[0], plain[0])
+
+
 class TestPackedTokensPerImage:
     def test_reads_the_adapter_output_off_the_wrapper(self):
         wrapper = _build_tiny_wrapper(num_image_tokens=8)

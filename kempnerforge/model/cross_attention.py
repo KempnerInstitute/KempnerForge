@@ -107,6 +107,10 @@ class CrossAttentionBlock(nn.Module):
     Mirrors ``TransformerBlock``'s outer shape so the freeze + FSDP +
     DCP plumbing applies uniformly. The MLP's output projection is also
     zero-initialized so the whole block is identity at construction.
+
+    A row whose ``image_mask`` is all ``False``, a text-only document, skips
+    the block: both residual updates are scaled by ``0`` for that row, so it
+    leaves as it came while the block's parameters stay in the graph.
     """
 
     def __init__(
@@ -136,6 +140,8 @@ class CrossAttentionBlock(nn.Module):
         image_features: torch.Tensor,
         image_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), image_features, image_mask)
-        x = x + self.mlp(self.mlp_norm(x))
-        return x
+        keep = None if image_mask is None else image_mask.any(dim=1).to(x.dtype)[:, None, None]
+        attn = self.attn(self.attn_norm(x), image_features, image_mask)
+        x = x + (attn if keep is None else attn * keep)
+        mlp = self.mlp(self.mlp_norm(x))
+        return x + (mlp if keep is None else mlp * keep)
