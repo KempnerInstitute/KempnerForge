@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -36,27 +37,58 @@ COMMAND = (
 class FakeChild:
     def __init__(self, status: int | None = 0) -> None:
         self.status = status
+        self.timeouts: list[float | None] = []
 
     def poll(self) -> int | None:
         return self.status
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.timeouts.append(timeout)
+        if self.status is None:
+            raise subprocess.TimeoutExpired("evaluate", timeout or 0.0)
+        return self.status
+
+
+class ExitsWhenWaitedFor(FakeChild):
+    """A command that is still running until it is waited for, then exits with status 0."""
+
+    def __init__(self) -> None:
+        super().__init__(None)
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.timeouts.append(timeout)
+        self.status = 0
+        return 0
 
 
 class Launcher:
     """Stands in for ``subprocess.Popen`` and records every launch."""
 
-    def __init__(self, status: int | None = 0, error: OSError | None = None) -> None:
+    def __init__(
+        self,
+        status: int | None = 0,
+        error: Exception | None = None,
+        child: Callable[[list[str]], FakeChild] | None = None,
+    ) -> None:
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
+        self.attempts = 0
         self.status = status
         self.error = error
+        self.child = child
         self.children: list[FakeChild] = []
 
-    def __call__(self, argv: list[str], **options: Any) -> FakeChild:
+    def __call__(self, argv: list[str], **options: Any) -> Any:
+        self.attempts += 1
         if self.error is not None:
             raise self.error
         self.calls.append((argv, options))
-        child = FakeChild(self.status)
+        child = FakeChild(self.status) if self.child is None else self.child(argv)
         self.children.append(child)
         return child
+
+
+def launched_steps(popen: Launcher) -> list[str]:
+    return [Path(argv[3]).name for argv, _ in popen.calls]
 
 
 def make_settings(tmp_path: Path, command: str = COMMAND, **options: Any) -> PeriodicEvaluation:
@@ -247,8 +279,7 @@ def test_a_complete_save_is_launched_detached_without_the_distributed_environmen
     assert options["stderr"] == subprocess.STDOUT
     assert options["env"]["KEEP"] == "1"
     assert not {"WORLD_SIZE", "SLURM_NTASKS", "TORCHELASTIC_RUN_ID"} & set(options["env"])
-    record = json.loads((launcher.settings.step_output(5) / LAUNCHED_FILE).read_text())
-    assert record == {"argv": argv}
+    assert not (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
     assert (launcher.settings.step_output(5) / LAUNCH_LOG_FILE).exists()
 
 
@@ -343,7 +374,9 @@ def test_a_pruned_step_is_skipped_with_a_log_line(
 def test_a_resumed_run_launches_only_what_no_run_launched(tmp_path: Path, run: Path) -> None:
     first = Launcher()
     save_step(run, 5)
-    make_launcher(tmp_path, first).saved(5, run)
+    earlier = make_launcher(tmp_path, first)
+    earlier.saved(5, run)
+    earlier.check()
     save_step(run, 10)
     resumed = Launcher()
     again = make_launcher(tmp_path, resumed)
@@ -395,35 +428,160 @@ def test_the_scan_of_a_missing_checkpoint_directory_does_nothing(tmp_path: Path)
     assert popen.calls == []
 
 
-def test_a_failed_launch_is_a_warning_and_is_released(
-    tmp_path: Path, run: Path, messages: list[str]
+@pytest.mark.parametrize(
+    "error",
+    [
+        FileNotFoundError("no sbatch"),
+        ValueError("embedded null byte"),
+        subprocess.SubprocessError("cannot start"),
+        RuntimeError("anything else"),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+def test_a_command_that_cannot_start_leaves_no_record_and_is_tried_at_the_next_save(
+    tmp_path: Path, run: Path, messages: list[str], error: Exception
 ) -> None:
-    popen = Launcher(error=FileNotFoundError("no sbatch"))
+    popen = Launcher(error=error)
     launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
     launcher.saved(5, run)
-    assert "could not launch step 5" in text(messages)
+    launcher.check()
+    assert popen.attempts == 1
+    assert f"could not launch step 5: {type(error).__name__}: {error}" in text(messages)
+    assert "tried again at the next save" in text(messages)
     assert not (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
-    launcher.finish(None)
-    assert popen.calls == []
+    popen.error = None
+    save_step(run, 6)
+    launcher.saved(6, run)
+    assert launched_steps(popen) == ["step_5", "step_6"]
+    launcher.check()
+    assert (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
 
 
-def test_a_command_that_exits_non_zero_is_a_warning_and_is_not_started_again(
+def test_a_command_that_exits_non_zero_is_tried_at_the_next_saves_at_most_three_times(
     tmp_path: Path, run: Path, messages: list[str]
 ) -> None:
     popen = Launcher(status=3)
     launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
     launcher.saved(5, run)
+    launcher.check()
+    launcher.check()
+    assert popen.attempts == 1
+    log = launcher.settings.step_output(5) / LAUNCH_LOG_FILE
+    assert f"exited with status 3; its output is in {log}" in text(messages)
+    for step in (6, 7, 8):
+        save_step(run, step, complete=False)
+        launcher.saved(step, run)
+        launcher.check()
     launcher.finish(None)
-    assert "exited with status 3" in text(messages)
+    assert popen.attempts == periodic.LAUNCH_ATTEMPTS == 3
+    assert launched_steps(popen) == ["step_5"] * 3
+    assert not (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
+    assert text(messages).count("step 5 is tried again at the next save") == 2
+    assert "no attempt left in this run, step 5 is left to a later run" in text(messages)
+
+
+def test_a_failed_step_is_tried_again_at_the_end_of_training(tmp_path: Path, run: Path) -> None:
+    popen = Launcher(status=3)
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 5)
+    launcher.saved(5, run)
+    popen.status = 0
+    launcher.finish(None)
+    assert popen.attempts == 2
     assert (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
-    again = Launcher()
-    make_launcher(tmp_path, again).scan(run)
-    assert again.calls == []
 
 
-def test_a_running_command_is_never_waited_for(tmp_path: Path, run: Path) -> None:
+def test_a_launch_that_fails_at_the_end_of_training_is_left_to_a_later_run(
+    tmp_path: Path, run: Path, messages: list[str]
+) -> None:
+    popen = Launcher(error=OSError(errno.EAGAIN, "try again"))
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 5)
+    launcher.finish(run)
+    launcher.finish(run)
+    assert popen.attempts == 1
+    assert "tried again" not in text(messages)
+    assert "no attempt left in this run, step 5 is left to a later run" in text(messages)
+
+
+def test_a_launch_log_that_cannot_be_opened_is_tried_again_within_the_run(
+    tmp_path: Path, run: Path, messages: list[str]
+) -> None:
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 5)
+    log = launcher.settings.step_output(5) / LAUNCH_LOG_FILE
+    log.mkdir(parents=True)
+    launcher.saved(5, run)
+    assert popen.calls == [] and "could not launch step 5" in text(messages)
+    log.rmdir()
+    launcher.finish(None)
+    assert launched_steps(popen) == ["step_5"]
+    assert (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
+
+
+def test_a_command_that_exits_zero_is_recorded_with_its_checkpoint_and_arguments(
+    tmp_path: Path, run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replaced: list[tuple[Path, Path]] = []
+    original = os.replace
+
+    def replace(source: str | Path, target: str | Path) -> None:
+        json.loads(Path(source).read_text())
+        replaced.append((Path(source), Path(target)))
+        original(source, target)
+
+    popen = Launcher(status=None)
+    launcher = make_launcher(tmp_path, popen)
+    step_dir = save_step(run, 5)
+    monkeypatch.setattr(periodic.os, "replace", replace)
+    launcher.saved(5, run)
+    output = launcher.settings.step_output(5)
+    assert not (output / LAUNCHED_FILE).exists()
+    popen.children[0].status = 0
+    launcher.check()
+    argv, _ = popen.calls[0]
+    assert json.loads((output / LAUNCHED_FILE).read_text()) == {
+        "checkpoint": str(step_dir.resolve()),
+        "argv": argv,
+    }
+    ((source, target),) = replaced
+    assert source.parent == output and source.name != LAUNCHED_FILE
+    assert target == output / LAUNCHED_FILE
+    assert sorted(path.name for path in output.iterdir()) == [LAUNCH_LOG_FILE, LAUNCHED_FILE]
+
+
+def test_a_launch_that_cannot_be_recorded_is_a_warning_and_a_later_run_launches_it_again(
+    tmp_path: Path, run: Path, messages: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(source: str | Path, target: str | Path) -> None:
+        raise OSError(errno.ENOSPC, "no space left on device")
+
+    popen = Launcher()
+    launcher = make_launcher(tmp_path, popen)
+    save_step(run, 5)
+    original = os.replace
+    monkeypatch.setattr(periodic.os, "replace", refuse)
+    launcher.saved(5, run)
+    launcher.check()
+    monkeypatch.setattr(periodic.os, "replace", original)
+    record = launcher.settings.step_output(5) / LAUNCHED_FILE
+    assert not record.exists()
+    assert f"could not record the launch of step 5 in {record}" in text(messages)
+    assert "a later run may launch the step again" in text(messages)
+    launcher.saved(5, run)
+    launcher.finish(run)
+    assert len(popen.calls) == 1
+    later = Launcher()
+    make_launcher(tmp_path, later).scan(run)
+    assert len(later.calls) == 1
+
+
+def test_a_running_command_is_never_waited_for_while_training_goes_on(
+    tmp_path: Path, run: Path
+) -> None:
     popen = Launcher(status=None)
     launcher = make_launcher(tmp_path, popen)
     save_step(run, 5)
@@ -431,25 +589,8 @@ def test_a_running_command_is_never_waited_for(tmp_path: Path, run: Path) -> Non
     launcher.check()
     launcher.finish(None)
     assert launcher.waiting
-    assert (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
-
-
-def test_a_claim_is_won_by_one_process_only(tmp_path: Path) -> None:
-    output = tmp_path / "step_1"
-    assert periodic._claim(output, ["a", "b"]) is True
-    assert periodic._claim(output, ["c"]) is False
-    assert json.loads((output / LAUNCHED_FILE).read_text()) == {"argv": ["a", "b"]}
-
-
-def test_a_step_claimed_between_the_check_and_the_launch_is_not_launched(
-    tmp_path: Path, run: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    popen = Launcher()
-    launcher = make_launcher(tmp_path, popen)
-    save_step(run, 5)
-    monkeypatch.setattr(periodic, "_claim", lambda output, argv: False)
-    launcher.saved(5, run)
-    assert popen.calls == []
+    assert popen.children[0].timeouts == []
+    assert not (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
 
 
 def test_the_default_launch_starts_the_command_and_logs_its_output(
@@ -476,10 +617,15 @@ def test_the_default_launch_starts_the_command_and_logs_its_output(
 
 
 class RecordingLauncher:
-    """Stands in for ``EvaluationLauncher`` and records what the worker thread asks of it."""
+    """Stands in for ``EvaluationLauncher`` and records what the worker thread asks of it.
+
+    ``waited`` records each end-of-training wait: its deadline, the thread that waited and
+    whether the worker's last look had returned by then.
+    """
 
     def __init__(self, fail_on: str | None = None) -> None:
         self.calls: list[tuple[str, Any]] = []
+        self.waited: list[tuple[float, int, bool]] = []
         self.waiting = False
         self.fail_on = fail_on
         self.finished = threading.Event()
@@ -501,6 +647,11 @@ class RecordingLauncher:
     def finish(self, directory: str | None) -> None:
         self._record("finish", directory)
         self.finished.set()
+
+    def wait(self, deadline: float) -> None:
+        self.waited.append((deadline, threading.get_ident(), self.finished.is_set()))
+        if self.fail_on == "wait":
+            raise RuntimeError("boom")
 
 
 def make_hook(
@@ -525,7 +676,9 @@ def test_the_hook_hands_a_run_to_its_worker_in_order(
     runner.on_train_begin(config_for(run))
     for step in (2, 4):
         runner.on_checkpoint_save(step, str(run))
+    before = time.monotonic()
     runner.on_train_end(4, 0)
+    after = time.monotonic()
     assert recorder.calls == [
         ("scan", (str(run), frozenset())),
         ("saved", (2, str(run))),
@@ -533,6 +686,10 @@ def test_the_hook_hands_a_run_to_its_worker_in_order(
         ("finish", str(run)),
     ]
     assert not hook._worker.is_alive()
+    ((deadline, thread, finished),) = recorder.waited
+    timeout = periodic.FINISH_TIMEOUT_SECONDS
+    assert before + timeout <= deadline <= after + timeout
+    assert thread == threading.get_ident() and finished
 
 
 def test_the_hook_does_not_touch_the_filesystem_on_the_training_thread(
@@ -602,12 +759,66 @@ def test_a_worker_that_does_not_finish_is_reported_and_not_waited_for(
         def finish(self, directory: str | None) -> None:
             release.wait(30)
 
-    hook = make_hook(tmp_path, Slow(), finish_timeout=0.05)
+    slow = Slow()
+    hook = make_hook(tmp_path, slow, finish_timeout=0.05)
     hook.on_train_begin(config_for(run))
     hook.on_train_end(1, 0)
     assert "did not finish its last check" in text(messages)
+    assert slow.waited == []
     release.set()
     hook._worker.join(30)
+
+
+def test_an_error_reading_the_exit_statuses_at_the_end_is_a_warning(
+    tmp_path: Path, run: Path, rank_zero: None, messages: list[str]
+) -> None:
+    recorder = RecordingLauncher(fail_on="wait")
+    hook = make_hook(tmp_path, recorder)
+    hook.on_train_begin(config_for(run))
+    hook.on_train_end(1, 0)
+    assert len(recorder.waited) == 1
+    assert "could not read the exit status" in text(messages)
+    assert "RuntimeError: boom" in text(messages)
+
+
+def test_the_end_of_training_records_a_command_that_exits_in_time_and_warns_of_a_running_one(
+    tmp_path: Path, run: Path, rank_zero: None, messages: list[str]
+) -> None:
+    children = {"step_5": ExitsWhenWaitedFor(), "step_6": FakeChild(None)}
+    popen = Launcher(child=lambda argv: children[Path(argv[3]).name])
+    launcher = make_launcher(tmp_path, popen)
+    hook = PeriodicEvaluationHook(launcher.settings, launcher=launcher, finish_timeout=30)
+    save_step(run, 5)
+    save_step(run, 6)
+    hook.on_train_begin(config_for(run))
+    hook.on_train_end(6, 0)
+    assert sorted(launched_steps(popen)) == ["step_5", "step_6"]
+    assert (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
+    assert not (launcher.settings.step_output(6) / LAUNCHED_FILE).exists()
+    results = launcher.settings.step_output(6) / "results.json"
+    assert "command for step 6 is still running at the end of training" in text(messages)
+    assert f"launches step 6 again unless {results} exists by then" in text(messages)
+    timeouts = children["step_5"].timeouts + children["step_6"].timeouts
+    assert len(timeouts) == 2
+    assert all(timeout is not None and 0 <= timeout <= 30 for timeout in timeouts)
+
+
+def test_the_end_of_training_waits_for_a_real_command_and_records_it(
+    tmp_path: Path, run: Path, rank_zero: None
+) -> None:
+    script = tmp_path / "submit.py"
+    script.write_text("import sys\nprint('queued', sys.argv[1])\n")
+    settings = make_settings(
+        tmp_path, command=f"{sys.executable} {script} {{checkpoint}} {{output}}"
+    )
+    hook = PeriodicEvaluationHook(settings, finish_timeout=60)
+    step_dir = save_step(run, 5)
+    hook.on_train_begin(config_for(run))
+    hook.on_train_end(5, 0)
+    record = json.loads((settings.step_output(5) / LAUNCHED_FILE).read_text())
+    assert record["checkpoint"] == str(step_dir.resolve())
+    log = (settings.step_output(5) / LAUNCH_LOG_FILE).read_text()
+    assert log.strip() == f"queued {step_dir.resolve()}"
 
 
 def test_the_other_ranks_start_nothing(
@@ -655,7 +866,7 @@ class ClosingFails:
         raise OSError(5, "input/output error")
 
 
-def test_a_log_that_fails_to_close_after_the_launch_keeps_the_step_launched(
+def test_a_log_that_fails_to_close_after_the_launch_leaves_the_step_running(
     tmp_path: Path, run: Path, messages: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     popen = Launcher(status=None)
@@ -663,33 +874,16 @@ def test_a_log_that_fails_to_close_after_the_launch_keeps_the_step_launched(
     save_step(run, 5)
     monkeypatch.setattr(periodic, "open", ClosingFails, raising=False)
     launcher.saved(5, run)
+    monkeypatch.delattr(periodic, "open")
     assert len(popen.calls) == 1
-    assert (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
+    assert "could not close the launch log of step 5" in text(messages)
     assert launcher.waiting
-    monkeypatch.undo()
-    again = Launcher()
-    make_launcher(tmp_path, again).scan(run)
-    assert again.calls == []
-
-
-def test_a_record_that_cannot_be_written_leaves_the_step_launchable(
-    tmp_path: Path, run: Path, messages: list[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def refuse(*args: Any, **kwargs: Any) -> None:
-        raise OSError(28, "no space left on device")
-
-    popen = Launcher()
-    launcher = make_launcher(tmp_path, popen)
-    save_step(run, 5)
-    monkeypatch.setattr(periodic.json, "dump", refuse)
     launcher.saved(5, run)
-    monkeypatch.undo()
-    assert popen.calls == []
-    assert not (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
-    assert "could not launch step 5" in text(messages)
-    later = Launcher()
-    make_launcher(tmp_path, later).scan(run)
-    assert len(later.calls) == 1
+    launcher.check()
+    assert len(popen.calls) == 1
+    popen.children[0].status = 0
+    launcher.check()
+    assert (launcher.settings.step_output(5) / LAUNCHED_FILE).exists()
 
 
 def test_the_scan_logs_each_incomplete_step_it_drops(

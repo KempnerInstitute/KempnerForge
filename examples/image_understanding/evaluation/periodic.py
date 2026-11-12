@@ -3,9 +3,11 @@
 ``PeriodicEvaluation`` holds the settings the training entry point reads from its
 command line and checks them before anything is built. ``PeriodicEvaluationHook``
 is a ``TrainingHook`` that, on rank 0 only, starts the user's command for every
-saved step whose checkpoint is complete on disk, and never waits for it: the
-command is started detached, so a scheduler's submit command returns at once and a
-local script outlives the training process.
+saved step whose checkpoint is complete on disk, and never waits for it while the
+run trains: the command is started detached, so a scheduler's submit command returns
+at once and a local script outlives the training process. When training ends, the
+hook waits a bounded time for the commands still running, to record the ones that
+succeeded.
 
 The command is a template whose placeholders are ``{config}``, ``{tasks}``,
 ``{checkpoint}`` (the step directory), ``{step}`` and ``{output}`` (that step's
@@ -16,6 +18,7 @@ placeholders are filled in afterwards, so a path with a space stays one argument
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import queue
@@ -25,10 +28,11 @@ import string
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable, Collection, Mapping, Sequence
+import time
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any
 
 import torch.distributed as dist
 
@@ -46,6 +50,7 @@ OVERRIDES_PLACEHOLDER = "{overrides}"
 REQUIRED_PLACEHOLDERS = ("checkpoint", "output")
 LAUNCHED_FILE = "launched.json"
 LAUNCH_LOG_FILE = "launch.log"
+LAUNCH_ATTEMPTS = 3
 POLL_INTERVAL_SECONDS = 10.0
 FINISH_TIMEOUT_SECONDS = 60.0
 
@@ -183,29 +188,6 @@ def _check_command(command: str) -> None:
         raise ValueError(f"the evaluation command's program {tokens[0]!r} was not found")
 
 
-def _claim(output: Path, argv: Sequence[str]) -> bool:
-    """Record that a launch of ``argv`` is under way; False when one was recorded before.
-
-    The record is created exclusively, so of several processes claiming a step, one wins.
-    A record that cannot be written is removed again, so the step stays launchable.
-
-    Raises:
-        OSError: the record could not be created or written.
-    """
-    output.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(output / LAUNCHED_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        return False
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"argv": list(argv)}, f)
-    except Exception:
-        (output / LAUNCHED_FILE).unlink(missing_ok=True)
-        raise
-    return True
-
-
 def _steps_the_run_may_save_again(config: JobConfig) -> frozenset[int]:
     """The steps the run may save over a directory that already exists: step 0 or none.
 
@@ -238,16 +220,31 @@ def child_environment(environ: Mapping[str, str]) -> dict[str, str]:
     }
 
 
+@dataclass(frozen=True)
+class _Launch:
+    """A command started for the checkpoint ``step_dir`` that has not been seen to exit."""
+
+    child: subprocess.Popen
+    step_dir: Path
+    argv: list[str]
+
+
 class EvaluationLauncher:
     """Decides which saved steps to start and starts them; every call is synchronous.
 
-    A saved step is pending until its directory is complete, then it is launched. A step
-    whose directory is gone (pruned) or never completed is skipped with a log line. A
-    step with a ``results.json`` or a ``launched.json`` in its output directory is not
-    launched again, so a resumed run starts only what no run started before. A launch
-    that fails is a warning and releases its ``launched.json``; a command that exits with
-    a non-zero status is a warning that keeps it, so a step is started at most once and
-    retrying one is deleting its ``launched.json``. Nothing here raises.
+    A saved step is pending until its directory is complete, then it is started unless its
+    output directory holds a ``results.json`` or a ``launched.json``, so a resumed run
+    starts only what no run recorded. A step whose directory is gone (pruned) or never
+    completed is skipped with a log line. Which steps are running and which are done is
+    kept in memory, so a run never starts a step twice at once.
+
+    A launched command's exit status is read when the launcher checks, without waiting,
+    and by ``wait`` at the end of training. Status 0 writes ``launched.json`` (for
+    ``sbatch``, the job was queued). A command that cannot be started or that exits
+    non-zero is a warning that leaves no record, and its step is tried again at the next
+    save and at ``finish``, at most ``LAUNCH_ATTEMPTS`` times in one run; after the last
+    try it is left to a later run, which tries it again since nothing records it. Nothing
+    here raises.
 
     A step the run may save again over a directory that already exists (step 0 of a
     dynamic checkpoint window, on a run that resumes from it) is deferred: its directory
@@ -264,31 +261,36 @@ class EvaluationLauncher:
         self.settings = settings
         self._launch = launch
         self._pending: dict[int, Path] = {}
-        self._handled: set[int] = set()
-        self._children: list[tuple[int, subprocess.Popen, Path]] = []
         self._deferred: dict[int, Path] = {}
+        self._failed: dict[int, Path] = {}
+        self._attempts: dict[int, int] = {}
+        self._running: dict[int, _Launch] = {}
+        self._done: set[int] = set()
+        self._finished = False
 
     @property
     def waiting(self) -> bool:
         """Whether a step is pending or a launched command has not been seen to exit.
 
-        A deferred step does not count: a later save or ``finish`` releases it, not polling.
+        A deferred step does not count, nor does a failed one: a later save or ``finish``
+        takes them up, not polling.
         """
-        return bool(self._pending or self._children)
+        return bool(self._pending or self._running)
 
     def saved(self, step: int, checkpoint_dir: str | Path) -> None:
         """Note that step ``step`` was saved under ``checkpoint_dir`` and start it if complete.
 
-        A deferred step is left as it is, since its save may still be writing. Any other
-        step first releases every deferred one: the checkpoint manager finishes the previous
-        save and writes ``train_state.pt`` and ``metadata.json`` inside ``save()`` before the
-        next one starts, so once a later step is announced every earlier directory is whole.
+        The steps whose launch failed are tried again. A deferred step is left as it is,
+        since its save may still be writing. Any other step first releases every deferred
+        one: the checkpoint manager finishes the previous save and writes ``train_state.pt``
+        and ``metadata.json`` inside ``save()`` before the next one starts, so once a later
+        step is announced every earlier directory is whole.
         """
-        if step in self._deferred:
-            return
-        self._pending.update(self._deferred)
-        self._deferred.clear()
-        self._pending[step] = Path(checkpoint_dir).resolve() / f"{_STEP_PREFIX}{step}"
+        self._retry()
+        if step not in self._deferred:
+            self._pending.update(self._deferred)
+            self._deferred.clear()
+            self._pending[step] = Path(checkpoint_dir).resolve() / f"{_STEP_PREFIX}{step}"
         self.check()
 
     def scan(self, checkpoint_dir: str | Path, rewritten: Collection[int] = ()) -> None:
@@ -315,7 +317,11 @@ class EvaluationLauncher:
         self.check()
 
     def check(self) -> None:
-        """Start the pending steps that are complete and skip the ones that are gone."""
+        """Start the pending steps that are complete and skip the ones that are gone.
+
+        The exit status of every launched command is read first, without waiting. A step
+        whose command failed is not tried again here, only at a save or at ``finish``.
+        """
         self._reap()
         for step in sorted(self._pending):
             step_dir = self._pending[step]
@@ -333,9 +339,13 @@ class EvaluationLauncher:
     def finish(self, checkpoint_dir: str | Path | None) -> None:
         """Take a last look when training ends: a save that has drained, an emergency save.
 
-        Every deferred step is released first, so the look takes it up. What is still
-        incomplete after it never will be, and is skipped with a log line.
+        The steps whose launch failed are tried again and every deferred step is released
+        first, so the look takes them up. What is still incomplete after it never will be,
+        and is skipped with a log line. A launch that fails from here on is left to a later
+        run.
         """
+        self._retry()
+        self._finished = True
         self._pending.update(self._deferred)
         self._deferred.clear()
         if checkpoint_dir is not None:
@@ -349,80 +359,123 @@ class EvaluationLauncher:
         self._pending.clear()
         self._reap()
 
+    def wait(self, deadline: float) -> None:
+        """Wait until ``deadline``, a ``time.monotonic()`` value, for the commands still running.
+
+        Meant for the end of training, after ``finish``. The exit statuses are then read as
+        ``check`` reads them. A command still running is a warning that its launch is not
+        recorded, so a later run launches its step again unless a ``results.json`` exists by
+        then.
+        """
+        for launch in self._running.values():
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                launch.child.wait(timeout=max(0.0, deadline - time.monotonic()))
+        self._reap()
+        for step in sorted(self._running):
+            results = self.settings.step_output(step) / RESULTS_FILE
+            logger.warning(
+                f"Periodic evaluation command for step {step} is still running at the end of "
+                f"training, so its launch is not recorded: a later run launches step {step} "
+                f"again unless {results} exists by then"
+            )
+
+    def _retry(self) -> None:
+        self._reap()
+        self._pending.update(self._failed)
+        self._failed.clear()
+
     def _start(self, step: int, step_dir: Path) -> None:
-        if step in self._handled:
+        if step in self._running or step in self._done:
             return
-        self._handled.add(step)
         output = self.settings.step_output(step)
         if (output / RESULTS_FILE).exists() or (output / LAUNCHED_FILE).exists():
             logger.info(f"Periodic evaluation skips step {step}: already started or finished")
+            self._done.add(step)
             return
         argv = self.settings.argv(step_dir, step)
-        log_path = output / LAUNCH_LOG_FILE
-        child = self._spawn(step, argv, output, log_path)
-        if child is None:
-            return
-        self._children.append((step, child, log_path))
-        logger.info(f"Periodic evaluation launched step {step}: {shlex.join(argv)}")
+        self._attempts[step] = self._attempts.get(step, 0) + 1
+        child = self._spawn(step, step_dir, argv, output)
+        if child is not None:
+            self._running[step] = _Launch(child, step_dir, argv)
+            logger.info(f"Periodic evaluation launched step {step}: {shlex.join(argv)}")
 
     def _spawn(
-        self, step: int, argv: list[str], output: Path, log_path: Path
+        self, step: int, step_dir: Path, argv: list[str], output: Path
     ) -> subprocess.Popen | None:
-        """Claim the step and start its command; None when nothing was started.
+        """Start the command of step ``step``; None, once the failure is handled, if it did not.
 
-        Once the command has started the step stays claimed whatever happens after, such as
-        an error on closing the launch log.
+        Once the command has started, an error such as one on closing the launch log is a
+        warning only: the step is running.
         """
         child = None
         try:
             output.mkdir(parents=True, exist_ok=True)
-            with open(log_path, "ab") as log:
-                child = self._run(step, argv, output, log)
-        except OSError as exc:
+            with open(output / LAUNCH_LOG_FILE, "ab") as log:
+                child = self._launch(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    env=child_environment(os.environ),
+                    start_new_session=True,
+                )
+        except Exception as exc:
             if child is None:
-                logger.warning(f"Periodic evaluation could not launch step {step}: {exc}")
+                self._fail(
+                    step,
+                    step_dir,
+                    f"Periodic evaluation could not launch step {step}: "
+                    f"{type(exc).__name__}: {exc}",
+                )
             else:
                 logger.warning(
                     f"Periodic evaluation could not close the launch log of step {step}: {exc}"
                 )
         return child
 
-    def _run(
-        self, step: int, argv: list[str], output: Path, log: BinaryIO
-    ) -> subprocess.Popen | None:
-        claimed = False
-        try:
-            claimed = _claim(output, argv)
-            if not claimed:
-                logger.info(f"Periodic evaluation skips step {step}: already started")
-                return None
-            return self._launch(
-                argv,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                env=child_environment(os.environ),
-                start_new_session=True,
-            )
-        except OSError as exc:
-            if claimed:
-                (output / LAUNCHED_FILE).unlink(missing_ok=True)
-            logger.warning(f"Periodic evaluation could not launch step {step}: {exc}")
-            return None
-
     def _reap(self) -> None:
-        running = []
-        for step, child, log_path in self._children:
-            status = child.poll()
+        for step, launch in list(self._running.items()):
+            status = launch.child.poll()
             if status is None:
-                running.append((step, child, log_path))
-            elif status != 0:
-                logger.warning(
+                continue
+            del self._running[step]
+            if status == 0:
+                self._done.add(step)
+                self._write_record(step, launch)
+            else:
+                log_path = self.settings.step_output(step) / LAUNCH_LOG_FILE
+                self._fail(
+                    step,
+                    launch.step_dir,
                     f"Periodic evaluation command for step {step} exited with status "
-                    f"{status}; its output is in {log_path}. The step is not started again "
-                    f"unless {self.settings.step_output(step) / LAUNCHED_FILE} is deleted"
+                    f"{status}; its output is in {log_path}",
                 )
-        self._children = running
+
+    def _fail(self, step: int, step_dir: Path, reason: str) -> None:
+        if self._attempts[step] < LAUNCH_ATTEMPTS and not self._finished:
+            self._failed[step] = step_dir
+            logger.warning(
+                f"{reason}; step {step} is tried again at the next save or at the end of training"
+            )
+            return
+        self._done.add(step)
+        logger.warning(
+            f"{reason}; with no attempt left in this run, step {step} is left to a later run, "
+            "which tries it again since nothing records its launch"
+        )
+
+    def _write_record(self, step: int, launch: _Launch) -> None:
+        record = self.settings.step_output(step) / LAUNCHED_FILE
+        partial = record.with_name(f"{LAUNCHED_FILE}.partial")
+        content = {"checkpoint": str(launch.step_dir), "argv": launch.argv}
+        try:
+            partial.write_text(json.dumps(content), encoding="utf-8")
+            os.replace(partial, record)
+        except OSError as exc:
+            logger.warning(
+                f"Periodic evaluation could not record the launch of step {step} in {record}: "
+                f"{exc}; a later run may launch the step again"
+            )
 
 
 class PeriodicEvaluationHook(TrainingHook):
@@ -430,12 +483,16 @@ class PeriodicEvaluationHook(TrainingHook):
 
     The training thread only puts a message on a queue, so nothing it does on the step path
     touches the filesystem or a scheduler: the worker checks whether a step is complete (every
-    ``poll_interval`` seconds while one is pending, and when one is saved), claims and
-    launches it, and reads the exit status of what it launched. Training ending asks the
-    worker for a last look, after the loop has drained a pending asynchronous save, and
-    waits for it at most ``finish_timeout`` seconds. A step saved outside the loop's
-    hook, as by the shutdown handler, is found by that look and by the scan at the
-    start of the next run. An error on the worker is a warning, never raised into training.
+    ``poll_interval`` seconds while one is pending or a launched command has not been seen
+    to exit, and when one is saved), launches it, and reads the exit status of what it
+    launched. Training ending asks the worker for a last look, after the loop has drained a
+    pending asynchronous save, and waits for it at most ``finish_timeout`` seconds. Once the
+    worker has returned, the training thread waits for the commands still running until
+    that same deadline, ``finish_timeout`` seconds after training ended, and reads their
+    exit statuses; it never touches the launcher while the worker is alive. A step saved
+    outside the loop's hook, as by the shutdown handler, is found by that look and by the
+    scan at the start of the next run. An error on the worker or in that wait is a warning,
+    never raised into training.
 
     At train begin the hook looks once, on the training thread and before the loop can
     save, whether step 0 is a dynamic checkpoint milestone whose directory already exists;
@@ -487,12 +544,22 @@ class PeriodicEvaluationHook(TrainingHook):
     def on_train_end(self, step: int, tokens_seen: int) -> None:
         if self._worker is None:
             return
+        deadline = time.monotonic() + self._finish_timeout
         self._messages.put(("finish", self._checkpoint_dir))
         self._worker.join(self._finish_timeout)
         if self._worker.is_alive():
             logger.warning(
                 f"Periodic evaluation did not finish its last check within "
-                f"{self._finish_timeout:g} s; steps still pending are left to the next run"
+                f"{self._finish_timeout:g} s; steps still pending, and launches whose exit "
+                "was not read, are left to the next run"
+            )
+            return
+        try:
+            self._launcher.wait(deadline)
+        except Exception as exc:
+            logger.warning(
+                f"Periodic evaluation could not read the exit status of what it launched: "
+                f"{type(exc).__name__}: {exc}"
             )
 
     def _work(self) -> None:
