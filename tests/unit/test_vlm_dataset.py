@@ -1252,7 +1252,6 @@ class TestPackVLMSamples:
             seq_len=12,
             tokens_per_image=2,
             pad_id=0,
-            allow_text_only=True,
         )
         assert batch["input_ids"][0].tolist() == [10, 11, 12, 0, 0, 20, 21, 22, 23, 0, 0, 0]
         assert batch["doc_ids"][0].tolist() == [0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1266,7 +1265,6 @@ class TestPackVLMSamples:
             seq_len=8,
             tokens_per_image=2,
             pad_id=0,
-            allow_text_only=True,
         )
         assert batch["pixel_values"].shape == (0, 3, 4, 4)
         assert batch["image_rows"].shape == (0,)
@@ -1305,14 +1303,9 @@ class TestPackVLMSamples:
         with pytest.raises(ValueError, match=f"text_len \\({text_len}\\) must lie within"):
             pack_vlm_samples([doc], seq_len=64, tokens_per_image=2, pad_id=0)
 
-    def test_a_text_only_document_needs_the_flag(self):
+    def test_the_collator_packs_text_only_documents_of_either_image_shape(self):
         doc = _doc(3, 10, views=0)
-        with pytest.raises(ValueError, match="hf_allow_text_only"):
-            pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)
-        collator = PackedVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2)
-        with pytest.raises(ValueError, match="hf_allow_text_only"):
-            collator([doc])
-        packed = PackedVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2, allow_text_only=True)
+        packed = PackedVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2)
         assert packed([doc])["pixel_values"].shape == (0, 3, 4, 4)
         doc["pixel_values"] = torch.zeros(0, 2, 3, 4, 4)
         assert packed([doc])["pixel_values"].shape == (0, 3, 4, 4)

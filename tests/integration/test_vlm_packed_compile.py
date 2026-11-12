@@ -210,7 +210,6 @@ def test_a_compiled_text_only_batch_keeps_the_visual_parameters_in_the_graph() -
             seq_len=_SEQ_LEN,
             tokens_per_image=_IMAGE_TOKENS,
             pad_id=0,
-            allow_text_only=True,
         )
         assert batch["pixel_values"].shape[0] == 0
         batch = {name: tensor.to("cuda") for name, tensor in batch.items()}

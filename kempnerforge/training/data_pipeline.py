@@ -158,7 +158,6 @@ def _build_vlm_pipeline(
                 pad_id=pad_id,
                 seq_len=tc.seq_len,
                 tokens_per_image=tokens_per_image,
-                allow_text_only=dataset.has_text_only_rows,
             )
             logger.info(
                 f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "

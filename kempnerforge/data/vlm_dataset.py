@@ -689,7 +689,6 @@ def pack_vlm_samples(
     seq_len: int,
     tokens_per_image: int,
     pad_id: int,
-    allow_text_only: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Pack image-text samples into rows of ``seq_len``, each document's image before its text.
 
@@ -721,8 +720,8 @@ def pack_vlm_samples(
 
     Raises:
         ValueError: ``samples`` is empty, a sample lacks ``text_len``, a document
-            has no image while ``allow_text_only`` is off or a footprint over
-            ``seq_len``, or ``seq_len`` or ``tokens_per_image`` is not positive.
+            has a footprint over ``seq_len``, or ``seq_len`` or
+            ``tokens_per_image`` is not positive.
     """
     if seq_len <= 0 or tokens_per_image <= 0:
         raise ValueError("seq_len and tokens_per_image must be positive")
@@ -742,11 +741,6 @@ def pack_vlm_samples(
             views = views.unsqueeze(0)
         elif views.shape[0] == 0:
             views = views.reshape(0, *views.shape[-3:])
-        if views.shape[0] == 0 and not allow_text_only:
-            raise ValueError(
-                "pack_vlm_samples got a text-only document; set data.hf_allow_text_only = true "
-                "to train on text-only rows"
-            )
         image_shape, image_dtype = tuple(views.shape[1:]), views.dtype
         n_ids = sample["input_ids"].shape[0]
         if "text_len" not in sample:
@@ -819,16 +813,13 @@ class PackedVLMCollator:
     The number of rows follows the documents' footprints, so it varies from
     batch to batch; ``train.batch_size`` is the number of documents per
     micro-batch, not the number of rows. A text-only document packs as its
-    text alone with ``allow_text_only``, and is rejected without it.
+    text alone.
     """
 
-    def __init__(
-        self, pad_id: int, seq_len: int, tokens_per_image: int, allow_text_only: bool = False
-    ) -> None:
+    def __init__(self, pad_id: int, seq_len: int, tokens_per_image: int) -> None:
         self.pad_id = pad_id
         self.seq_len = seq_len
         self.tokens_per_image = tokens_per_image
-        self.allow_text_only = allow_text_only
 
     def __call__(self, samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         return pack_vlm_samples(
@@ -836,5 +827,4 @@ class PackedVLMCollator:
             seq_len=self.seq_len,
             tokens_per_image=self.tokens_per_image,
             pad_id=self.pad_id,
-            allow_text_only=self.allow_text_only,
         )
