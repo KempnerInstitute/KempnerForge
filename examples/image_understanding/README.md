@@ -351,8 +351,10 @@ time. That is safe: an evaluation removes the files of the last one when it star
 and writes each file whole, so two evaluations of a checkpoint that overlap leave
 whole files from one or the other.
 
-When training begins, the hook finds the step the run resumed from, as the run
-found it. The run may save a step above it again, over that step's directory: with
+When training begins, the hook reads the step the run resumed from in the checkpoint
+directory's `latest` link, which is where a run resumes whenever the link names a
+directory; without one, every step directory on disk counts as above it. The run may
+save a step above it again, over that step's directory: with
 asynchronous checkpointing, a crash after a save completed but before `latest` moved
 to it leaves such a step, and on a fresh start every step directory on disk is one.
 Each such step is deferred: it is evaluated once a later step has been saved, or at

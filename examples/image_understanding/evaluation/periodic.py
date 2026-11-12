@@ -47,7 +47,6 @@ from evaluation.evaluator import RESULTS_FILE
 from evaluation.tasks import load_tasks
 from kempnerforge.config.job import JobConfig
 from kempnerforge.metrics.logger import get_logger
-from kempnerforge.resilience.elastic import resolve_resume_path
 from kempnerforge.training.hooks import HookRunner, TrainingHook
 
 logger = get_logger(__name__)
@@ -82,6 +81,7 @@ _DISTRIBUTED_VARIABLES = frozenset(
 )
 _DISTRIBUTED_PREFIXES = ("TORCHELASTIC_",)
 _STEP_PREFIX = "step_"
+_LATEST_LINK = "latest"
 _RECORD_FILES = (RESULTS_FILE, LAUNCHED_FILE)
 
 
@@ -218,15 +218,17 @@ def _step_directories(checkpoint_dir: str | Path) -> list[tuple[int, Path]]:
 def _resume_of(config: JobConfig) -> tuple[int | None, bool]:
     """The step the run resumed from, and whether the run saves that step again.
 
-    The step is found as the run found it, with ``resolve_resume_path`` on
-    ``checkpoint.dir``. It is None for a fresh start, and when it cannot be told: the
-    look raised, or found a directory not named ``step_N``. The run saves it again when it
-    is step 0 and a dynamic checkpoint milestone, as the loop then saves step 0 before its
-    first step. Never raises.
+    The step is the one the ``latest`` link of ``checkpoint.dir`` names: a run resumes
+    from it whenever it names a directory, and only rank 0 moves it, inside a save the
+    other ranks wait for, so it holds still while rank 0 looks. It is None when it cannot
+    be told this way: no link, or one to a missing directory or to a directory not named
+    ``step_N``, or the look raised. The run saves the step again when it is step 0 and a
+    dynamic checkpoint milestone, as the loop then saves step 0 before its first step.
+    Never raises, and logs nothing.
     """
     try:
-        path = resolve_resume_path(config.checkpoint.dir)
-        step = None if path is None else _step_of(path.name)
+        latest = Path(config.checkpoint.dir) / _LATEST_LINK
+        step = _step_of(latest.resolve().name) if latest.exists() else None
         return step, step == 0 and config.checkpoint.is_dynamic_milestone(0)
     except Exception:
         return None, False
@@ -393,7 +395,8 @@ class EvaluationLauncher:
         """Take up the step directories already under ``checkpoint_dir`` when training begins.
 
         ``resumed_step`` is the step the run resumed from, None for a fresh start or when it
-        cannot be told. Every step directory above it, every one when it is None, is
+        cannot be told (see ``_resume_of``). Every step directory above it, every one when
+        it is None, is
         deferred, since the run may save that step again over it; so is ``resumed_step``
         itself when ``saves_resumed_step``, though a save of it holds the weights the run
         loaded, so its records still count. A deferred step is neither pending nor logged
@@ -638,10 +641,11 @@ class PeriodicEvaluationHook(TrainingHook):
     the first look of the next run. An error on the worker or in that wait is a warning,
     never raised into training.
 
-    At train begin the hook looks once, on the training thread and before the loop can
-    save, for the step the run resumed from, and whether the run saves that step again
-    (step 0 of a dynamic checkpoint window); the launcher defers the steps the run may save
-    again, so none is evaluated while it may be half rewritten. That look never raises.
+    At train begin the hook looks once, on the training thread, at the ``latest`` link of
+    the checkpoint directory for the step the run resumed from, and whether the run saves
+    that step again (step 0 of a dynamic checkpoint window); the launcher defers the steps
+    the run may save again, so none is evaluated while it may be half rewritten. That look
+    never raises and logs nothing.
     """
 
     def __init__(

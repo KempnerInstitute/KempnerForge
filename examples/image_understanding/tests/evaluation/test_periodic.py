@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -1159,18 +1160,53 @@ def test_the_hook_hands_the_worker_the_step_the_run_resumed_from(
     assert first_look(tmp_path, dynamic_config(run)) == ("begin", (str(run), 100, False))
 
 
-def test_the_hook_finds_the_resumed_step_without_a_latest_link(
+def test_without_a_latest_link_the_resumed_step_is_not_known(
     tmp_path: Path, run: Path, rank_zero: None
 ) -> None:
     save_step(run, 100)
     save_step(run, 200, complete=False)
-    assert first_look(tmp_path, config_for(run)) == ("begin", (str(run), 100, False))
+    assert first_look(tmp_path, config_for(run)) == ("begin", (str(run), None, False))
+
+
+def test_a_latest_link_to_a_missing_directory_leaves_the_resumed_step_unknown(
+    tmp_path: Path, run: Path, rank_zero: None
+) -> None:
+    save_step(run, 100)
+    (run / "latest").symlink_to("step_300")
+    assert first_look(tmp_path, config_for(run)) == ("begin", (str(run), None, False))
+
+
+class Collected(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+def test_the_first_look_logs_no_resume_lines_while_other_ranks_begin_to_save_step_zero(
+    tmp_path: Path, run: Path, rank_zero: None
+) -> None:
+    save_step(run, 0, complete=False)
+    collected = Collected()
+    core = logging.getLogger("kempnerforge")
+    level = core.level
+    core.addHandler(collected)
+    core.setLevel(logging.DEBUG)
+    try:
+        assert first_look(tmp_path, dynamic_config(run)) == ("begin", (str(run), None, False))
+    finally:
+        core.removeHandler(collected)
+        core.setLevel(level)
+    assert [message for message in collected.messages if "Auto-resume" in message] == []
 
 
 def test_the_hook_says_the_run_saves_step_zero_again_when_it_resumes_from_a_dynamic_milestone(
     tmp_path: Path, run: Path, rank_zero: None
 ) -> None:
     save_step(run, 0)
+    (run / "latest").symlink_to("step_0")
     assert first_look(tmp_path, dynamic_config(run)) == ("begin", (str(run), 0, True))
 
 
@@ -1178,6 +1214,7 @@ def test_the_hook_says_step_zero_is_not_saved_again_when_it_is_not_a_dynamic_mil
     tmp_path: Path, run: Path, rank_zero: None
 ) -> None:
     save_step(run, 0)
+    (run / "latest").symlink_to("step_0")
     assert first_look(tmp_path, config_for(run)) == ("begin", (str(run), 0, False))
 
 
