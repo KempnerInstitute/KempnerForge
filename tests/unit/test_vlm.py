@@ -523,9 +523,7 @@ class TestPackedForward:
         """With no images the rows are ordinary packed text, so the backbone alone decides."""
         wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
         docs = [_packed_doc(10, 1, images=0), _packed_doc(12, 2, images=0)]
-        batch = pack_vlm_samples(
-            docs, seq_len=32, tokens_per_image=8, pad_id=0
-        )
+        batch = pack_vlm_samples(docs, seq_len=32, tokens_per_image=8, pad_id=0)
         assert batch["pixel_values"].shape == (0, 3, 16, 16)
         with torch.no_grad():
             packed, _ = self._forward(wrapper, batch)
@@ -568,17 +566,13 @@ class TestPackedForward:
         wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
         text_doc = _packed_doc(10, 4, images=0)
         image_doc = _packed_doc(12, 5)
-        batch = pack_vlm_samples(
-            [image_doc, text_doc], seq_len=40, tokens_per_image=8, pad_id=0
-        )
+        batch = pack_vlm_samples([image_doc, text_doc], seq_len=40, tokens_per_image=8, pad_id=0)
         assert batch["pixel_values"].shape == (1, 3, 16, 16)
         with torch.no_grad():
             packed, _ = self._forward(wrapper, batch)
             alone, _ = self._forward(
                 wrapper,
-                pack_vlm_samples(
-                    [text_doc], seq_len=40, tokens_per_image=8, pad_id=0
-                ),
+                pack_vlm_samples([text_doc], seq_len=40, tokens_per_image=8, pad_id=0),
             )
         assert torch.allclose(packed[0, 12:22], alone[0, :10], atol=1e-5)
 
