@@ -83,6 +83,9 @@ class PeriodicEvaluation:
         command: template of the command that evaluates one step.
         output_root: directory that gets one ``step_<N>`` directory of results per step.
         overrides: the run's ``--section.key=value`` overrides, for ``{overrides}``.
+
+    ``config`` and ``tasks`` are made absolute here, as ``{checkpoint}`` and ``{output}``
+    are, so the command finds them from whatever directory it runs in.
     """
 
     config: str
@@ -92,6 +95,8 @@ class PeriodicEvaluation:
     overrides: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "config", str(Path(self.config).resolve()))
+        object.__setattr__(self, "tasks", str(Path(self.tasks).resolve()))
         _check_command(self.command)
         load_tasks(self.tasks)
         root = Path(self.output_root)

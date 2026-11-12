@@ -184,7 +184,7 @@ def test_the_command_is_split_before_the_placeholders_are_filled(tmp_path: Path)
     argv = settings.argv(step_dir, 7)
     assert argv[1:] == [
         "--name=eval-7",
-        "my run.toml",
+        str(Path("my run.toml").resolve()),
         str(step_dir),
         str(settings.step_output(7)),
         "--train.max_steps=3",
@@ -197,6 +197,27 @@ def test_the_command_is_split_before_the_placeholders_are_filled(tmp_path: Path)
 def test_an_empty_overrides_placeholder_adds_no_argument(tmp_path: Path) -> None:
     argv = make_settings(tmp_path).argv(tmp_path / "step_1", 1)
     assert argv[-1] == str(make_settings(tmp_path).step_output(1))
+
+
+def test_relative_config_and_task_paths_reach_the_command_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work = tmp_path / "work"
+    (work / "configs").mkdir(parents=True)
+    (work / "configs" / "tasks.toml").write_text(SAMPLE_TASKS.read_text())
+    monkeypatch.chdir(work)
+    settings = PeriodicEvaluation(
+        config="configs/run.toml",
+        tasks="configs/tasks.toml",
+        command=COMMAND,
+        output_root=str(tmp_path / "results"),
+    )
+    argv = settings.argv(tmp_path / "run" / "step_1", 1)
+    config = str((work / "configs" / "run.toml").resolve())
+    tasks = str((work / "configs" / "tasks.toml").resolve())
+    assert (settings.config, settings.tasks) == (config, tasks)
+    assert (argv[2], argv[4]) == (config, tasks)
+    assert all(Path(argument).is_absolute() for argument in argv[2:])
 
 
 def test_a_complete_save_is_launched_detached_without_the_distributed_environment(
@@ -215,8 +236,11 @@ def test_a_complete_save_is_launched_detached_without_the_distributed_environmen
     launcher.saved(5, run)
     assert len(popen.calls) == 1
     argv, options = popen.calls[0]
-    assert argv[2:] == ["run.toml", str(step_dir.resolve()), str(SAMPLE_TASKS)] + [
-        str(launcher.settings.step_output(5))
+    assert argv[2:] == [
+        str(Path("run.toml").resolve()),
+        str(step_dir.resolve()),
+        str(SAMPLE_TASKS),
+        str(launcher.settings.step_output(5)),
     ]
     assert options["start_new_session"] is True
     assert options["stdin"] == subprocess.DEVNULL
