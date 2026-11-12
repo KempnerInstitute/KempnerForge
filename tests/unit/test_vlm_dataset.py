@@ -1005,7 +1005,7 @@ def _mixed_image_dataset(tmp_path, images):
 
 class TestTextOnlyRows:
     @pytest.mark.parametrize("missing", [None, []])
-    def test_a_row_without_an_image_is_text_only_when_allowed(self, missing):
+    def test_a_row_without_an_image_is_text_only(self, missing):
         ds = _dataset_over([{"image": missing, "caption": "a b c"}])
         item = ds[0]
         assert item["pixel_values"].shape == (0, 3, 16, 16)
