@@ -599,6 +599,47 @@ class TestClearResults:
         assert (predictions / "a.jsonl").exists()
 
 
+class TestWriteWhole:
+    def test_two_overlapping_writes_of_one_file_both_finish_and_leave_it_whole(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "results.json"
+        replace = os.replace
+        nested: list[bool] = []
+
+        def interleaved(source: Any, destination: Any) -> None:
+            if not nested:
+                nested.append(True)
+                evaluator._write_json(target, {"writer": "second"})
+            replace(source, destination)
+
+        monkeypatch.setattr(evaluator.os, "replace", interleaved)
+        evaluator._write_json(target, {"writer": "first"})
+        assert json.loads(target.read_text()) == {"writer": "first"}
+        assert [path.name for path in tmp_path.iterdir()] == ["results.json"]
+
+    def test_the_predictions_are_written_whole_too(
+        self,
+        run: Run,
+        write_task: Callable[..., Path],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ours = ["docvqa.jsonl", "metrics.json", "results.json"]
+        replaced: list[str] = []
+        replace = os.replace
+
+        def recorded(source: Any, destination: Any) -> None:
+            replaced.append(Path(destination).name)
+            replace(source, destination)
+
+        monkeypatch.setattr(evaluator.os, "replace", recorded)
+        output = tmp_path / "results"
+        _evaluate(run, write_task(rows=2), output)
+        assert [name for name in replaced if name in ours] == ours
+        assert sorted(path.name for path in (output / "predictions").iterdir()) == ["docvqa.jsonl"]
+
+
 class TestEvaluateCheckpoint:
     def test_results_metrics_and_predictions_are_written(
         self, run: Run, write_task: Callable[..., Path], tmp_path: Path

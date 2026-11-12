@@ -251,8 +251,10 @@ files of the last one are removed from the output directory: `results.json`
 first, then `metrics.json` and the `predictions/*.jsonl` files; nothing else
 there is touched. `results.json` is written last, so it is there only for an
 evaluation that finished, and a failed one leaves no file of an earlier one; it
-names the step directory it evaluated. When that checkpoint's `metadata.json` records an MLflow run, rank 0
-then appends the metrics to it as `eval/<task>/<metric>` at the checkpoint's
+names the step directory it evaluated. Each file is written to a sibling of its
+own and renamed into place, so none is ever half written, even when two
+evaluations write the same output directory at once. When that checkpoint's
+`metadata.json` records an MLflow run, rank 0 then appends the metrics to it as `eval/<task>/<metric>` at the checkpoint's
 step. `--no-publish` turns that off, and a failure to publish is a warning with
 the command that publishes `metrics.json` later, never a failed evaluation.
 
