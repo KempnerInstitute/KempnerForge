@@ -158,11 +158,12 @@ def _build_vlm_pipeline(
             prompt_field=config.data.hf_dataset_prompt_field or None,
             image_size=config.data.hf_image_size,
             dataset_config=config.data.hf_dataset_config,
-            allow_text_only=config.data.hf_allow_text_only,
             max_images=config.data.hf_max_images,
             tile_grid=vlm_cfg.tile_grid,
             tile_global=vlm_cfg.tile_global,
         )
+        if dataset.has_text_only_rows and vlm_cfg.arch == "cross_attention":
+            raise ValueError("Text-only rows are not supported with vlm.arch='cross_attention'")
         pad_id = _resolve_pad_id(config.data.tokenizer_path)
         if laid_out:
             collator = PackedVLMCollator(
@@ -170,7 +171,6 @@ def _build_vlm_pipeline(
                 seq_len=tc.seq_len,
                 tokens_per_image=row_tokens,
                 max_docs_per_row=0 if config.data.pack_sequences else 1,
-                allow_text_only=dataset.has_text_only_rows,
             )
             layout = "packed" if config.data.pack_sequences else "one per row"
             logger.info(
@@ -182,7 +182,7 @@ def _build_vlm_pipeline(
             collator = VLMCollator(
                 pad_id=pad_id,
                 max_text_len=vlm_cfg.max_text_len,
-                allow_text_only=dataset.has_text_only_rows,
+                frame_mask=dataset.has_text_only_rows,
             )
             rows = "with" if dataset.has_text_only_rows else "without"
             logger.info(

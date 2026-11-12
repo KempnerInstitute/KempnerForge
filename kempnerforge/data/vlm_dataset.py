@@ -8,8 +8,7 @@ produces the ``VLMSample`` contract:
   ``tile_grid`` cuts the image into ``V`` views (``tile_image``); with
   ``max_images >= 2`` a row's ``K`` images, or their views, concatenate to
   ``(K * V, 3, H, W)``; an empty tensor of the image shape (``(0, 3, H, W)``
-  or ``(0, V, 3, H, W)``) for a row without an image when ``allow_text_only``
-  is set.
+  or ``(0, V, 3, H, W)``) for a row without an image, a text-only document.
 - ``input_ids``: ``(T,)`` int64 tensor, right-padded to ``max_text_len``.
 - ``labels``: ``(T,)`` int64 next-token targets (``labels[i]`` = input
   token ``i+1``), right-padded to ``max_text_len``; pad, trailing, and
@@ -20,12 +19,11 @@ produces the ``VLMSample`` contract:
 ``VLMCollator`` stacks a list of samples into a batch. All batches are
 padded to the same fixed ``max_text_len`` regardless of batch content so
 different ranks see identical tensor shapes (no NCCL desync under
-FSDP2). With ``allow_text_only`` every batch carries a ``frame_mask``; a
-text-only sample gets a blank image and a ``False`` entry, which hides its
-image tokens from attention while the vision encoder still runs on every
-rank. The collator also emits ``image_positions: (B,)`` zeros, which the
-Joint-Decoder wrapper does not use; documents with several images go through
-``PackedVLMCollator`` instead.
+FSDP2). A text-only sample gets a blank image and a ``False`` entry in the
+batch's ``frame_mask``, which hides its image tokens from attention while the
+vision encoder still runs on every rank. The collator also emits
+``image_positions: (B,)`` zeros, which the Joint-Decoder wrapper does not
+use; documents with several images go through ``PackedVLMCollator`` instead.
 
 ``PackedVLMCollator`` packs several documents into each row instead
 (``pack_vlm_samples``): a document is its images' placeholder slots followed
@@ -387,34 +385,21 @@ def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
     return np.concatenate(counts)
 
 
-def _usable_rows(
-    rows: Any, image_field: str, allow_text_only: bool, max_images: int
-) -> tuple[np.ndarray, int]:
-    """Pick the rows a run can train, counting the rest in one warning.
+def _check_image_counts(rows: Any, image_field: str, max_images: int) -> int:
+    """Count every row's images before training, warning once about rows over ``max_images``.
 
-    A row with no image is kept when ``allow_text_only`` is on and skipped
-    otherwise. Rows holding more than ``max_images`` images are kept, each
-    with its first ``max_images``, and counted in one warning.
-
-    Returns:
-        The indices of the kept rows, and how many of them have no image.
+    Returns the number of rows without an image, the text-only documents.
+    Rows holding more than ``max_images`` images are kept, each with its
+    first ``max_images``.
 
     Raises:
-        ValueError: The dataset has rows and every one of them is skipped.
+        ValueError: The dataset has rows and none of them holds an image, which
+            points at the wrong image field rather than a text-only dataset.
     """
     counts = _images_per_row(rows, image_field)
-    missing = counts == 0
     total = f"{len(counts):,}"
-    if not allow_text_only and missing.any():
-        logger.warning(
-            "Skipping %s of %s rows with no image in field %r; set data.hf_allow_text_only = "
-            "true to train them as text-only documents",
-            f"{int(missing.sum()):,}",
-            total,
-            image_field,
-        )
-        if missing.all():
-            raise ValueError(f"Every one of the {total} rows has no image in field {image_field!r}")
+    if len(counts) and not counts.any():
+        raise ValueError(f"None of the {total} rows has an image in field {image_field!r}")
     over = int((counts > max_images).sum())
     if over:
         logger.warning(
@@ -426,8 +411,7 @@ def _usable_rows(
             image_field,
             max_images,
         )
-    keep = np.flatnonzero(~missing) if not allow_text_only else np.arange(len(counts))
-    return keep, int(missing[keep].sum())
+    return int((counts == 0).sum())
 
 
 def _tokenize_and_mask(
@@ -494,6 +478,10 @@ def _tokenize_and_mask(
 class HuggingFaceVLMDataset(Dataset):
     """Map-style HF image-text dataset for Joint-Decoder training.
 
+    A row whose image field is ``None`` or an empty list is a text-only
+    document, returned with an empty ``pixel_values`` of the image shape;
+    ``has_text_only_rows`` says whether the dataset holds one.
+
     Args:
         dataset_name: HF dataset name (e.g. ``"sayakpaul/coco-30-val-2014"``)
             or a local directory written by ``datasets.save_to_disk``.
@@ -516,10 +504,6 @@ class HuggingFaceVLMDataset(Dataset):
         image_mean / image_std: Normalization stats. Defaults match
             SigLIP's ``(0.5, 0.5, 0.5)``.
         dataset_config: HF dataset config name, if required.
-        allow_text_only: Accept rows whose image field is ``None`` or an
-            empty list and return them with an empty ``pixel_values`` of
-            the image shape. Off, such rows are skipped when the dataset is
-            loaded, and one warning counts them.
         max_images: Images a row may hold; a longer list keeps its first
             ``max_images``, and the dataset warns once, when it is loaded, how
             many rows that trims. ``1`` (default) returns the one image as
@@ -544,7 +528,6 @@ class HuggingFaceVLMDataset(Dataset):
         image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
         image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
         dataset_config: str | None = None,
-        allow_text_only: bool = False,
         max_images: int = 1,
         tile_grid: int = 0,
         tile_global: bool = True,
@@ -567,9 +550,6 @@ class HuggingFaceVLMDataset(Dataset):
                 "Streaming or split-dict outputs are not supported by "
                 "HuggingFaceVLMDataset (use `split=` to resolve a single split)."
             )
-        keep, text_only = _usable_rows(ds, image_field, allow_text_only, max_images)
-        if len(keep) < len(ds):
-            ds = ds.select(keep)
         self._ds: HFDataset = ds
         self._text_rows: Any = ds.remove_columns([image_field])
         self._image_rows: Any = ds.select_columns([image_field]).with_format("arrow")
@@ -585,10 +565,9 @@ class HuggingFaceVLMDataset(Dataset):
         views = tile_grid * tile_grid + int(tile_global) if tile_grid else 0
         self._view_shape = (*((views,) if views else ()), 3, image_size, image_size)
         self._max_text_len = max_text_len
-        self._allow_text_only = allow_text_only
         self._max_images = max_images
         self._tokenizer = build_tokenizer(tokenizer_path)
-        self.has_text_only_rows = text_only > 0
+        self.has_text_only_rows = _check_image_counts(ds, image_field, max_images) > 0
         if prompt_field is not None:
             _check_prompt_column_is_string(ds, prompt_field)
             _check_prompt_column_has_room(ds, prompt_field, self._tokenizer, max_text_len)
@@ -611,11 +590,6 @@ class HuggingFaceVLMDataset(Dataset):
         row = self._text_rows[idx]
         images = _images_of(self._image_value(idx))[: self._max_images]
         if not images:
-            if not self._allow_text_only:
-                raise ValueError(
-                    f"row {idx} has no image in field {self._image_field!r}; set "
-                    "data.hf_allow_text_only = true to train on text-only rows"
-                )
             pixels = torch.zeros(0, *self._view_shape)
         else:
             views = [
@@ -666,21 +640,22 @@ class VLMCollator:
       - ``image_positions``: ``(B,)`` long tensor, all zeros; the wrapper
         does not read it, and documents with several images go through
         ``PackedVLMCollator``.
-      - ``frame_mask``: ``(B, V)`` bool, with ``allow_text_only``; ``False``
-        hides a text-only sample's image tokens. Emitted on every batch, so
-        the attention mask's shape and kernel stay the same from batch to
-        batch, at the price of the unmasked causal fast path.
+      - ``frame_mask``: ``(B, V)`` bool, ``False`` hiding a text-only sample's
+        image tokens; on a batch holding a text-only sample, or on every batch
+        with ``frame_mask``, so the attention mask's shape and kernel stay the
+        same from batch to batch, at the price of the unmasked causal fast
+        path.
 
     Padding is always to ``max_text_len``, never batch-max, so ranks
     always see identical tensor shapes under FSDP2.
     """
 
-    def __init__(self, pad_id: int, max_text_len: int, allow_text_only: bool = False) -> None:
+    def __init__(self, pad_id: int, max_text_len: int, frame_mask: bool = False) -> None:
         if max_text_len <= 0:
             raise ValueError("max_text_len must be positive")
         self.pad_id = pad_id
         self.max_text_len = max_text_len
-        self.allow_text_only = allow_text_only
+        self.frame_mask = frame_mask
 
     def __call__(self, samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         if not samples:
@@ -691,11 +666,6 @@ class VLMCollator:
         for s in samples:
             p = s["pixel_values"]
             if p.shape[0] == 0:
-                if not self.allow_text_only:
-                    raise ValueError(
-                        "VLMCollator got a text-only sample; set data.hf_allow_text_only = true "
-                        "to train on text-only rows"
-                    )
                 images.append(torch.zeros(p.shape[1:], dtype=p.dtype))
                 has_image.append(False)
             else:
@@ -724,7 +694,7 @@ class VLMCollator:
             "labels": labels,
             "image_positions": image_positions,
         }
-        if self.allow_text_only:
+        if self.frame_mask or not all(has_image):
             mask = torch.tensor(has_image, dtype=torch.bool)
             batch["frame_mask"] = mask.unsqueeze(1).repeat(1, views)
         return batch
@@ -737,7 +707,6 @@ def pack_vlm_samples(
     tokens_per_image: int,
     pad_id: int,
     max_docs_per_row: int = 0,
-    allow_text_only: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Pack image-text samples into rows of ``seq_len``, each document's images before its text.
 
@@ -770,8 +739,8 @@ def pack_vlm_samples(
 
     Raises:
         ValueError: ``samples`` is empty, a sample lacks ``text_len``, a document
-            has no image while ``allow_text_only`` is off or a footprint over
-            ``seq_len``, or ``seq_len`` or ``tokens_per_image`` is not positive.
+            has a footprint over ``seq_len``, or ``seq_len`` or
+            ``tokens_per_image`` is not positive.
     """
     if seq_len <= 0 or tokens_per_image <= 0:
         raise ValueError("seq_len and tokens_per_image must be positive")
@@ -791,11 +760,6 @@ def pack_vlm_samples(
             views = views.unsqueeze(0)
         elif views.shape[0] == 0:
             views = views.reshape(0, *views.shape[-3:])
-        if views.shape[0] == 0 and not allow_text_only:
-            raise ValueError(
-                "pack_vlm_samples got a text-only document; set data.hf_allow_text_only = true "
-                "to train on text-only rows"
-            )
         image_shape, image_dtype = tuple(views.shape[1:]), views.dtype
         n_ids = sample["input_ids"].shape[0]
         if "text_len" not in sample:
@@ -877,8 +841,7 @@ class PackedVLMCollator:
     batch to batch; ``train.batch_size`` is the number of documents per
     micro-batch, not the number of rows. A positive ``max_docs_per_row`` caps
     the documents a row takes; ``1`` lays each document out on its own row.
-    A text-only document packs as its text alone with ``allow_text_only``,
-    and is rejected without it.
+    A text-only document packs as its text alone.
     """
 
     def __init__(
@@ -887,13 +850,11 @@ class PackedVLMCollator:
         seq_len: int,
         tokens_per_image: int,
         max_docs_per_row: int = 0,
-        allow_text_only: bool = False,
     ) -> None:
         self.pad_id = pad_id
         self.seq_len = seq_len
         self.tokens_per_image = tokens_per_image
         self.max_docs_per_row = max_docs_per_row
-        self.allow_text_only = allow_text_only
 
     def __call__(self, samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         return pack_vlm_samples(
@@ -902,5 +863,4 @@ class PackedVLMCollator:
             tokens_per_image=self.tokens_per_image,
             pad_id=self.pad_id,
             max_docs_per_row=self.max_docs_per_row,
-            allow_text_only=self.allow_text_only,
         )

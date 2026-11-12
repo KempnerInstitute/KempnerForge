@@ -32,7 +32,6 @@ from kempnerforge.config.schema import (
     VisionEncoderConfig,
     VLMConfig,
 )
-from kempnerforge.config.video import VideoConfig
 
 
 class TestModelConfig:
@@ -833,36 +832,6 @@ class TestJobConfig:
         )
         with pytest.raises(ValueError, match="train.seq_len.*insufficient for VLM"):
             config.validate(world_size=1)
-
-    def test_text_only_rows_need_an_image_vlm_run(self):
-        kwargs = dict(
-            model=ModelConfig(max_seq_len=1024),
-            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
-            adapter=AdapterConfig(),
-        )
-        JobConfig(
-            vlm=VLMConfig(max_text_len=64), data=DataConfig(hf_allow_text_only=True), **kwargs
-        )
-        with pytest.raises(ValueError, match="add a \\[vlm\\] section"):
-            JobConfig(data=DataConfig(hf_allow_text_only=True))
-        with pytest.raises(ValueError, match="not \\[video\\]"):
-            JobConfig(
-                vlm=VLMConfig(max_text_len=64),
-                data=DataConfig(hf_allow_text_only=True, tokenizer_path="gpt2"),
-                video=VideoConfig(data_root="/x"),
-                **kwargs,
-            )
-        with pytest.raises(ValueError, match="not supported with vlm.arch='cross_attention'"):
-            JobConfig(
-                vlm=VLMConfig.for_arch("cross_attention", max_text_len=64),
-                data=DataConfig(hf_allow_text_only=True),
-                **kwargs,
-            )
-        JobConfig(
-            vlm=VLMConfig.for_arch("mot", max_text_len=64),
-            data=DataConfig(hf_allow_text_only=True),
-            **kwargs,
-        )
 
     def test_several_images_per_document_rules(self):
         kwargs = dict(

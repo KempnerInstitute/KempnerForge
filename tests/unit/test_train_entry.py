@@ -3005,36 +3005,30 @@ class TestVlmSourceBuilders:
         data = dp.build_data_pipeline(self._vlm_data_config(), _runtime())
         assert data.dataloader == "stateful_OBJ"
         assert seen["image_collator"]["pad_id"] == 7
+        assert seen["image_collator"]["frame_mask"] is False
         assert "video_collator" not in seen
 
-    def test_image_path_passes_the_text_only_and_image_cap_settings_to_the_dataset(
-        self, monkeypatch
-    ):
+    def test_image_path_passes_the_image_cap_to_the_dataset(self, monkeypatch):
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
         self._stub_vlm_modules(monkeypatch, seen)
         config = self._vlm_data_config()
-        config.data.hf_allow_text_only = True
         config.data.hf_max_images = 2
         dp.build_data_pipeline(config, _runtime(), tokens_per_image=16)
-        assert seen["dataset"]["allow_text_only"] is True
         assert seen["dataset"]["max_images"] == 2
         assert seen["packed_collator"]["max_docs_per_row"] == 1 and "image_collator" not in seen
 
-    def test_image_path_passes_the_text_only_flag_to_the_collator(self, monkeypatch):
+    def test_a_dataset_with_text_only_rows_masks_every_batch(self, monkeypatch):
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
         self._stub_vlm_modules(monkeypatch, seen)
-        config = self._vlm_data_config()
-        config.data.hf_allow_text_only = True
         monkeypatch.setattr(FakeDataset, "has_text_only_rows", True)
-        dp.build_data_pipeline(config, _runtime())
-        assert seen["image_collator"]["allow_text_only"] is True
-        assert seen["dataset"]["allow_text_only"] is True
-        monkeypatch.setattr(FakeDataset, "has_text_only_rows", False)
-        seen.clear()
-        dp.build_data_pipeline(config, _runtime())
-        assert seen["image_collator"]["allow_text_only"] is False
+        dp.build_data_pipeline(self._vlm_data_config(), _runtime())
+        assert seen["image_collator"]["frame_mask"] is True
+        config = self._vlm_data_config()
+        config.vlm.arch = "cross_attention"
+        with pytest.raises(ValueError, match="not supported with vlm.arch='cross_attention'"):
+            dp.build_data_pipeline(config, _runtime())
 
     def test_an_image_cap_above_one_without_packing_uses_fixed_rows(self, monkeypatch):
         seen: dict = {}
@@ -3049,7 +3043,6 @@ class TestVlmSourceBuilders:
             "seq_len": config.train.seq_len,
             "tokens_per_image": 16,
             "max_docs_per_row": 1,
-            "allow_text_only": False,
         }
         assert "image_collator" not in seen
         with pytest.raises(ValueError, match="data.hf_max_images on a VLM run needs the built"):
@@ -3084,7 +3077,6 @@ class TestVlmSourceBuilders:
             "seq_len": config.train.seq_len,
             "tokens_per_image": 12,
             "max_docs_per_row": 0,
-            "allow_text_only": False,
         }
         assert "image_collator" not in seen
         with pytest.raises(ValueError, match="built model's tokens per image"):
