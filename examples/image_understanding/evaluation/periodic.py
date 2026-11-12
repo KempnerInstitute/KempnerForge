@@ -13,7 +13,13 @@ The command is a template whose placeholders are ``{config}``, ``{tasks}``,
 ``{checkpoint}`` (the step directory), ``{step}`` and ``{output}`` (that step's
 output directory), plus ``{overrides}``, which stands for the run's config
 overrides as separate arguments. It is split into arguments first and the
-placeholders are filled in afterwards, so a path with a space stays one argument.
+placeholders are filled in afterwards, so a path with a space stays one argument;
+every path is filled in absolute.
+
+The command should submit the evaluation and return, as ``sbatch`` does. Nothing
+limits how many evaluations start at once: every step that is due at the same
+moment starts then, such as each complete step a resumed run finds. A local script
+runs on the training job's node and GPUs, so it should queue its evaluations itself.
 """
 
 from __future__ import annotations
@@ -253,8 +259,8 @@ def _counted_record(step: int, step_dir: Path, output: Path) -> bool:
     """Whether a record in ``output`` counts for the checkpoint ``step_dir`` of step ``step``.
 
     A ``results.json`` or a ``launched.json`` counts when it names ``step_dir`` or cannot be
-    read; one of another checkpoint does not, so that step is evaluated again. Each is
-    logged.
+    read; one of another checkpoint does not, so that step is evaluated again. A skip is
+    logged, and a record that cannot be read or is of another checkpoint is a warning.
     """
     others: list[tuple[Path, str]] = []
     for record in (output / name for name in _RECORD_FILES):
@@ -284,7 +290,7 @@ def _remove_records(step: int, output: Path) -> None:
     """Remove the records in ``output`` of what step ``step`` held before the run saved it again.
 
     Raises:
-        OSError: a record exists and could not be removed.
+        OSError: a record could not be looked at or removed.
     """
     stale = [output / name for name in _RECORD_FILES if (output / name).exists()]
     for record in stale:
@@ -345,8 +351,9 @@ class EvaluationLauncher:
     A step the run may save again over a directory that already exists is deferred (see
     ``begin``): its directory may be half rewritten, so it is not started until a later
     step is saved, since the checkpoint manager finishes one save before it starts the
-    next, or until ``finish``. If the run saves it again, it holds new weights, so its
-    records from before the run are removed when it is started and it is evaluated again.
+    next, or until ``finish``. If the run saves it again, it holds new weights, unless it
+    is the step the run resumed from: its records from before the run are then removed
+    when it is started, and it is evaluated again.
     """
 
     def __init__(
@@ -611,8 +618,8 @@ class PeriodicEvaluationHook(TrainingHook):
     worker has returned, the training thread waits for the commands still running until
     that same deadline, ``finish_timeout`` seconds after training ended, and reads their
     exit statuses; it never touches the launcher while the worker is alive. A step saved
-    outside the loop's hook, as by the shutdown handler, is found by that look and by the
-    scan at the start of the next run. An error on the worker or in that wait is a warning,
+    outside the loop's hook, as by the shutdown handler, is found by that last look and by
+    the first look of the next run. An error on the worker or in that wait is a warning,
     never raised into training.
 
     At train begin the hook looks once, on the training thread and before the loop can

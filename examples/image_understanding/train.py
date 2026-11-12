@@ -7,10 +7,10 @@ The VLM step body still lives in core, so ``run_training`` selects it from
 
 Periodic evaluation is off by default. With ``--eval-tasks``, ``--eval-command`` and
 ``--eval-output`` every checkpoint the run saves is evaluated: the command is a template
-started once the checkpoint is complete and never waited for, and the output is the
-directory that gets one results directory per step. Every other argument must then be a
-``--section.key=value`` override: the evaluations receive the same overrides and refuse
-any other argument.
+started once the checkpoint is complete and never waited for while the run trains, and
+the output is the directory that gets one results directory per step. Every other
+argument must then be a ``--section.key=value`` override: the evaluations receive the
+same overrides and refuse any other argument.
 
 Usage:
     # Multi-GPU (single node, via torchrun)
