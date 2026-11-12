@@ -47,7 +47,7 @@ def _dataset_over(
 
     ds = HuggingFaceVLMDataset.__new__(HuggingFaceVLMDataset)
     ds._ds = rows
-    ds._text_rows = rows
+    ds._text_columns = rows
     ds._image_rows = rows
     ds._image_feature = None
     ds._image_field = "image"
@@ -951,10 +951,30 @@ class TestHuggingFaceVLMDataset:
         """A prompt value that is not a string is rejected, not dropped as no prompt."""
         ds = _prompted_dataset(tmp_path, monkeypatch, ["ab"])
         row = {"image": _make_image(32), "caption": "xyz", "prompt": ["ab"]}
-        monkeypatch.setattr(ds, "_text_rows", [row])
+        monkeypatch.setattr(ds, "_text_columns", [row])
         monkeypatch.setattr(ds, "_image_rows", [row])
         with pytest.raises(TypeError, match="'prompt' must be str or None, got list"):
             _ = ds[0]
+
+    def test_a_sample_reads_only_the_text_and_prompt_columns(self, tmp_path, monkeypatch):
+        from datasets import Dataset
+
+        rows = Dataset.from_dict(
+            {"image": [_make_image(8)], "thumb": [_make_image(8)], "caption": ["a b"], "id": [7]}
+        )
+        rows.save_to_disk(str(tmp_path / "extra"))
+        ds = HuggingFaceVLMDataset(
+            str(tmp_path / "extra"),
+            split="train",
+            image_field="image",
+            text_field="caption",
+            tokenizer_path="gpt2",
+            max_text_len=8,
+        )
+        assert ds._text_columns.column_names == ["caption"]
+        assert ds[0]["pixel_values"].shape == (3, 224, 224)
+        prompted = _prompted_dataset(tmp_path, monkeypatch, ["ab"])
+        assert prompted._text_columns.column_names == ["caption", "prompt"]
 
     def test_missing_prompt_trains_as_an_unprompted_caption(self, tmp_path, monkeypatch):
         """``None`` is how a string column stores a missing value: that row has no prompt."""

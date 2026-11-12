@@ -551,7 +551,8 @@ class HuggingFaceVLMDataset(Dataset):
                 "HuggingFaceVLMDataset (use `split=` to resolve a single split)."
             )
         self._ds: HFDataset = ds
-        self._text_rows: Any = ds.remove_columns([image_field])
+        used = [text_field, *([prompt_field] if prompt_field is not None else [])]
+        self._text_columns: Any = ds.select_columns(used)
         self._image_rows: Any = ds.select_columns([image_field]).with_format("arrow")
         self._image_feature = _image_feature(ds.features, image_field)
         self._image_field = image_field
@@ -587,7 +588,7 @@ class HuggingFaceVLMDataset(Dataset):
         return raw.column(self._image_field)[0].as_py()
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        row = self._text_rows[idx]
+        row = self._text_columns[idx]
         images = _images_of(self._image_value(idx))[: self._max_images]
         if not images:
             pixels = torch.zeros(0, *self._view_shape)
