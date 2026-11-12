@@ -21,6 +21,7 @@ import json
 import os
 import re
 import threading
+import uuid
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
@@ -511,11 +512,25 @@ def _evaluate_batches(
     return records
 
 
+def _write_whole(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` whole: to a sibling file of its own, then renamed over it.
+
+    The sibling's name is unique to this write, so two evaluations that write the same
+    file at once each leave it whole and neither fails on the other's file.
+    """
+    partial = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(partial, "x", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(partial, path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+
+
 def _write_json(path: Path, value: Any) -> None:
-    """Write ``value`` to ``path`` whole: to a sibling file first, then renamed over it."""
-    partial_path = path.with_name(f"{path.name}.tmp")
-    partial_path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-    os.replace(partial_path, path)
+    """Write ``value`` to ``path`` as JSON, whole (see ``_write_whole``)."""
+    _write_whole(path, json.dumps(value, indent=2) + "\n")
 
 
 def _start(output: Path, checkpoint: str | Path) -> str:
@@ -531,9 +546,10 @@ def _finish_task(
     records = merge_records(per_rank, rows)
     summary = summarize(task, records)
     predictions = Path(PREDICTIONS_DIR) / f"{task.name}.jsonl"
-    with open(output / predictions, "w", encoding="utf-8") as f:
-        for record in records:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _write_whole(
+        output / predictions,
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+    )
     logger.info(
         f"{task.name}: {summary['metrics']} over {summary['samples']} of {summary['rows']} "
         f"rows, skipped {summary['skipped']}"
