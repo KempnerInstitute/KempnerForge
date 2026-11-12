@@ -921,6 +921,18 @@ class TestJobConfig:
                 data=DataConfig(pack_sequences=True),
             )
 
+    @pytest.mark.parametrize("pack", [False, True])
+    def test_several_images_per_document_are_refused_with_fp8(self, pack):
+        with pytest.raises(ValueError, match="hf_max_images != 1 is not supported with train"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=1024),
+                train=TrainConfig(seq_len=512, mixed_precision="fp8"),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64),
+                data=DataConfig(hf_max_images=2, pack_sequences=pack),
+            )
+
     def test_vlm_packing_inherits_the_sequence_parallel_refusal(self):
         """Packed rows are indexed as plain tensors, which sequence parallelism cannot carry."""
         config = JobConfig(

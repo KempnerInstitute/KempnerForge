@@ -80,6 +80,10 @@ class JobConfig:
                     "data.hf_max_images != 1 requires vlm.arch='joint_decoder' (got "
                     f"{self.vlm.arch!r}); only its inline route places several images per document"
                 )
+            if self.train.is_fp8:
+                raise ValueError(
+                    "data.hf_max_images != 1 is not supported with train.mixed_precision='fp8'"
+                )
 
         if self.video is not None:
             if self.vlm is None:

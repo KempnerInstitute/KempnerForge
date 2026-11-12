@@ -179,7 +179,8 @@ image contributes all of its views in order. With `data.pack_sequences = true`
 such documents pack like any other; without it the same packer lays each
 document out in its own row of `train.seq_len`, so the token tensors keep one
 shape across micro-batches and ranks (the image tensor still holds the batch's
-image count). Both need `vlm.arch = "joint_decoder"`, and `n` images' tokens
+image count). Both need `vlm.arch = "joint_decoder"` and not
+`train.mixed_precision = "fp8"`, and `n` images' tokens
 (every view of each) plus `vlm.max_text_len` have to fit `train.seq_len` and
 `model.max_seq_len`. The config checks that when `vision_encoder.num_tokens` is
 set; the data pipeline checks it again against the built model's token count
