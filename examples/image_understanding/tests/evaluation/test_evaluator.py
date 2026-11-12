@@ -618,6 +618,17 @@ class TestWriteWhole:
         assert json.loads(target.read_text()) == {"writer": "first"}
         assert [path.name for path in tmp_path.iterdir()] == ["results.json"]
 
+    def test_a_write_that_fails_raises_and_leaves_no_sibling_behind(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def refuse(source: Any, destination: Any) -> None:
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(evaluator.os, "replace", refuse)
+        with pytest.raises(OSError, match="No space left on device"):
+            evaluator._write_json(tmp_path / "results.json", {"writer": "first"})
+        assert list(tmp_path.iterdir()) == []
+
     def test_the_predictions_are_written_whole_too(
         self,
         run: Run,
