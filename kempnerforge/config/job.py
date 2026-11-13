@@ -84,6 +84,10 @@ class JobConfig:
                 raise ValueError(
                     "data.hf_max_images != 1 is not supported with train.mixed_precision='fp8'"
                 )
+            if self.model.sdpa_backend == "flash" and self.model.attention_backend == "sdpa":
+                raise ValueError(
+                    "data.hf_max_images != 1 is not supported with model.sdpa_backend='flash'"
+                )
 
         if self.video is not None:
             if self.vlm is None:

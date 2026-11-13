@@ -175,17 +175,17 @@ is refused with `model.sdpa_backend = "flash"` under `attention_backend =
 
 An image column that holds a list of images is a multi-image document.
 `data.hf_max_images = n` (`n >= 2`) accepts up to `n` of them per document, in
-list order. A longer list keeps its first `n` at any cap, the default of `1`
-included, and when the dataset is loaded the rows that trims are counted in
-one warning. The images' tokens go before the document's text, each image in
-its own block, which is the layout packing uses; with `vlm.tile_grid` set, each
+list order. A row with more than `n` images, at any cap including the
+default of `1`, is skipped when the dataset is loaded, and one warning counts
+the skipped rows. The images' tokens go before the document's text, each image
+in its own block, which is the layout packing uses; with `vlm.tile_grid` set, each
 image contributes all of its views in order. With `data.pack_sequences = true`
 such documents pack like any other; without it the same packer lays each
 document out in its own row of `train.seq_len`, so the token tensors keep one
 shape across micro-batches and ranks (the image tensor still holds the batch's
 image count). Both need `vlm.arch = "joint_decoder"` and not
-`train.mixed_precision = "fp8"`, and `n` images' tokens
-(every view of each) plus `vlm.max_text_len` have to fit `train.seq_len` and
+`train.mixed_precision = "fp8"`, nor `model.sdpa_backend = "flash"` under
+`attention_backend = "sdpa"`; and `n` images' tokens (every view of each) plus `vlm.max_text_len` have to fit `train.seq_len` and
 `model.max_seq_len`. The config checks that when `vision_encoder.num_tokens` is
 set; the data pipeline checks it again against the built model's token count
 before training starts, with packing or without, so a probed encoder is

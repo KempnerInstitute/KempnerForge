@@ -324,8 +324,6 @@ def _image_feature(features: Any, image_field: str) -> Any:
     feature: Any = features[image_field]
     while not hasattr(feature, "decode_example"):
         if isinstance(feature, list):
-            if not feature:
-                return None
             feature = feature[0]
         elif hasattr(feature, "feature"):
             feature = feature.feature
@@ -385,33 +383,35 @@ def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
     return np.concatenate(counts)
 
 
-def _check_image_counts(rows: Any, image_field: str, max_images: int) -> int:
-    """Count every row's images before training, warning once about rows over ``max_images``.
+def _usable_rows(rows: Any, image_field: str, max_images: int) -> tuple[np.ndarray, int]:
+    """The rows to keep, skipping those over ``max_images``, and how many are text-only.
 
-    Returns the number of rows without an image, the text-only documents.
-    Rows holding more than ``max_images`` images are kept, each with its
-    first ``max_images``.
+    A row holding more than ``max_images`` images is skipped, with one warning
+    that counts them, so a caption never describes an image the model does
+    not see.
 
     Raises:
-        ValueError: The dataset has rows and none of them holds an image, which
-            points at the wrong image field rather than a text-only dataset.
+        ValueError: The dataset has rows and none of them holds from one to
+            ``max_images`` images.
     """
     counts = _images_per_row(rows, image_field)
+    over = counts > max_images
     total = f"{len(counts):,}"
-    if len(counts) and not counts.any():
-        raise ValueError(f"None of the {total} rows has an image in field {image_field!r}")
-    over = int((counts > max_images).sum())
-    if over:
+    if len(counts) and not ((counts > 0) & ~over).any():
+        raise ValueError(
+            f"None of the {total} rows holds from 1 to data.hf_max_images={max_images} images "
+            f"in field {image_field!r}"
+        )
+    if over.any():
         logger.warning(
-            "%s of %s rows hold more than data.hf_max_images=%d images in field %r; each keeps "
-            "its first %d",
-            f"{over:,}",
+            "Skipping %s of %s rows that hold more than data.hf_max_images=%d images in field %r",
+            f"{int(over.sum()):,}",
             total,
             max_images,
             image_field,
-            max_images,
         )
-    return int((counts == 0).sum())
+    keep = np.flatnonzero(~over)
+    return keep, int((counts[keep] == 0).sum())
 
 
 def _tokenize_and_mask(
@@ -504,11 +504,10 @@ class HuggingFaceVLMDataset(Dataset):
         image_mean / image_std: Normalization stats. Defaults match
             SigLIP's ``(0.5, 0.5, 0.5)``.
         dataset_config: HF dataset config name, if required.
-        max_images: Images a row may hold; a longer list keeps its first
-            ``max_images``, and the dataset warns once, when it is loaded, how
-            many rows that trims. ``1`` (default) returns the one image as
-            above; ``n >= 2`` concatenates a row's images' views to ``(K * V,
-            3, H, W)``.
+        max_images: Images a row may hold; rows holding more are skipped
+            when the dataset is loaded, with one warning that counts them.
+            ``1`` (default) returns the one image as above; ``n >= 2``
+            concatenates a row's images' views to ``(K * V, 3, H, W)``.
         tile_grid: ``0`` keeps one view per image; ``n`` cuts each image into
             an ``n × n`` grid of ``image_size`` crops (``tile_image``), so
             ``pixel_values`` is ``(views, 3, H, W)``.
@@ -550,6 +549,9 @@ class HuggingFaceVLMDataset(Dataset):
                 "Streaming or split-dict outputs are not supported by "
                 "HuggingFaceVLMDataset (use `split=` to resolve a single split)."
             )
+        keep, text_only = _usable_rows(ds, image_field, max_images)
+        if len(keep) < len(ds):
+            ds = ds.select(keep)
         self._ds: HFDataset = ds
         used = [text_field, *([prompt_field] if prompt_field is not None else [])]
         self._text_columns: Any = ds.select_columns(used)
@@ -568,7 +570,7 @@ class HuggingFaceVLMDataset(Dataset):
         self._max_text_len = max_text_len
         self._max_images = max_images
         self._tokenizer = build_tokenizer(tokenizer_path)
-        self.has_text_only_rows = _check_image_counts(ds, image_field, max_images) > 0
+        self.has_text_only_rows = text_only > 0
         if prompt_field is not None:
             _check_prompt_column_is_string(ds, prompt_field)
             _check_prompt_column_has_room(ds, prompt_field, self._tokenizer, max_text_len)
@@ -589,7 +591,7 @@ class HuggingFaceVLMDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         row = self._text_columns[idx]
-        images = _images_of(self._image_value(idx))[: self._max_images]
+        images = _images_of(self._image_value(idx))
         if not images:
             pixels = torch.zeros(0, *self._view_shape)
         else:

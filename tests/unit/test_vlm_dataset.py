@@ -1072,7 +1072,7 @@ class TestTextOnlyRows:
         ds = HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
         assert not ds.has_text_only_rows
 
-    def test_a_row_with_several_images_keeps_its_first_at_the_default_cap(
+    def test_rows_with_several_images_are_skipped_at_the_default_cap(
         self, tmp_path, monkeypatch, caplog
     ):
         monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
@@ -1080,14 +1080,18 @@ class TestTextOnlyRows:
         path = _mixed_image_dataset(tmp_path, images)
         with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
             ds = HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
-        assert "1 of 3 rows hold more than data.hf_max_images=1" in caplog.text
-        assert len(ds) == 3
+        assert [r.getMessage() for r in caplog.records] == [
+            "Skipping 1 of 3 rows that hold more than data.hf_max_images=1 images in field 'image'"
+        ]
+        assert len(ds) == 2
         assert ds.has_text_only_rows
         assert ds[0]["pixel_values"].shape == (3, 224, 224)
+        assert ds[1]["pixel_values"].shape == (0, 3, 224, 224)
 
-    def test_a_dataset_with_no_image_in_any_row_is_rejected(self, tmp_path):
-        path = _mixed_image_dataset(tmp_path, [None, []])
-        with pytest.raises(ValueError, match="None of the 2 rows has an image in field"):
+    @pytest.mark.parametrize("images", [[None, []], [None, [_make_image(8)] * 2]])
+    def test_a_dataset_without_a_row_within_the_cap_is_rejected(self, tmp_path, images):
+        path = _mixed_image_dataset(tmp_path, images)
+        with pytest.raises(ValueError, match="None of the 2 rows holds from 1 to data.hf_max_"):
             HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
 
     def test_images_per_row_counts_lists_and_single_images(self):
@@ -1135,19 +1139,7 @@ class TestMultiImageRows:
         assert _dataset_over(rows)[0]["pixel_values"].shape == (3, 16, 16)
         assert _dataset_over(rows, max_images=3)[0]["pixel_values"].shape == (1, 3, 16, 16)
 
-    def test_a_longer_list_keeps_the_first_images(self):
-        rows = [{"image": [_make_image(8, c) for c in (0, 128, 255)], "caption": "a b"}]
-        pixels = _dataset_over(rows, max_images=2)[0]["pixel_values"]
-        assert pixels.shape == (2, 3, 16, 16)
-        assert pixels[0].mean() < pixels[1].mean() < 0.5
-
-    def test_several_images_keep_the_first_at_the_default_cap(self):
-        rows = [{"image": [_make_image(8, 0), _make_image(8, 255)], "caption": "a b"}]
-        pixels = _dataset_over(rows)[0]["pixel_values"]
-        assert pixels.shape == (3, 16, 16)
-        assert pixels.mean() < 0
-
-    def test_rows_over_the_cap_are_counted_once_when_the_dataset_is_loaded(
+    def test_rows_over_the_cap_are_skipped_when_the_dataset_is_loaded(
         self, tmp_path, monkeypatch, caplog
     ):
         monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
@@ -1158,17 +1150,14 @@ class TestMultiImageRows:
             split="train", image_field="image", text_field="caption", tokenizer_path="gpt2"
         )
         with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
-            HuggingFaceVLMDataset(path, max_text_len=8, **kwargs)
-        assert "2 of 3 rows hold more than data.hf_max_images=1" in caplog.text
+            ds = HuggingFaceVLMDataset(path, max_text_len=8, max_images=3, **kwargs)
+        assert "Skipping 1 of 3 rows that hold more than data.hf_max_images=3" in caplog.text
+        assert [ds[i]["pixel_values"].shape[0] for i in range(len(ds))] == [3, 1]
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
-            ds = HuggingFaceVLMDataset(path, max_text_len=8, max_images=2, **kwargs)
-        assert "2 of 3 rows hold more than data.hf_max_images=2" in caplog.text
-        assert ds[2]["pixel_values"].shape == (2, 3, 224, 224)
-        caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
-            HuggingFaceVLMDataset(path, max_text_len=8, max_images=4, **kwargs)
+            ds = HuggingFaceVLMDataset(path, max_text_len=8, max_images=4, **kwargs)
         assert "hf_max_images" not in caplog.text
+        assert len(ds) == 3
 
 
 class TestOneDocumentPerRow:
