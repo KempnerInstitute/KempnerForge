@@ -129,11 +129,18 @@ def _trimmed(text: str) -> str:
     return text.strip().lower().rstrip("?.!")
 
 
+def _number(text: str) -> float | None:
+    """``text`` as a number, a trailing ``%`` read as hundredths, or ``None`` when it is not one."""
+    try:
+        return float(text.rstrip("%")) / 100 if text.endswith("%") else float(text)
+    except ValueError:
+        return None
+
+
 def _matches_relaxed(prediction: str, answer: str) -> bool:
     predicted, target = _trimmed(prediction), _trimmed(answer)
-    try:
-        predicted_value, target_value = float(predicted), float(target)
-    except ValueError:
+    predicted_value, target_value = _number(predicted), _number(target)
+    if predicted_value is None or target_value is None:
         return predicted == target
     error = abs(predicted_value - target_value) / (abs(target_value) + ZERO_TARGET_GUARD)
     return error <= RELAXED_TOLERANCE
@@ -144,17 +151,21 @@ def relaxed_accuracy(prediction: str, answers: Sequence[str]) -> float:
 
     Each side is stripped of surrounding whitespace, lowercased, and then stripped
     of trailing ``?``, ``.`` and ``!``, in that order, so whitespace before a
-    trailing mark stays (``"yes !"`` becomes ``"yes "``). When both then parse with
-    ``float``, the prediction is correct if
-    ``|prediction - target| / (|target| + ZERO_TARGET_GUARD)`` is at most
-    ``RELAXED_TOLERANCE``; the guard keeps a zero target defined, and only a
+    trailing mark stays (``"yes !"`` becomes ``"yes "``). A side is then a number
+    when ``float`` parses it, or parses it once a trailing ``%`` is removed, which
+    makes it hundredths: ``"45%"`` is 0.45, so it matches ``"45.1%"`` and
+    ``"0.45"`` but not ``"45"``, as in the relaxed correctness of Pix2Struct (Lee
+    et al., "Pix2Struct: Screenshot Parsing as Pretraining for Visual Language
+    Understanding", ICML 2023). When both sides are numbers, the prediction is
+    correct if ``|prediction - target| / (|target| + ZERO_TARGET_GUARD)`` is at
+    most ``RELAXED_TOLERANCE``; the guard keeps a zero target defined, and only a
     prediction within 5e-12 of zero matches one. Any other pair must be the same
-    string. A percent sign, a comma or a unit makes an answer text, while ``float``
-    reads an underscore between digits as a separator (``"1_000"`` is 1000), and
-    ``nan`` and ``inf`` parse but match nothing. With several references any
-    match counts (Masry et al., "ChartQA: A Benchmark for Question Answering about
-    Charts with Visual and Logical Reasoning", Findings of ACL 2022, section 5.1,
-    after Methani et al., "PlotQA: Reasoning over Scientific Plots", WACV 2020).
+    string. A comma or a unit makes an answer text, while ``float`` reads an
+    underscore between digits as a separator (``"1_000"`` is 1000), and ``nan``
+    and ``inf`` parse but match nothing. With several references any match counts
+    (Masry et al., "ChartQA: A Benchmark for Question Answering about Charts with
+    Visual and Logical Reasoning", Findings of ACL 2022, section 5.1, after
+    Methani et al., "PlotQA: Reasoning over Scientific Plots", WACV 2020).
     """
     return float(
         any(_matches_relaxed(prediction, answer) for answer in _references(prediction, answers))

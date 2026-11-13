@@ -207,8 +207,9 @@ roadmap.
   - `relaxed_accuracy` (ChartQA): 1 for a number within 5 percent of a numeric
     reference, or for text equal to a reference but for case, surrounding
     whitespace and trailing `?`, `.` and `!`, applied in that order, so
-    `"yes !"` becomes `"yes "`. A number is what `float` parses, so `45%` and
-    `1,000` are text while `1_000` is 1000.
+    `"yes !"` becomes `"yes "`. A number is what `float` parses, and a trailing
+    `%` makes hundredths, as in Pix2Struct's relaxed correctness: `45%` matches
+    `0.45` and `45.1%` but not `45`. `1,000` is text, while `1_000` is 1000.
 
 `configs/eval_tasks.toml` is a sample with five tasks and their caps (VQAv2 10,
 TextVQA 75, DocVQA 50, ChartQA human and machine 50); its paths are

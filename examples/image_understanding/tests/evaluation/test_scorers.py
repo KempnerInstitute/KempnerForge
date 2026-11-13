@@ -161,9 +161,30 @@ class TestRelaxedAccuracy:
     @pytest.mark.parametrize(
         ("prediction", "answer", "expected"),
         [
-            ("5%", "5", 0.0),
-            ("5%", "5%", 1.0),
-            ("4.9%", "5%", 0.0),
+            ("45.1%", "45%", 1.0),
+            ("4.9%", "5%", 1.0),
+            ("4.7%", "5%", 0.0),
+            ("0.45", "45%", 1.0),
+            ("45%", "0.45", 1.0),
+            ("45 %", "0.45", 1.0),
+            ("45%.", "45%", 1.0),
+            ("-5%", "-0.05", 1.0),
+            ("0%", "0", 1.0),
+            ("45%", "45", 0.0),
+            ("45", "45%", 0.0),
+        ],
+    )
+    def test_a_trailing_percent_sign_makes_hundredths(
+        self, prediction: str, answer: str, expected: float
+    ) -> None:
+        assert relaxed_accuracy(prediction, [answer]) == expected
+
+    @pytest.mark.parametrize(
+        ("prediction", "answer", "expected"),
+        [
+            ("%", "%", 1.0),
+            ("%5", "5", 0.0),
+            ("5%x", "5%x", 1.0),
             ("1,000", "1000", 0.0),
             ("1,000", "1,000", 1.0),
             ("$5", "5", 0.0),
@@ -176,7 +197,7 @@ class TestRelaxedAccuracy:
     ) -> None:
         assert relaxed_accuracy(prediction, [answer]) == expected
 
-    @pytest.mark.parametrize("answer", ["nan", "inf", "-inf"])
+    @pytest.mark.parametrize("answer", ["nan", "inf", "-inf", "nan%", "inf%"])
     def test_values_that_are_not_finite_match_nothing(self, answer: str) -> None:
         assert relaxed_accuracy(answer, [answer]) == 0.0
 
