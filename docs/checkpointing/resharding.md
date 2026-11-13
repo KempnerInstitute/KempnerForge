@@ -27,9 +27,11 @@ shards. On load:
    slices pick the right piece.
 4. The loader's tensor is mutated in place.
 
-The catch: **parameter names must match**. If you rename a layer
-between save and load, DCP won't find the saved shard and will
-either error or silently leave the tensor uninitialized (it warns).
+The catch: **parameter names must match**. The load is strict: every
+tensor the model holds must be in the checkpoint under the same name.
+Rename a layer or add one between save and load, and DCP finds no
+saved shard for it and the load fails with `Missing key in checkpoint
+state_dict`, naming the tensor.
 
 ## What it lets you change
 
@@ -42,7 +44,7 @@ either error or silently leave the tensor uninitialized (it warns).
 | World size | yes | Pure rebalance across fewer/more ranks |
 | **`pp` stage count** | **no** | Per-stage `pp{N}/` subdirs; changing `pp` reassigns layers and moves the embedding/output to different stages |
 | Precision (bf16 → fp32) | yes | DCP upcasts on load |
-| Add a new parameter | yes | Missing-from-shard → warned, default-initialized |
+| Add a new parameter | no | Not in `.metadata` → `Missing key in checkpoint state_dict`; see Missing parameter below |
 | Rename a parameter | no | Old name not in `.metadata` → error (or you patch the state dict keys before `load_state_dict`) |
 
 The table is about model and optimizer state, which is all DCP reshards. The
@@ -94,11 +96,23 @@ checkpoint loads into an EP run. Packed experts under FSDP need torch
   model config changed between save and load (e.g. `n_heads`
   changed, `dim` changed, `vocab_size` changed). DCP errors with
   the target vs saved shape. Diff the configs.
-- **Missing parameter**: the saver never wrote a tensor for
-  `layers.42.mlp.some_new_module` because that module wasn't in the
-  model yet. DCP warns; the tensor stays default-initialized. Fine
-  when you've added a new head or adapter; bad when you expected
-  transfer.
+- **Missing parameter** (`Missing key in checkpoint state_dict:
+  model.layers.42.mlp.some_new_module.weight`): the saver never wrote
+  that tensor because the module wasn't in the model yet. Neither a
+  resume nor a `checkpoint.load_path` warm start can add it:
+  `exclude_from_loading` skips the whole model or the whole optimizer,
+  not single tensors. For a change `ModelConfig` can express that adds
+  tensors without resizing existing ones (more layers, for example),
+  the weights-only round trip in [HF conversion](hf-conversion.md)
+  carries the old weights over:
+  `dcp-to-hf` with the old config, then `hf-to-dcp` with the new one,
+  which leaves the new parameters at their initial values with a
+  warning. The export casts the weights to the export dtype, bfloat16
+  unless you choose another (see [Dtypes](hf-conversion.md#dtypes)),
+  and the result has no optimizer state or `train_state.pt`, so the
+  run starts at step 0. A change that also resizes an existing tensor,
+  such as more experts (the router grows) or a larger vocabulary, fails
+  in `hf-to-dcp` with a size mismatch.
 - **Extra parameter**: the saver wrote a tensor the loader doesn't
   want (you removed a module). DCP ignores the extra shard —
   silently, so watch the checkpoint size rather than relying on

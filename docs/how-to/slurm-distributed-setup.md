@@ -15,8 +15,10 @@ assemble, and how preemption + auto-resume compose with them.
 ## Single node: `singlenode.sh`
 
 ```bash
-sbatch scripts/slurm/singlenode.sh configs/train/7b.toml
-sbatch scripts/slurm/singlenode.sh configs/train/7b.toml --train.max_steps=1000
+sbatch scripts/slurm/singlenode.sh configs/train/debug.toml \
+    --checkpoint.dir=checkpoints/debug_slurm
+sbatch scripts/slurm/singlenode.sh configs/train/7b.toml \
+    --data.dataset_path=<your shards> --train.max_steps=1000
 ```
 
 The script:
@@ -45,9 +47,10 @@ both it and `scripts/slurm/13b_validation.sh` pin a GPU model through
 ## Multi-node: `multinode.sh`
 
 ```bash
-sbatch --nodes=4 scripts/slurm/multinode.sh configs/train/7b.toml
+sbatch --nodes=4 scripts/slurm/multinode.sh configs/train/7b.toml \
+    --data.dataset_path=<your shards>
 sbatch --nodes=8 scripts/slurm/multinode.sh \
-    configs/train/7b.toml --train.max_steps=50000
+    configs/train/7b.toml --data.dataset_path=<your shards> --train.max_steps=50000
 ```
 
 Two things make multi-node different from single-node on this
@@ -68,7 +71,7 @@ codebase:
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=4      # ← must match gpus-per-node
 #SBATCH --gpus-per-node=4
-#SBATCH --signal=B:SIGTERM@120   # SLURM sends SIGTERM 120s before time-limit
+#SBATCH --signal=SIGTERM@120     # SIGTERM to the srun ranks before the time limit
 #SBATCH --requeue                # auto-resubmit on preemption
 ```
 
@@ -97,13 +100,19 @@ NCCL_SOCKET_IFNAME=ib0      # OOB bootstrap + socket transport
 NCCL_IB_DISABLE=0           # enable IB verbs transport
 NCCL_NET_GDR_LEVEL=2        # GPU-direct RDMA
 NCCL_IB_GID_INDEX=3         # H100/H200 fabric config
-NCCL_TIMEOUT=1800           # 30 minutes — raise for slow collectives
 GLOO_SOCKET_IFNAME=ib0
 ```
 
 `NCCL_IB_GID_INDEX=3` is specific to the RoCE/IB fabric on Kempner
 H100/H200 nodes. On other clusters this may need to be 0 or 1 — check
 with your admins or `ibv_devinfo`.
+
+No environment variable bounds a hung collective: neither NCCL nor
+PyTorch reads `NCCL_TIMEOUT`. `distributed.nccl_timeout_sec` (default
+1800 seconds) is the timeout of the default process group, which plain
+FSDP uses; the groups `init_device_mesh` creates for TP, PP, EP, HSDP and
+other extra mesh dimensions keep PyTorch's 30-minute default. Set it in
+the config or with `--distributed.nccl_timeout_sec=<seconds>`.
 
 ## Interactive / existing allocation: `interactive.sh`
 
@@ -113,7 +122,8 @@ want to attach training to it without a new `sbatch`:
 ```bash
 # Pass the JOBID of the existing allocation, then the config:
 bash scripts/slurm/interactive.sh 3565401 configs/train/debug.toml
-bash scripts/slurm/interactive.sh 3565401 configs/train/7b.toml --train.max_steps=50
+bash scripts/slurm/interactive.sh 3565401 configs/train/7b.toml \
+    --data.dataset_path=<your shards> --train.max_steps=50
 ```
 
 The script resolves `NODELIST` / `MASTER_ADDR` via `squeue -j $JOBID`
@@ -128,23 +138,30 @@ The full mechanics live in
 [Resilience § SLURM preemption](../resilience/slurm-preemption.md);
 the short version:
 
-- `#SBATCH --signal=B:SIGTERM@120` tells SLURM: "send SIGTERM 120
-  seconds before the wallclock time limit, to rank 0 (`B:` = batch
-  script process)."
+- `#SBATCH --signal=SIGTERM@120` tells SLURM to send `SIGTERM` to every
+  job step, that is, to every `srun`-launched rank, 120 to 180 seconds
+  before the time limit. The batch shell is not signaled. `singlenode.sh`
+  has no job step, so it keeps `--signal=B:SIGTERM@120` (batch shell only)
+  and forwards one `SIGTERM` to `uv run torchrun` from a `trap`; see
+  [Resilience § SLURM preemption](../resilience/slurm-preemption.md#slurm-side).
 - The training loop's
   [`ShutdownHandler`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/signal_handler.py)
   catches SIGTERM, flips `should_shutdown()` to `True`, and the step
   loop writes an emergency DCP checkpoint before exiting cleanly.
-- `#SBATCH --requeue` puts the job back in the queue. When it starts
+- `#SBATCH --requeue` puts a preempted job back in the queue. When it starts
   again, `CheckpointManager` follows the `latest` symlink in
   `checkpoint.dir` and resumes at the exact step / sample.
 
-The 120-second window is a design parameter: emergency checkpoints
-must finish within it or the job is SIGKILL'd. Async DCP save times
-depend on model size, FSDP degree, and filesystem — measure on your
-cluster with `checkpoint.async_mode = "async"` and a test run before
-trusting the default for 70B+. If your save consistently overruns,
-raise `#SBATCH --signal=B:SIGTERM@<seconds>` accordingly.
+The 120-second window is a design parameter: the step in flight and the
+emergency checkpoint must finish within it. At the time limit the ranks
+get `SIGTERM` again and may be killed at once rather than after
+`KillWait`, so plan for the save to finish before the limit. Async DCP
+save times depend on model size, FSDP degree, and filesystem, so measure
+them on your cluster with `checkpoint.async_mode = "async"` and a test run
+before trusting the default for 70B+. If your save consistently overruns,
+raise `#SBATCH --signal=SIGTERM@<seconds>` accordingly. Under
+`singlenode.sh`, `torchrun` gives its workers 30 seconds after the signal,
+whatever the lead.
 
 ## Auto-resume in practice
 
@@ -165,8 +182,9 @@ Restart cnt:  2
 
 If you see rising restart counts but training never crosses step
 `eval_interval`, something is preempting the job faster than it can
-checkpoint — raise the `#SBATCH --signal` window or drop
-`checkpoint.interval`.
+checkpoint. Lower `checkpoint.interval`: a preempted job gets no
+`--signal` lead on a partition without a preemption grace time, so the
+periodic checkpoints are what it resumes from.
 
 ## Checking the launch worked
 

@@ -56,9 +56,9 @@ Assume preflight has passed. Walk the user through the status of the subsystems 
 - **Gaps**: No per-step-range retention policy beyond `keep_last_n`. No cross-cloud checkpoint (S3/GCS). No partial-shape-compatible resume (e.g., resume a bigger model from a smaller-model checkpoint).
 
 ### Resilience (kempnerforge/resilience/)
-- **Implemented**: SIGTERM/SIGUSR1 handlers for SLURM preemption (`signal_handler.py`), GPU compute and memory health probes (`health.py`), NCCL liveness via all-reduce (`health.py`), elastic rendezvous helpers (`elastic.py`).
+- **Implemented**: SIGTERM/SIGUSR1 handlers for SLURM preemption (`signal_handler.py`), GPU compute and memory health probes (`health.py`), NCCL liveness via all-reduce (`health.py`), SLURM job info and auto-resume helpers (`elastic.py`).
 - **Tested**: `test_resilience.py`.
-- **Gaps**: No automatic rollback to a specific earlier checkpoint on persistent NaN. Recommendation today is manual: the NaN handler warns and exits with guidance. No integration with external HPC monitoring (Prometheus / DCGM alerts).
+- **Gaps**: No elastic training: no elastic (torchelastic) rendezvous, and a job cannot gain or lose nodes while it runs. No automatic rollback to a specific earlier checkpoint on persistent NaN. Recommendation today is manual: the NaN handler warns and exits with guidance. No integration with external HPC monitoring (Prometheus / DCGM alerts).
 
 ### Metrics (kempnerforge/metrics/)
 - **Implemented**: `MetricsTracker` with EMA smoothing, WandB and TensorBoard backends (`tracker.py`), MFU computation (`mfu.py`), peak memory tracking with optional snapshot export (`memory.py`), rank-aware logger (`logger.py`).

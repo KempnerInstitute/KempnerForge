@@ -50,7 +50,7 @@ The reference preemption-resilient launch script is
 [`scripts/slurm/7b_requeue.sh`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/slurm/7b_requeue.sh):
 
 ```bash
-#SBATCH --signal=B:SIGTERM@120   # SIGTERM 120s before hard kill
+#SBATCH --signal=SIGTERM@120     # SIGTERM to the ranks before the time limit
 #SBATCH --requeue                # auto-resubmit on preempt
 
 srun --kill-on-bad-exit=1 uv run python scripts/train.py "${CONFIG}"

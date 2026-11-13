@@ -171,53 +171,99 @@ if you want the timer to bound a hung save.
 
 ```bash
 # scripts/slurm/7b_requeue.sh
-#SBATCH --signal=B:SIGTERM@120
+#SBATCH --signal=SIGTERM@120
 #SBATCH --requeue
 ```
 
 Two directives:
 
-- **`--signal=B:SIGTERM@120`** — SLURM sends `SIGTERM` to the batch
-  script's bash shell 120 seconds before the hard kill. The `B:` prefix
-  means "signal the batch process"; without it the signal goes only to
-  the allocation's `srun` child and bash (and therefore our Python)
-  might miss it.
+- **`--signal=SIGTERM@120`**: when the job is within 120 seconds of its
+  time limit, SLURM sends `SIGTERM` to every job step, which here means
+  every `srun`-launched rank. The batch shell is not signaled. SLURM's
+  event handling can send it up to 60 seconds early, so the ranks get 120
+  to 180 seconds. Each task runs `uv run python scripts/train.py`, and
+  `uv run` forwards the signal to the rank; where SLURM signals every
+  process of a step (`SignalChildrenProcesses=yes` in `cgroup.conf`, as
+  on the Kempner cluster), the rank gets it directly as well. A second
+  `SIGTERM` only sets the shutdown flag again.
 
-  How the signal reaches the ranks depends on the launch script. The
-  emergency save, its flush and the teardown must finish before SLURM's
-  SIGKILL. The forced-exit timer only helps if it fires first, so
-  `shutdown_timeout_sec` must be shorter than the lead. The 600 s
+  With the `B:` prefix (`--signal=B:SIGTERM@120`) SLURM signals the batch
+  shell only and none of its children (`man sbatch`). The ranks under
+  `srun` never see that signal, and a batch shell without a `trap` dies of
+  it, which ends the job early. Forwarding the signal to `srun` does not
+  help either: `srun` answers `SIGTERM` by sending `SIGKILL` to its tasks
+  (`man srun`, under `--ignore-signals`).
+
+  `scripts/slurm/singlenode.sh` is the exception. It runs `torchrun` in
+  the batch shell, so the job has no step for SLURM to signal, and it
+  keeps `--signal=B:SIGTERM@120`. It starts `uv run torchrun` in the
+  background and traps `SIGTERM` and `SIGUSR1`. On the first of them it
+  sends a `SIGTERM` to that `uv` process, which forwards it to `torchrun`.
+  It does not forward later ones: `torchrun` restarts its shutdown on a
+  second `SIGTERM` and can exit on a third without waiting for its
+  workers. `torchrun` signals its workers and kills any still running 30
+  seconds later, so a single-node run has 30 seconds for its emergency
+  checkpoint, whatever the lead time. `torchrun` then exits with status 1,
+  so `sacct` reports the job as failed even when the checkpoint was
+  written; look in the log for `Checkpoint committed` for the step that
+  `Shutdown requested at step N` names.
+
+  Both launch shapes rely on `uv run` passing `SIGTERM` and `SIGUSR1` on to
+  its child and exiting with the child's status (143 when the child dies
+  of `SIGTERM`), which was verified with uv 0.9.16.
+
+  The lead time has to cover the step in flight plus the emergency
+  checkpoint, including the flush of an async save. Measure the save on
+  your cluster before trusting 120 seconds for a large model, and raise
+  the lead if it does not fit. Plan for the emergency save to finish
+  before the time limit: at the limit SLURM sends `SIGTERM` again, and the
+  ranks may be killed at once rather than after `KillWait` (30 seconds on
+  the Kempner cluster), because `srun` itself can receive that `SIGTERM`
+  and turn it into a `SIGKILL` of its tasks.
+
+  The forced-exit timer only helps if it fires before SLURM's `SIGKILL`,
+  so `shutdown_timeout_sec` must be shorter than the lead. The 600 s
   default is not, so under these scripts SLURM's kill always comes
   first. Deriving the timeout from the lead is not done yet.
 
-- **`--requeue`** — if the job is preempted, SLURM re-submits it. The
-  new run reads
-  [`resolve_resume_path`](../checkpointing/auto-resume.md) and picks up
-  from the emergency checkpoint written in the previous run. SLURM
-  increments `SLURM_RESTART_COUNT` — visible in `log_job_info()` output.
+- **`--requeue`**: if the job is preempted, SLURM puts it back in the
+  queue. The new run reads
+  [`resolve_resume_path`](../checkpointing/auto-resume.md) and resumes
+  from the last checkpoint saved. SLURM increments
+  `SLURM_RESTART_COUNT`, which `log_job_info()` prints. A job that reaches
+  its time limit is not requeued; resubmit it, and it resumes the same
+  way.
 
-## The full preemption timeline
+## The full shutdown timeline
+
+At the time limit, for a script that launches the ranks with `srun`:
 
 ```
-  T-120s: SIGTERM reaches the ranks, the way the launch script arranges
-  T-120s: ShutdownHandler sets _shutdown_requested = True
-          ShutdownHandler starts the forced-exit timer, due
-          shutdown_timeout_sec later; with the 600s default that is
-          after the SIGKILL at T-0, so it never fires
-  T-120s: Training loop in mid-step — completes the step
-   T-??s: Ranks vote on should_shutdown() → all save the emergency
-          checkpoint at the same step; a rank the vote stopped
-          starts its own forced-exit timer with request()
-          ckpt_mgr.wait() flushes async writer to disk
-   T-??s: Process group destroyed; shutdown_handler.finish() restores
-          the handlers and cancels the forced-exit timer
-   T-??s: Process exits cleanly, SLURM epilogue runs
-     T-0: SLURM's SIGTERM deadline — if still alive, hard SIGKILL
-          (in practice we exit well before this because async save is fast)
-   T+??: SLURM sees job failed; `--requeue` re-submits
-          new job starts, resolve_resume_path finds the checkpoint
-          training resumes from step N+1
+  T-180..T-120 s  SLURM sends SIGTERM to every job step; each rank gets it
+                  through `uv run`, and directly where SLURM signals every
+                  process of a step; a second SIGTERM only sets the flag
+                  again. ShutdownHandler sets _shutdown_requested = True
+                  and starts its forced-exit timer, due
+                  shutdown_timeout_sec later (with the 600 s default that
+                  is after SLURM's SIGKILL, so it never fires)
+  next step end   the ranks vote on should_shutdown() and all write the
+                  emergency checkpoint at the same step (or reuse that
+                  step's scheduled save), then stop; a rank that learns of
+                  the shutdown only from the vote arms its own timer with
+                  request(); ckpt_mgr.wait() flushes an async save
+  then            the process group is destroyed; shutdown_handler.finish()
+                  restores the handlers and cancels the timer; srun returns
+                  0 and the job completes before its limit
+  T-0             a rank still running gets SIGTERM again and may be killed
+                  at once; plan for the save to finish before this point
 ```
+
+On preemption there is no lead. A partition without a preemption grace
+time (`GraceTime=0`, as on every Kempner partition) terminates the job at
+once with SLURM's kill sequence, `SIGTERM` and then `SIGKILL` after
+`KillWait` at the latest, and `--requeue` puts it back in the queue. What
+a requeued job loses is bounded by `checkpoint.interval`, not by the
+`--signal` lead.
 
 ## `SIGUSR1`
 
@@ -234,6 +280,11 @@ timing. This is the recommended way to stop a run manually — don't
 with a short grace period and may skip the emergency checkpoint if the
 step is long.
 
+`scancel` sends `USR1` to the job steps only. `scripts/slurm/singlenode.sh`
+has none, so stop it with `scancel --batch --signal=USR1 <JOBID>`: its
+trap turns that into one `SIGTERM` for `uv run torchrun`, with the
+30-second limit described above.
+
 Native code can replace the handlers below Python, where
 `signal.getsignal` still reports KempnerForge's. The LLVM inside Triton
 does when it compiles a kernel in the training process that Triton's
@@ -248,13 +299,17 @@ on another thread skips the reinstall.
 ## Troubleshooting
 
 **"Received SIGTERM" logged but no emergency checkpoint saved.** Usually
-means SLURM killed the ranks before the save and its flush finished
-(the signal lead plus KillWait). With `shutdown_timeout_sec` below
-that, the forced exit can also end a slow flush; the log then shows
-`Graceful shutdown timed out`. If an ERROR says the parameters are not
-finite, the signal arrived during a run of NaN steps whose weights a
-bad update had already ruined, and the loop skipped the save on
-purpose; `latest` still names the last checkpoint saved.
+means SLURM killed the ranks before the save and its flush finished:
+they took longer than the `--signal` lead, plus `KillWait` where SLURM
+waits that long after the limit. Raise the `--signal` lead or make the
+save faster. For `singlenode.sh` only a faster save helps, because
+`torchrun` allows its workers 30 seconds whatever the lead. With
+`shutdown_timeout_sec` below that window, the forced exit can also end
+a slow flush; the log then shows `Graceful shutdown timed out`. If an
+ERROR says the parameters are not finite, the signal arrived during a
+run of NaN steps whose weights a bad update had already ruined, and the
+loop skipped the save on purpose; `latest` still names the last
+checkpoint saved.
 
 **`SIGUSR1` sent but nothing logged.** If it arrived during a step in
 which Triton compiled a kernel in the training process, usually the

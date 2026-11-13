@@ -1,22 +1,22 @@
 <p align="center">
-  <img src="docs/assets/logo.png" alt="KempnerForge" width="240"/>
+  <img src="../docs/assets/logo.png" alt="KempnerForge" width="240"/>
 </p>
 
 <p align="center">
   <a href="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/ci.yml"><img src="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/ci.yml/badge.svg" alt="CI"/></a>
   <a href="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/docs.yml"><img src="https://github.com/KempnerInstitute/KempnerForge/actions/workflows/docs.yml/badge.svg" alt="Docs"/></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
+  <a href="../LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"/></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12+-blue.svg" alt="Python 3.12+"/></a>
   <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/pytorch-2.4+-ee4c2c.svg" alt="PyTorch 2.4+"/></a>
-  <a href="docs/claude-ready.md"><img src="https://img.shields.io/badge/agent--ready-v0.1-4c8eda.svg" alt="Agent-ready v0.1"/></a>
+  <a href="../docs/claude-ready.md"><img src="https://img.shields.io/badge/agent--ready-v0.1-4c8eda.svg" alt="Agent-ready v0.1"/></a>
 </p>
 
 PyTorch-native framework for fault-tolerant distributed training of foundation models on AI clusters.
 
 ## AI / NeuroAI use cases
 
-- **Scaling law experiments**: train the same architecture from 125M to 70B by swapping a TOML config. FSDP, tensor, expert, and pipeline parallelism are automatic.
-- **Mechanistic interpretability**: activation extraction hooks at any layer with CPU offload; attention weight capture exposes raw QK^T matrices.
+- **Scaling law experiments**: train the same architecture at different sizes by changing `dim`, `n_layers` and the head counts in a TOML config; the training presets in `configs/train/` range from a 20M-parameter debug model to 70B. FSDP, tensor, expert, and pipeline parallelism are set in the same config.
+- **Mechanistic interpretability**: activation extraction hooks at any layer with CPU offload; attention weight capture records each head's softmax(QK^T/√d) matrix.
 - **Sparse architecture research**: switch between dense and MoE by setting `num_experts` (0 for dense, >0 for MoE). Softmax top-k or DeepSeek-V3 sigmoid routing, shared experts, configurable MoE frequency.
 - **Optimizer and scheduler comparison**: 4 optimizers (AdamW, Muon, Lion, Schedule-Free AdamW) × 6 LR schedulers, composable via config. Data annealing phases for curriculum learning.
 - **Long-running jobs on shared clusters**: SLURM preemption handling, async DCP checkpointing, auto-resume, NaN detection, GPU/NCCL health monitoring.
@@ -98,7 +98,7 @@ flowchart TB
     end
 ```
 
-Parallelism application order is enforced. Wrong order causes silent correctness bugs. See [`docs/architecture/parallelism-order.md`](docs/architecture/parallelism-order.md) for the rationale.
+Parallelism application order is enforced. Wrong order causes silent correctness bugs. See [`docs/architecture/parallelism-order.md`](../docs/architecture/parallelism-order.md) for the rationale.
 
 ## Measured performance
 
@@ -113,7 +113,7 @@ Llama-3 architecture on NVIDIA H200 (141 GB), bf16 + full activation checkpointi
 | 32 | 8 | 13B | TP=4 + FSDP=8 | 32.7% | 104,309 |
 | 32 | 8 | 70B | TP=4 + FSDP=8 | 25.4% | 17,657 |
 
-Full 14-configuration sweep: [`benchmarks/mfu_scaling/`](benchmarks/mfu_scaling/). MoE expert parallelism results: [`benchmarks/moe_expert_parallel/`](benchmarks/moe_expert_parallel/).
+Full 14-configuration sweep: [`benchmarks/mfu_scaling/`](../benchmarks/mfu_scaling/). MoE expert parallelism results: [`benchmarks/moe_expert_parallel/`](../benchmarks/moe_expert_parallel/).
 
 ## Quick start
 
@@ -127,15 +127,20 @@ uv sync
 uv run python scripts/train.py configs/train/debug.toml
 
 # Multi-GPU (4 GPUs, FSDP)
-uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/7b.toml
+uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/debug.toml \
+    --checkpoint.dir=checkpoints/debug_4gpu
 
-# SLURM (single node)
-sbatch scripts/slurm/singlenode.sh configs/train/7b.toml
+# SLURM (single node, 4 GPUs): use your cluster's partition and account
+mkdir -p logs
+sbatch --partition=<partition> --account=<account> scripts/slurm/singlenode.sh \
+    configs/train/debug.toml --checkpoint.dir=checkpoints/debug_slurm
 ```
 
+`debug.toml` trains a 20M-parameter model on synthetic tokens, so these commands need no dataset, but they do need CUDA GPUs: one for the debug run, four for the other two. A run resumes from the latest checkpoint in its `checkpoint.dir`, so each command writes to its own. Most other configs in `configs/train/` set `dataset_path = "/path/to/tokenized/dataset"`, a placeholder: pass `--data.dataset_path=<your shards>` or edit the config before running them (see [available configs](../docs/reference/available-configs.md)). The sbatch scripts in `scripts/slurm/` carry placeholder `--partition` and `--account` values in their `#SBATCH` headers; the `sbatch` flags above override them, or you can edit the headers. The scripts write their output to `logs/`; Slurm 23.02 and later create it, and older versions fail the job silently without it.
+
 Further reading:
-- [`docs/getting-started/quickstart.md`](docs/getting-started/quickstart.md): 5-minute walkthrough (install → debug → multi-GPU → custom data → optimizer swap → MoE → hooks)
-- [`docs/how-to/end-to-end-training-run.md`](docs/how-to/end-to-end-training-run.md): tokenize → config → 1 GPU → 4 GPUs → resume → generate
+- [`docs/getting-started/quickstart.md`](../docs/getting-started/quickstart.md): 5-minute walkthrough (install → debug → multi-GPU → custom data → optimizer swap → MoE → hooks)
+- [`docs/how-to/end-to-end-training-run.md`](../docs/how-to/end-to-end-training-run.md): tokenize → config → 1 GPU → 4 GPUs → resume → generate
 
 ## Agent-ready
 
@@ -153,18 +158,18 @@ First-run flow, from a fresh clone (use the absolute path to your checkout; rela
 
 The `marketplace list` step is a sanity check: `kempnerforge` should appear under "Configured marketplaces". If it doesn't, the add silently failed; re-check the absolute path.
 
-v0.1 ships these skills: `install-and-verify`, `cluster-config`, `smoke-test`, `slurm-launch`, `explain-architecture`, `add-optimizer`, `component-gaps`. Full catalog, install details, and how skills stay in sync with the code: [`docs/claude-ready.md`](docs/claude-ready.md).
+v0.1 ships these skills: `install-and-verify`, `cluster-config`, `smoke-test`, `slurm-launch`, `explain-architecture`, `add-optimizer`, `component-gaps`. Full catalog, install details, and how skills stay in sync with the code: [`docs/claude-ready.md`](../docs/claude-ready.md).
 
 ## Documentation
 
-The [documentation site](docs/index.md) is the canonical reference. Key entry points:
+The [documentation site](../docs/index.md) is the canonical reference. Key entry points:
 
-- [Getting started](docs/getting-started/index.md): install, quickstart, first run
-- [Architecture](docs/architecture/index.md): model forward pass, parallelism order, data flow
-- [How-to guides](docs/how-to/index.md): end-to-end workflows, scaling, debugging, FP8, MoE experiments, interpretability
-- [Configuration](docs/configuration/index.md): config sections, CLI overrides, validation rules, registry
-- **Subsystems**: [training](docs/training/index.md) · [distributed](docs/distributed/index.md) · [MoE](docs/moe/index.md) · [data](docs/data/index.md) · [checkpointing](docs/checkpointing/index.md) · [metrics & profiling](docs/metrics-and-profiling/index.md) · [resilience](docs/resilience/index.md)
-- [Reference](docs/reference/index.md): available configs, parallelism recipes, benchmarks, environment variables
+- [Getting started](../docs/getting-started/index.md): install, quickstart, first run
+- [Architecture](../docs/architecture/index.md): model forward pass, parallelism order, data flow
+- [How-to guides](../docs/how-to/index.md): end-to-end workflows, scaling, debugging, FP8, MoE experiments, interpretability
+- [Configuration](../docs/configuration/index.md): config sections, CLI overrides, validation rules, registry
+- **Subsystems**: [training](../docs/training/index.md) · [distributed](../docs/distributed/index.md) · [MoE](../docs/moe/index.md) · [data](../docs/data/index.md) · [checkpointing](../docs/checkpointing/index.md) · [metrics & profiling](../docs/metrics-and-profiling/index.md) · [resilience](../docs/resilience/index.md)
+- [Reference](../docs/reference/index.md): available configs, parallelism recipes, benchmarks, environment variables
 
 ## MoE engineering roadmap
 
@@ -180,7 +185,7 @@ Core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, FSDP2 compatibility, an
 | Multi-token prediction (MTP) | Planned | 10-15% sample efficiency |
 | Large-scale EP (hierarchical all-to-all, 256+ experts) | Planned | 1000+ GPU scale |
 
-> Dense pipeline parallelism works. MoE + PP is rejected at config validation time because MoE data-dependent routing is incompatible with static pipeline stage splitting. Use FSDP, TP, or EP for MoE models.
+> Pipeline parallelism runs dense models with the 1F1B or GPipe schedule; 4-GPU end-to-end tests train and resume PP=4, PP=2 with FSDP=2, and PP=2 with TP=2; tied embeddings, VLMs and MoE are rejected with PP at config validation time. MoE data-dependent routing is incompatible with static pipeline stage splitting, so use FSDP, TP, or EP for MoE models.
 
 ## Project structure
 
@@ -212,8 +217,8 @@ tests/         # unit, integration, distributed, and end-to-end tests
 
 ## Contributing
 
-See [`docs/contributing.md`](docs/contributing.md) for the editor loop, build commands, and style conventions.
+See [`CONTRIBUTING.md`](../CONTRIBUTING.md) for the editor loop, build commands, and style conventions.
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](../LICENSE).
