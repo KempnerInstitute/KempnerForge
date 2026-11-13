@@ -13,13 +13,14 @@ never imports it, so this directory can be deleted without touching the core.
 examples/image_understanding/
 ├── README.md
 ├── train.py              # training entry point
+├── evaluate_checkpoint.py   # evaluation entry point (below)
 ├── configs/
 │   └── eval_tasks.toml   # sample evaluation tasks, with placeholder paths
-├── evaluation/           # evaluation tasks and answer scorers (below)
+├── evaluation/           # checkpoint evaluator, evaluation tasks and answer scorers (below)
 ├── image_text/           # image-text dataset readers and chat renderer (below)
 └── tests/
     ├── test_image_understanding_entry.py   # the entry point loads a config and hands it off
-    ├── evaluation/       # task-file and scorer tests (CPU)
+    ├── evaluation/       # evaluator, task-file and scorer tests (CPU)
     └── image_text/       # reader and renderer tests (CPU)
 ```
 
@@ -170,11 +171,97 @@ and the optimizer starts fresh. Stage 2 starts from a stage-1 checkpoint as
 weights alone with `checkpoint.exclude_from_loading = ["optimizer", "train_state"]`,
 so its step and schedule start again from 0.
 
+## Evaluate a checkpoint
+
+`evaluate_checkpoint.py` decodes an answer for every row of each task's split
+with a saved checkpoint and scores it. It takes the config the checkpoint was
+trained with and the overrides that run used, a run directory (its latest
+checkpoint is evaluated) or one step directory, a task file (next section) and
+an output directory:
+
+```bash
+uv run torchrun --nproc_per_node=4 examples/image_understanding/evaluate_checkpoint.py \
+    <config.toml> --checkpoint /your/run/dir --tasks <tasks.toml> \
+    --output /your/results/dir --batch-size 32
+```
+
+The model is built from the config and loads the checkpoint's weights; every
+rank holds all of it, whatever parallelism the run trained with. The language
+model and the adapter compute in the dtype of `train.mixed_precision`, the image
+encoder in `vision_encoder.mixed_precision` when that is set and otherwise in
+the dtype it loads in. The decode takes a `joint_decoder` that sees one view of
+one image, so another arch, a `[video]` config or `vlm.tile_grid` is refused
+before anything is built. So is `model.moe_capacity_factor > 0`, which drops
+tokens by what else is in the batch. A save from pipeline parallelism
+(`distributed.pp > 1`) is refused too: it holds one set of shards per stage, and
+every rank here loads the whole model from one set.
+
+The inputs are training's. Each document goes through the training
+`ChatRenderer`: the prompt is the text it puts before the assistant's reply, and
+the image is preprocessed as in a training sample. A document needs one image
+and one turn; any other stops the run with the limit named
+(`evaluation/inputs.py` is where a document becomes model inputs).
+
+Decoding is greedy. A batch is laid out like a training row (image tokens, then
+text, padding last), each image is encoded once, and a row ends at the turn end
+or EOS, or after the task's `max_new_tokens`. A split is cut into consecutive
+batches, the ranks take them in turn, and rank 0 merges the rows, each scored
+once. Every batch holds the same rows whatever the number of ranks, so with one
+`--batch-size` the scores are the same on any number of GPUs of one kind. Causal
+attention keeps a row independent of its batch in exact arithmetic; across batch
+sizes the scores match up to floating-point (bf16) numerics, which can flip a
+close argmax.
+
+A row is scored as it is or counted under a reason, never changed to fit:
+
+- `unreadable_row`: the reader passed over the row because its image does not
+  decode. The row it moved on to is not scored in its place.
+- `prompt_too_long`: the prompt and `max_new_tokens` do not fit
+  `vlm.max_text_len`, the text length training lays out.
+- `unrenderable_row`: the chat template does not lay the row out as training
+  does (a `conversation` document whose turn the template mangles), so training
+  passes over it too. Its record holds the error text.
+
+A task's rows are the rows its reader yields: a reader that drops rows when it
+loads a split (a row with no question or no answer, for one) does so before the
+evaluation and does not count them. A reader that passes over rows while it is
+read must say so, either through `read_with_index`, which returns the index of
+the row it read with the document, or through a `skipped` count that moves
+whenever it passes over a row. A reader that gives up after a run of unusable
+rows raises `NoUsableRowError` (what `first_usable` raises); each such row is
+counted as `unreadable_row`, and any other error fails the run.
+
+The prediction that is scored is the generation decoded with special tokens
+skipped and nothing else cleaned up; the scorers normalize their own input. The
+predictions file keeps the raw `generation` beside it.
+
+A task's metrics are over its scored rows, with the counts beside them. A
+missing image file, a task whose cap leaves no room for any prompt, or a task
+with no scored row fails the run.
+
+```
+/your/results/dir/
+├── predictions/<task>.jsonl   # per row: question, references, generation, prediction, score
+├── metrics.json               # <task>/<metric> to value
+└── results.json               # per task: metrics, rows (its reader's), samples, skips by reason
+```
+
+When an evaluation starts, before the config and the task file are loaded, the
+files of the last one are removed from the output directory: `results.json`
+first, then `metrics.json` and the `predictions/*.jsonl` files; nothing else
+there is touched. `results.json` is written last, so it is there only for an
+evaluation that finished, and a failed one leaves no file of an earlier one; it
+names the step directory it evaluated. Each file is written to a sibling of its
+own and renamed into place, so none is ever half written, even when two
+evaluations write the same output directory at once. When that checkpoint's
+`metadata.json` records an MLflow run, rank 0 then appends the metrics to it as `eval/<task>/<metric>` at the checkpoint's
+step. `--no-publish` turns that off, and a failure to publish is a warning with
+the command that publishes `metrics.json` later, never a failed evaluation.
+
 ## Evaluation tasks and scorers
 
-`evaluation/` holds what an evaluation run is made of: the tasks to run and the
-scorers of their answers. The evaluator that runs them on a checkpoint is on the
-roadmap.
+`evaluation/` also holds what an evaluation run is made of: the tasks to run and
+the scorers of their answers.
 
 - `tasks.py`: `load_tasks` reads a TOML task file into frozen `EvalTask`s. A task
   has a unique `name`, a `reader` (one of the `testbed.py` loaders) with that
@@ -247,16 +334,16 @@ or in core where it belongs:
 - Text-only documents in image-text batches
 - Documents with several images
 - Per-module learning rates and schedules
-- Evaluation: the evaluator that runs the tasks on a saved checkpoint, periodic
-  evaluation during training, PixMo point and count scorers, documents with
-  several images or none, and image attention when decoding
+- Evaluation: periodic evaluation during training, PixMo point and count
+  scorers, documents with several images or none, image attention when
+  decoding, and a KV cache for decoding
 - Run-comparison metrics: documents seen, token counts, MFU with the encoder
 
 ## Tests
 
 The tests live outside the repo's `tests/` tree (the main suite's
-`testpaths`), so run them by path. They need no GPU; the renderer tests download
-the `Qwen/Qwen3-0.6B` tokenizer once:
+`testpaths`), so run them by path. They need no GPU; the renderer
+tests download the `Qwen/Qwen3-0.6B` tokenizer once:
 
 ```bash
 uv run pytest examples/image_understanding/tests
