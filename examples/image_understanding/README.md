@@ -163,9 +163,13 @@ route's attention takes an explicit dense mask rather than the unmasked causal
 fast path (or the flex backend's block-sparse mask) for that run, and never
 flips between the two. On `cross_attention` a text-only row skips the
 cross-attention blocks: their attention and MLP updates are zeroed for that
-row, so its text runs through the backbone alone. On `mot` and `moma` the
-hidden blank image's tokens still pass through the image experts and count in
-the load-balance loss.
+row, so its text runs through the backbone alone. On `mot` the hidden blank
+image's tokens still pass through the image experts. On `moma` they are dropped
+before routing, so they take no expert capacity; a micro-batch with no image
+gives the image experts zero gradients. On `joint_decoder` and `moma` the
+FlashAttention kernel takes no mask, so an unpacked dataset with text-only rows
+is refused with `model.sdpa_backend = "flash"` under `attention_backend =
+"sdpa"`.
 
 ## Documents with several images
 

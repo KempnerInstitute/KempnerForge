@@ -15,6 +15,7 @@ from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import VLMConfig
 from kempnerforge.data.vlm_dataset import pack_vlm_samples
 from kempnerforge.model.masking import use_dynamic_flex_shapes
+from kempnerforge.model.vision import VisionEncoder
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 from kempnerforge.training.loop import _mark_rows_dynamic
 
@@ -63,6 +64,20 @@ def _batch(rows: int) -> dict[str, torch.Tensor]:
     assert batch["input_ids"].shape == (rows, _SEQ_LEN)
     assert batch["pixel_values"].shape[0] == 2 * rows - 1
     return {name: tensor.to("cuda") for name, tensor in batch.items()}
+
+
+class _LinearEncoder(VisionEncoder):
+    """A vision encoder with parameters, so a gradient check can see it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.num_tokens = _IMAGE_TOKENS
+        self.feature_dim = 32
+        self.proj = torch.nn.Linear(3 * 4 * 4, self.num_tokens * self.feature_dim)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        flat = self.proj(pixel_values.flatten(1))
+        return flat.view(pixel_values.shape[0], self.num_tokens, self.feature_dim)
 
 
 def _models() -> tuple[VLMWrapper, VLMWrapper]:
@@ -187,12 +202,15 @@ def test_eager_packed_flex_reuses_the_dynamic_pair() -> None:
 
 @pytest.mark.gpu
 def test_a_compiled_text_only_batch_keeps_the_visual_parameters_in_the_graph() -> None:
-    """An all-text packed batch still gives the encoder and adapter zero, not missing, gradients."""
+    """An all-text packed batch gives a trainable encoder and the adapter zero gradients."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
     torch._dynamo.reset()
     dense, sparse = _models()
+    dense.vision_encoder = _LinearEncoder().to("cuda")
+    sparse.vision_encoder = _LinearEncoder().to("cuda")
+    sparse.vision_encoder.load_state_dict(dense.vision_encoder.state_dict())
     use_dynamic_flex_shapes(True)
     try:
         compiled = torch.compile(sparse)
@@ -225,7 +243,7 @@ def test_a_compiled_text_only_batch_keeps_the_visual_parameters_in_the_graph() -
             for name, parameter in module.named_parameters()
             if parameter.requires_grad
         ]
-        assert visual
+        assert any(name.startswith("proj.") for name, _ in visual)
         for name, parameter in visual:
             assert parameter.grad is not None, name
             assert torch.count_nonzero(parameter.grad) == 0, name

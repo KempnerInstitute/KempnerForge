@@ -177,6 +177,15 @@ def _build_vlm_pipeline(
                 f"per document, {layout} in rows of {tc.seq_len}"
             )
         else:
+            flash = (
+                config.model.sdpa_backend == "flash"
+                and config.model.attention_backend == "sdpa"
+                and vlm_cfg.arch in ("joint_decoder", "moma")
+            )
+            if dataset.has_text_only_rows and flash:
+                raise ValueError(
+                    "A dataset with text-only rows is not supported with model.sdpa_backend='flash'"
+                )
             collator = VLMCollator(
                 pad_id=pad_id,
                 max_text_len=vlm_cfg.max_text_len,
