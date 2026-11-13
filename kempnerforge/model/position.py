@@ -25,8 +25,12 @@ def precompute_rope_frequencies(
 
     Returns:
         Tuple of (cos, sin) tensors, each shape (max_seq_len, head_dim // 2).
+
+    Raises:
+        ValueError: ``head_dim`` is odd.
     """
-    assert head_dim % 2 == 0, f"head_dim must be even, got {head_dim}"
+    if head_dim % 2:
+        raise ValueError(f"head_dim must be even for rotary embeddings, got {head_dim}")
 
     freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
 
