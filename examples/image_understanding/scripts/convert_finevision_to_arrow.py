@@ -198,7 +198,8 @@ def _convert_job(job: tuple[Path, Path, float]) -> int | str:
 
     A stale claim is taken over by renaming it, which only one process can do; a
     process whose claim was taken over stops at its next row group and leaves the
-    file and its claim to the taker. An error while claiming is this file's failure.
+    file and its claim to the taker. An error while claiming is this file's failure and
+    leaves no claim behind.
     """
     src_file, dst_file, stale_seconds = job
     claim = dst_file.with_name(dst_file.name + ".claim")
@@ -218,12 +219,16 @@ def _convert_job(job: tuple[Path, Path, float]) -> int | str:
         return 0
     except OSError as exc:
         return f"{src_file}: {type(exc).__name__}: {exc}"
-    lost = False
     try:
         try:
             os.write(fd, f"{tag} {time.time():.0f}\n".encode())
         finally:
             os.close(fd)
+    except OSError as exc:
+        claim.unlink(missing_ok=True)
+        return f"{src_file}: {type(exc).__name__}: {exc}"
+    lost = False
+    try:
         return convert_file(src_file, dst_file, tag, heartbeat=lambda: _touch_claim(claim, tag))
     except ClaimLostError:
         lost = True

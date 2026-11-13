@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import io
 import os
@@ -297,6 +298,27 @@ class TestConversion:
             "train-00000-of-00001.meta.npz",
         ]
         assert list((dst / "locked").iterdir()) == []
+
+    def test_a_failed_claim_write_leaves_no_claim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A full disk while writing the claim fails the file, and a rerun converts it."""
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        parquet = src / "demo" / "train-00000-of-00001.parquet"
+        _write_parquet(parquet, [[_row(1, [("Q0", "A0")], 5)]])
+        (dst / "demo").mkdir(parents=True)
+        arrow = dst / "demo" / "train-00000-of-00001.arrow"
+        converter = _converter()
+        write = converter.os.write
+
+        def full_once(fd: int, data: bytes) -> int:
+            monkeypatch.setattr(converter.os, "write", write)
+            raise OSError(errno.EDQUOT, "Disk quota exceeded")
+
+        monkeypatch.setattr(converter.os, "write", full_once)
+        assert "Disk quota exceeded" in converter._convert_job((parquet, arrow, 3600.0))
+        assert list((dst / "demo").iterdir()) == []
+        assert converter._convert_job((parquet, arrow, 3600.0)) > 0
 
     def test_the_recorded_source_size_is_the_converted_file(self, tmp_path: Path) -> None:
         src = tmp_path / "parquet" / "demo" / "train-00000-of-00001.parquet"
