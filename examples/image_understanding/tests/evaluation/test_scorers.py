@@ -36,15 +36,14 @@ class TestVQAAccuracy:
             vqa_accuracy("yes", _votes(2, 5))
         )
 
-    @pytest.mark.parametrize("count", range(2, 13))
+    @pytest.mark.parametrize("count", range(1, 13))
     def test_every_reference_count_has_a_best_score(self, count: int) -> None:
         best = min(1.0, (count - 1) / 3)
         assert vqa_accuracy("yes", ["yes"] * count) == pytest.approx(best)
 
     @pytest.mark.parametrize("answers", [["yes"], ["no"], ("yes",)])
-    def test_a_single_reference_is_refused(self, answers: Sequence[str]) -> None:
-        with pytest.raises(ValueError, match="at least two references"):
-            vqa_accuracy("yes", answers)
+    def test_a_single_reference_scores_zero(self, answers: Sequence[str]) -> None:
+        assert vqa_accuracy("yes", answers) == 0.0
 
     @pytest.mark.parametrize(
         ("matching", "total", "expected"),

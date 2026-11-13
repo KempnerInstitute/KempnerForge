@@ -197,10 +197,10 @@ roadmap.
     prediction scores `min(1, m / 3)` against the `m` remaining annotators who
     gave the same answer, and the score is the mean over those rounds, after the
     official answer normalization (`vqa_normalization.py`) of the prediction and
-    of every reference. With ten references, three matching annotators score 0.9
-    and four score 1. A sample needs at least two references: with one the score
-    could only be 0, so `vqa_accuracy` raises `ValueError` instead, and data with a
-    single answer per question needs another scorer. Four or more can reach 1.
+    of every reference, whether or not the references agree. With ten references,
+    three matching annotators score 0.9 and four score 1. Four or more references
+    can reach 1, and a single reference scores 0, as in the official evaluation,
+    so data with one answer per question needs another scorer.
   - `anls` (DocVQA): the similarity `1 - NL` to the closest reference, where `NL`
     is the Levenshtein distance over the longer length, and 0 once `NL` reaches
     0.5. Case is ignored, and whitespace is collapsed first: none at either end,
