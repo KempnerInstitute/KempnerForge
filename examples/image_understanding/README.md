@@ -186,7 +186,10 @@ roadmap.
   `str`, `Path`, `bool`, `int` or `float` (alone or with `None`) are refused with
   the valid ones listed. Nothing else is judged at load: other annotations,
   nested values and every limit on a value (a count of at least 1, say) are
-  checked by the reader itself when `build_reader` constructs it.
+  checked by the reader itself when `build_reader` constructs it. A relative
+  path given to a reader parameter annotated `Path`, as the testbed loaders'
+  `annotation_file` and `image_root` are, is taken from the task file's
+  directory, so a task file reads the same data from any working directory.
 - `scorers.py`: a scorer rates one prediction against a sample's reference
   answers with a value in [0, 1], and a task's score is the mean over its
   samples. The text scorers take the prediction as a `str` and the references as
