@@ -15,8 +15,10 @@ assemble, and how preemption + auto-resume compose with them.
 ## Single node: `singlenode.sh`
 
 ```bash
-sbatch scripts/slurm/singlenode.sh configs/train/7b.toml
-sbatch scripts/slurm/singlenode.sh configs/train/7b.toml --train.max_steps=1000
+sbatch scripts/slurm/singlenode.sh configs/train/debug.toml \
+    --checkpoint.dir=checkpoints/debug_slurm
+sbatch scripts/slurm/singlenode.sh configs/train/7b.toml \
+    --data.dataset_path=<your shards> --train.max_steps=1000
 ```
 
 The script:
@@ -45,9 +47,10 @@ both it and `scripts/slurm/13b_validation.sh` pin a GPU model through
 ## Multi-node: `multinode.sh`
 
 ```bash
-sbatch --nodes=4 scripts/slurm/multinode.sh configs/train/7b.toml
+sbatch --nodes=4 scripts/slurm/multinode.sh configs/train/7b.toml \
+    --data.dataset_path=<your shards>
 sbatch --nodes=8 scripts/slurm/multinode.sh \
-    configs/train/7b.toml --train.max_steps=50000
+    configs/train/7b.toml --data.dataset_path=<your shards> --train.max_steps=50000
 ```
 
 Two things make multi-node different from single-node on this
@@ -113,7 +116,8 @@ want to attach training to it without a new `sbatch`:
 ```bash
 # Pass the JOBID of the existing allocation, then the config:
 bash scripts/slurm/interactive.sh 3565401 configs/train/debug.toml
-bash scripts/slurm/interactive.sh 3565401 configs/train/7b.toml --train.max_steps=50
+bash scripts/slurm/interactive.sh 3565401 configs/train/7b.toml \
+    --data.dataset_path=<your shards> --train.max_steps=50
 ```
 
 The script resolves `NODELIST` / `MASTER_ADDR` via `squeue -j $JOBID`

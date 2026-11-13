@@ -33,9 +33,9 @@ for DCP ↔ HuggingFace conversion.
 | File | Purpose | Model | GPUs | Parallelism | MoE |
 |------|---------|-------|-----:|-------------|-----|
 | [`debug_moe.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/debug_moe.toml) | Tiny MoE smoke test | 256-dim, 4-layer | 1+ | FSDP (`dp_shard=-1`) | 4 experts, top-2, `moe_frequency=2` |
-| [`moe_8gpu_stress.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/moe_8gpu_stress.toml) | Saturate 2 nodes with MoE | ~4B total / 1.8B active | 8 | TP=4 × FSDP=2 | 8 experts, top-2, `moe_frequency=1` |
-| [`moe_24gpu.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/moe_24gpu.toml) | 24-GPU MoE stress test | ~7B total / 1.8B active | 24 | TP=4 × FSDP=6 | 8 experts, top-2, `grad_accum=32` for full saturation |
-| [`moe_ep_32gpu.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/moe_ep_32gpu.toml) | MoE + Expert Parallel | ~4B total / 1.8B active | 32 | TP=4 × EP=2 × FSDP=4 | 8 experts, top-2, all-to-all across IB |
+| [`moe_8gpu_stress.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/moe_8gpu_stress.toml) | Saturate 2 nodes with MoE | ~9.2B total / ~2.9B active | 8 | TP=4 × FSDP=2 | 8 experts, top-2, `moe_frequency=1` |
+| [`moe_24gpu.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/moe_24gpu.toml) | 24-GPU MoE stress test | ~9.2B total / ~2.9B active | 24 | TP=4 × FSDP=6 | 8 experts, top-2, `grad_accum=32` for full saturation |
+| [`moe_ep_32gpu.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/moe_ep_32gpu.toml) | MoE + Expert Parallel | ~9.2B total / ~2.9B active | 32 | TP=4 × EP=2 × FSDP=4 | 8 experts, top-2, all-to-all across IB |
 
 See the [MoE Expert Parallel benchmark](benchmarks.md#moe-expert-parallelism)
 for the numbers the last config produced.
@@ -65,10 +65,13 @@ HuggingFace.
   produces data-dependent shapes that break `torch.compile`'s graph —
   [`JobConfig.validate(world_size)`](../configuration/validation-rules.md)
   logs a warning (not an error) if you combine them.
-- **Paths in these configs** (`dataset_path = "/path/to/..."`) are
-  placeholders — replace them with a real tokenized shard directory
-  before running. The `hf_wikitext.toml` config is the only one that
-  runs end-to-end without path edits (it streams from the HF Hub).
+- **`dataset_path = "/path/to/tokenized/dataset"`**, in 13 of the 17
+  training configs, is a placeholder: point it at a real tokenized
+  shard directory, in the config or with `--data.dataset_path=…`,
+  before running. The other four run without path edits: `debug.toml`,
+  `debug_moe.toml` and `moe_24gpu.toml` set no data source and train
+  on synthetic tokens, and `hf_wikitext.toml` streams Wikitext-103 from
+  the HF Hub.
 - **Short `max_steps`** (20–100) in the multi-node configs is a
   benchmark-sizing default, not a training budget. Override with
   `--train.max_steps=…` for real runs.

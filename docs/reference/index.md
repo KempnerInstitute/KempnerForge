@@ -30,10 +30,3 @@ environment-variables
 - **[Environment variables](environment-variables.md)** — every env var
   the framework reads, grouped by source (torchrun / SLURM / NCCL /
   logging) with who-sets-what.
-
-## See also
-
-- [README § Training Configurations](https://github.com/KempnerInstitute/KempnerForge#training-configurations)
-  — the current configs table at the repo root.
-- [README § Benchmarks](https://github.com/KempnerInstitute/KempnerForge#benchmarks)
-  — the MFU table at the repo root.

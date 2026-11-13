@@ -1,7 +1,7 @@
 # 8-GPU MoE stress test: saturate 2 nodes × 4 H200 141GB.
 #
-# ~4B total params, ~1.8B active per token. TP=4 intra-node, DP_shard=2
-# across nodes (FSDP). All layers MoE, real FineWeb-Edu dataset, bf16.
+# ~9.2B total params, ~2.9B active per token. TP=4 intra-node, DP_shard=2
+# across nodes (FSDP). All layers MoE, bf16; dataset_path is a placeholder.
 # Activation checkpointing on and large batch to saturate compute.
 
 [model]
