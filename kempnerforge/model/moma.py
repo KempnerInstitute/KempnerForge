@@ -344,7 +344,8 @@ class MoMaFFN(nn.Module):
                 keep = valid_flat.index_select(0, mod_idx).nonzero(as_tuple=False).squeeze(-1)
                 idx = mod_idx.index_select(0, keep)
             if idx.numel() == 0:
-                anchor = sum(p.sum() for p in self.experts[m].parameters()) * 0
+                params = self.experts[m].parameters()
+                anchor = sum((p.sum() for p in params), out.new_zeros(())) * 0
                 out = out + anchor.to(out.dtype)
                 continue
             x_m = x_flat.index_select(0, idx)
