@@ -35,8 +35,9 @@ self._config.wandb_run_id = self._run.id      # write back for checkpoint
 Two reasons for lazy init:
 
 - **Distributed setup finishes first.** By the time the first step logs,
-  process groups are built, checkpoint resume has happened, and
-  `wandb_run_id` may have been restored from the checkpoint `extra` dict.
+  process groups are built, checkpoint resume has happened, and on an
+  auto-resume `wandb_run_id` may have been restored from the checkpoint
+  `extra` dict.
 - **No wandb call in CI / tests.** Constructing a tracker never touches
   the network unless a step actually logs.
 
@@ -58,17 +59,25 @@ On a fresh run:
 
    This ends up in the `train_state.extra` dict inside the checkpoint.
 
-On resume:
+On an auto-resume from `checkpoint.dir`:
 
 ```python
-# training/entry.py::restore_checkpoint — right after ckpt_mgr.load(...)
-if ckpt_extra_loaded.get("wandb_run_id"):
-    config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
+# training/entry.py::restore_checkpoint, right after ckpt_mgr.load(...)
+if resume_path is not None:
+    if ckpt_extra_loaded.get("wandb_run_id"):
+        config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
 ```
 
 Then when tracker backends initialize lazily, `init_kwargs["id"]` carries
 the restored ID and `resume="allow"` tells wandb to reattach to that run.
 Metrics continue on the same chart rather than splitting across runs.
+
+A `checkpoint.load_path` warm start is a new run, so it does not restore
+`wandb_run_id`: wandb mints a new run for it, and the warm start's own
+checkpoints carry that one, so its requeues continue it. To log a warm
+start into an existing run on purpose, set `metrics.wandb_run_id`; a run
+id the config sets is kept. The MLflow backend also tags its new run with
+the source checkpoint ([MLflow § Run ID and resume](mlflow.md#run-id-and-resume)).
 
 `resume="allow"` (not `"must"`) is intentional: if the old run was
 deleted wandb-side, the flag falls back to a fresh run rather than
