@@ -9,11 +9,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask
 
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
 from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
-from kempnerforge.model.attention import Attention
+from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
 from kempnerforge.model.mlp import StandardMLP, SwiGLUMLP, build_mlp
@@ -177,6 +178,67 @@ class TestAttention:
     def test_sdpa_backend_stored_on_module(self):
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend="math")
         assert attn.sdpa_backend == "math"
+
+    @pytest.mark.parametrize("capture", [False, True])
+    @pytest.mark.parametrize("past", [0, 4])
+    def test_a_visibility_mask_is_refused_before_writing_the_cache(self, capture, past):
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2)
+        attn.capture_attention_weights = capture
+        cos, sin = precompute_rope_frequencies(16, 16)
+        cache = KVCache(
+            batch_size=1,
+            max_seq_len=16,
+            n_kv_heads=2,
+            head_dim=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        with torch.no_grad():
+            if past:
+                attn(torch.randn(1, past, 64), cos[:past], sin[:past], kv_cache=cache)
+            x = torch.randn(1, 3, 64)
+            square = torch.ones(1, 1, 3, 3, dtype=torch.bool)
+            whole = torch.ones(7, 7, dtype=torch.bool)
+            for wrong in (square, whole):
+                with pytest.raises(ValueError, match="cannot be combined with kv_cache"):
+                    attn(
+                        x,
+                        cos[past : past + 3],
+                        sin[past : past + 3],
+                        kv_cache=cache,
+                        attn_mask=wrong,
+                    )
+                assert cache.seq_len == past
+            block = create_block_mask(lambda b, h, q, kv: q >= kv, 1, 1, 3, 3, device="cpu")
+            with pytest.raises(ValueError, match="cannot be combined with kv_cache"):
+                attn(x, cos[past : past + 3], sin[past : past + 3], kv_cache=cache, attn_mask=block)
+            assert cache.seq_len == past
+
+    @pytest.mark.parametrize("capture", [False, True])
+    def test_a_layer_on_its_own_appends_tokens_under_a_pinned_kernel(self, capture):
+        """Without a mask from the transformer, a layer derives the lower-right one itself."""
+        torch.manual_seed(0)
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2, sdpa_backend="math")
+        attn.capture_attention_weights = capture
+        cos, sin = precompute_rope_frequencies(16, 16)
+        x = torch.randn(1, 8, 64)
+        cache = KVCache(
+            batch_size=1,
+            max_seq_len=16,
+            n_kv_heads=2,
+            head_dim=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        with torch.no_grad():
+            full = attn(x, cos[:8], sin[:8])
+            prefill = attn(x[:, :4], cos[:4], sin[:4], kv_cache=cache)
+            appended = attn(x[:, 4:7], cos[4:7], sin[4:7], kv_cache=cache)
+            last = attn(x[:, 7:], cos[7:8], sin[7:8], kv_cache=cache)
+        torch.testing.assert_close(torch.cat([prefill, appended, last], dim=1), full)
+        if capture:
+            assert attn.last_attention_weights is not None
+            assert attn.last_attention_weights.shape == (1, 4, 1, 8)
 
 
 class TestMLP:
@@ -594,7 +656,7 @@ def _norms(model: torch.nn.Module) -> dict[str, torch.nn.Module]:
     return {
         name: module
         for name, module in model.named_modules()
-        if isinstance(module, (RMSNorm, torch.nn.LayerNorm))
+        if isinstance(module, RMSNorm | torch.nn.LayerNorm)
     }
 
 
@@ -1443,3 +1505,138 @@ class TestHeadDimDefaultsUnchanged:
         with torch.no_grad():
             second = again(tokens)
         assert torch.equal(first, second)
+
+
+class TestInlineEmbeds:
+    def _inline(self, model, tokens, rows, positions, embeds):
+        return model(
+            tokens,
+            modality=ModalityContext(
+                inline_embeds=embeds, inline_rows=rows, inline_positions=positions
+            ),
+        )
+
+    def test_matches_embeddings_written_by_hand(self):
+        """The inline route equals embedding the tokens and overwriting the slots."""
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+        rows = torch.tensor([0, 0, 1, 1, 1], device=DEVICE)
+        positions = torch.tensor([3, 4, 0, 1, 2], device=DEVICE)
+        embeds = torch.randn(5, 128, device=DEVICE)
+        with torch.no_grad():
+            by_hand = model.token_embedding(tokens).clone()
+            by_hand[rows, positions] = embeds
+            expected = model(modality=ModalityContext(inputs_embeds=by_hand))
+            out = self._inline(model, tokens, rows, positions, embeds)
+        assert torch.equal(out, expected)
+
+    def test_gradients_reach_the_inline_embeds_and_the_embedding(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        embeds = torch.randn(3, 128, device=DEVICE, requires_grad=True)
+        rows = torch.zeros(3, dtype=torch.long, device=DEVICE)
+        positions = torch.tensor([1, 2, 3], device=DEVICE)
+        self._inline(model, tokens, rows, positions, embeds).sum().backward()
+        assert embeds.grad is not None and torch.isfinite(embeds.grad).all()
+        assert all(p.grad is not None for p in model.token_embedding.parameters())
+
+    def test_output_gather_runs_the_head_on_the_chosen_positions(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).eval()
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+        rows = torch.tensor([0, 1, 1], device=DEVICE)
+        positions = torch.tensor([5, 0, 15], device=DEVICE)
+        with torch.no_grad():
+            full = model(tokens)
+            picked = model(
+                tokens, modality=ModalityContext(output_rows=rows, output_positions=positions)
+            )
+        assert picked.shape == (1, 3, 256)
+        torch.testing.assert_close(picked[0], full[rows, positions])
+
+    def test_output_gather_rejects_a_slice_and_a_cache(self):
+        with pytest.raises(ValueError, match="both trim the head"):
+            ModalityContext(
+                output_rows=torch.zeros(1, dtype=torch.long),
+                output_positions=torch.zeros(1, dtype=torch.long),
+                output_slice=slice(1, None),
+            )
+        with pytest.raises(ValueError, match="must be given together"):
+            ModalityContext(output_rows=torch.zeros(1, dtype=torch.long))
+
+    def test_width_mismatch_raises(self):
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        tokens = torch.randint(0, 256, (1, 8), device=DEVICE)
+        with pytest.raises(ValueError, match="inline_embeds width"):
+            self._inline(model, tokens, torch.tensor([0]), torch.tensor([0]), torch.randn(1, 64))
+
+    def test_context_requires_both_indices(self):
+        embeds = torch.randn(2, 128)
+        with pytest.raises(ValueError, match="requires both inline_rows and inline_positions"):
+            ModalityContext(inline_embeds=embeds, inline_rows=torch.zeros(2, dtype=torch.long))
+        with pytest.raises(ValueError, match="require inline_embeds"):
+            ModalityContext(inline_rows=torch.zeros(2, dtype=torch.long))
+        with pytest.raises(ValueError, match="inline_positions must be \\(2,\\)"):
+            ModalityContext(
+                inline_embeds=embeds,
+                inline_rows=torch.zeros(2, dtype=torch.long),
+                inline_positions=torch.zeros(3, dtype=torch.long),
+            )
+        with pytest.raises(ValueError, match="at most one of"):
+            ModalityContext(
+                inline_embeds=embeds,
+                inline_rows=torch.zeros(2, dtype=torch.long),
+                inline_positions=torch.zeros(2, dtype=torch.long),
+                prefix_embeds=torch.randn(1, 2, 128),
+            )
+
+    def test_inline_embeddings_reject_kv_caches(self) -> None:
+        from kempnerforge.model.attention import KVCache
+
+        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        caches = [
+            KVCache(
+                batch_size=1,
+                max_seq_len=32,
+                n_kv_heads=4,
+                head_dim=32,
+                dtype=torch.float32,
+                device=DEVICE,
+            )
+            for _ in range(_KWARG_CONFIG.n_layers)
+        ]
+        modality = ModalityContext(
+            inline_embeds=torch.randn(2, 128, device=DEVICE),
+            inline_rows=torch.zeros(2, dtype=torch.long, device=DEVICE),
+            inline_positions=torch.arange(2, device=DEVICE),
+        )
+        tokens = torch.randint(0, 256, (1, 4), device=DEVICE)
+        with pytest.raises(ValueError, match="modality.inline_embeds is training-only"):
+            model(tokens, modality=modality, kv_caches=caches)
+
+    def test_inline_embeddings_require_a_matrix(self) -> None:
+        with pytest.raises(ValueError, match=r"inline_embeds must be \(M, dim\)"):
+            ModalityContext(
+                inline_embeds=torch.randn(2, 1, 128),
+                inline_rows=torch.zeros(2, dtype=torch.long),
+                inline_positions=torch.arange(2),
+            )
+
+    @pytest.mark.parametrize("name", ["inline_rows", "inline_positions"])
+    def test_inline_indices_require_int64(self, name: str) -> None:
+        indices = {
+            "inline_rows": torch.zeros(2, dtype=torch.long),
+            "inline_positions": torch.arange(2),
+        }
+        indices[name] = indices[name].to(torch.int32)
+        with pytest.raises(ValueError, match=rf"{name}\.dtype must be torch.long"):
+            ModalityContext(inline_embeds=torch.randn(2, 128), **indices)
+
+    def test_inline_embeddings_accept_key_padding_mask(self) -> None:
+        mask = torch.ones(1, 4, dtype=torch.bool)
+        context = ModalityContext(
+            inline_embeds=torch.randn(2, 128),
+            inline_rows=torch.zeros(2, dtype=torch.long),
+            inline_positions=torch.arange(2),
+            key_padding_mask=mask,
+        )
+        assert context.key_padding_mask is mask
