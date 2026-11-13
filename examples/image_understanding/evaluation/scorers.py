@@ -104,21 +104,29 @@ def _similarity(prediction: str, answer: str) -> float:
     return 1 - distance if distance < ANLS_THRESHOLD else 0.0
 
 
+def _collapsed(text: str) -> str:
+    """``text`` lowercased, with no whitespace at either end and each inner run one space."""
+    return " ".join(text.lower().split())
+
+
 def anls(prediction: str, answers: Sequence[str]) -> float:
     """Normalized Levenshtein similarity of ``prediction`` to its closest reference.
 
-    The similarity to a reference is ``1 - NL``, where ``NL`` is the Levenshtein
-    distance divided by the length of the longer string, and it counts only while
-    ``NL`` is below ``ANLS_THRESHOLD``: a similarity of exactly one half scores 0.
-    The score is the best over the references, and its mean over a task is ANLS
-    (Biten et al., "Scene Text Visual Question Answering", ICCV 2019, equation 1;
-    the DocVQA metric). Strings are compared lowercased and without surrounding
-    whitespace, inner whitespace counts as written, and two empty strings are
-    identical.
+    Both strings are lowercased and their whitespace collapsed: none is left at
+    either end, and each run inside becomes one space, so ``"123\\nMain  St"``
+    equals ``"123 main st"``. The similarity to a reference is ``1 - NL``, where
+    ``NL`` is the Levenshtein distance between the collapsed strings divided by
+    the length of the longer one, and it counts only while ``NL`` is below
+    ``ANLS_THRESHOLD``. The score is the best over the references, and its mean
+    over a task is ANLS (Biten et al., "Scene Text Visual Question Answering",
+    ICCV 2019, equation 1; the DocVQA metric). Equation 1 leaves ``NL`` equal to
+    the threshold open: here a similarity of exactly one half scores 0, as in
+    Pix2Struct, while the evaluation script distributed with the DocVQA datasets
+    (docvqa.org) scores it 0.5. Two empty strings are identical.
     """
     references = _references(prediction, answers)
-    predicted = prediction.strip().lower()
-    return max(_similarity(predicted, answer.strip().lower()) for answer in references)
+    predicted = _collapsed(prediction)
+    return max(_similarity(predicted, _collapsed(answer)) for answer in references)
 
 
 def _trimmed(text: str) -> str:

@@ -87,13 +87,29 @@ class TestANLS:
             ("sunday", "saturday", 1 - 3 / 8),
             ("abcd", "abcdef", 1 - 2 / 6),
             ("abcdef", "abcd", 1 - 2 / 6),
-            ("new  york", "new york", 1 - 1 / 9),
+            ("newyork", "new york", 1 - 1 / 8),
         ],
     )
     def test_similarity_is_one_minus_the_normalized_distance(
         self, prediction: str, answer: str, expected: float
     ) -> None:
         assert anls(prediction, [answer]) == pytest.approx(expected)
+
+    @pytest.mark.parametrize(
+        ("prediction", "answer"),
+        [
+            ("123\nMain St", "123 main st"),
+            ("new  york", "new york"),
+            ("new york", "new \t york"),
+            ("\n new\r\nyork ", "New York"),
+        ],
+    )
+    def test_each_run_of_whitespace_counts_as_one_space(self, prediction: str, answer: str) -> None:
+        assert anls(prediction, [answer]) == 1.0
+
+    def test_whitespace_does_not_lengthen_the_compared_strings(self) -> None:
+        assert anls("abd" + " " * 20, ["abc"]) == pytest.approx(2 / 3)
+        assert anls("a   b   d", ["a b c"]) == pytest.approx(1 - 1 / 5)
 
     @pytest.mark.parametrize(
         ("prediction", "answer"),

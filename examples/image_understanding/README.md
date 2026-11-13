@@ -203,7 +203,8 @@ roadmap.
     single answer per question needs another scorer. Four or more can reach 1.
   - `anls` (DocVQA): the similarity `1 - NL` to the closest reference, where `NL`
     is the Levenshtein distance over the longer length, and 0 once `NL` reaches
-    0.5. Case and surrounding whitespace are ignored.
+    0.5. Case is ignored, and whitespace is collapsed first: none at either end,
+    and each run inside one space.
   - `relaxed_accuracy` (ChartQA): 1 for a number within 5 percent of a numeric
     reference, or for text equal to a reference but for case, surrounding
     whitespace and trailing `?`, `.` and `!`, applied in that order, so
