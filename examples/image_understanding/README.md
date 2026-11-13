@@ -279,8 +279,10 @@ Its placeholders are `{config}` and `{tasks}` (the two files above), `{checkpoin
 `--eval-output`, `step_<N>`) and `{overrides}`, which stands for the run's
 `--section.key=value` overrides as separate arguments, so the evaluation builds the
 model the run trained. `{checkpoint}` and `{output}` are required. Every path is
-filled in absolute, so the command may change directory, as the job script below
-does. The template is split into arguments first and the placeholders filled in
+filled in absolute, and the task file's own relative paths are taken from its
+directory, so the command may change directory, as the job script below does;
+relative paths in the config are read from the working directory, as in training.
+The template is split into arguments first and the placeholders filled in
 afterwards, so a path with a space is still one argument, and it is run without a
 shell.
 
