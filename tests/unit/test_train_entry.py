@@ -3000,6 +3000,19 @@ class TestVlmSourceBuilders:
         dp.build_data_pipeline(self._vlm_data_config(), _runtime())
         assert seen["image_collator"]["frame_mask"] is True
 
+    def test_text_only_rows_are_refused_with_flash_attention(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.model.sdpa_backend = "flash"
+        dp.build_data_pipeline(config, _runtime())
+        monkeypatch.setattr(FakeDataset, "has_text_only_rows", True)
+        with pytest.raises(ValueError, match="sdpa_backend='flash'"):
+            dp.build_data_pipeline(config, _runtime())
+        config.model.attention_backend = "flex"
+        dp.build_data_pipeline(config, _runtime())
+
     def test_packed_image_path_takes_the_model_token_count(self, monkeypatch):
         import kempnerforge.data.vlm_dataset as vlmd
 
