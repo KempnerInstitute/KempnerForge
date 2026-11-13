@@ -16,6 +16,7 @@ SUPPORTED_ARCHES = ("joint_decoder",)
 
 _DCP_METADATA_FILE = ".metadata"
 _SIDECAR_FILE = "metadata.json"
+_TRAIN_STATE_FILE = "train_state.pt"
 
 
 def check_supported(config: JobConfig) -> None:
@@ -92,6 +93,20 @@ def read_step(step_dir: Path) -> int | None:
     except (OSError, ValueError, AttributeError):
         return None
     return step if type(step) is int else None
+
+
+def step_dir_complete(step_dir: Path) -> bool:
+    """Whether the checkpoint in ``step_dir`` is complete and its evaluation can start.
+
+    The DCP ``.metadata`` is written once every shard is durable, after which the
+    checkpoint is readable whether or not the manager has pointed ``latest`` at it yet;
+    ``train_state.pt`` and ``metadata.json`` are rank 0's other files of a save.
+    Three ``stat`` calls, cheap enough to poll.
+    """
+    return all(
+        (step_dir / name).exists()
+        for name in (_DCP_METADATA_FILE, _TRAIN_STATE_FILE, _SIDECAR_FILE)
+    )
 
 
 def load_model(config: JobConfig, step_dir: Path, device: torch.device) -> VLMWrapper:
