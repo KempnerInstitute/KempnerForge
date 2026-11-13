@@ -385,7 +385,10 @@ the scorers of their answers.
   `str`, `Path`, `bool`, `int` or `float` (alone or with `None`) are refused with
   the valid ones listed. Nothing else is judged at load: other annotations,
   nested values and every limit on a value (a count of at least 1, say) are
-  checked by the reader itself when `build_reader` constructs it.
+  checked by the reader itself when `build_reader` constructs it. A relative
+  path given to a reader parameter annotated `Path`, as the testbed loaders'
+  `annotation_file` and `image_root` are, is taken from the task file's
+  directory, so a task file reads the same data from any working directory.
 - `scorers.py`: a scorer rates one prediction against a sample's reference
   answers with a value in [0, 1], and a task's score is the mean over its
   samples. The text scorers take the prediction as a `str` and the references as
@@ -396,18 +399,20 @@ the scorers of their answers.
     prediction scores `min(1, m / 3)` against the `m` remaining annotators who
     gave the same answer, and the score is the mean over those rounds, after the
     official answer normalization (`vqa_normalization.py`) of the prediction and
-    of every reference. With ten references, three matching annotators score 0.9
-    and four score 1. A sample needs at least two references: with one the score
-    could only be 0, so `vqa_accuracy` raises `ValueError` instead, and data with a
-    single answer per question needs another scorer. Four or more can reach 1.
+    of every reference, whether or not the references agree. With ten references,
+    three matching annotators score 0.9 and four score 1. Four or more references
+    can reach 1, and a single reference scores 0, as in the official evaluation,
+    so data with one answer per question needs another scorer.
   - `anls` (DocVQA): the similarity `1 - NL` to the closest reference, where `NL`
     is the Levenshtein distance over the longer length, and 0 once `NL` reaches
-    0.5. Case and surrounding whitespace are ignored.
+    0.5. Case is ignored, and whitespace is collapsed first: none at either end,
+    and each run inside one space.
   - `relaxed_accuracy` (ChartQA): 1 for a number within 5 percent of a numeric
     reference, or for text equal to a reference but for case, surrounding
     whitespace and trailing `?`, `.` and `!`, applied in that order, so
-    `"yes !"` becomes `"yes "`. A number is what `float` parses, so `45%` and
-    `1,000` are text while `1_000` is 1000.
+    `"yes !"` becomes `"yes "`. A number is what `float` parses, and a trailing
+    `%` makes hundredths, as in Pix2Struct's relaxed correctness: `45%` matches
+    `0.45` and `45.1%` but not `45`. `1,000` is text, while `1_000` is 1000.
 
 `configs/eval_tasks.toml` is a sample with five tasks and their caps (VQAv2 10,
 TextVQA 75, DocVQA 50, ChartQA human and machine 50); its paths are

@@ -115,13 +115,17 @@ def _quoted_optional(annotation_file: str, limit: Optional["int"] = None) -> lis
 
 class TestLoadTasks:
     def test_a_task_table_becomes_a_task(self, tmp_path: Path) -> None:
+        base = tmp_path.resolve()
         assert load_tasks(_write(tmp_path, TASK)) == (
             EvalTask(
                 name="docvqa",
                 reader="docvqa",
                 scorer="anls",
                 max_new_tokens=50,
-                reader_args={"annotation_file": "ann.json", "image_root": "images"},
+                reader_args={
+                    "annotation_file": str(base / "ann.json"),
+                    "image_root": str(base / "images"),
+                },
             ),
         )
 
@@ -156,7 +160,96 @@ class TestSampleFile:
     def test_its_paths_are_placeholders(self) -> None:
         for task in load_tasks(SAMPLE):
             assert set(task.reader_args) == {"annotation_file", "image_root"}
-            assert all(value.startswith("path-to-") for value in task.reader_args.values())
+            for value in task.reader_args.values():
+                assert Path(value).parent == SAMPLE.parent
+                assert Path(value).name.startswith("path-to-")
+
+
+def _relative_task(annotation_file: str, image_root: str) -> str:
+    return TASK.replace('"ann.json"', f'"{annotation_file}"').replace('"images"', f'"{image_root}"')
+
+
+def _path_only(annotation_file: Path, limit: int = 0) -> list[str]:
+    return [str(annotation_file)]
+
+
+def _path_or_count(annotation_file: Path | int, limit: int = 0) -> list[str]:
+    return [str(annotation_file)]
+
+
+class TestRelativePaths:
+    @pytest.mark.parametrize("relative", ["ann.json", "data/ann.json", "../shared/ann.json"])
+    def test_a_relative_path_is_taken_from_the_task_file_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str
+    ) -> None:
+        (tmp_path / "run").mkdir()
+        (tmp_path / "elsewhere").mkdir()
+        path = _write(tmp_path / "run", _relative_task(relative, "images"))
+        monkeypatch.chdir(tmp_path / "elsewhere")
+        args = load_tasks(path)[0].reader_args
+        base = (tmp_path / "run").resolve()
+        assert args == {"annotation_file": str(base / relative), "image_root": str(base / "images")}
+
+    def test_a_relative_task_file_path_is_resolved_first(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "run").mkdir()
+        _write(tmp_path / "run", TASK)
+        monkeypatch.chdir(tmp_path)
+        args = load_tasks(Path("run") / "tasks.toml")[0].reader_args
+        assert args["annotation_file"] == str(tmp_path.resolve() / "run" / "ann.json")
+
+    def test_an_absolute_path_is_kept_as_written(self, tmp_path: Path) -> None:
+        annotation = tmp_path / "data" / "ann.json"
+        path = _write(tmp_path, _relative_task(str(annotation), "images"))
+        assert load_tasks(path)[0].reader_args["annotation_file"] == str(annotation)
+
+    def test_a_linked_task_file_reads_from_its_target_directory(self, tmp_path: Path) -> None:
+        (tmp_path / "configs").mkdir()
+        (tmp_path / "run").mkdir()
+        target = _write(tmp_path / "configs", TASK)
+        (tmp_path / "run" / "tasks.toml").symlink_to(target)
+        args = load_tasks(tmp_path / "run" / "tasks.toml")[0].reader_args
+        assert args["annotation_file"] == str(tmp_path.resolve() / "configs" / "ann.json")
+
+    def test_a_string_parameter_is_not_a_path(self, tmp_path: Path) -> None:
+        captions = TASK.replace('reader = "docvqa"', 'reader = "coco_captions"')
+        loaded = load_tasks(_write(tmp_path, captions + 'prompt = "images/describe.txt"\n'))
+        assert loaded[0].reader_args["prompt"] == "images/describe.txt"
+        assert Path(loaded[0].reader_args["annotation_file"]).is_absolute()
+
+    @pytest.mark.parametrize(
+        ("factory", "expected"),
+        [(_wrapped_rows, "ann.json"), (_unresolved_value, "ann.json"), (_path_only, None)],
+    )
+    def test_only_a_parameter_annotated_path_is_joined(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory: Any, expected: str | None
+    ) -> None:
+        monkeypatch.setitem(READERS, "docvqa", factory)
+        text = TASK.replace('image_root = "images"', "limit = 1")
+        args = load_tasks(_write(tmp_path, text))[0].reader_args
+        assert args["annotation_file"] == (expected or str(tmp_path.resolve() / "ann.json"))
+        assert args["limit"] == 1
+
+    def test_a_path_parameter_given_another_type_keeps_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(READERS, "docvqa", _path_or_count)
+        text = HEAD + "\n[tasks.reader_args]\nannotation_file = 3\n"
+        assert load_tasks(_write(tmp_path, text))[0].reader_args["annotation_file"] == 3
+
+    def test_a_task_file_reads_its_data_from_any_working_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = tmp_path / "run"
+        (run / "documents").mkdir(parents=True)
+        Image.new("RGB", (8, 6)).save(run / "documents" / "page.png")
+        rows = [{"question": "Date?", "answers": ["1999"], "image": "documents/page.png"}]
+        (run / "docvqa.json").write_text(json.dumps({"data": rows}))
+        path = _write(run, _relative_task("docvqa.json", "."))
+        monkeypatch.chdir(tmp_path)
+        reader = build_reader(load_tasks(path)[0])
+        assert isinstance(reader, ImageTextRows) and reader[0].turns[0].answers == ("1999",)
 
 
 class TestFileLayout:

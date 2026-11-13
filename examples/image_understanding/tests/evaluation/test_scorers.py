@@ -36,15 +36,14 @@ class TestVQAAccuracy:
             vqa_accuracy("yes", _votes(2, 5))
         )
 
-    @pytest.mark.parametrize("count", range(2, 13))
+    @pytest.mark.parametrize("count", range(1, 13))
     def test_every_reference_count_has_a_best_score(self, count: int) -> None:
         best = min(1.0, (count - 1) / 3)
         assert vqa_accuracy("yes", ["yes"] * count) == pytest.approx(best)
 
     @pytest.mark.parametrize("answers", [["yes"], ["no"], ("yes",)])
-    def test_a_single_reference_is_refused(self, answers: Sequence[str]) -> None:
-        with pytest.raises(ValueError, match="at least two references"):
-            vqa_accuracy("yes", answers)
+    def test_a_single_reference_scores_zero(self, answers: Sequence[str]) -> None:
+        assert vqa_accuracy("yes", answers) == 0.0
 
     @pytest.mark.parametrize(
         ("matching", "total", "expected"),
@@ -87,13 +86,29 @@ class TestANLS:
             ("sunday", "saturday", 1 - 3 / 8),
             ("abcd", "abcdef", 1 - 2 / 6),
             ("abcdef", "abcd", 1 - 2 / 6),
-            ("new  york", "new york", 1 - 1 / 9),
+            ("newyork", "new york", 1 - 1 / 8),
         ],
     )
     def test_similarity_is_one_minus_the_normalized_distance(
         self, prediction: str, answer: str, expected: float
     ) -> None:
         assert anls(prediction, [answer]) == pytest.approx(expected)
+
+    @pytest.mark.parametrize(
+        ("prediction", "answer"),
+        [
+            ("123\nMain St", "123 main st"),
+            ("new  york", "new york"),
+            ("new york", "new \t york"),
+            ("\n new\r\nyork ", "New York"),
+        ],
+    )
+    def test_each_run_of_whitespace_counts_as_one_space(self, prediction: str, answer: str) -> None:
+        assert anls(prediction, [answer]) == 1.0
+
+    def test_whitespace_does_not_lengthen_the_compared_strings(self) -> None:
+        assert anls("abd" + " " * 20, ["abc"]) == pytest.approx(2 / 3)
+        assert anls("a   b   d", ["a b c"]) == pytest.approx(1 - 1 / 5)
 
     @pytest.mark.parametrize(
         ("prediction", "answer"),
@@ -161,9 +176,30 @@ class TestRelaxedAccuracy:
     @pytest.mark.parametrize(
         ("prediction", "answer", "expected"),
         [
-            ("5%", "5", 0.0),
-            ("5%", "5%", 1.0),
-            ("4.9%", "5%", 0.0),
+            ("45.1%", "45%", 1.0),
+            ("4.9%", "5%", 1.0),
+            ("4.7%", "5%", 0.0),
+            ("0.45", "45%", 1.0),
+            ("45%", "0.45", 1.0),
+            ("45 %", "0.45", 1.0),
+            ("45%.", "45%", 1.0),
+            ("-5%", "-0.05", 1.0),
+            ("0%", "0", 1.0),
+            ("45%", "45", 0.0),
+            ("45", "45%", 0.0),
+        ],
+    )
+    def test_a_trailing_percent_sign_makes_hundredths(
+        self, prediction: str, answer: str, expected: float
+    ) -> None:
+        assert relaxed_accuracy(prediction, [answer]) == expected
+
+    @pytest.mark.parametrize(
+        ("prediction", "answer", "expected"),
+        [
+            ("%", "%", 1.0),
+            ("%5", "5", 0.0),
+            ("5%x", "5%x", 1.0),
             ("1,000", "1000", 0.0),
             ("1,000", "1,000", 1.0),
             ("$5", "5", 0.0),
@@ -176,7 +212,7 @@ class TestRelaxedAccuracy:
     ) -> None:
         assert relaxed_accuracy(prediction, [answer]) == expected
 
-    @pytest.mark.parametrize("answer", ["nan", "inf", "-inf"])
+    @pytest.mark.parametrize("answer", ["nan", "inf", "-inf", "nan%", "inf%"])
     def test_values_that_are_not_finite_match_nothing(self, answer: str) -> None:
         assert relaxed_accuracy(answer, [answer]) == 0.0
 

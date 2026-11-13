@@ -59,23 +59,15 @@ def vqa_accuracy(prediction: str, answers: Sequence[str]) -> float:
     With ten references, three matching annotators score 0.9 (the rounds that
     leave one of them out give 2/3) and four score 1. Answers are compared after
     ``normalize_vqa_answer``, applied to the prediction and to every reference
-    whether or not the references agree.
+    whether or not the references agree, as https://visualqa.org/evaluation.html
+    describes; the official code skips it when every reference is the same.
 
     The rounds follow the number of references given. With ``n`` references the
-    best score is ``min(1, (n - 1) / 3)``: four or more can reach 1.
-
-    Raises:
-        ValueError: with no reference, or with exactly one, because the only round
-            leaves nothing to match and the score could only be 0; data with a
-            single answer per question needs another scorer.
+    best score is ``min(1, (n - 1) / 3)``: four or more can reach 1, and a single
+    reference, whose only round leaves nothing to match, scores 0, as in the
+    official evaluation. Data with one answer per question needs another scorer.
     """
-    checked = _references(prediction, answers)
-    if len(checked) == 1:
-        raise ValueError(
-            "vqa_accuracy needs at least two references, because with one the score can "
-            "only be 0; data with a single answer per question needs another scorer"
-        )
-    references = [normalize_vqa_answer(answer) for answer in checked]
+    references = [normalize_vqa_answer(answer) for answer in _references(prediction, answers)]
     predicted = normalize_vqa_answer(prediction)
     matches = sum(answer == predicted for answer in references)
     rounds = [
@@ -104,21 +96,29 @@ def _similarity(prediction: str, answer: str) -> float:
     return 1 - distance if distance < ANLS_THRESHOLD else 0.0
 
 
+def _collapsed(text: str) -> str:
+    """``text`` lowercased, with no whitespace at either end and each inner run one space."""
+    return " ".join(text.lower().split())
+
+
 def anls(prediction: str, answers: Sequence[str]) -> float:
     """Normalized Levenshtein similarity of ``prediction`` to its closest reference.
 
-    The similarity to a reference is ``1 - NL``, where ``NL`` is the Levenshtein
-    distance divided by the length of the longer string, and it counts only while
-    ``NL`` is below ``ANLS_THRESHOLD``: a similarity of exactly one half scores 0.
-    The score is the best over the references, and its mean over a task is ANLS
-    (Biten et al., "Scene Text Visual Question Answering", ICCV 2019, equation 1;
-    the DocVQA metric). Strings are compared lowercased and without surrounding
-    whitespace, inner whitespace counts as written, and two empty strings are
-    identical.
+    Both strings are lowercased and their whitespace collapsed: none is left at
+    either end, and each run inside becomes one space, so ``"123\\nMain  St"``
+    equals ``"123 main st"``. The similarity to a reference is ``1 - NL``, where
+    ``NL`` is the Levenshtein distance between the collapsed strings divided by
+    the length of the longer one, and it counts only while ``NL`` is below
+    ``ANLS_THRESHOLD``. The score is the best over the references, and its mean
+    over a task is ANLS (Biten et al., "Scene Text Visual Question Answering",
+    ICCV 2019, equation 1; the DocVQA metric). Equation 1 leaves ``NL`` equal to
+    the threshold open: here a similarity of exactly one half scores 0, as in
+    Pix2Struct, while the evaluation script distributed with the DocVQA datasets
+    (docvqa.org) scores it 0.5. Two empty strings are identical.
     """
     references = _references(prediction, answers)
-    predicted = prediction.strip().lower()
-    return max(_similarity(predicted, answer.strip().lower()) for answer in references)
+    predicted = _collapsed(prediction)
+    return max(_similarity(predicted, _collapsed(answer)) for answer in references)
 
 
 def _trimmed(text: str) -> str:
@@ -129,11 +129,18 @@ def _trimmed(text: str) -> str:
     return text.strip().lower().rstrip("?.!")
 
 
+def _number(text: str) -> float | None:
+    """``text`` as a number, a trailing ``%`` read as hundredths, or ``None`` when it is not one."""
+    try:
+        return float(text.rstrip("%")) / 100 if text.endswith("%") else float(text)
+    except ValueError:
+        return None
+
+
 def _matches_relaxed(prediction: str, answer: str) -> bool:
     predicted, target = _trimmed(prediction), _trimmed(answer)
-    try:
-        predicted_value, target_value = float(predicted), float(target)
-    except ValueError:
+    predicted_value, target_value = _number(predicted), _number(target)
+    if predicted_value is None or target_value is None:
         return predicted == target
     error = abs(predicted_value - target_value) / (abs(target_value) + ZERO_TARGET_GUARD)
     return error <= RELAXED_TOLERANCE
@@ -144,17 +151,21 @@ def relaxed_accuracy(prediction: str, answers: Sequence[str]) -> float:
 
     Each side is stripped of surrounding whitespace, lowercased, and then stripped
     of trailing ``?``, ``.`` and ``!``, in that order, so whitespace before a
-    trailing mark stays (``"yes !"`` becomes ``"yes "``). When both then parse with
-    ``float``, the prediction is correct if
-    ``|prediction - target| / (|target| + ZERO_TARGET_GUARD)`` is at most
-    ``RELAXED_TOLERANCE``; the guard keeps a zero target defined, and only a
+    trailing mark stays (``"yes !"`` becomes ``"yes "``). A side is then a number
+    when ``float`` parses it, or parses it once a trailing ``%`` is removed, which
+    makes it hundredths: ``"45%"`` is 0.45, so it matches ``"45.1%"`` and
+    ``"0.45"`` but not ``"45"``, as in the relaxed correctness of Pix2Struct (Lee
+    et al., "Pix2Struct: Screenshot Parsing as Pretraining for Visual Language
+    Understanding", ICML 2023). When both sides are numbers, the prediction is
+    correct if ``|prediction - target| / (|target| + ZERO_TARGET_GUARD)`` is at
+    most ``RELAXED_TOLERANCE``; the guard keeps a zero target defined, and only a
     prediction within 5e-12 of zero matches one. Any other pair must be the same
-    string. A percent sign, a comma or a unit makes an answer text, while ``float``
-    reads an underscore between digits as a separator (``"1_000"`` is 1000), and
-    ``nan`` and ``inf`` parse but match nothing. With several references any
-    match counts (Masry et al., "ChartQA: A Benchmark for Question Answering about
-    Charts with Visual and Logical Reasoning", Findings of ACL 2022, section 5.1,
-    after Methani et al., "PlotQA: Reasoning over Scientific Plots", WACV 2020).
+    string. A comma or a unit makes an answer text, while ``float`` reads an
+    underscore between digits as a separator (``"1_000"`` is 1000), and ``nan``
+    and ``inf`` parse but match nothing. With several references any match counts
+    (Masry et al., "ChartQA: A Benchmark for Question Answering about Charts with
+    Visual and Logical Reasoning", Findings of ACL 2022, section 5.1, after
+    Methani et al., "PlotQA: Reasoning over Scientific Plots", WACV 2020).
     """
     return float(
         any(_matches_relaxed(prediction, answer) for answer in _references(prediction, answers))
