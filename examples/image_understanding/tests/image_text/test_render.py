@@ -9,6 +9,7 @@ import pytest
 import torch
 from image_text.document import Document, Turn
 from image_text.render import ChatRenderer, RenderedDataset, UnrenderableDocumentError
+from image_text.skip import UnusableRowError
 from PIL import Image
 
 
@@ -236,6 +237,19 @@ class TestRenderedDataset:
             RenderedDataset(docs[:1], _renderer(tokenizer, max_text_len=24), max_attempts=1)[0]
         with pytest.raises(IndexError):
             dataset[2]
+
+    def test_a_row_the_reader_refuses_is_not_read_again(self, tokenizer: Any) -> None:
+        """Rows the reader itself refuses step to the next row, not back to the same one."""
+
+        class Reader(list):
+            def __getitem__(self, index: int) -> Document:
+                if index < 2:
+                    raise UnusableRowError(f"row {index} refused")
+                return super().__getitem__(index)
+
+        dataset = RenderedDataset(Reader([_qa()] * 3), _renderer(tokenizer), max_attempts=3)
+        assert _trained_text(tokenizer, dataset[0]) == "a cat<|im_end|>"
+        assert dataset.skipped == 2
 
 
 class TestDocument:

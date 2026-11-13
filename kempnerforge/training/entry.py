@@ -31,11 +31,13 @@ from kempnerforge.distributed.parallel import (
 )
 from kempnerforge.distributed.setup import destroy_distributed
 from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
+from kempnerforge.distributed.utils import get_dp_info
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
+from kempnerforge.model.masking import use_dynamic_flex_shapes
 from kempnerforge.model.mot import mot_warm_start_from_text_stack
 from kempnerforge.model.transformer import Transformer
-from kempnerforge.model.vlm import inner_transformer
+from kempnerforge.model.vlm import inner_transformer, packed_tokens_per_image
 from kempnerforge.profiling.profiler import build_profiler
 from kempnerforge.resilience.elastic import resolve_resume_path
 from kempnerforge.resilience.health import NaNDetector
@@ -178,6 +180,8 @@ def build_checkpoint_manager(
     With PP, each stage has different parameters — DCP needs a group scoped
     to ranks within the same PP stage (all non-PP mesh dimensions), and each
     stage saves DCP shards to its own subdirectory to avoid file collisions.
+    The manager records each rank's data-parallel coordinates, the partition
+    ``build_data_pipeline`` reads, with the per-rank loader/RNG state.
     """
     ckpt_pg = None
     ckpt_pp_rank = None
@@ -193,6 +197,7 @@ def build_checkpoint_manager(
         optimizer,
         process_group=ckpt_pg,
         pp_rank=ckpt_pp_rank,
+        dp_info=get_dp_info(device_mesh),
         weight_decay_scope=config.optimizer.weight_decay_scope,
         lr_multipliers=config.optimizer.lr_multipliers,
         module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
@@ -318,6 +323,7 @@ def restore_checkpoint(
         scheduler=scheduler,
         exclude_keys=warm_start_exclude,
         vlm_freeze_expected=vlm_freeze_expected,
+        exact_resume=resume_path is not None,
     )
     if ckpt_extra_loaded.get("wandb_run_id"):
         config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
@@ -364,6 +370,7 @@ def run_training(
         nan_detector = NaNDetector(action="warn", max_consecutive=10)
 
         loss_fn = build_loss_fn(config.train)
+        use_dynamic_flex_shapes(config.is_vlm and config.data.pack_sequences)
         model, pipeline = build_model(config, runtime, loss_fn)
         amp_dtype = autocast_dtype(model, config.train.master_dtype, config.train.param_dtype)
         if amp_dtype is not None:
@@ -389,7 +396,10 @@ def run_training(
 
         prof = build_profiler(config.profiling, rank=runtime.rank)
 
-        data = build_data_pipeline(config, runtime)
+        tokens_per_image = (
+            packed_tokens_per_image(model) if config.is_vlm and config.data.pack_sequences else None
+        )
+        data = build_data_pipeline(config, runtime, tokens_per_image=tokens_per_image)
         if data.dataloader is not None:
             ckpt_mgr.apply_dataloader_state(data.dataloader)
 
@@ -420,6 +430,7 @@ def run_training(
         run_training_loop(session, step=step, tokens_seen=tokens_seen)
         finished = True
     finally:
+        use_dynamic_flex_shapes(False)
         if tracker is not None:
             tracker.close()
         if finished:

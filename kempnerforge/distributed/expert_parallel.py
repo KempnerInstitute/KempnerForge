@@ -276,7 +276,10 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
 
     For each MoEMLP in the model:
       - Prunes ``experts`` to the local subset for this EP rank
-      - Stores EP metadata (group, rank, world_size, local expert range)
+      - Stores EP metadata (group, mesh, world_size, local expert range)
+
+    The EP mesh lets a checkpoint place each rank's experts among all of them
+    (see ``kempnerforge.checkpoint.expert_layout``).
 
     Must be called AFTER tensor parallelism and BEFORE FSDP2.
 
@@ -321,6 +324,7 @@ def apply_expert_parallel(model: torch.nn.Module, device_mesh: DeviceMesh | None
 
         module.ep_world_size = ep_size
         module.ep_group = ep_group  # type: ignore[reportAttributeAccessIssue]
+        module.ep_mesh = ep_mesh
         module.local_expert_start = start
         module.num_local_experts = experts_per_rank
 
