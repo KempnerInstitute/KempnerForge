@@ -10,7 +10,7 @@
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/%j_%x.out
 #SBATCH --error=logs/%j_%x.err
-#SBATCH --signal=B:SIGTERM@120
+#SBATCH --signal=SIGTERM@120
 #SBATCH --requeue
 
 set -euo pipefail
@@ -35,8 +35,6 @@ export NCCL_NET_GDR_LEVEL=2
 export NCCL_IB_GID_INDEX=3
 
 export GLOO_SOCKET_IFNAME="${IB_IFNAME}"
-
-export NCCL_TIMEOUT=1800
 
 mkdir -p logs
 
