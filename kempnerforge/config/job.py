@@ -70,6 +70,18 @@ class JobConfig:
         if not isinstance(self.plugins, list) or not all(isinstance(p, str) for p in self.plugins):
             raise ValueError(f"plugins must be a list of module paths (got {self.plugins!r})")
 
+        if self.video is not None:
+            if self.vlm is None:
+                raise ValueError(
+                    "[video] is set but [vlm] is missing; video training runs through "
+                    "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
+                )
+            if self.vlm.tile_grid:
+                raise ValueError(
+                    "vlm.tile_grid tiles the image path, but [video] is set; a video run "
+                    "samples frames instead, so leave vlm.tile_grid at 0"
+                )
+
         if self.vlm is not None:
             if self.vision_encoder is None:
                 raise ValueError(
@@ -98,7 +110,7 @@ class JobConfig:
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
-                frames = self.video.max_frames if self.video is not None else 1
+                frames = self.views_per_sample
                 visual_tokens = frames * per_frame
                 residual_image_tokens = self.vlm.residual_stream_image_tokens(visual_tokens)
                 required = residual_image_tokens + self.vlm.max_text_len
@@ -109,11 +121,35 @@ class JobConfig:
                         f"vlm.max_text_len ({self.vlm.max_text_len}) = {required}"
                     )
 
-        if self.video is not None and self.vlm is None:
-            raise ValueError(
-                "[video] is set but [vlm] is missing; video training runs through "
-                "the VLM wrapper, so a [vlm] section (and [vision_encoder]) is required."
-            )
+        if self.data.pack_sequences and self.vlm is not None:
+            if self.video is not None:
+                raise ValueError("data.pack_sequences is not supported with [video]")
+            if self.vlm.arch != "joint_decoder":
+                raise ValueError(
+                    "data.pack_sequences on a VLM run requires vlm.arch='joint_decoder' "
+                    f"(got {self.vlm.arch!r}); the other arches place image tokens as a "
+                    "prefix only"
+                )
+            if self.train.is_fp8:
+                raise ValueError(
+                    "data.pack_sequences on a VLM run does not support "
+                    "train.mixed_precision='fp8': the packed head runs over the batch's text "
+                    "tokens, whose count is the inner dimension of the head's FP8 "
+                    "weight-gradient GEMM and must be a multiple of 16"
+                )
+
+        if self.optimizer.lr_multipliers:
+            if self.vlm is None:
+                raise ValueError(
+                    "optimizer.lr_multipliers names modules of vlm.module_patterns, so it needs "
+                    "a [vlm] section"
+                )
+            unknown = sorted(set(self.optimizer.lr_multipliers) - set(self.vlm.module_patterns))
+            if unknown:
+                raise ValueError(
+                    f"optimizer.lr_multipliers names unknown modules {unknown}; the modules of "
+                    f"vlm.module_patterns are {sorted(self.vlm.module_patterns)}"
+                )
 
         if self.model.attention_backend == "flex" and self.train.seq_len < FLEX_BLOCK_SIZE:
             raise ValueError(
@@ -130,6 +166,15 @@ class JobConfig:
     def is_video(self) -> bool:
         """Whether this job trains on a video dataset (a VLM sub-mode)."""
         return self.video is not None
+
+    @property
+    def views_per_sample(self) -> int:
+        """Images the encoder sees per sample: a clip's frames, a tiled image's views, or one."""
+        if self.video is not None:
+            return self.video.max_frames
+        if self.vlm is not None:
+            return self.vlm.views_per_image
+        return 1
 
     def validate(self, world_size: int = 1) -> None:
         """Run cross-config validations that depend on the world size."""
@@ -228,6 +273,21 @@ class JobConfig:
                 "or TP without FP8."
             )
 
+        if (
+            self.model.is_moe
+            and self.model.moe_router == "sigmoid_topk"
+            and self.train.activation_checkpointing == "full"
+        ):
+            raise ValueError(
+                "model.moe_router = 'sigmoid_topk' does not support "
+                "train.activation_checkpointing = 'full': the sigmoid router updates its expert "
+                "bias in place in every training forward, so the backward's replay of a "
+                "checkpointed block routes with a moved bias, can pick other experts than the "
+                "forward did, and then raises CheckpointError. Use activation_checkpointing = "
+                "'selective', which checkpoints attention only and leaves the MoE layers out "
+                "of the replay."
+            )
+
         if self.model.is_moe and self.distributed.pp > 1:
             alternatives = (
                 "Use FSDP instead; MoT runs neither TP nor EP."
@@ -247,9 +307,7 @@ class JobConfig:
                     f"(distributed.ep={self.distributed.ep}): the FSDP2 wrap for expert-parallel "
                     "blocks expects layer.attention and layer.mlp, and MoTBlock names its "
                     "attention attn and keeps its FFNs per modality, so a MoT model with experts "
-                    "fails to build. Set distributed.ep = 1. MoT with MoE then trains, but "
-                    "without its load-balancing loss, router z-loss, bias schedule or balance "
-                    "metric (https://github.com/KempnerInstitute/KempnerForge/issues/308)."
+                    "fails to build. Set distributed.ep = 1."
                 )
             if isinstance(self.vlm, MoMaConfig):
                 raise ValueError(
@@ -273,7 +331,7 @@ class JobConfig:
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
-                frames = self.video.max_frames if self.video is not None else 1
+                frames = self.views_per_sample
                 visual_tokens = frames * per_frame
                 residual_image_tokens = self.vlm.residual_stream_image_tokens(visual_tokens)
                 required = residual_image_tokens + self.vlm.max_text_len
@@ -303,14 +361,4 @@ class JobConfig:
                         "torch.compile is not yet validated for MoMa dispatch "
                         "(modality_ids-based scatter/gather + expert-choice top-k cause "
                         "graph breaks). Set compile_model=false for MoMa models."
-                    )
-
-                if self.train.activation_checkpointing == "full":
-                    import logging
-
-                    logging.getLogger(__name__).warning(
-                        "AC=full is currently a no-op for MoMa (apply_ac matches "
-                        "TransformerBlock only; MoMaBlock is a sibling nn.Module). "
-                        "Use ac='selective' (wraps the Attention submodule, still works) "
-                        "or reduce moma_experts_per_modality until the apply_ac refactor lands."
                     )

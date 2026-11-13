@@ -10,7 +10,7 @@ Entry points:
 
 - [`apply_expert_parallel(model, device_mesh)`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/expert_parallel.py)
   — prunes each `MoEMLP` to the local expert slice and stores EP
-  metadata (`ep_group`, `ep_world_size`, `local_expert_start`,
+  metadata (`ep_group`, `ep_mesh`, `ep_world_size`, `local_expert_start`,
   `num_local_experts`).
 - `ep_dispatch_and_compute(x, weights, indices, moe, ...)` — runs
   inside `MoEMLP.forward()` when `ep_world_size > 1` and implements the
@@ -99,6 +99,7 @@ for module in model.modules():
         module.experts = ModuleList([module.experts[i] for i in range(start, end)])
     module.ep_world_size = ep_size
     module.ep_group = ep_group
+    module.ep_mesh = ep_mesh
     module.local_expert_start = start
     module.num_local_experts = num_experts // ep_size
 ```
@@ -108,6 +109,74 @@ full router weights so it can make the routing decision locally
 before dispatch. The shared experts (`moe.shared_expert`, one MLP
 `moe_shared_experts` times the expert width) are also kept whole on
 every EP rank.
+
+## Checkpoints
+
+After the apply step every EP rank numbers its unpacked experts from 0
+and holds its own rows of each packed weight, so each rank's state dict
+names and shapes its experts as if they were the layer's only ones.
+DCP writes one copy of each name and offset, so saving those state
+dicts as they are would keep one rank's experts in place of all of
+them ([#202](https://github.com/KempnerInstitute/KempnerForge/issues/202)).
+`CheckpointManager` instead saves and loads through
+[`ExpertLayout`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/expert_layout.py),
+which places each rank's experts among all `num_experts`:
+
+- **Unpacked experts** take their global index. With 8 experts and
+  `ep=2`, rank 1's `experts.0` is saved as `experts.4`, with its
+  optimizer state. Each optimizer param group lists every rank's
+  experts, so the saved list is the same whichever rank writes it.
+- **Packed weights** (`up_w`, `down_w`, `gate_w`) and their optimizer
+  state are presented as a DTensor of all `num_experts` rows over the
+  FSDP mesh and `ep`: `ep` splits the rows, and FSDP shards each EP
+  rank's block of them. That is how FSDP2 lays out a parameter that
+  tensor parallelism shards on the same dimension, with FSDP's
+  `Shard(0)` becoming `_StridedShard(0, split_factor=ep)`.
+
+Packed weights that FSDP shards need torch 2.10 or newer for this:
+joining the EP mesh to FSDP's uses `DeviceMesh._get_root_mesh`, which
+arrived in 2.10. `pyproject.toml` allows torch 2.6 and newer, and with
+torch 2.6 to 2.9 a save or load of such a layer raises and names the
+version it needs. Unpacked experts need no particular torch version.
+
+The presented tensors are views of each rank's own, so a save copies,
+gathers and sends nothing more than DCP writes, and each expert is
+written once, by a rank that holds it. The checkpoint is the one an
+`ep=1` run writes, with the same names and one tensor of `num_experts`
+rows per packed weight, so DCP reshards it like any other parameter:
+it loads at any `ep` that divides `num_experts`, under FSDP, HSDP or
+TP, and [`dcp-to-hf`](../checkpointing/hf-conversion.md) exports every
+expert. An `ep=1` checkpoint loads into an EP run the same way, each
+rank taking its own experts.
+
+Every EP rank also holds a copy of each weight outside the routed
+experts. The copies can drift apart on GPU
+([#482](https://github.com/KempnerInstitute/KempnerForge/issues/482)),
+and DCP writes each chunk that several ranks hold from one of them, by
+default the one with the least to write so far, which could join
+chunks of different copies into one tensor. An EP save writes each
+such chunk from its lowest rank instead, so the checkpoint holds EP
+rank 0's copy whole, and a resume gives every EP rank that copy. The
+lowest rank also writes every other chunk that several ranks share:
+under HSDP (`dp_replicate > 1`) replica 0 writes all of them, and
+under TP, which leaves the MoE layers whole, `tp` rank 0 writes every
+routed expert. The bytes written are the same as with DCP's default,
+but fewer ranks write them, so a save can take longer on those
+layouts.
+
+A checkpoint saved with `ep>1` before this layout holds
+`num_experts / ep` experts per layer, one rank's, under every rank's
+names; the other experts' weights were never written. A load,
+`dcp-to-hf`, `scripts/generate.py` and the lmms-eval adapter in
+`examples/vlm` refuse it with an error that says how many experts it
+holds, instead of giving every rank one rank's experts or failing on a
+missing key.
+
+Do not resume an EP checkpoint saved this way with an older
+KempnerForge at `ep>1`: it loads an unpacked checkpoint without error
+but gives every EP rank the first rank's experts, and it fails on a
+packed one. An older version loads such a checkpoint correctly at
+`ep=1`.
 
 ## Composition with other parallelisms
 
@@ -166,12 +235,46 @@ mesh: ("dp_shard", "ep", "tp") → (4, 2, 4)
 
 - Each EP group (size 2) splits the 8 experts as `experts 0-3` on
   rank 0 and `experts 4-7` on rank 1.
-- Within each EP group, TP shards the per-expert Linears along `tp=4`.
+- Within each EP group, TP shards the attention projections along
+  `tp=4`; the TP plan leaves the MoE layers whole, so their experts
+  are replicated over `tp`.
 - FSDP shards the remaining params across the `dp_shard=4` axis with
   per-sub-module wrapping.
 
 Benchmark and reproducer: [Benchmarks § MoE Expert
 Parallelism](../reference/benchmarks.md#moe-expert-parallelism).
+
+## Gradients and clipping
+
+The ranks of an EP group differ only in `ep`, so they share a DP rank
+and read the same batch: `ep` splits the experts, not the data. The
+global batch, and the tokens counted per step, are those of the DP
+dimensions alone, as without EP.
+
+Each local expert therefore receives every token routed to it once
+from each rank of its EP group, and its weight gradient sums the
+gradients of `ep` ranks' losses, while FSDP2 averages over the DP mesh
+only. `ep_dispatch_and_compute` divides the gradient that enters the
+local expert compute by `ep` and multiplies the gradient it hands back
+to the tokens by `ep`. The routed-expert gradients are then the mean
+over the EP group, equal to one process's on the same batch, and every
+other gradient is unchanged. Both factors are exact when `ep` is a
+power of two. For other sizes the gradient handed back to the tokens,
+which reaches every parameter outside the routed experts, takes two
+extra roundings, which shows in bf16.
+
+The routers, the shared experts and every parameter outside the MoE
+layers have a copy on each EP rank. FSDP2 does not reduce their
+gradients over `ep`, so the copies stay equal only as long as the EP
+ranks compute and scale those gradients alike. `clip_grad_norm_`
+therefore sums the routed experts' squared norms over the EP group and
+averages the copies', and every EP rank clips by the whole model's norm
+with the same coefficient; see
+[Gradient utilities § Under expert parallelism](../training/gradient-utilities.md#under-expert-parallelism).
+That removes one cause of drift, not every cause: on GPU the copies
+still drift apart over training, with or without clipping, and nothing
+re-syncs them across the EP group yet
+([#482](https://github.com/KempnerInstitute/KempnerForge/issues/482)).
 
 ## Gradient scaling (optional)
 
@@ -183,6 +286,13 @@ gradient flows back through the dispatch all-to-all to the router
 and expert params correctly. Disabled by default — it changes
 gradient magnitudes and should be validated against a baseline run
 before flipping on.
+
+`avg_tokens` is the average load over all `num_experts` experts, as in
+`MoEMLP._local_forward`, and as there the scale applies in training
+mode only, whether or not gradients are on. A local expert receives a
+copy of its tokens from each EP rank, so in those units the average is
+`num_tokens · top_k / num_local_experts`, and EP leaves the scale, and
+with it the forward pass, unchanged.
 
 ## See also
 

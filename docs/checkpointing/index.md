@@ -22,7 +22,7 @@ contains two kinds of state:
 | File(s) | Contents | Format |
 |---------|----------|--------|
 | DCP shards (`.distcp` + `.metadata`) | Model + optimizer state, one shard per rank | [DCP § Model + optimizer](dcp-model.md) |
-| `train_state.pt` | step, tokens_seen, scheduler, RNG, extras (e.g. `phase_idx`, `wandb_run_id`, `mlflow_run_id`) | [Train state](train-state.md) |
+| `train_state.pt` | step, tokens_seen, scheduler, per-rank dataloader/RNG state, extras (e.g. `phase_idx`, `wandb_run_id`, `mlflow_run_id`) | [Train state](train-state.md) |
 | `metadata.json` | Human-readable `{"step": N, "tokens_seen": M}`, plus the logging runs live at save time | Plain JSON, see below |
 | `latest` symlink | Points at the most recent `step_N` (updated atomically) | [Auto-resume](auto-resume.md) |
 
@@ -31,7 +31,10 @@ contains two kinds of state:
 Written by rank 0 beside `train_state.pt`, and readable with a plain `json.load` (no torch).
 It holds `step` and `tokens_seen`, plus the run's `optimizer.weight_decay_scope` as
 `weight_decay_scope` when the checkpoint manager was built with it, as the training entry does
-(VLM runs add `vlm_freeze`). When a logging backend has a live run at save time it also holds a
+(VLM runs add `vlm_freeze`, and `lr_multipliers` with the `lr_module_patterns` of its
+modules and the module of each optimizer param group, `lr_group_modules`, when
+`optimizer.lr_multipliers` lists any). A load reads it on rank 0, once, for the checks of
+those records. When a logging backend has a live run at save time it also holds a
 `tracking` list, one entry per backend:
 
 ```json

@@ -54,7 +54,10 @@ version.
 
 During generation, `Transformer.forward` slices `cos`/`sin` starting at
 `kv_caches[0].seq_len` so incremental tokens get the correct absolute
-positions.
+positions. A caller may instead give the positions of the tokens being
+appended (`position_ids`, by argument or on the `ModalityContext`) or the
+rotation itself (`modality.rope_cos`/`rope_sin`, built from the same
+tables), at prefill and at every decode step alike.
 
 ## Attention
 
@@ -104,7 +107,8 @@ before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
 3. **Single-token decode** (`seq_len == 1` with a KV cache): no mask, so the
    query attends to all cached positions. `is_causal=True` here would
    incorrectly restrict attention to only the first key. Mask inputs are
-   refused together with a KV cache.
+   refused together with a KV cache, whether passed as arguments or carried
+   on the ``ModalityContext``.
 4. **Several tokens appended to a filled cache** (`seq_len > 1` with cached
    keys): SDPA with `torch.nn.attention.bias.causal_lower_right`, so each new
    token attends to every cached key and to the new keys up to its own
@@ -134,7 +138,9 @@ silent-incorrectness risk. Keep them module-level.
 ### SDPA backend
 
 `sdpa_backend` (default `"auto"`) selects flash / mem-efficient / cudnn /
-math via a context manager. `"auto"` lets PyTorch pick.
+math via a context manager. `"auto"` lets PyTorch pick. Cached multi-token
+appends use `causal_lower_right` without a dense mask or kernel fallback,
+so a pinned flash backend stays enabled.
 
 ## MLP
 
@@ -224,14 +230,19 @@ raises).
 
 Extra helpers on `Transformer`:
 
-- `init_weights_and_freqs()` — called after `model.to_empty(device=...)`
+- `init_weights_and_freqs()`: called after `model.to_empty(device=...)`
   to fill parameter values after meta-device materialization
-- `set_moe_step(step, max_steps)` — forwards the current step to every
-  `SigmoidTopKRouter` for the adaptive bias schedule
-- `get_moe_aux_loss()` — sums the per-layer MoE aux loss; returns 0 for
-  dense models
-- `get_expert_counts()` — returns `{layer_idx: counts}` for MoE layers;
-  empty for dense
+- `set_moe_step(step, max_steps)`: forwards the current step to every
+  `SigmoidTopKRouter`, each MoT modality's included, for the adaptive
+  bias schedule
+- `get_moe_aux_loss()` and `get_moe_router_z_loss()`: sum the MoE aux
+  loss and the router z-loss over every router, one per modality on a
+  MoT layer; return 0 for dense models
+- `get_expert_counts()`: returns `{layer_idx: counts}` for flat MoE
+  layers; empty for dense, MoT and MoMa models
+- `get_mot_expert_counts()`: returns `{layer_idx: {modality: counts}}`
+  for MoT MoE layers, one router per modality; `get_moma_expert_counts()`
+  is the MoMa counterpart
 
 The whole class is registered under the `"model"` registry key
 `"transformer"`, which is what the training loop asks for.

@@ -34,13 +34,19 @@ from pathlib import Path
 import torch
 import torch.distributed.checkpoint as dcp
 
+from kempnerforge.checkpoint.expert_layout import check_saved_experts
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.registry import registry
 from kempnerforge.model.generate import generate
 
 
 def _load_model(config, device, dtype):
-    """Build model and load DCP checkpoint weights."""
+    """Build model and load DCP checkpoint weights.
+
+    A checkpoint whose MoE layers hold fewer experts than the model, as one saved with
+    expert parallelism before each rank's experts were saved under their global index,
+    is refused (see ``check_saved_experts``).
+    """
     model_builder = registry.get_model(config.model.model_type)
     model = model_builder(config.model).to(device=device, dtype=dtype)
 
@@ -51,6 +57,8 @@ def _load_model(config, device, dtype):
             print(f"Error: checkpoint path does not exist: {ckpt_path}", file=sys.stderr)
             sys.exit(1)
 
+        saved = dcp.FileSystemReader(str(ckpt_path)).read_metadata().state_dict_metadata
+        check_saved_experts(model, saved, ckpt_path)
         state_dict = {"model": model.state_dict()}
         dcp.load(state_dict, checkpoint_id=str(ckpt_path))
         model.load_state_dict(state_dict["model"])

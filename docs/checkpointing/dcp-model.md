@@ -20,10 +20,21 @@ dcp_state = {
     "optimizer":               optim_state,
     "optimizer_never_stepped": _never_stepped_record(optim_state),
 }
-self._async_ckpt.save(
-    dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group
-)
+dcp_state, layout = self._present_experts(dcp_state)
+save = self._async_ckpt.save
+if layout is not None:
+    save = partial(save, planner=DefaultSavePlanner(dedup_save_to_lowest_rank=True))
+save(dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group)
 ```
+
+`_present_experts` returns the state as it is unless a layer splits its
+experts with expert parallelism. Then it places each rank's experts,
+and their optimizer state, among all of the layer's experts, so the
+checkpoint holds every expert; `load` does the same before DCP and
+undoes it after. Such a save also writes each chunk that several ranks
+hold from its lowest rank, so the EP ranks' copies of the other weights
+are not mixed. See
+[Expert parallelism § Checkpoints](../distributed/expert-parallelism.md#checkpoints).
 
 `checkpointed_optimizers` is the optimizer plus any inner optimizers it
 hands parameters to — see [Inner optimizers](#inner-optimizers).
@@ -213,12 +224,22 @@ dcp_state = {
     "model":     get_model_state_dict(self.model),
     "optimizer": get_optimizer_state_dict(self.model, self.checkpointed_optimizers),
 }
+dcp_state, layout = self._present_experts(dcp_state, dcp_dir, saved_keys)
 dcp.load(dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group)
+if layout is not None:
+    dcp_state = layout.to_local(dcp_state)
 set_model_state_dict(self.model, dcp_state["model"])
 set_optimizer_state_dict(
     self.model, self.checkpointed_optimizers, optim_state_dict=dcp_state["optimizer"]
 )
 ```
+
+Under expert parallelism `_present_experts` places each rank's experts
+among all of them before `dcp.load`, as on save, and `layout.to_local`
+gives the setters this rank's names and tensors back. For any model with
+MoE layers it first refuses a checkpoint that holds fewer experts than
+the model. See
+[Expert parallelism § Checkpoints](../distributed/expert-parallelism.md#checkpoints).
 
 A Muon checkpoint saved before the inner AdamW was checkpointed is the
 one exception: the load passes Muon alone — see
@@ -256,7 +277,9 @@ and an absent state cannot be told apart from one that went missing, so
 a never-stepped parameter in one of those still fails the load. Start
 from it in a new `checkpoint.dir`, with `[checkpoint].load_path`
 pointing at it and `exclude_from_loading = ["optimizer"]`, which
-restores the weights and begins with a fresh optimizer. In the old
+restores the weights and begins with a fresh optimizer
+(`["optimizer", "train_state"]` also starts the step, schedule and data
+order fresh). In the old
 `checkpoint.dir` the resume would take precedence over `load_path`.
 
 A parameter whose optimizer changed since the save holds another
@@ -275,6 +298,14 @@ covers only the optimizers the load restores, so a Muon checkpoint saved
 before the inner AdamW was checkpointed is not checked: a parameter that
 moved to the inner AdamW starts fresh, and one that moved to Muon still
 fails inside `dcp.load`.
+
+Each rank runs these checks on its own part of the checkpoint, so under
+pipeline parallelism one stage can fail them while the others pass. A
+load that restores optimizer state therefore ends its checks with one
+all-reduce on the manager's gloo group, which every rank enters: a rank
+whose check failed raises its error, and every other rank raises a
+`RuntimeError` naming the ranks that failed, before any rank loads
+anything.
 
 The template also holds every param-group key the optimizer has now,
 and DCP requires each one. An optimizer whose param groups gained a key
