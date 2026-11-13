@@ -391,9 +391,8 @@ def run_training(
 
         prof = build_profiler(config.profiling, rank=runtime.rank)
 
-        tokens_per_image = (
-            packed_tokens_per_image(model) if config.is_vlm and config.data.pack_sequences else None
-        )
+        laid_out = config.data.pack_sequences or config.data.hf_max_images != 1
+        tokens_per_image = packed_tokens_per_image(model) if config.is_vlm and laid_out else None
         data = build_data_pipeline(config, runtime, tokens_per_image=tokens_per_image)
         if data.dataloader is not None:
             ckpt_mgr.apply_dataloader_state(data.dataloader)

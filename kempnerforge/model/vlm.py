@@ -275,7 +275,8 @@ class JointDecoderStrategy:
     A packed batch (``image_rows`` given) takes the inline route instead:
     the flat images are encoded and each one's tokens are written over its
     placeholder slots inside its row, ``doc_ids`` isolates the documents, and
-    the head runs on the text positions the packer names. A text-only sample
+    the head runs on the text positions the packer names. A batch of documents
+    with several images arrives the same way, one document per row. A text-only sample
     on the prefix route arrives with a blank image and a ``frame_mask`` of
     ``False`` that hides its prefix; a packed batch of text-only documents
     arrives with no images at all, and the encoder runs on a blank one so its

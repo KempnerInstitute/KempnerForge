@@ -37,6 +37,7 @@ def _dataset_over(
     *,
     image_size: int = 16,
     max_text_len: int = 8,
+    max_images: int = 1,
     tile_grid: int = 0,
     tile_global: bool = True,
     tokenizer_path: str = "gpt2",
@@ -46,6 +47,9 @@ def _dataset_over(
 
     ds = HuggingFaceVLMDataset.__new__(HuggingFaceVLMDataset)
     ds._ds = rows
+    ds._text_columns = rows
+    ds._image_rows = rows
+    ds._image_feature = None
     ds._image_field = "image"
     ds._text_field = "caption"
     ds._prompt_field = None
@@ -57,6 +61,7 @@ def _dataset_over(
     views = tile_grid * tile_grid + int(tile_global) if tile_grid else 0
     ds._view_shape = (*((views,) if views else ()), 3, image_size, image_size)
     ds._max_text_len = max_text_len
+    ds._max_images = max_images
     ds._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     return ds
 
@@ -946,9 +951,30 @@ class TestHuggingFaceVLMDataset:
         """A prompt value that is not a string is rejected, not dropped as no prompt."""
         ds = _prompted_dataset(tmp_path, monkeypatch, ["ab"])
         row = {"image": _make_image(32), "caption": "xyz", "prompt": ["ab"]}
-        monkeypatch.setattr(ds, "_ds", [row])
+        monkeypatch.setattr(ds, "_text_columns", [row])
+        monkeypatch.setattr(ds, "_image_rows", [row])
         with pytest.raises(TypeError, match="'prompt' must be str or None, got list"):
             _ = ds[0]
+
+    def test_a_sample_reads_only_the_text_and_prompt_columns(self, tmp_path, monkeypatch):
+        from datasets import Dataset
+
+        rows = Dataset.from_dict(
+            {"image": [_make_image(8)], "thumb": [_make_image(8)], "caption": ["a b"], "id": [7]}
+        )
+        rows.save_to_disk(str(tmp_path / "extra"))
+        ds = HuggingFaceVLMDataset(
+            str(tmp_path / "extra"),
+            split="train",
+            image_field="image",
+            text_field="caption",
+            tokenizer_path="gpt2",
+            max_text_len=8,
+        )
+        assert ds._text_columns.column_names == ["caption"]
+        assert ds[0]["pixel_values"].shape == (3, 224, 224)
+        prompted = _prompted_dataset(tmp_path, monkeypatch, ["ab"])
+        assert prompted._text_columns.column_names == ["caption", "prompt"]
 
     def test_missing_prompt_trains_as_an_unprompted_caption(self, tmp_path, monkeypatch):
         """``None`` is how a string column stores a missing value: that row has no prompt."""
@@ -1024,12 +1050,9 @@ class TestTextOnlyRows:
         assert batch["pixel_values"].shape == (2, views, 3, 16, 16)
         assert batch["frame_mask"].tolist() == [[False] * views, [True] * views]
 
-    def test_a_list_of_nothing_is_text_only_and_a_list_of_several_raises(self):
+    def test_a_list_of_nothing_is_text_only(self):
         ds = _dataset_over([{"image": [None, None], "caption": "a b"}])
         assert ds[0]["pixel_values"].shape == (0, 3, 16, 16)
-        rows = [{"image": [_make_image(8), _make_image(8)], "caption": "a b"}]
-        with pytest.raises(ValueError, match="holds 2 images"):
-            _dataset_over(rows)[0]
 
     _LOAD = dict(split="train", image_field="image", text_field="caption", tokenizer_path="gpt2")
 
@@ -1049,22 +1072,26 @@ class TestTextOnlyRows:
         ds = HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
         assert not ds.has_text_only_rows
 
-    def test_rows_with_several_images_are_skipped_when_loaded(self, tmp_path, caplog, monkeypatch):
+    def test_rows_with_several_images_are_skipped_at_the_default_cap(
+        self, tmp_path, monkeypatch, caplog
+    ):
         monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
         images = [[_make_image(8)] * 2, [_make_image(8)], None]
         path = _mixed_image_dataset(tmp_path, images)
         with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
             ds = HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
+        assert [r.getMessage() for r in caplog.records] == [
+            "Skipping 1 of 3 rows that hold more than data.hf_max_images=1 images in field 'image'"
+        ]
         assert len(ds) == 2
         assert ds.has_text_only_rows
-        assert [r.getMessage() for r in caplog.records] == [
-            "Skipping 1 of 3 rows that hold several images in field 'image'; a document "
-            "takes one image"
-        ]
+        assert ds[0]["pixel_values"].shape == (3, 224, 224)
+        assert ds[1]["pixel_values"].shape == (0, 3, 224, 224)
 
-    def test_a_dataset_without_a_single_image_row_is_rejected(self, tmp_path):
-        path = _mixed_image_dataset(tmp_path, [None, [_make_image(8)] * 2])
-        with pytest.raises(ValueError, match="None of the 2 rows holds one image in field"):
+    @pytest.mark.parametrize("images", [[None, []], [None, [_make_image(8)] * 2]])
+    def test_a_dataset_without_a_row_within_the_cap_is_rejected(self, tmp_path, images):
+        path = _mixed_image_dataset(tmp_path, images)
+        with pytest.raises(ValueError, match="None of the 2 rows holds from 1 to data.hf_max_"):
             HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
 
     def test_images_per_row_counts_lists_and_single_images(self):
@@ -1090,6 +1117,69 @@ class TestTextOnlyRows:
         )
         empties = Dataset(pa.table({"image": structs}))
         assert vlm_dataset._images_per_row(empties, "image").tolist() == [1, 0, 0, 1]
+
+
+class TestMultiImageRows:
+    def test_a_list_of_images_stacks_in_order(self):
+        rows = [{"image": [_make_image(8, 0), _make_image(8, 255)], "caption": "a b"}]
+        pixels = _dataset_over(rows, max_images=2)[0]["pixel_values"]
+        assert pixels.shape == (2, 3, 16, 16)
+        assert pixels[0].mean() < pixels[1].mean()
+
+    def test_tiled_images_concatenate_their_views_in_order(self):
+        rows = [{"image": [_make_image(8, 0), _make_image(8, 255)], "caption": "a b"}]
+        ds = _dataset_over(rows, max_images=2, tile_grid=2, tile_global=True)
+        pixels = ds[0]["pixel_values"]
+        assert pixels.shape == (10, 3, 16, 16)
+        assert pixels[:5].mean() < pixels[5:].mean()
+
+    def test_the_cap_fixes_the_sample_rank(self):
+        """One image is ``(3, H, W)`` at the default cap and ``(1, 3, H, W)`` above it."""
+        rows = [{"image": [_make_image(8)], "caption": "a b"}]
+        assert _dataset_over(rows)[0]["pixel_values"].shape == (3, 16, 16)
+        assert _dataset_over(rows, max_images=3)[0]["pixel_values"].shape == (1, 3, 16, 16)
+
+    def test_rows_over_the_cap_are_skipped_when_the_dataset_is_loaded(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        path = _mixed_image_dataset(
+            tmp_path, [[_make_image(8)] * 3, [_make_image(8)], [_make_image(8)] * 4]
+        )
+        kwargs = dict(
+            split="train", image_field="image", text_field="caption", tokenizer_path="gpt2"
+        )
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
+            ds = HuggingFaceVLMDataset(path, max_text_len=8, max_images=3, **kwargs)
+        assert "Skipping 1 of 3 rows that hold more than data.hf_max_images=3" in caplog.text
+        assert [ds[i]["pixel_values"].shape[0] for i in range(len(ds))] == [3, 1]
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
+            ds = HuggingFaceVLMDataset(path, max_text_len=8, max_images=4, **kwargs)
+        assert "hf_max_images" not in caplog.text
+        assert len(ds) == 3
+
+
+class TestOneDocumentPerRow:
+    def test_one_document_per_fixed_row(self):
+        collator = PackedVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2, max_docs_per_row=1)
+        batch = collator([_doc(3, 10, views=2), _doc(4, 20), _doc(2, 30, views=0)])
+        assert batch["input_ids"].shape == (3, 12)
+        assert batch["pixel_values"].shape == (3, 3, 4, 4)
+        assert batch["image_rows"].tolist() == [0, 0, 1]
+        assert batch["image_starts"].tolist() == [0, 2, 0]
+        assert batch["input_ids"][0, 4:7].tolist() == [10, 11, 12]
+        assert batch["input_ids"][1, 2:6].tolist() == [20, 21, 22, 23]
+        assert batch["input_ids"][2, :2].tolist() == [30, 31]
+        assert batch["doc_ids"][2].tolist() == [0, 0] + [1] * 10
+        assert "frame_mask" not in batch
+
+    def test_empty_batches_and_oversized_documents_raise(self):
+        collator = PackedVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2, max_docs_per_row=1)
+        with pytest.raises(ValueError, match="no samples"):
+            collator([])
+        with pytest.raises(ValueError, match="does not fit a row"):
+            collator([_doc(3, 10, views=5)])
 
 
 class TestFramesToClipTensor:
@@ -1242,6 +1332,21 @@ class TestPackVLMSamples:
         assert batch["image_starts"].shape == (0,)
         assert batch["image_rows"].dtype == torch.long
         assert batch["input_ids"][0].tolist() == [10, 11, 12, 20, 21, 22, 23, 0]
+
+    def test_max_docs_per_row_keeps_documents_apart(self):
+        batch = pack_vlm_samples(
+            [_doc(3, 10), _doc(4, 20)], seq_len=12, tokens_per_image=2, pad_id=0, max_docs_per_row=1
+        )
+        assert batch["input_ids"].shape == (2, 12)
+        assert batch["image_rows"].tolist() == [0, 1]
+        assert batch["doc_ids"][0].tolist() == [0] * 5 + [1] * 7
+
+    def test_max_docs_per_row_caps_a_row_at_the_count(self):
+        docs = [_doc(2, 10), _doc(2, 20), _doc(2, 30)]
+        batch = pack_vlm_samples(docs, seq_len=12, tokens_per_image=2, pad_id=0, max_docs_per_row=2)
+        assert batch["input_ids"].shape == (2, 12)
+        assert batch["image_rows"].tolist() == [0, 0, 1]
+        assert batch["doc_ids"][0].tolist() == [0] * 4 + [1] * 4 + [2] * 4
 
     def test_collator_packs_the_batch(self):
         collator = PackedVLMCollator(pad_id=7, seq_len=12, tokens_per_image=2)

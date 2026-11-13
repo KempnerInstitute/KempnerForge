@@ -5,9 +5,10 @@ produces the ``VLMSample`` contract:
 
 - ``pixel_values``: ``(3, H, W)`` float tensor, resized to ``image_size``
   and normalized with the provided mean/std; ``(V, 3, H, W)`` when
-  ``tile_grid`` cuts the image into ``V`` views (``tile_image``); an
-  empty tensor of that image shape (``(0, 3, H, W)`` or ``(0, V, 3, H,
-  W)``) for a row without an image, a text-only document.
+  ``tile_grid`` cuts the image into ``V`` views (``tile_image``); with
+  ``max_images >= 2`` a row's ``K`` images, or their views, concatenate to
+  ``(K * V, 3, H, W)``; an empty tensor of the image shape (``(0, 3, H, W)``
+  or ``(0, V, 3, H, W)``) for a row without an image, a text-only document.
 - ``input_ids``: ``(T,)`` int64 tensor, right-padded to ``max_text_len``.
 - ``labels``: ``(T,)`` int64 next-token targets (``labels[i]`` = input
   token ``i+1``), right-padded to ``max_text_len``; pad, trailing, and
@@ -21,16 +22,20 @@ different ranks see identical tensor shapes (no NCCL desync under
 FSDP2). A text-only sample gets a blank image and a ``False`` entry in the
 batch's ``frame_mask``, which hides its image tokens from attention while the
 vision encoder still runs on every rank. The collator also emits
-``image_positions: (B,)`` zeros; this slot is reserved for a future
-multi-image extension and is unused by the Joint-Decoder wrapper today.
+``image_positions: (B,)`` zeros, which the Joint-Decoder wrapper does not
+use; documents with several images go through ``PackedVLMCollator`` instead.
 
 ``PackedVLMCollator`` packs several documents into each row instead
-(``pack_vlm_samples``): a document is its image's placeholder slots followed
+(``pack_vlm_samples``): a document is its images' placeholder slots followed
 by its real text, rows are filled first-fit to ``seq_len``, and the batch
 carries ``doc_ids``, per-document ``position_ids`` and the image placement the
 Joint-Decoder wrapper uses to write each image's tokens over its slots. A
 text-only document is just its text; a batch of nothing but text carries an
 empty image tensor.
+
+With ``max_docs_per_row=1`` the same layout holds one document per row of
+``seq_len`` positions without packing, so documents with different image
+counts share a batch of fixed shape.
 
 The HF ``datasets`` and ``transformers`` packages are imported lazily
 so this module is safe to import without them (e.g. in unit tests that
@@ -314,6 +319,26 @@ def _warn_sample_masked_for_prompt(min_text_len: int, max_text_len: int) -> None
         )
 
 
+def _image_feature(features: Any, image_field: str) -> Any:
+    """The column's image feature (inside a list feature if need be), or ``None``."""
+    feature: Any = features[image_field]
+    while not hasattr(feature, "decode_example"):
+        if isinstance(feature, list):
+            feature = feature[0]
+        elif hasattr(feature, "feature"):
+            feature = feature.feature
+        else:
+            return None
+    return feature
+
+
+def _decode_image(feature: Any, value: Any) -> Any:
+    """A PIL image from an undecoded entry of ``feature``'s column, or the entry itself."""
+    if feature is not None and isinstance(value, dict):
+        return feature.decode_example(value)
+    return value
+
+
 def _images_of(value: Any) -> list[Any]:
     """The images an image field holds: none for ``None``, a list's present entries, else it."""
     if value is None:
@@ -358,32 +383,35 @@ def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
     return np.concatenate(counts)
 
 
-def _usable_rows(rows: Any, image_field: str) -> tuple[np.ndarray, int]:
-    """Pick the rows a run can train: a row with several images is skipped, with one warning.
+def _usable_rows(rows: Any, image_field: str, max_images: int) -> tuple[np.ndarray, int]:
+    """The rows to keep, skipping those over ``max_images``, and how many are text-only.
 
-    Returns:
-        The indices of the kept rows, and how many of them have no image.
+    A row holding more than ``max_images`` images is skipped, with one warning
+    that counts them, so a caption never describes an image the model does
+    not see.
 
     Raises:
-        ValueError: The dataset has rows and none of them holds one image, which
-            points at the wrong image field rather than a text-only dataset.
+        ValueError: The dataset has rows and none of them holds from one to
+            ``max_images`` images.
     """
     counts = _images_per_row(rows, image_field)
-    missing = counts == 0
-    several = counts > 1
+    over = counts > max_images
     total = f"{len(counts):,}"
-    if len(counts) and not (counts == 1).any():
-        raise ValueError(f"None of the {total} rows holds one image in field {image_field!r}")
-    if several.any():
+    if len(counts) and not ((counts > 0) & ~over).any():
+        raise ValueError(
+            f"None of the {total} rows holds from 1 to data.hf_max_images={max_images} images "
+            f"in field {image_field!r}"
+        )
+    if over.any():
         logger.warning(
-            "Skipping %s of %s rows that hold several images in field %r; a document takes "
-            "one image",
-            f"{int(several.sum()):,}",
+            "Skipping %s of %s rows that hold more than data.hf_max_images=%d images in field %r",
+            f"{int(over.sum()):,}",
             total,
+            max_images,
             image_field,
         )
-    keep = np.flatnonzero(~several)
-    return keep, int(missing[keep].sum())
+    keep = np.flatnonzero(~over)
+    return keep, int((counts[keep] == 0).sum())
 
 
 def _tokenize_and_mask(
@@ -452,9 +480,7 @@ class HuggingFaceVLMDataset(Dataset):
 
     A row whose image field is ``None`` or an empty list is a text-only
     document, returned with an empty ``pixel_values`` of the image shape;
-    ``has_text_only_rows`` says whether the dataset holds one. A row with
-    several images is skipped when the dataset is loaded, and one warning
-    counts those rows.
+    ``has_text_only_rows`` says whether the dataset holds one.
 
     Args:
         dataset_name: HF dataset name (e.g. ``"sayakpaul/coco-30-val-2014"``)
@@ -478,6 +504,10 @@ class HuggingFaceVLMDataset(Dataset):
         image_mean / image_std: Normalization stats. Defaults match
             SigLIP's ``(0.5, 0.5, 0.5)``.
         dataset_config: HF dataset config name, if required.
+        max_images: Images a row may hold; rows holding more are skipped
+            when the dataset is loaded, with one warning that counts them.
+            ``1`` (default) returns the one image as above; ``n >= 2``
+            concatenates a row's images' views to ``(K * V, 3, H, W)``.
         tile_grid: ``0`` keeps one view per image; ``n`` cuts each image into
             an ``n × n`` grid of ``image_size`` crops (``tile_image``), so
             ``pixel_values`` is ``(views, 3, H, W)``.
@@ -497,6 +527,7 @@ class HuggingFaceVLMDataset(Dataset):
         image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
         image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
         dataset_config: str | None = None,
+        max_images: int = 1,
         tile_grid: int = 0,
         tile_global: bool = True,
     ) -> None:
@@ -518,10 +549,14 @@ class HuggingFaceVLMDataset(Dataset):
                 "Streaming or split-dict outputs are not supported by "
                 "HuggingFaceVLMDataset (use `split=` to resolve a single split)."
             )
-        keep, text_only = _usable_rows(ds, image_field)
+        keep, text_only = _usable_rows(ds, image_field, max_images)
         if len(keep) < len(ds):
             ds = ds.select(keep)
         self._ds: HFDataset = ds
+        used = [text_field, *([prompt_field] if prompt_field is not None else [])]
+        self._text_columns: Any = ds.select_columns(used)
+        self._image_rows: Any = ds.select_columns([image_field]).with_format("arrow")
+        self._image_feature = _image_feature(ds.features, image_field)
         self._image_field = image_field
         self._text_field = text_field
         self._prompt_field = prompt_field
@@ -533,6 +568,7 @@ class HuggingFaceVLMDataset(Dataset):
         views = tile_grid * tile_grid + int(tile_global) if tile_grid else 0
         self._view_shape = (*((views,) if views else ()), 3, image_size, image_size)
         self._max_text_len = max_text_len
+        self._max_images = max_images
         self._tokenizer = build_tokenizer(tokenizer_path)
         self.has_text_only_rows = text_only > 0
         if prompt_field is not None:
@@ -546,25 +582,34 @@ class HuggingFaceVLMDataset(Dataset):
     def __len__(self) -> int:
         return len(self._ds)
 
+    def _image_value(self, idx: int) -> Any:
+        """The row's image field as stored, so only the images kept are decoded."""
+        raw = self._image_rows[idx]
+        if isinstance(raw, dict):
+            return raw[self._image_field]
+        return raw.column(self._image_field)[0].as_py()
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        row = self._ds[idx]
-        images = _images_of(row[self._image_field])
+        row = self._text_columns[idx]
+        images = _images_of(self._image_value(idx))
         if not images:
             pixels = torch.zeros(0, *self._view_shape)
-        elif len(images) > 1:
-            raise ValueError(
-                f"row {idx} holds {len(images)} images in field {self._image_field!r}; "
-                "a document takes one image"
-            )
         else:
-            pixels = image_to_views(
-                images[0],
-                self._image_size,
-                self._image_mean,
-                self._image_std,
-                tile_grid=self._tile_grid,
-                tile_global=self._tile_global,
-            )
+            views = [
+                image_to_views(
+                    _decode_image(self._image_feature, img),
+                    self._image_size,
+                    self._image_mean,
+                    self._image_std,
+                    tile_grid=self._tile_grid,
+                    tile_global=self._tile_global,
+                )
+                for img in images
+            ]
+            if self._max_images == 1:
+                pixels = views[0]
+            else:
+                pixels = torch.cat([v if v.dim() == 4 else v.unsqueeze(0) for v in views])
         text_val = row[self._text_field]
         if not isinstance(text_val, str):
             raise TypeError(
@@ -595,9 +640,9 @@ class VLMCollator:
         depends on which samples have images.
       - ``input_ids``: ``(B, max_text_len)`` int64.
       - ``labels``: ``(B, max_text_len)`` int64 with ``-100`` on pad.
-      - ``image_positions``: ``(B,)`` long tensor. Reserved slot for
-        multi-image extensions; currently all zeros (single image per
-        example placed at sequence position 0).
+      - ``image_positions``: ``(B,)`` long tensor, all zeros; the wrapper
+        does not read it, and documents with several images go through
+        ``PackedVLMCollator``.
       - ``frame_mask``: ``(B, V)`` bool, ``False`` hiding a text-only sample's
         image tokens; on a batch holding a text-only sample, or on every batch
         with ``frame_mask``, so the attention mask's shape and kernel stay the
@@ -664,8 +709,9 @@ def pack_vlm_samples(
     seq_len: int,
     tokens_per_image: int,
     pad_id: int,
+    max_docs_per_row: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Pack image-text samples into rows of ``seq_len``, each document's image before its text.
+    """Pack image-text samples into rows of ``seq_len``, each document's images before its text.
 
     A sample is one document: ``pixel_values`` ``(3, H, W)`` or ``(V, 3, H, W)``
     (``V`` views, each an encoder input; ``V = 0`` for a text-only document),
@@ -677,7 +723,8 @@ def pack_vlm_samples(
     ``HuggingFaceVLMDataset`` (which already leaves it so): the token after a
     trimmed ``text_len`` is not in the row.
     Documents go first-fit into rows in order: into the first open row with
-    room, else a new row. A row's tail is padding that forms its own document.
+    room (and, when ``max_docs_per_row`` is positive, fewer documents than
+    that), else a new row. A row's tail is padding that forms its own document.
 
     Returns:
         ``pixel_values`` ``(N, 3, H, W)``, every image or view across the batch in
@@ -732,7 +779,15 @@ def pack_vlm_samples(
                 f"a document of {views.shape[0]} image(s) x {tokens_per_image} tokens + "
                 f"{text_len} text tokens does not fit a row of seq_len={seq_len}"
             )
-        row_index = next((i for i, r in enumerate(rows) if r["fill"] + footprint <= seq_len), None)
+        row_index = next(
+            (
+                i
+                for i, r in enumerate(rows)
+                if r["fill"] + footprint <= seq_len
+                and (max_docs_per_row <= 0 or r["docs"] < max_docs_per_row)
+            ),
+            None,
+        )
         if row_index is None:
             row_index = len(rows)
             rows.append(
@@ -787,14 +842,22 @@ class PackedVLMCollator:
 
     The number of rows follows the documents' footprints, so it varies from
     batch to batch; ``train.batch_size`` is the number of documents per
-    micro-batch, not the number of rows. A text-only document packs as its
-    text alone.
+    micro-batch, not the number of rows. A positive ``max_docs_per_row`` caps
+    the documents a row takes; ``1`` lays each document out on its own row.
+    A text-only document packs as its text alone.
     """
 
-    def __init__(self, pad_id: int, seq_len: int, tokens_per_image: int) -> None:
+    def __init__(
+        self,
+        pad_id: int,
+        seq_len: int,
+        tokens_per_image: int,
+        max_docs_per_row: int = 0,
+    ) -> None:
         self.pad_id = pad_id
         self.seq_len = seq_len
         self.tokens_per_image = tokens_per_image
+        self.max_docs_per_row = max_docs_per_row
 
     def __call__(self, samples: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         return pack_vlm_samples(
@@ -802,4 +865,5 @@ class PackedVLMCollator:
             seq_len=self.seq_len,
             tokens_per_image=self.tokens_per_image,
             pad_id=self.pad_id,
+            max_docs_per_row=self.max_docs_per_row,
         )

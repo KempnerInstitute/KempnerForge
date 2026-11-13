@@ -86,6 +86,7 @@ class DataConfig:
     hf_dataset_image_field: str = "image"
     hf_dataset_prompt_field: str = ""
     hf_image_size: int = 224
+    hf_max_images: int = 1
     hf_streaming: bool = False
     pack_sequences: bool = False
     datasets: list[DatasetSource] = field(default_factory=list)
@@ -99,6 +100,8 @@ class DataConfig:
             raise ValueError("num_workers must be non-negative")
         if self.prefetch_factor < 1:
             raise ValueError("prefetch_factor must be >= 1")
+        if self.hf_max_images < 1:
+            raise ValueError("hf_max_images must be >= 1")
         if self.mix_temperature <= 0:
             raise ValueError("mix_temperature must be positive")
         check_token_dtype(self.token_dtype, "data.token_dtype")

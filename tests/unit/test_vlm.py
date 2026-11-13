@@ -29,6 +29,7 @@ from kempnerforge.config.vlm import (
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
+    PackedVLMCollator,
     VLMCollator,
     pack_vlm_samples,
     tile_image,
@@ -671,6 +672,64 @@ class TestPackedForward:
                 image_rows=batch["image_rows"],
                 image_starts=batch["image_starts"],
             )
+
+
+class TestMultiImageDocuments:
+    @staticmethod
+    def _collate(docs):
+        collator = PackedVLMCollator(pad_id=0, seq_len=28, tokens_per_image=8, max_docs_per_row=1)
+        return collator(docs)
+
+    def _forward(self, wrapper, batch):
+        return wrapper(
+            batch["pixel_values"],
+            batch["input_ids"],
+            batch["labels"],
+            doc_ids=batch["doc_ids"],
+            position_ids=batch["position_ids"],
+            image_rows=batch["image_rows"],
+            image_starts=batch["image_starts"],
+            image_tokens=int(batch["image_tokens"]),
+        )
+
+    def test_two_images_match_the_prefix_path_with_two_frames(self):
+        """Image blocks then text is the clip layout, so a two-frame wrapper agrees."""
+        mc, vc, ac, lc = _tiny_configs(num_image_tokens=8)
+        wrapper = build_vlm_wrapper(mc, vc, ac, lc, frames_per_clip=2).eval()
+        doc = _packed_doc(12, 1, images=2)
+        batch = self._collate([doc])
+        assert batch["input_ids"].shape == (1, 28)
+        with torch.no_grad():
+            inline, _ = self._forward(wrapper, batch)
+            prefix, _ = wrapper(doc["pixel_values"].unsqueeze(0), doc["input_ids"].unsqueeze(0))
+        assert torch.allclose(inline[0, 16:28], prefix[0], atol=1e-5)
+
+    def test_the_second_image_reaches_the_text(self):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
+        doc = _packed_doc(10, 2, images=2)
+        other = dict(doc)
+        other["pixel_values"] = doc["pixel_values"].clone()
+        other["pixel_values"][1] += 1.0
+        with torch.no_grad():
+            a, _ = self._forward(wrapper, self._collate([doc]))
+            b, _ = self._forward(wrapper, self._collate([other]))
+        assert not torch.allclose(a[0, 16:26], b[0, 16:26])
+
+    def test_documents_with_different_image_counts_share_a_batch(self):
+        wrapper = _build_tiny_wrapper(num_image_tokens=8).eval()
+        two, one, none = (
+            _packed_doc(10, 3, images=2),
+            _packed_doc(11, 4),
+            _packed_doc(12, 5, images=0),
+        )
+        batch = self._collate([two, one, none])
+        assert batch["pixel_values"].shape == (3, 3, 16, 16)
+        with torch.no_grad():
+            together, _ = self._forward(wrapper, batch)
+            alone = [self._forward(wrapper, self._collate([d]))[0][0] for d in (two, one, none)]
+        assert torch.allclose(together[0], alone[0], atol=1e-5)
+        assert torch.allclose(together[1, :19], alone[1][:19], atol=1e-5)
+        assert torch.allclose(together[2, :12], alone[2][:12], atol=1e-5)
 
 
 class TestTextOnlyPrefixRows:
