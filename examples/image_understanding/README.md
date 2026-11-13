@@ -14,6 +14,8 @@ examples/image_understanding/
 ├── README.md
 ├── train.py              # training entry point
 ├── image_text/           # image-text dataset readers and chat renderer (below)
+├── scripts/
+│   └── convert_finevision_to_arrow.py  # FineVision parquet -> memory-mappable Arrow
 └── tests/
     ├── test_image_understanding_entry.py   # the entry point loads a config and hands it off
     └── image_text/       # reader and renderer tests (CPU)
@@ -57,6 +59,7 @@ samples `VLMCollator` batches.
   process add to its count.
 - `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
   `points.py` writes the point answers.
+- `finevision.py`: FineVision subsets from their memory-mappable Arrow copy.
 
 Every sample the renderer builds carries one image, resized square to `image_size`,
 with no tiling or packing. PixMo-Count stores its points in pixels; they are
@@ -66,6 +69,24 @@ outruns `max_text_len` and trains only the leading points. `max_points` retains
 the count only when the cap is small enough for the label and the text budget:
 with a 40-point `dot` row at 256 tokens, a cap of 30 still cuts the count, while
 a cap of 3 keeps it.
+
+`FineVisionArrow` keeps only the rows with one image (`max_images`, which `None`
+lifts), using the per-row image counts `index.npz` stores; an index written
+without them takes the counts from `num_images`, and `text_only` keeps the rows
+without images. A conversation keeps its turns up to the first one missing its
+user message or reply, so a row whose first turn is incomplete is not kept.
+
+Convert FineVision once; any number of `convert` processes can share the work,
+a file that fails to convert is listed at the end without stopping the others,
+and `index` refuses a subset with a file missing or whose parquet file changed
+size since its conversion:
+
+```bash
+uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py convert \
+    --src path-to-FineVision --dst path-to-FineVision-arrow --procs 8
+uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py index \
+    --src path-to-FineVision --dst path-to-FineVision-arrow
+```
 
 ## Tile images
 
