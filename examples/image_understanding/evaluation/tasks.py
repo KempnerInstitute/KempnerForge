@@ -22,11 +22,15 @@ the task unloadable, and a value must be of the TOML type of a parameter
 annotated ``str``, ``Path``, ``bool``, ``int`` or ``float`` (alone or with
 ``None``). Nothing else is judged there: a parameter with another or an
 unresolvable annotation, a nested value, and every limit on a value are left to
-the reader, which checks them itself when ``build_reader`` constructs it.
+the reader, which checks them itself when ``build_reader`` constructs it. A
+relative path given to a parameter annotated ``Path`` is taken from the
+directory of the task file, so a task file reads the same data from any working
+directory.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import inspect
 import re
@@ -63,10 +67,14 @@ _TOML_VALUES: dict[Any, tuple[str, tuple[type, ...]]] = {
 }
 
 
+def _members(hint: Any) -> tuple[Any, ...]:
+    """The types a union ``hint`` joins, or ``hint`` alone."""
+    return get_args(hint) if get_origin(hint) in (Union, UnionType) else (hint,)
+
+
 def _judged(hint: Any) -> list[Any] | None:
     """The types of ``hint`` a TOML value can be checked against, or ``None`` when one cannot be."""
-    members = get_args(hint) if get_origin(hint) in (Union, UnionType) else (hint,)
-    judged = [member for member in members if member is not type(None)]
+    judged = [member for member in _members(hint) if member is not type(None)]
     return judged if judged and all(member in _TOML_VALUES for member in judged) else None
 
 
@@ -222,18 +230,39 @@ def _tasks(document: Mapping[str, Any]) -> tuple[EvalTask, ...]:
     return tuple(tasks)
 
 
+def _anchored(task: EvalTask, base: Path) -> EvalTask:
+    """``task`` with each relative path its reader takes as a ``Path`` joined to ``base``."""
+    factory = READERS[task.reader]
+    parameters = inspect.signature(factory).parameters
+
+    def anchored(key: str, value: Any) -> Any:
+        takes_path = Path in _members(_annotation(factory, parameters[key]))
+        if takes_path and isinstance(value, str) and not Path(value).is_absolute():
+            return str(base / value)
+        return value
+
+    args = {key: anchored(key, value) for key, value in task.reader_args.items()}
+    return dataclasses.replace(task, reader_args=args)
+
+
 def load_tasks(path: str | Path) -> tuple[EvalTask, ...]:
     """The tasks of the TOML file at ``path``, in file order.
 
     The file holds only ``[[tasks]]`` tables, each with the keys ``name``,
     ``reader``, ``scorer`` and ``max_new_tokens`` and, for the reader's arguments,
-    ``reader_args``. Invalid TOML, an unknown or missing key, a task ``EvalTask``
-    refuses or a name used twice raises ``ValueError`` that names the file and
-    what is accepted.
+    ``reader_args``. A relative path given to a reader parameter annotated
+    ``Path`` (alone or in a union, as the ``annotation_file`` and ``image_root`` of
+    the testbed readers are) is joined to the directory of the file, its symbolic
+    links resolved, and held as an absolute path string; an absolute path and
+    every other value are kept as written. Invalid TOML, an unknown or missing
+    key, a task ``EvalTask`` refuses or a name used twice raises ``ValueError``
+    that names the file and what is accepted.
     """
     try:
         with open(path, "rb") as f:
-            return _tasks(tomllib.load(f))
+            document = tomllib.load(f)
+        base = Path(path).resolve().parent
+        return tuple(_anchored(task, base) for task in _tasks(document))
     except ValueError as exc:
         raise ValueError(f"{path}: {exc}") from exc
 
