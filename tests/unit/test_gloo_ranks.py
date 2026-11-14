@@ -87,9 +87,25 @@ def _reducing_in_a_thread(rank: int, world: int, port: int) -> None:
     assert totals == [float(world)]
 
 
+def _wait_until_finished(port: int, rank: int) -> None:
+    """Wait until the held store at ``port`` records that ``rank`` finished its block.
+
+    Gives up after ``LEAVE_TIMEOUT``, as a rank waiting to leave does.
+    """
+    client = dist.TCPStore(HOST, port, is_master=False, timeout=gloo_ranks.STORE_TIMEOUT)
+    join = client.get(f"joined/{rank}").decode()
+    client.wait([f"{join}/finished/{rank}"], gloo_ranks.LEAVE_TIMEOUT)
+
+
 def _raise_on_rank_1(rank: int, world: int, port: int) -> None:
+    """Rank 1 raises once rank 0 has finished its block and waits to leave.
+
+    Rank 0 records its block finished only after its group is set up, so rank 1's teardown
+    cannot fail rank 0's setup, and rank 1 is the only rank the note can name.
+    """
     with gloo_group(rank, world, port):
         if rank == 1:
+            _wait_until_finished(port, 0)
             raise ValueError("rank 1 failed")
 
 
