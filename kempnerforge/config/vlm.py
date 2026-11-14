@@ -47,10 +47,17 @@ DEFAULT_MODULE_PATTERNS: dict[str, list[str]] = {
 
 
 def is_parameter_pattern(module: str) -> bool:
-    """Whether a ``FreezeSpec.module`` names parameters by pattern rather than by alias.
+    """Whether a ``FreezeSpec.module`` is spelled as a parameter pattern.
 
     A pattern spells a parameter path or a glob, so it holds a dot or one of ``*?[``; a
-    bare word is taken for a module alias.
+    bare word reads as a module alias. This looks at the spelling only: a name that is a
+    key of the module pattern map resolves as that alias first, dot or not.
+
+    Args:
+        module: The ``FreezeSpec.module`` to classify.
+
+    Returns:
+        True when ``module`` holds a dot or one of ``*?[``.
     """
     return any(char in module for char in ".*?[")
 

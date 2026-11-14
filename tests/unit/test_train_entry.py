@@ -552,6 +552,22 @@ class TestCheckpointExtra:
         )
         assert "vlm_freeze" in checkpoint_extra(config, 3, PhaseState())
 
+    def test_vlm_freeze_metadata_takes_a_parameter_pattern(self, tiny_vlm_configs):
+        """A pattern the build applies goes into the metadata written after every step."""
+        from kempnerforge.config.vlm import FreezeSpec, VLMConfig
+
+        mc, vision, adapter, _ = tiny_vlm_configs
+        freeze = [FreezeSpec("transformer"), FreezeSpec("transformer.layers.1.*", False)]
+        config = JobConfig(
+            model=mc,
+            train=TrainConfig(batch_size=1, seq_len=64, max_steps=1),
+            vision_encoder=vision,
+            adapter=adapter,
+            vlm=VLMConfig(max_text_len=32, freeze=freeze),
+        )
+        meta = checkpoint_extra(config, 3, PhaseState())["vlm_freeze"]
+        assert {"module": "transformer.layers.1.*", "frozen": False} in meta
+
 
 def _mixture_pipeline() -> DataPipeline:
     return DataPipeline(
@@ -2523,6 +2539,30 @@ class TestRestoreCheckpoint:
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
         assert mgr.peeked == [str(tmp_path / "s")]
         assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(11, config.vlm)
+
+    def test_vlm_resume_takes_parameter_patterns(self, monkeypatch, tmp_path):
+        """A resume compares and reapplies a freeze that names parameter patterns."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.config.vlm import FreezeSpec, FreezeStage
+        from kempnerforge.training.freeze import freeze_meta_at_step
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
+        applied: list = []
+        monkeypatch.setattr(
+            entry,
+            "apply_freeze_specs",
+            lambda m, specs, pat: applied.append([s.module for s in specs]),
+        )
+        config = _vlm_config(
+            freeze=[FreezeSpec("transformer"), FreezeSpec("transformer.layers.1.*", False)],
+            freeze_schedule=(FreezeStage(start_step=5, specs=(FreezeSpec("adapter.*", True),)),),
+        )
+        mgr = FakeResumeManager(step=9, saved_step=9)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        expected = mgr.load_kwargs["vlm_freeze_expected"]
+        assert expected == freeze_meta_at_step(9, config.vlm)
+        assert {"module": "adapter.*", "frozen": True} in expected
+        assert applied == [["transformer", "transformer.layers.1.*", "adapter.*"]]
 
     def test_freeze_schedule_is_reapplied_at_the_resumed_step(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry

@@ -291,6 +291,40 @@ class TestFreezeNames:
             "transformer.layers.[01].*",
         ]
 
+    @pytest.mark.parametrize("name", ["transformer.layers", "adapter*", "adapte?", "adapte[r]"])
+    def test_each_pattern_marker_alone_makes_a_pattern(self, name):
+        from kempnerforge.config.vlm import VLMConfig, is_parameter_pattern
+        from kempnerforge.training.freeze import effective_freeze
+
+        assert is_parameter_pattern(name)
+        assert not is_parameter_pattern("adapter")
+        assert [s.module for s in VLMConfig(freeze=[FreezeSpec(name)]).freeze] == [name]
+        out = effective_freeze(
+            step=0, base=[FreezeSpec(name)], schedule=[], valid_modules={"adapter"}
+        )
+        assert [s.module for s in out] == [name]
+
+    def test_a_dotted_alias_resolves_as_its_alias(self, model):
+        from kempnerforge.config.vlm import VLMConfig
+
+        patterns = {**DEFAULT_MODULE_PATTERNS, "vision.tower": ["vision_encoder.*"]}
+        config = VLMConfig(freeze=[FreezeSpec("vision.tower")], module_patterns=patterns)
+        apply_freeze_specs(model, config.freeze, patterns)
+        assert not any(p.requires_grad for p in model.vision_encoder.parameters())
+        assert all(p.requires_grad for p in model.transformer.parameters())
+
+    def test_a_pattern_in_a_later_stage_counts_from_its_start(self):
+        from kempnerforge.config.vlm import FreezeStage, VLMConfig
+        from kempnerforge.training.freeze import freeze_meta_at_step
+
+        vlm = VLMConfig(
+            max_text_len=8,
+            freeze_schedule=[FreezeStage(5, (FreezeSpec("transformer.layers.1.*", True),))],
+        )
+        spec = {"module": "transformer.layers.1.*", "frozen": True}
+        assert spec not in freeze_meta_at_step(4, vlm)
+        assert spec in freeze_meta_at_step(5, vlm)
+
     def test_a_typo_in_toml_fails_when_the_config_loads(self, tmp_path):
         from kempnerforge.config.loader import load_config
 

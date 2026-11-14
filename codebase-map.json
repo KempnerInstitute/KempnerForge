@@ -228,6 +228,9 @@
           ]
         }
       },
+      "functions": [
+        "is_parameter_pattern(module) -> bool"
+      ],
       "globals": [
         "DEFAULT_MODULE_PATTERNS",
         "_RESERVED_ARCHS"
@@ -243,7 +246,8 @@
         "tests/unit/test_vlm_config.py::TestCrossAttentionResolvedHeads",
         "tests/unit/test_vlm_config.py::TestMoTConfig",
         "tests/unit/test_vlm_config.py::TestModalityStrategyRegistry",
-        "tests/unit/test_vlm_config.py::TestModelConfigWithVLM"
+        "tests/unit/test_vlm_config.py::TestModelConfigWithVLM",
+        "tests/unit/test_freeze.py::TestFreezeNames"
       ]
     },
     "kempnerforge/config/loader.py": {
@@ -812,6 +816,7 @@
         "tests/unit/test_freeze.py::TestApplyFreezeSpecs",
         "tests/unit/test_freeze.py::TestCanonicalFreezeMeta",
         "tests/unit/test_freeze.py::TestEffectiveFreeze",
+        "tests/unit/test_freeze.py::TestFreezeNames",
         "tests/integration/test_vlm_cross_attn.py::TestFreezeStageHook",
         "tests/integration/test_vlm_mot.py::TestFreezeStageHook",
         "tests/distributed/test_vlm_cross_attn_fsdp.py::TestFreezeStageUnderFsdp",
@@ -1914,9 +1919,9 @@
           "TestApplyFreezeSpecs(3)",
           "TestCanonicalFreezeMeta(4)",
           "TestEffectiveFreeze(7)",
-          "TestFreezeNames(6)"
+          "TestFreezeNames(12)"
         ],
-        "count": 26
+        "count": 32
       },
       "tests/unit/test_check_env.py": {
         "classes": [

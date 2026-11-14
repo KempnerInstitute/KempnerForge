@@ -59,6 +59,12 @@ and the `gpt2` tokenizer. The `vlm_7b*` presets are 4-8 GPU starting points.
 | `vlm_video_webvid.toml` | joint_decoder | siglip2 | video (WebVid-10M) |
 | `vlm_qwen3_0.6b_joint_decoder_webvid.toml` | joint_decoder | siglip2 | video, from a pretrained backbone |
 
+A name in `vlm.freeze` or in a `FreezeStage` is a module alias of `vlm.module_patterns`
+(`transformer`, `vision_encoder` and `adapter` by default) or a parameter pattern, which
+holds a dot or one of `*?[`, such as `transformer.layers.1.*`. A bare word that is neither
+fails when the config loads; the TOML is checked before CLI overrides apply, so fix it in
+the TOML.
+
 Paths in these configs are placeholders (`data_root = "path-to-webvid-10m"`) —
 point them at your own data and output directories, or override on the CLI.
 
