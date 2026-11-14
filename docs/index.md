@@ -48,7 +48,7 @@ once you want a real run:
 - **{doc}`metrics-and-profiling/index`** — metrics tracker, MFU,
   memory monitor, profiler, WandB / TensorBoard backends.
 - **{doc}`resilience/index`** — SLURM preemption, NaN detection,
-  NCCL liveness, GPU health, elastic training.
+  NCCL liveness, GPU health, SLURM job info and auto-resume.
 
 ### Reference Tables and API Documentation
 

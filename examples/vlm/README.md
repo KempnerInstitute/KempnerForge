@@ -37,9 +37,10 @@ examples/vlm/
 
 ## Configs
 
-`vlm_debug*` are 1-GPU smoke presets — tiny backbone, `random` encoder, so they
-run on a fresh clone with no download. The `vlm_7b*` presets are 4-8 GPU
-starting points.
+`vlm_debug*` are 1-GPU smoke presets: a tiny backbone and a `random` encoder, so
+they need no pretrained weights, but on first use they download the default
+dataset, `sayakpaul/coco-30-val-2014` (30,000 image-caption pairs, about 4.9 GB),
+and the `gpt2` tokenizer. The `vlm_7b*` presets are 4-8 GPU starting points.
 
 | Config | Arch | Encoder | For |
 | --- | --- | --- | --- |
