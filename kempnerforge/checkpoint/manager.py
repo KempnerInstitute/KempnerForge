@@ -238,15 +238,18 @@ def _rate_taken_groups(optimizer: torch.optim.Optimizer, scheduler: Any, taken: 
         optimizer: The optimizer ``scheduler`` drives.
         scheduler: The LR scheduler, its state restored.
         taken: The indices of the taken groups among ``optimizer``'s param groups.
+
+    Raises:
+        ValueError: ``scheduler`` holds other than one base rate and one lambda per param
+            group of ``optimizer``, as a restored ``LambdaLR`` always does.
     """
     groups = optimizer.param_groups
     base_lrs = getattr(scheduler, "base_lrs", None)
     lambdas = getattr(scheduler, "lr_lambdas", None)
     if not (isinstance(base_lrs, list) and isinstance(lambdas, list)):
         return
-    if not len(base_lrs) == len(lambdas) == len(groups):
-        return
-    rates = [base * fn(scheduler.last_epoch) for base, fn in zip(base_lrs, lambdas, strict=True)]
+    epoch = scheduler.last_epoch
+    rates = [base * fn(epoch) for _, base, fn in zip(groups, base_lrs, lambdas, strict=True)]
     saved = next((i for i, rate in enumerate(rates) if i not in taken and rate), None)
     scale = groups[saved]["lr"] / rates[saved] if saved is not None else 1.0
     for i in taken:

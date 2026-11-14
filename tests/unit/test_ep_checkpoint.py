@@ -291,6 +291,46 @@ def _save_with_lr_groups(rank, world, port, names, sizes, overrides, root) -> No
         dist.destroy_process_group()
 
 
+def _resume_experts_the_save_left_out(rank, world, port, names, sizes, overrides, root) -> None:
+    """Save from an optimizer without the frozen experts, then resume them fresh.
+
+    The saving run built its optimizer from the trainable parameters alone, as main did
+    before a freeze stage that unfreezes the experts; the resume holds them, so the load
+    must leave out their state under the names the expert layout saves on every EP rank.
+    Rank 0 writes the reference, what the resume gave, and the experts that got state.
+    """
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+        config = _config(overrides)
+        ckpt = CheckpointConfig(dir=str(Path(root) / "ckpt"))
+        torch.manual_seed(0)
+        model = build_parallel_model(
+            config, torch.device("cpu"), mesh, mp_policy=FP32, param_dtype=torch.float32
+        )
+        experts = sorted(name for name, _ in model.named_parameters() if _is_expert(name))
+        for name, p in model.named_parameters():
+            p.requires_grad_(name not in experts)
+        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-2)
+        _train(model, optimizer, mesh)
+        reference = _gathered(model, optimizer, mesh)
+        CheckpointManager(ckpt, model, optimizer).save(STEP)
+        resumed, resumed_optimizer = _build(mesh, config, seed=1)
+        CheckpointManager(ckpt, resumed, resumed_optimizer).load(fresh_if_unheld=experts)
+        loaded = _gathered(resumed, resumed_optimizer, mesh)
+        with_state = [
+            name
+            for name, p in resumed.named_parameters()
+            if name in experts and resumed_optimizer.state.get(p)
+        ]
+        if rank == 0:
+            torch.save(reference, Path(root) / "reference.pt")
+            torch.save(loaded, Path(root) / "resumed.pt")
+            torch.save(with_state, Path(root) / "with_state.pt")
+    finally:
+        dist.destroy_process_group()
+
+
 def _save_on_two_meshes(rank, world, port, names, sizes, overrides, root) -> None:
     """Save and resume twice at one layout, each time on a new mesh.
 
@@ -562,6 +602,18 @@ class TestResumeAtTheSameLayout:
         root = saved_layout(layout)
         reference = torch.load(root / "reference.pt")
         assert _mismatches(torch.load(root / "resumed.pt"), reference) == []
+
+
+class TestExpertsTheSaveLeftOut:
+    @pytest.mark.parametrize("layout", ["ep2", "dp_shard2_ep2_packed"])
+    def test_every_rank_resumes_its_experts_fresh(self, tmp_path, layout):
+        """Experts a freeze stage unfreezes resume without state on each EP rank, and the
+        rest of the model with the state it saved."""
+        names, sizes, overrides = LAYOUTS[layout]
+        _spawn(_resume_experts_the_save_left_out, names, sizes, overrides, str(tmp_path))
+        reference = torch.load(tmp_path / "reference.pt")
+        assert _mismatches(torch.load(tmp_path / "resumed.pt"), reference) == []
+        assert torch.load(tmp_path / "with_state.pt") == []
 
 
 class TestPerModuleLearningRates:

@@ -1760,24 +1760,25 @@
           "TestPlacementCheck(1)",
           "TestFailureOnOneRank(1)",
           "TestResumeAtTheSameLayout(11)",
+          "TestExpertsTheSaveLeftOut(2)",
           "TestPerModuleLearningRates(2)",
           "TestLoadAtAnotherEP(18)",
           "TestUnfixedCheckpoint(8)",
           "TestExportFromAnEPCheckpoint(3)",
           "TestWithoutEP(2)"
         ],
-        "count": 61
+        "count": 63
       },
       "tests/unit/test_expert_layout.py": {
         "classes": [
           "TestMoELayers(2)",
-          "TestUnpackedNames(8)",
+          "TestUnpackedNames(9)",
           "TestPackedWithoutMesh(3)",
           "TestOlderTorch(1)",
           "TestCheckSavedExperts(6)",
           "TestRootLayer(5)"
         ],
-        "count": 25
+        "count": 26
       },
       "tests/unit/test_fp8.py": {
         "classes": [

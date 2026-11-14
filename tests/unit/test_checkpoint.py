@@ -3626,6 +3626,17 @@ class TestMuonResume:
         _rate_taken_groups(optimizer, scheduler, [1])
         assert optimizer.param_groups[1]["lr"] == 0.0
 
+    def test_a_scheduler_that_does_not_cover_every_group_is_refused(self):
+        """A group added after the scheduler was built has no base rate or lambda of its own."""
+        from kempnerforge.checkpoint.manager import _rate_taken_groups
+
+        optimizer, scheduler = self._three_groups(lambda step: 1.0)
+        optimizer.add_param_group({"params": [torch.nn.Parameter(torch.zeros(1))], "lr": 1e-3})
+        before = [g["lr"] for g in optimizer.param_groups]
+        with pytest.raises(ValueError, match="zip"):
+            _rate_taken_groups(optimizer, scheduler, [3])
+        assert [g["lr"] for g in optimizer.param_groups] == before
+
     def test_a_scheduler_without_lambdas_leaves_the_taken_rates(self):
         from kempnerforge.checkpoint.manager import _rate_taken_groups
 
