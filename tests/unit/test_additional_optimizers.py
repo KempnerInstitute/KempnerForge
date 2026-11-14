@@ -366,6 +366,37 @@ class TestScheduleFreeAdamW:
         assert {state["step"].item() for state in optimizer2.state.values()} == {3.0}
         assert optimizer2.warmup_steps == 7
 
+    def test_the_legacy_count_reaches_only_entries_with_state_and_no_step(self):
+        """``_k`` leaves an empty entry empty and an entry's own ``step`` as it is.
+
+        An empty entry, as the legacy ``train_params`` left for a parameter without state,
+        stays empty, so that parameter's first gradient starts it at step 1.
+        """
+        torch.manual_seed(0)
+        params = [nn.Parameter(torch.randn(4, 4)) for _ in range(3)]
+        optimizer = ScheduleFreeAdamW(params, lr=0.01)
+        for _ in range(3):
+            for p in params[:2]:
+                p.grad = torch.randn(4, 4)
+            optimizer.step()
+        sd = copy.deepcopy(optimizer.state_dict())
+        del sd["state"][0]["step"]
+        sd["state"][1]["step"] = torch.tensor(5.0)
+        sd["state"][2] = {}
+        sd["_k"] = 3
+
+        params2 = [nn.Parameter(torch.randn(4, 4)) for _ in range(3)]
+        optimizer2 = ScheduleFreeAdamW(params2, lr=0.01)
+        optimizer2.load_state_dict(sd)
+        steps = [optimizer2.state[p].get("step") for p in params2]
+        assert [None if s is None else s.item() for s in steps] == [3.0, 5.0, None]
+        assert optimizer2.state[params2[2]] == {}
+
+        for p in params2:
+            p.grad = torch.ones(4, 4)
+        optimizer2.step()
+        assert [optimizer2.state[p]["step"].item() for p in params2] == [4.0, 6.0, 1.0]
+
     def test_the_step_count_is_float32_under_any_default_dtype(self):
         """Under a bf16 default dtype a bf16 count would stop at 256; the count stays exact."""
         previous = torch.get_default_dtype()

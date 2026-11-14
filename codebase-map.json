@@ -1806,11 +1806,11 @@
       "tests/unit/test_additional_optimizers.py": {
         "classes": [
           "TestLion(10)",
-          "TestScheduleFreeAdamW(20)",
+          "TestScheduleFreeAdamW(21)",
           "TestNoneScheduler(3)",
           "TestOptimizerConfig(3)"
         ],
-        "count": 36
+        "count": 37
       },
       "tests/unit/test_scheduler_extensions.py": {
         "classes": [
