@@ -89,6 +89,43 @@ def _encode_and_adapt(wrapper: VLMWrapper, images: torch.Tensor) -> torch.Tensor
     return wrapper.adapter(feats)
 
 
+def _check_image_tokens(k: int, image_tokens: int | None) -> None:
+    if image_tokens is not None and k != image_tokens:
+        raise ValueError(
+            f"the packer laid out {image_tokens} tokens per image but the adapter produces "
+            f"{k}; set the packer's tokens_per_image to the adapter's output count"
+        )
+
+
+def _text_only_context(
+    wrapper: VLMWrapper,
+    pixel_values: torch.Tensor,
+    image_tokens: int | None,
+    output_rows: torch.Tensor | None,
+    output_positions: torch.Tensor | None,
+) -> ModalityContext:
+    """The inline context of a batch with no images, keeping every rank's collectives in step.
+
+    FSDP2's all-gathers and reduce-scatters run on every rank, so the encoder
+    and adapter see one blank image here whatever their wrapping, and write
+    nothing: the result enters the graph as an empty ``(0, dim)`` inline
+    embedding with zero weight, so their parameters get zero gradients rather
+    than none.
+    """
+    blank = pixel_values.new_zeros((1, *pixel_values.shape[1:]))
+    embeds = _encode_and_adapt(wrapper, blank)
+    _check_image_tokens(embeds.shape[1], image_tokens)
+    anchor = (embeds.sum() * 0).expand(0, embeds.shape[-1])
+    empty = torch.zeros(0, dtype=torch.long, device=anchor.device)
+    return ModalityContext(
+        inline_embeds=anchor,
+        inline_rows=empty,
+        inline_positions=empty,
+        output_rows=output_rows,
+        output_positions=output_positions,
+    )
+
+
 def _inline_image_context(
     wrapper: VLMWrapper,
     pixel_values: torch.Tensor,
@@ -108,7 +145,8 @@ def _inline_image_context(
     output must match it or the slots would be filled wrong. The placement
     itself is the packer's and is not re-checked on the device. ``text_rows``
     and ``text_positions`` name the real text tokens, so the head runs on
-    them alone instead of on every slot of every row.
+    them alone instead of on every slot of every row. ``N = 0`` is a batch of
+    text-only documents (``_text_only_context``).
     """
     if pixel_values.dim() != 4:
         raise ValueError(
@@ -119,14 +157,16 @@ def _inline_image_context(
             f"image_rows and image_starts must be ({pixel_values.shape[0]},), got "
             f"{tuple(image_rows.shape)} and {tuple(image_starts.shape)}"
         )
+    device = input_ids.device
+    output_rows = None if text_rows is None else text_rows.to(device)
+    output_positions = None if text_positions is None else text_positions.to(device)
+    if pixel_values.shape[0] == 0:
+        return _text_only_context(
+            wrapper, pixel_values, image_tokens, output_rows, output_positions
+        )
     embeds = _encode_and_adapt(wrapper, pixel_values)
     n, k, dim = embeds.shape
-    if image_tokens is not None and k != image_tokens:
-        raise ValueError(
-            f"the packer laid out {image_tokens} tokens per image but the adapter produces "
-            f"{k}; set the packer's tokens_per_image to the adapter's output count"
-        )
-    device = input_ids.device
+    _check_image_tokens(k, image_tokens)
     offsets = torch.arange(k, device=device)
     positions = (image_starts.to(device).unsqueeze(1) + offsets).reshape(-1)
     rows = image_rows.to(device).repeat_interleave(k)
@@ -134,8 +174,8 @@ def _inline_image_context(
         inline_embeds=embeds.reshape(n * k, dim),
         inline_rows=rows,
         inline_positions=positions,
-        output_rows=None if text_rows is None else text_rows.to(device),
-        output_positions=None if text_positions is None else text_positions.to(device),
+        output_rows=output_rows,
+        output_positions=output_positions,
     )
 
 
@@ -235,7 +275,11 @@ class JointDecoderStrategy:
     A packed batch (``image_rows`` given) takes the inline route instead:
     the flat images are encoded and each one's tokens are written over its
     placeholder slots inside its row, ``doc_ids`` isolates the documents, and
-    the head runs on the text positions the packer names.
+    the head runs on the text positions the packer names. A text-only sample
+    on the prefix route arrives with a blank image and a ``frame_mask`` of
+    ``False`` that hides its prefix; a packed batch of text-only documents
+    arrives with no images at all, and the encoder runs on a blank one so its
+    collectives stay in step across ranks.
     """
 
     def prepare(

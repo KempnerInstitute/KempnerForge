@@ -107,6 +107,29 @@ def test_moma_ffn_excludes_padded_from_routing():
     assert torch.equal(out[0, real], out2[0, real])
 
 
+def test_moma_ffn_gives_a_masked_modality_zero_gradients():
+    """With every image token masked, the image experts get zero, not missing, gradients."""
+    torch.manual_seed(0)
+    cfg = ModelConfig(dim=32, n_layers=2, n_heads=4, vocab_size=128, max_seq_len=64)
+    ffn = MoMaFFN(
+        cfg,
+        modalities=("image", "text"),
+        experts_per_modality={"image": 2, "text": 2},
+        capacity_factor_per_modality={"image": 1.0, "text": 1.0},
+        gumbel_noise=False,
+    )
+    modality_ids = torch.tensor([[0, 0, 1, 1, 1, 1]])
+    kpm = torch.tensor([[False, False, True, True, True, True]])
+    out = ffn(torch.randn(1, 6, cfg.dim), modality_ids, key_padding_mask=kpm)
+    assert torch.count_nonzero(out[0, :2]) == 0
+    out.sum().backward()
+    image = list(ffn.experts["image"].named_parameters())
+    assert image
+    for name, parameter in image:
+        assert parameter.grad is not None, name
+        assert torch.count_nonzero(parameter.grad) == 0, name
+
+
 class TestMoMaConfig:
     def test_defaults(self):
         cfg = MoMaConfig()

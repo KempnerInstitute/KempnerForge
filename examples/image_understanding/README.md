@@ -166,6 +166,33 @@ least two rows. The views of
 an image attend causally; bidirectional image attention is a follow-up on the
 core's attention groups. A `[video]` run and the other arches do not pack.
 
+## Mix in text-only documents
+
+Image-text mixes often carry documents without an image, such as FineVision's
+`text_*` subsets. A row whose image column is `None` or an empty list is a
+text-only document; no setting turns this on. Without packing it
+takes a blank image and a `frame_mask` entry of `False`, so its image tokens
+are hidden from attention; the document still occupies the image positions,
+so its text sits after them in the row and in the position encoding, as a
+masked image document rather than plain text. With packing it is just its
+text, and a micro-batch of nothing but text carries no images; the vision
+encoder and adapter then run on one blank image whose output carries no weight,
+so FSDP2's collectives still see every rank, and under `train.compile_model`
+such a micro-batch is a second compiled graph. When the loaded dataset holds
+text-only rows, every unpacked batch carries a `frame_mask`, so the prefix
+route's attention takes an explicit dense mask rather than the unmasked causal
+fast path (or the flex backend's block-sparse mask) for that run, and never
+flips between the two. On `cross_attention` a text-only row skips the
+cross-attention blocks: their attention and MLP updates are zeroed for that
+row, so its text runs through the backbone alone. On `mot` the hidden blank
+image's tokens still pass through the image experts. On `moma` they are dropped
+before routing, so they take no expert capacity; a micro-batch with no image
+gives the image experts zero gradients. On `joint_decoder` and `moma` the
+FlashAttention kernel takes no mask, so an unpacked dataset with text-only rows
+is refused with `model.sdpa_backend = "flash"` under `attention_backend =
+"sdpa"`. Rows that hold several
+images are skipped when the dataset is loaded, and one warning counts them.
+
 ## Start from the pretrained backbone
 
 Stage 1 warm-starts from a checkpoint that holds the pretrained Qwen3-0.6B
@@ -196,7 +223,6 @@ or in core where it belongs:
   DataComp), chat-template rendering with the loss on the assistant turns only,
   and the mixture loader
 - Typed stage contract and pinned source manifest, which fix the stage presets
-- Text-only documents in image-text batches
 - Documents with several images
 - Per-module learning rates and schedules
 - Evaluation parity: chat-template prompts, image attention, the recipe's scorers
