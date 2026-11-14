@@ -15,8 +15,13 @@ Every notebook opens with the same header:
 From the repo root:
 
 ```bash
-uv run jupyter lab examples/notebooks/
+uv run --with jupyterlab jupyter lab examples/notebooks/
 ```
+
+JupyterLab is not a project dependency. `--with` installs it into a temporary
+environment layered on the project's, so the notebook kernel runs in that
+environment and imports `kempnerforge`. An editor that runs notebooks on the
+repo's `.venv` works too.
 
 Or execute a single notebook non-interactively:
 

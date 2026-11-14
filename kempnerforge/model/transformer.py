@@ -117,6 +117,27 @@ class TransformerBlock(nn.Module):
         return x
 
 
+def _write_inline_embeds(h: torch.Tensor, modality: ModalityContext) -> torch.Tensor:
+    """Write ``modality.inline_embeds`` over ``h`` at ``(inline_rows, inline_positions)``.
+
+    Out of place, so gradients reach both the token embedding and the inline
+    embeddings. Raises ``ValueError`` when the embedding width differs from the
+    model dim; the caller checks the indices.
+    """
+    embeds, rows, positions = (
+        modality.inline_embeds,
+        modality.inline_rows,
+        modality.inline_positions,
+    )
+    assert embeds is not None and rows is not None and positions is not None
+    dim = h.shape[-1]
+    if embeds.shape[1] != dim:
+        raise ValueError(
+            f"modality.inline_embeds width ({embeds.shape[1]}) does not match the model dim ({dim})"
+        )
+    return h.index_put((rows, positions), embeds.to(h.dtype))
+
+
 class Transformer(nn.Module):
     """Full transformer model built from ModelConfig.
 
@@ -406,9 +427,14 @@ class Transformer(nn.Module):
         Exactly one of ``tokens`` or ``modality.inputs_embeds`` must be
         provided. Modality-injection routes (``prefix_embeds``,
         ``output_slice``, ``image_features``, ``image_mask``,
-        ``modality_ids``) are grouped on the optional
+        ``modality_ids``, ``inline_embeds``) are grouped on the optional
         ``ModalityContext`` arg; see ``kempnerforge/model/modality.py``
-        for the full intra-context invariant table.
+        for the full intra-context invariant table. ``inline_embeds`` are
+        written over the embedded ``tokens`` at ``(inline_rows,
+        inline_positions)`` before the first layer, which is how a packed
+        row carries each document's image tokens before its own text, and
+        ``output_rows`` / ``output_positions`` pick the positions the head
+        runs on, giving ``(1, M, vocab)`` logits.
 
         Args:
             tokens: Integer token ids, shape ``(batch, seq_len)``.
@@ -470,7 +496,9 @@ class Transformer(nn.Module):
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
             where ``out_seq_len == seq_len`` normally or the sliced
-            length when ``modality.output_slice`` is set. Built with
+            length when ``modality.output_slice`` is set, or ``(1, M,
+            vocab_size)`` over the ``M`` positions ``modality.output_rows``
+            and ``output_positions`` pick. Built with
             ``include_output_head=False``, returns the final hidden
             states ``(batch, out_seq_len, dim)`` instead.
         """
@@ -481,6 +509,9 @@ class Transformer(nn.Module):
         image_mask = modality.image_mask if modality is not None else None
         modality_ids = modality.modality_ids if modality is not None else None
         key_padding_mask = modality.key_padding_mask if modality is not None else None
+        inline_embeds = modality.inline_embeds if modality is not None else None
+        output_rows = modality.output_rows if modality is not None else None
+        output_positions = modality.output_positions if modality is not None else None
         position_ids = _argument_or_context("position_ids", position_ids, modality)
         rope_cos = modality.rope_cos if modality is not None else None
         rope_sin = modality.rope_sin if modality is not None else None
@@ -513,6 +544,14 @@ class Transformer(nn.Module):
             if modality_ids is not None:
                 raise ValueError(
                     "modality.modality_ids is training-only; cannot be combined with kv_caches"
+                )
+            if inline_embeds is not None:
+                raise ValueError(
+                    "modality.inline_embeds is training-only; cannot be combined with kv_caches"
+                )
+            if output_rows is not None:
+                raise ValueError(
+                    "modality.output_rows is training-only; cannot be combined with kv_caches"
                 )
             if key_padding_mask is not None:
                 raise ValueError(
@@ -608,6 +647,10 @@ class Transformer(nn.Module):
         )
         assert h is not None
 
+        if inline_embeds is not None:
+            assert modality is not None
+            h = _write_inline_embeds(h, modality)
+
         if prefix_embeds is not None:
             if prefix_embeds.dtype != h.dtype:
                 prefix_embeds = prefix_embeds.to(h.dtype)
@@ -682,6 +725,9 @@ class Transformer(nn.Module):
 
         if output_slice is not None:
             h = h[:, output_slice, :]
+        if output_rows is not None:
+            assert output_positions is not None
+            h = h[output_rows, output_positions].unsqueeze(0)
 
         if self.output_head is not None:
             h = self.output_head(h)

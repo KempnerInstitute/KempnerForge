@@ -8,6 +8,7 @@ import importlib.machinery
 import io
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -129,17 +130,18 @@ class _FakeMlflow:
         )
 
 
-_MLFLOW_HTTP_ENV = (
+_MLFLOW_IMPORT_ENV = (
     "MLFLOW_HTTP_REQUEST_TIMEOUT",
     "MLFLOW_HTTP_REQUEST_MAX_RETRIES",
     "MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT",
+    "MLFLOW_DISABLE_TELEMETRY",
 )
 
 
 @pytest.fixture(autouse=True)
-def _unset_mlflow_http_env(monkeypatch):
-    """Start each test without the HTTP bounds; the caller's values are restored afterwards."""
-    for name in _MLFLOW_HTTP_ENV:
+def _unset_mlflow_import_env(monkeypatch):
+    """Start each test without the import defaults; the caller's values are restored afterwards."""
+    for name in _MLFLOW_IMPORT_ENV:
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
 
@@ -147,6 +149,7 @@ def _unset_mlflow_http_env(monkeypatch):
 _TRACKING_ENV = (
     "MLFLOW_TRACKING_URI",
     "MLFLOW_EXPERIMENT",
+    "MLFLOW_EXPERIMENT_ID",
     "DATABRICKS_HOST",
     "DATABRICKS_TOKEN",
     "DATABRICKS_API_TOKEN",
@@ -160,6 +163,33 @@ def _unset_tracking_env(monkeypatch):
     for name in _TRACKING_ENV:
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
+def _no_profile_mismatch_warned_yet(monkeypatch):
+    """Start each test before any Databricks profile mismatch was warned in this process."""
+    monkeypatch.setattr(auth_mod, "_profile_mismatches_warned", set())
+
+
+@pytest.fixture
+def real_mlflow(monkeypatch):
+    """The installed mlflow over local file stores, skipped when it is absent.
+
+    ``set_tracking_uri`` and ``set_experiment`` keep the tracking URI and the active experiment
+    in module globals for the rest of the process, and a file store draws from Python's global
+    ``random`` to name a run or an experiment, so all three are put back after the test. The
+    variables MLflow exports are in ``_TRACKING_ENV``.
+    """
+    mlflow = pytest.importorskip("mlflow")
+    import mlflow.tracking._tracking_service.utils as tracking_utils
+    import mlflow.tracking.fluent as fluent
+
+    monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+    monkeypatch.setattr(tracking_utils, "_tracking_uri", tracking_utils._tracking_uri)
+    monkeypatch.setattr(fluent, "_active_experiment_id", fluent._active_experiment_id)
+    state = random.getstate()
+    yield mlflow
+    random.setstate(state)
 
 
 @pytest.fixture(autouse=True)
@@ -216,7 +246,7 @@ def _park_log_metrics(fm):
 
 def _capture_warnings(monkeypatch) -> list[str]:
     seen: list[str] = []
-    for module in (backend_mod, worker_mod):
+    for module in (backend_mod, worker_mod, auth_mod):
         monkeypatch.setattr(module.logger, "warning", lambda msg, *a, **k: seen.append(str(msg)))
     return seen
 
@@ -482,7 +512,7 @@ def _workspace_of(user):
     return types.SimpleNamespace(current_user=types.SimpleNamespace(me=lambda: me))
 
 
-def _no_credentials():
+def _no_credentials(**kwargs):
     raise ValueError("default auth: cannot configure default credentials")
 
 
@@ -532,8 +562,9 @@ class TestMlflowDatabricksAuth:
         under, the fake mlflow)."""
         built: list = []
 
-        def workspace_client():
-            built.append(os.environ.get("DATABRICKS_CONFIG_PROFILE"))
+        def workspace_client(**kwargs):
+            """The profile a real client resolves: the one passed, else the environment's."""
+            built.append(kwargs.get("profile") or os.environ.get("DATABRICKS_CONFIG_PROFILE"))
             return _workspace_of("me")
 
         _fake_databricks_sdk(monkeypatch, workspace_client)
@@ -549,11 +580,39 @@ class TestMlflowDatabricksAuth:
         assert fm.tracking_uris == ["databricks://profile-a"]
         assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "profile-a"
 
-    def test_an_operator_set_profile_wins(self, monkeypatch):
+    def test_an_operator_set_profile_is_kept_and_the_lookup_follows_the_uri(self, monkeypatch):
+        """MLflow's tracking client takes the URI's profile first, so the experiment lookup does
+        too (#463), and the operator's variable is left as it was."""
         monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "profile-b")
         built, _ = self._profile_seen_by_sdk(monkeypatch, "databricks://profile-a")
-        assert built == ["profile-b"]
+        assert built == ["profile-a"]
         assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "profile-b"
+
+    def test_a_kept_operator_profile_is_warned_once_per_pair(self, monkeypatch):
+        """The warning names both profiles. The publisher prepares auth for every checkpoint it
+        publishes, so a process warns once for each pair."""
+        warnings_seen = _capture_warnings(monkeypatch)
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "profile-b")
+        for _ in range(3):
+            auth_mod._prepare_databricks_auth("databricks://profile-a")
+        auth_mod._prepare_databricks_auth("databricks://profile-c")
+        first, second = warnings_seen
+        assert "'profile-a'" in first and "DATABRICKS_CONFIG_PROFILE='profile-b'" in first
+        assert "'profile-c'" in second and "DATABRICKS_CONFIG_PROFILE='profile-b'" in second
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "profile-b"
+
+    def test_an_operator_set_profile_equal_to_the_uris_is_quiet(self, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "profile-a")
+        warnings_seen = _capture_warnings(monkeypatch)
+        built, _ = self._profile_seen_by_sdk(monkeypatch, "databricks://profile-a")
+        assert built == ["profile-a"] and warnings_seen == []
+
+    def test_an_empty_operator_profile_counts_as_unset(self, monkeypatch):
+        """The SDK skips an empty variable, so the URI's profile is exported over it."""
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "")
+        built, _ = self._profile_seen_by_sdk(monkeypatch, "databricks://profile-a")
+        assert built == ["profile-a"]
+        assert os.environ["DATABRICKS_CONFIG_PROFILE"] == "profile-a"
 
     @pytest.mark.parametrize("uri", ["databricks", "http://localhost:5000"])
     def test_other_uris_select_no_profile(self, monkeypatch, uri):
@@ -705,7 +764,7 @@ class TestMlflowDatabricksAuth:
 
         _fake_databricks_sdk(
             monkeypatch,
-            (lambda: _workspace_of("me")) if credentials == "found" else _no_credentials,
+            (lambda **kwargs: _workspace_of("me")) if credentials == "found" else _no_credentials,
         )
         cfg = MetricsConfig(enable_mlflow=True, mlflow_tracking_uri="databricks://profile-a")
         backend, _ = _init_backend(monkeypatch, cfg)
@@ -1031,6 +1090,29 @@ class TestResolveMlflowExperiment:
         cfg = MetricsConfig(enable_mlflow=True, wandb_project="proj")
         assert _resolve_mlflow_experiment(cfg, "databricks") == "/Users/abbas/proj"
 
+    @pytest.mark.parametrize(
+        ("uri", "kwargs"),
+        [
+            ("databricks://profile-a", {"profile": "profile-a"}),
+            ("databricks://profile-a/", {"profile": "profile-a"}),
+            ("databricks", {}),
+            ("databricks://scope:prefix", {}),
+        ],
+    )
+    def test_auto_resolve_builds_its_client_with_the_uris_profile(self, monkeypatch, uri, kwargs):
+        """As MLflow does: the URI's profile when it names one, else no ``profile=`` at all, so
+        auth the SDK resolves from the environment alone (OIDC among it) still applies."""
+        seen: list = []
+
+        def workspace_client(**passed):
+            seen.append(passed)
+            return _workspace_of("abbas")
+
+        _fake_databricks_sdk(monkeypatch, workspace_client)
+        cfg = MetricsConfig(enable_mlflow=True, wandb_project="proj")
+        assert _resolve_mlflow_experiment(cfg, uri) == "/Users/abbas/proj"
+        assert seen == [kwargs]
+
     def test_auto_resolve_failure_returns_none(self, monkeypatch):
         """If the SDK lookup fails, auto-resolution returns None (backend then disables)."""
         monkeypatch.delenv("MLFLOW_EXPERIMENT", raising=False)
@@ -1075,7 +1157,7 @@ class TestMlflowHelpers:
 
 
 class _ImportSpy(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """Serves `fake` for `import mlflow` and records the HTTP bounds in force at import time."""
+    """Serves `fake` for `import mlflow` and records the import defaults in force at the time."""
 
     def __init__(self, fake):
         self.fake = fake
@@ -1085,7 +1167,7 @@ class _ImportSpy(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         return importlib.machinery.ModuleSpec(name, self) if name == "mlflow" else None
 
     def create_module(self, spec):
-        self.env_at_import = {n: os.environ.get(n) for n in _MLFLOW_HTTP_ENV}
+        self.env_at_import = {n: os.environ.get(n) for n in _MLFLOW_IMPORT_ENV}
         return self.fake
 
     def exec_module(self, module):
@@ -1109,25 +1191,29 @@ def _import_mlflow_via_spy(monkeypatch) -> _ImportSpy:
 class TestMLflowBestEffort:
     """Tracking calls are bounded in time: the training thread never waits on the server."""
 
-    def test_http_bounds_default_before_mlflow_is_imported(self, monkeypatch):
+    def test_import_defaults_are_set_before_mlflow_is_imported(self, monkeypatch):
         spy = _import_mlflow_via_spy(monkeypatch)
         assert spy.env_at_import == {
             "MLFLOW_HTTP_REQUEST_TIMEOUT": "30",
             "MLFLOW_HTTP_REQUEST_MAX_RETRIES": "3",
             "MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT": "60",
+            "MLFLOW_DISABLE_TELEMETRY": "true",
         }
 
-    def test_operator_http_bounds_win(self, monkeypatch):
+    def test_operator_values_win(self, monkeypatch):
         monkeypatch.setenv("MLFLOW_HTTP_REQUEST_TIMEOUT", "7")
         monkeypatch.setenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "9")
         monkeypatch.setenv("MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT", "11")
+        monkeypatch.setenv("MLFLOW_DISABLE_TELEMETRY", "false")
         spy = _import_mlflow_via_spy(monkeypatch)
         assert spy.env_at_import == {
             "MLFLOW_HTTP_REQUEST_TIMEOUT": "7",
             "MLFLOW_HTTP_REQUEST_MAX_RETRIES": "9",
             "MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT": "11",
+            "MLFLOW_DISABLE_TELEMETRY": "false",
         }
         assert os.environ["MLFLOW_HTTP_REQUEST_TIMEOUT"] == "7"
+        assert os.environ["MLFLOW_DISABLE_TELEMETRY"] == "false"
 
     def test_calls_name_the_run_and_run_off_the_calling_thread(self, monkeypatch):
         fm = _FakeMlflow()
@@ -1329,6 +1415,157 @@ class TestMLflowBestEffort:
         assert fm.sampling_intervals == ([2.5] if enabled else [])
         backend.close()
         assert fm.ended == ["run-xyz"] and fm.monitor_alive is False
+
+
+class TestMLflowTelemetry:
+    """MLflow's usage telemetry stays off, so it never draws from a restored Python RNG (#547)."""
+
+    def test_a_resumed_run_leaves_pythons_rng_where_the_restore_put_it(
+        self, real_mlflow, monkeypatch, tmp_path
+    ):
+        """A resume's first call MLflow records is a metric log, made after the RNG restore.
+
+        With telemetry on, that call starts MLflow's config fetch, whose thread then draws from
+        Python's global ``random``. Here the config is served from memory, nothing is sent, and
+        MLflow keeps its installation id under ``tmp_path``. ``real_mlflow`` puts the global RNG
+        back afterwards, the draws of the file store below included.
+        """
+        telemetry_client = pytest.importorskip("mlflow.telemetry.client")
+        import mlflow.telemetry.utils as telemetry_utils
+
+        class _Config:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "mlflow_version": real_mlflow.__version__,
+                    "rollout_percentage": 100,
+                    "ingestion_url": "http://127.0.0.1:9",
+                }
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+        monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+        monkeypatch.setattr(telemetry_utils, "_IS_IN_CI_ENV_OR_TESTING", False)
+        monkeypatch.setattr(
+            telemetry_client,
+            "requests",
+            types.SimpleNamespace(get=lambda url, timeout=None: _Config()),
+        )
+        monkeypatch.setattr(
+            telemetry_client.TelemetryClient,
+            "_process_records",
+            lambda self, records, request_timeout=1: None,
+        )
+        monkeypatch.setattr(telemetry_client, "_MLFLOW_TELEMETRY_CLIENT", None)
+        uri = (tmp_path / "mlruns").as_uri()
+        store = real_mlflow.MlflowClient(uri)
+        run_id = store.create_run(store.create_experiment("rng")).info.run_id
+        telemetry = telemetry_client.TelemetryClient()
+        monkeypatch.setattr(telemetry_client, "_MLFLOW_TELEMETRY_CLIENT", telemetry)
+        cfg = _mlflow_cfg(mlflow_tracking_uri=uri, mlflow_experiment="rng", mlflow_run_id=run_id)
+        try:
+            random.seed(0)
+            restored = random.getstate()
+            backend = MLflowBackend(cfg)
+            backend.log({"train/loss": 1.0}, step=5)
+            _flush(backend)
+            backend.close()
+            fetch = getattr(telemetry, "_config_thread", None)
+            if fetch is not None:
+                fetch.join(10)
+            assert random.getstate() == restored
+            history = store.get_metric_history(run_id, "train/loss")
+            assert [(m.step, m.value) for m in history] == [(5, 1.0)]
+        finally:
+            telemetry._clean_up()
+
+
+class TestWarmStartRun:
+    """A checkpoint.load_path warm start logs to a run of its own, tagged with its source (#511).
+
+    Real MLflow over a local file store, through the real CheckpointManager and
+    restore_checkpoint; the tag names are spelled out, so the tests fail on main by behavior.
+    """
+
+    @staticmethod
+    def _stage1(mlflow, tmp_path):
+        """A source run that logged steps 1..10, and its checkpoint at step 5."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.checkpoint import CheckpointConfig
+
+        uri = (tmp_path / "mlruns").as_uri()
+        store = mlflow.MlflowClient(uri)
+        source = store.create_run(store.create_experiment("ws"), run_name="stage1").info.run_id
+        for s in range(1, 11):
+            store.log_metric(source, "train/loss", float(s), step=s)
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        stage1 = CheckpointManager(CheckpointConfig(dir=str(tmp_path / "stage1")), model, optimizer)
+        stage1.save(step=5, extra={"mlflow_run_id": source})
+        return uri, store, source
+
+    @staticmethod
+    def _stage2(tmp_path, uri, experiment, last_step):
+        """Launch stage 2 with ``load_path`` at stage 1's step 5 (an auto-resume once stage 2
+        has saved), log ``train/loss`` up to ``last_step`` and save there.
+
+        Returns the restored step, the run the backend logged to, and whether it was active.
+        """
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.training.data_pipeline import PhaseState
+        from kempnerforge.training.entry import restore_checkpoint
+        from kempnerforge.training.loop import checkpoint_extra
+
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        job = JobConfig()
+        job.checkpoint.dir = str(tmp_path / "stage2")
+        job.checkpoint.load_path = str(tmp_path / "stage1" / "step_5")
+        job.metrics = _mlflow_cfg(
+            mlflow_tracking_uri=uri, mlflow_experiment=experiment, mlflow_run_name="stage2"
+        )
+        manager = CheckpointManager(job.checkpoint, model, optimizer)
+        step, _ = restore_checkpoint(job, model, None, manager)
+        backend = MLflowBackend(job.metrics, job)
+        for s in range(step + 1, last_step + 1):
+            backend.log({"train/loss": 100.0 + s}, step=s)
+        _flush(backend)
+        active = backend._active
+        manager.save(step=last_step, extra=checkpoint_extra(job, last_step, PhaseState()))
+        backend.close()
+        return step, job.metrics.mlflow_run_id, active
+
+    @pytest.mark.parametrize("experiment", ["ws", "stage2"], ids=["same", "other-experiment"])
+    def test_a_warm_start_logs_to_a_new_run_and_leaves_the_source_run_alone(
+        self, real_mlflow, monkeypatch, tmp_path, experiment
+    ):
+        monkeypatch.setenv("MLFLOW_DISABLE_TELEMETRY", "true")
+        uri, store, source = self._stage1(real_mlflow, tmp_path)
+        step, new, active = self._stage2(tmp_path, uri, experiment, last_step=7)
+        assert (step, active) == (5, True)
+        assert new and new != source
+        history = {m.step: m.value for m in store.get_metric_history(new, "train/loss")}
+        assert history == {6: 106.0, 7: 107.0}
+        run = store.get_run(new)
+        assert run.data.tags["kempnerforge.warm_start.source_run_id"] == source
+        assert run.data.tags["kempnerforge.warm_start.checkpoint"] == str(
+            (tmp_path / "stage1" / "step_5").resolve()
+        )
+        assert run.data.params["checkpoint.load_path"] == str(tmp_path / "stage1" / "step_5")
+        assert store.get_run(source).info.run_name == "stage1"
+        assert [m.value for m in store.get_metric_history(source, "train/loss")] == [
+            float(s) for s in range(1, 11)
+        ]
+
+    def test_a_requeued_warm_start_continues_its_own_run(self, real_mlflow, monkeypatch, tmp_path):
+        """Once stage 2 has saved, a requeue resumes stage 2's checkpoint and its new run."""
+        monkeypatch.setenv("MLFLOW_DISABLE_TELEMETRY", "true")
+        uri, store, source = self._stage1(real_mlflow, tmp_path)
+        _, first, _ = self._stage2(tmp_path, uri, "ws", last_step=7)
+        step, second, _ = self._stage2(tmp_path, uri, "ws", last_step=9)
+        assert step == 7 and second == first != source
+        history = {m.step: m.value for m in store.get_metric_history(first, "train/loss")}
+        assert history == {6: 106.0, 7: 107.0, 8: 108.0, 9: 109.0}
 
 
 class TestRunOwner:

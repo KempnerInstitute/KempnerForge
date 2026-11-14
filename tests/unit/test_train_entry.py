@@ -1251,6 +1251,48 @@ def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
 
 
 class TestRunTraining:
+    def test_packed_vlm_batches_train_through_run_training(self, monkeypatch):
+        """run_training drives vlm_step over packed rows with a real wrapper."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.data.vlm_dataset import pack_vlm_samples
+        from kempnerforge.model.vlm import build_vlm_wrapper
+        from kempnerforge.training.entry import run_training
+
+        config = _vlm_config()
+        config.data.pack_sequences = True
+        config.train.max_steps = 2
+        assert config.vision_encoder is not None and config.adapter is not None
+        assert config.vlm is not None
+        model = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
+        before = next(model.transformer.parameters()).detach().clone()
+
+        def doc(text_len: int, seed: int) -> dict:
+            gen = torch.Generator().manual_seed(seed)
+            ids = torch.randint(0, 256, (text_len,), generator=gen)
+            labels = torch.full((text_len,), -100, dtype=torch.long)
+            labels[:-1] = ids[1:]
+            return {
+                "pixel_values": torch.randn(3, 16, 16, generator=gen),
+                "input_ids": ids,
+                "labels": labels,
+                "text_len": torch.tensor(text_len),
+            }
+
+        batches = [
+            pack_vlm_samples(
+                [doc(10, 1), doc(20, 2), doc(6, 3)], seq_len=64, tokens_per_image=8, pad_id=0
+            ),
+            pack_vlm_samples([doc(30, 4), doc(24, 5)], seq_len=64, tokens_per_image=8, pad_id=0),
+        ]
+        assert [b["input_ids"].shape[0] for b in batches] == [1, 2]
+        ckpt = _stub_entry(monkeypatch, model)
+        ckpt.apply_dataloader_state = lambda _loader: None
+        monkeypatch.setattr(
+            entry, "build_data_pipeline", lambda *_a, **_k: DataPipeline(dataloader=batches)
+        )
+        run_training(config)
+        assert not torch.equal(before, next(model.transformer.parameters()))
+
     def test_defaults_to_the_registry_selected_step_body(self, monkeypatch):
         from kempnerforge.training.entry import run_training
 
@@ -1801,6 +1843,78 @@ class TestDpSizeReachesTokenAccounting:
         per_step = config.train.batch_size * config.train.seq_len * config.train.grad_accum_steps
         assert tokens_seen == 2 * per_step * 8
 
+    def test_packed_counts_do_not_count_tensor_parallel_replicas(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        session = make_session(
+            make_config(),
+            data=DataPipeline(dp_size=2),
+            runtime=dataclasses.replace(_runtime(), world_size=8),
+        )
+        reductions: list[Any] = []
+
+        def reduce_counts(count: torch.Tensor, op: Any) -> None:
+            assert count.item() == 7
+            reductions.append(op)
+            count.fill_(4 * (7 + 11))
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(loop.dist, "all_reduce", reduce_counts)
+        result = loop.StepResult(loss=1.0, grad_norm=0.5, tokens=7)
+        assert loop._tokens_in_step(session, result) == 18
+        assert reductions == [loop.dist.ReduceOp.SUM]
+
+    def test_packed_counts_reach_tokens_seen_without_another_accumulation_factor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+        counts = iter((17, 23))
+
+        def step_fn(_session: TrainingSession, _step: int) -> loop.StepResult:
+            return loop.StepResult(loss=1.0, grad_norm=0.5, tokens=next(counts))
+
+        session = make_session(
+            make_config(max_steps=2, grad_accum_steps=3),
+            data=DataPipeline(dp_size=4),
+            step_fn=step_fn,
+        )
+        step, tokens_seen = run_training_loop(session)
+        assert (step, tokens_seen) == (2, (17 + 23) * 4)
+        assert session.checkpointer.saves[-1][1] == tokens_seen
+
+    def test_packed_count_is_reduced_before_the_optimizer_steps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+        events: list[str] = []
+        counted = loop._tokens_in_step
+
+        def recording(session: TrainingSession, result: loop.StepResult) -> int:
+            events.append("count")
+            return counted(session, result)
+
+        monkeypatch.setattr(loop, "_tokens_in_step", recording)
+        session = make_session(
+            make_config(max_steps=1),
+            step_fn=lambda _session, _step: loop.StepResult(loss=1.0, grad_norm=0.5, tokens=5),
+        )
+        stepped = session.optimizer.step
+
+        def stepping(*args, **kwargs):
+            events.append("optimizer")
+            return stepped(*args, **kwargs)
+
+        monkeypatch.setattr(session.optimizer, "step", stepping)
+        step, tokens_seen = run_training_loop(session)
+        assert events == ["count", "optimizer"]
+        assert (step, tokens_seen) == (1, 5)
+
     def test_default_dp_size_is_one_not_zero(self):
         assert DataPipeline().dp_size == 1
 
@@ -1841,23 +1955,38 @@ class TestPhaseTemperatureReachesSampler:
 
 
 class FakeSubMesh:
-    def __init__(self, key) -> None:
+    def __init__(self, key, coords=(0, 1)) -> None:
         self.key = key
+        self.coords = coords
 
     def get_group(self):
         return f"group:{self.key}"
 
+    def get_local_rank(self) -> int:
+        return self.coords[0]
+
+    def size(self) -> int:
+        return self.coords[1]
+
 
 class FakeMesh:
-    """Enough DeviceMesh surface for the build phases to run on CPU."""
+    """Enough DeviceMesh surface for the build phases to run on CPU.
 
-    def __init__(self, dims=("pp", "dp_shard")) -> None:
+    ``coords`` maps a dimension name to its (local rank, size); any other
+    dimension or slice reports (0, 1).
+    """
+
+    def __init__(self, dims=("pp", "dp_shard"), coords=None) -> None:
         self.mesh_dim_names = dims
+        self.coords = coords or {}
         self.sliced: list = []
 
     def __getitem__(self, key):
         self.sliced.append(key)
-        return FakeSubMesh(key)
+        return FakeSubMesh(key, self.coords.get(key, (0, 1)))
+
+    def get_local_rank(self, name) -> int:
+        return self.coords.get(name, (0, 1))[0]
 
 
 class FakeStageModule(nn.Module):
@@ -2016,6 +2145,32 @@ class TestBuildModel:
             entry.build_model(config, _runtime(), "LOSS")
 
 
+class TestBuildCheckpointManager:
+    def test_records_the_data_pipelines_partition(self, tmp_path):
+        """The manager records the (dp_rank, dp_size) the data pipeline reads."""
+        from kempnerforge.training.data_pipeline import build_data_pipeline
+        from kempnerforge.training.entry import build_checkpoint_manager
+
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "c")
+        model = TinyTextModel()
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        single = build_checkpoint_manager(config, _runtime(), model, opt, None)
+        assert single._dp_info == (0, 1)
+
+        mesh = FakeMesh(
+            ("dp_replicate", "dp_shard", "tp"),
+            coords={"dp_replicate": (1, 2), "dp_shard": (3, 4), "tp": (1, 2)},
+        )
+        runtime = dataclasses.replace(_runtime(), device_mesh=mesh)
+        mgr = build_checkpoint_manager(config, runtime, model, opt, None)
+        assert mgr._dp_info == (7, 8)
+        assert {"dp_replicate", "dp_shard"} <= set(mesh.sliced)
+        data = build_data_pipeline(config, runtime)
+        assert (data.dp_rank, data.dp_size) == mgr._dp_info
+
+
 class FakeResumeManager:
     """CheckpointManager surface restore_checkpoint actually uses."""
 
@@ -2117,14 +2272,17 @@ class TestRestoreCheckpoint:
         assert mgr.load_kwargs["path"] is None
 
     def test_metrics_run_ids_are_restored_onto_the_config(self, monkeypatch, tmp_path):
+        """An auto-resume continues the saved runs, so it adds no warm-start tags."""
         import kempnerforge.training.entry as entry
 
         monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         config = make_config()
+        config.metrics.enable_mlflow = True
         mgr = FakeResumeManager(extra={"wandb_run_id": "W1", "mlflow_run_id": "M1"})
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
         assert config.metrics.wandb_run_id == "W1"
         assert config.metrics.mlflow_run_id == "M1"
+        assert config.metrics.mlflow_tags == {}
 
     def test_absent_run_ids_do_not_clobber_existing_ones(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
@@ -2134,6 +2292,175 @@ class TestRestoreCheckpoint:
         config.metrics.wandb_run_id = "KEEP"
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(extra={}))
         assert config.metrics.wandb_run_id == "KEEP"
+
+    @staticmethod
+    def _warm_start(monkeypatch, tmp_path, extra, *, metadata=None, rank=0, link=None, **metrics):
+        """Warm-start a config with MLflow on, and ``metrics`` set, from ``tmp_path/step_5``
+        (a ``load_path`` with nothing in ``checkpoint.dir``); return the config and the source.
+
+        ``metadata`` is the source's ``metadata.json``: a dict to write as JSON, or raw text.
+        ``link`` names a symlink to the source, made under ``tmp_path`` and used as ``load_path``.
+        """
+        import kempnerforge.training.entry as entry
+
+        source = tmp_path / "step_5"
+        source.mkdir()
+        if metadata is not None:
+            text = metadata if isinstance(metadata, str) else json.dumps(metadata)
+            (source / "metadata.json").write_text(text)
+        load_path = source
+        if link is not None:
+            load_path = tmp_path / link
+            load_path.symlink_to(source.name)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
+        if rank:
+            monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
+            monkeypatch.setattr(entry.dist, "get_rank", lambda: rank)
+            monkeypatch.setattr(entry.dist, "broadcast_object_list", lambda lst, src=0: None)
+        config = make_config()
+        config.checkpoint.load_path = str(load_path)
+        config.metrics.enable_mlflow = True
+        for name, value in metrics.items():
+            setattr(config.metrics, name, value)
+        manager = FakeResumeManager(step=5, extra=extra)
+        entry.restore_checkpoint(config, TinyTextModel(), None, manager)
+        return config, source
+
+    def test_a_warm_start_opens_new_tracking_runs(self, monkeypatch, tmp_path):
+        """A load_path warm start is a new run (#511): the ids of the runs that saved its
+        checkpoint stay unused, and its MLflow run is tagged with the checkpoint and that run."""
+        extra = {"wandb_run_id": "W1", "mlflow_run_id": "M1"}
+        config, source = self._warm_start(monkeypatch, tmp_path, extra, enable_wandb=True)
+        assert (config.metrics.wandb_run_id, config.metrics.mlflow_run_id) == ("", "")
+        assert config.metrics.mlflow_tags == {
+            "kempnerforge.warm_start.checkpoint": str(source.resolve()),
+            "kempnerforge.warm_start.source_run_id": "M1",
+        }
+
+    def test_a_warm_start_keeps_the_run_ids_its_config_sets(self, monkeypatch, tmp_path):
+        """Naming a run in the config is how a warm start continues one on purpose."""
+        extra = {"wandb_run_id": "W1", "mlflow_run_id": "M1"}
+        config, _ = self._warm_start(
+            monkeypatch, tmp_path, extra, wandb_run_id="MINE-W", mlflow_run_id="MINE-M"
+        )
+        assert (config.metrics.wandb_run_id, config.metrics.mlflow_run_id) == ("MINE-W", "MINE-M")
+
+    def test_a_warm_start_names_the_run_its_checkpoint_sidecar_records(self, monkeypatch, tmp_path):
+        """The sidecar names the source run even when train_state.pt is not loaded."""
+        metadata = {"step": 5, "tracking": [{"backend": "mlflow", "run_id": "FROM-SIDECAR"}]}
+        config, _ = self._warm_start(monkeypatch, tmp_path, {}, metadata=metadata)
+        tag = config.metrics.mlflow_tags["kempnerforge.warm_start.source_run_id"]
+        assert tag == "FROM-SIDECAR"
+
+    @pytest.mark.parametrize(
+        "tracking",
+        [
+            [{"backend": "mlflow", "run_id": "FROM-SIDECAR"}],
+            [
+                {"backend": "wandb", "run_id": "W-SIDECAR"},
+                {"backend": "mlflow", "run_id": "FROM-SIDECAR"},
+            ],
+        ],
+        ids=["over-the-train-state", "after-a-wandb-record"],
+    )
+    def test_the_sidecars_mlflow_record_names_the_source_run(self, monkeypatch, tmp_path, tracking):
+        """The sidecar's ``mlflow`` record wins over the train state's id and any other record."""
+        extra = {"mlflow_run_id": "M1"}
+        metadata = {"step": 5, "tracking": tracking}
+        config, _ = self._warm_start(monkeypatch, tmp_path, extra, metadata=metadata)
+        tag = config.metrics.mlflow_tags["kempnerforge.warm_start.source_run_id"]
+        assert tag == "FROM-SIDECAR"
+
+    def test_the_checkpoint_tag_is_the_directory_a_symlinked_load_path_names(
+        self, monkeypatch, tmp_path
+    ):
+        """A load_path through ``latest`` is tagged with the step directory it points at."""
+        config, source = self._warm_start(monkeypatch, tmp_path, {}, link="latest")
+        assert config.checkpoint.load_path == str(tmp_path / "latest")
+        tag = config.metrics.mlflow_tags["kempnerforge.warm_start.checkpoint"]
+        assert tag == str(source.resolve())
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            "{not json",
+            "[]",
+            '{"tracking": "mlflow"}',
+            '{"tracking": [5]}',
+            '{"tracking": [{"backend": "mlflow", "run_id": " "}]}',
+        ],
+        ids=["malformed", "not-an-object", "not-a-list", "entry-not-an-object", "blank-run-id"],
+    )
+    def test_an_unusable_sidecar_falls_back_to_the_train_state(
+        self, monkeypatch, tmp_path, metadata
+    ):
+        """Reading the sidecar never raises: only rank 0 reads it, after the load's collectives."""
+        extra = {"mlflow_run_id": "M1"}
+        config, _ = self._warm_start(monkeypatch, tmp_path, extra, metadata=metadata)
+        assert config.metrics.mlflow_tags["kempnerforge.warm_start.source_run_id"] == "M1"
+
+    def test_a_warm_start_without_a_source_run_tags_only_the_checkpoint(
+        self, monkeypatch, tmp_path
+    ):
+        config, source = self._warm_start(monkeypatch, tmp_path, {}, metadata={"step": 5})
+        assert config.metrics.mlflow_tags == {
+            "kempnerforge.warm_start.checkpoint": str(source.resolve())
+        }
+
+    def test_a_configured_tag_wins_over_a_warm_start_tag(self, monkeypatch, tmp_path):
+        tags = {"kempnerforge.warm_start.source_run_id": "mine", "team": "vlm"}
+        config, _ = self._warm_start(
+            monkeypatch, tmp_path, {"mlflow_run_id": "M1"}, mlflow_tags=tags
+        )
+        assert config.metrics.mlflow_tags["kempnerforge.warm_start.source_run_id"] == "mine"
+        assert config.metrics.mlflow_tags["team"] == "vlm"
+
+    def test_a_warm_start_without_mlflow_adds_no_tags(self, monkeypatch, tmp_path):
+        extra = {"wandb_run_id": "W1", "mlflow_run_id": "M1"}
+        config, _ = self._warm_start(monkeypatch, tmp_path, extra, enable_mlflow=False)
+        assert config.metrics.mlflow_tags == {}
+        assert (config.metrics.wandb_run_id, config.metrics.mlflow_run_id) == ("", "")
+
+    def test_only_rank_zero_tags_a_warm_start(self, monkeypatch, tmp_path):
+        config, _ = self._warm_start(monkeypatch, tmp_path, {"mlflow_run_id": "M1"}, rank=1)
+        assert config.metrics.mlflow_tags == {}
+        assert config.metrics.mlflow_run_id == ""
+
+    @pytest.mark.parametrize(
+        ("metrics", "named"),
+        [
+            ({"enable_wandb": True}, ["mlflow_run_id=M1", "wandb_run_id=W1"]),
+            ({"enable_wandb": True, "mlflow_run_id": "MINE"}, ["wandb_run_id=W1"]),
+            ({"enable_mlflow": False}, []),
+        ],
+        ids=["both-backends", "mlflow-run-named-in-config", "no-backend"],
+    )
+    def test_a_warm_start_says_which_saved_runs_it_does_not_continue(
+        self, monkeypatch, tmp_path, metrics, named
+    ):
+        import kempnerforge.training.entry as entry
+
+        seen: list[str] = []
+        monkeypatch.setattr(entry.logger, "info", lambda msg, *a, **k: seen.append(str(msg)))
+        extra = {"wandb_run_id": "W1", "mlflow_run_id": "M1"}
+        self._warm_start(monkeypatch, tmp_path, extra, **metrics)
+        lines = [m for m in seen if m.startswith("Warm start from")]
+        assert len(lines) == (1 if named else 0)
+        for item in ("mlflow_run_id=M1", "wandb_run_id=W1"):
+            assert any(item in line for line in lines) == (item in named)
+
+    def test_a_weights_only_warm_start_names_the_mlflow_run_its_sidecar_records(
+        self, monkeypatch, tmp_path
+    ):
+        """A load that skips train_state.pt has no ``extra``, so the sidecar names the run."""
+        import kempnerforge.training.entry as entry
+
+        seen: list[str] = []
+        monkeypatch.setattr(entry.logger, "info", lambda msg, *a, **k: seen.append(str(msg)))
+        metadata = {"step": 5, "tracking": [{"backend": "mlflow", "run_id": "FROM-SIDECAR"}]}
+        self._warm_start(monkeypatch, tmp_path, {}, metadata=metadata)
+        (line,) = [m for m in seen if m.startswith("Warm start from")]
+        assert "mlflow_run_id=FROM-SIDECAR" in line
 
     def test_vlm_resume_computes_expected_freeze_at_the_saved_step(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
@@ -2198,6 +2525,7 @@ class TestRestoreCheckpoint:
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
         assert mgr.load_kwargs["path"] == (str(resume) if resume_found else None)
         assert mgr.load_kwargs["exclude_keys"] == want_exclude
+        assert mgr.load_kwargs["exact_resume"] is resume_found
 
     def test_resume_with_stale_load_path_restores_full_state(self, monkeypatch, tmp_path):
         """A requeued run keeps its warm-start config; the resume must still
@@ -2833,6 +3161,58 @@ class TestVlmSourceBuilders:
         assert seen["image_collator"]["pad_id"] == 7
         assert "video_collator" not in seen
 
+    def test_packed_image_path_takes_the_model_token_count(self, monkeypatch):
+        import kempnerforge.data.vlm_dataset as vlmd
+
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        monkeypatch.setattr(vlmd, "PackedVLMCollator", lambda **k: seen.setdefault("packed", k))
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        data = dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        assert data.dataloader == "stateful_OBJ"
+        assert seen["packed"] == {
+            "pad_id": 7,
+            "seq_len": config.train.seq_len,
+            "tokens_per_image": 12,
+        }
+        assert "image_collator" not in seen
+        with pytest.raises(ValueError, match="built model's tokens per image"):
+            dp.build_data_pipeline(config, _runtime())
+        with pytest.raises(ValueError, match="cannot hold one packed document"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
+
+    def test_packed_fit_check_runs_before_the_dataset_loads(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        with pytest.raises(ValueError, match="cannot hold one packed document"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
+        with pytest.raises(ValueError, match="built model's tokens per image"):
+            dp.build_data_pipeline(config, _runtime())
+        assert "dataset" not in seen
+
+    def test_packed_tiled_image_budget_counts_every_view(self, monkeypatch):
+        import kempnerforge.data.vlm_dataset as vlmd
+
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        monkeypatch.setattr(vlmd, "PackedVLMCollator", lambda **k: seen.setdefault("packed", k))
+        config = self._vlm_data_config(tile_grid=2, tile_global=False)
+        config.data.pack_sequences = True
+        config.train.seq_len = 4 * 12 + config.vlm.max_text_len - 1
+        with pytest.raises(ValueError, match="48 image tokens"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        config.train.seq_len += 1
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        assert seen["packed"]["tokens_per_image"] == 12
+        assert seen["dataset"]["tile_grid"] == 2
+        assert seen["dataset"]["tile_global"] is False
+
     def test_image_path_hands_the_tiling_to_the_dataset(self, monkeypatch):
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
@@ -3065,9 +3445,11 @@ class TinyVlmModel(nn.Module):
         self.proj = nn.Linear(DIM, VOCAB)
         self.embed = nn.Embedding(VOCAB, DIM)
         self.seen_frame_mask: list = []
+        self.seen_packed: list = []
 
-    def forward(self, pixel_values, input_ids, labels, frame_mask=None):
+    def forward(self, pixel_values, input_ids, labels, frame_mask=None, **packed):
         self.seen_frame_mask.append(frame_mask)
+        self.seen_packed.append(packed)
         return self.proj(self.embed(input_ids)), labels
 
 
@@ -3105,6 +3487,61 @@ class TestVlmStep:
         session, model = self._session([self._batch(with_mask=True)])
         session.step_fn(session, 0)
         assert model.seen_frame_mask[0] is not None
+
+    def test_packed_keys_are_threaded_when_present(self):
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        batch["image_rows"] = torch.tensor([0, 1])
+        batch["image_starts"] = torch.tensor([0, 0])
+        batch["position_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        batch["image_tokens"] = torch.tensor(2)
+        session, model = self._session([batch])
+        session.step_fn(session, 0)
+        packed = model.seen_packed[0]
+        assert set(packed) == {
+            "doc_ids",
+            "position_ids",
+            "image_rows",
+            "image_starts",
+            "image_tokens",
+        }
+        assert packed["image_tokens"] == 2
+        assert packed["doc_ids"].shape == (2, 4)
+
+    def test_reports_tokens_only_for_packed_batches(self):
+        session, _ = self._session([self._batch()])
+        assert session.step_fn(session, 0).tokens is None
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        session, _ = self._session([batch])
+        assert session.step_fn(session, 0).tokens is None
+        batch["image_rows"] = torch.tensor([0, 1])
+        batch["image_starts"] = torch.tensor([0, 0])
+        batch["image_tokens"] = torch.tensor(2)
+        session, _ = self._session([batch])
+        assert session.step_fn(session, 0).tokens == 8
+
+    def test_packed_rows_are_marked_dynamic_for_compile(self, monkeypatch):
+        import torch._dynamo
+
+        marked: list = []
+        monkeypatch.setattr(torch._dynamo, "maybe_mark_dynamic", lambda t, d: marked.append(d))
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        batch["image_rows"] = torch.tensor([0, 1])
+        batch["image_starts"] = torch.tensor([0, 0])
+        batch["image_tokens"] = torch.tensor(2)
+        session, _ = self._session([batch])
+        session.step_fn(session, 0)
+        assert marked == []
+        session.config.train.compile_model = True
+        session.step_fn(session, 0)
+        assert marked == [0] * 6
+
+    def test_unpacked_batches_pass_no_packed_keys(self):
+        session, model = self._session([self._batch()])
+        session.step_fn(session, 0)
+        assert model.seen_packed[0] == {}
 
     def test_frame_mask_is_none_for_image_batches(self):
         session, model = self._session([self._batch()])

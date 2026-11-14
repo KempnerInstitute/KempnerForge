@@ -96,6 +96,7 @@ class CheckpointConfig:
     export_dtype: Literal["float32", "bfloat16"] = "bfloat16"
     exclude_from_loading: list[str] = field(default_factory=list)
     ignore_freeze_mismatch: bool = False
+    ignore_rank_state_mismatch: bool = False
 
     def __post_init__(self) -> None:
         if self.interval <= 0:

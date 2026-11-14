@@ -22,7 +22,7 @@ contains two kinds of state:
 | File(s) | Contents | Format |
 |---------|----------|--------|
 | DCP shards (`.distcp` + `.metadata`) | Model + optimizer state, one shard per rank | [DCP § Model + optimizer](dcp-model.md) |
-| `train_state.pt` | step, tokens_seen, scheduler, RNG, extras (e.g. `phase_idx`, `wandb_run_id`, `mlflow_run_id`) | [Train state](train-state.md) |
+| `train_state.pt` | step, tokens_seen, scheduler, per-rank dataloader/RNG state, extras (e.g. `phase_idx`, `wandb_run_id`, `mlflow_run_id`) | [Train state](train-state.md) |
 | `metadata.json` | Human-readable `{"step": N, "tokens_seen": M}`, plus the logging runs live at save time | Plain JSON, see below |
 | `latest` symlink | Points at the most recent `step_N` (updated atomically) | [Auto-resume](auto-resume.md) |
 
@@ -84,7 +84,8 @@ those records. When a logging backend has a live run at save time it also holds 
   — `CheckpointManager.save()`/`load()`/`wait()`, `latest` symlink
   maintenance, retention cleanup.
 - [`kempnerforge/checkpoint/async_save.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/async_save.py)
-  — `AsyncCheckpointer`: sync / async / pinned-memory modes.
+  — `AsyncCheckpointer`: the sync and async save modes
+  (`async_with_pinned_mem` runs the same call as `async`).
 - [`kempnerforge/checkpoint/state.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/state.py)
   — `build_train_state` / `restore_train_state`, RNG capture.
 - [`kempnerforge/resilience/elastic.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)
