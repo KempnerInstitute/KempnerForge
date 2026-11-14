@@ -21,6 +21,7 @@ from kempnerforge.config.schema import CheckpointConfig, DataConfig, JobConfig, 
 from kempnerforge.data.dataloader import DataPositionError, StatefulDataLoader, StreamingDataLoader
 from kempnerforge.data.dataset import StreamingHuggingFaceDataset
 from kempnerforge.data.sampler import DistributedSampler
+from kempnerforge.metrics.logger import _RankFilter
 from kempnerforge.training.data_pipeline import DataPipeline, build_data_pipeline
 from kempnerforge.training.loop import BatchStream
 from kempnerforge.training.runtime import RuntimeContext
@@ -359,8 +360,9 @@ def test_a_later_pass_on_another_ranks_position_warns(corpus, caplog, monkeypatc
 
     A rank's own count, which an auto-resume restores, fits in every pass, and any
     count fits in the first pass. A count saved before the rank was recorded may be
-    another rank's. The ``kempnerforge`` logger stops propagation once configured,
-    so the test lets records reach ``caplog``.
+    another rank's. Rank 0 takes its own count, so the warning must pass the training
+    log's rank-0 filter on the other ranks. The ``kempnerforge`` logger stops
+    propagation once configured, so the test lets records reach ``caplog``.
     """
     monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
     state = _stream_loader(corpus, world_size=2).state_dict()
@@ -374,6 +376,9 @@ def test_a_later_pass_on_another_ranks_position_warns(corpus, caplog, monkeypatc
         assert "pass 1 on 2 data-parallel ranks from data-parallel rank 0's position" in (
             caplog.text
         )
+        warned = [r for r in caplog.records if "Resuming the stream in pass" in r.getMessage()]
+        monkeypatch.setenv("RANK", "1")
+        assert _RankFilter(rank=0).filter(warned[0]), "the training log would drop it on rank 1"
         caplog.clear()
         unrecorded = {k: v for k, v in later.items() if k != "data_parallel_rank"}
         _stream_loader(corpus, world_size=2).load_state_dict(unrecorded)

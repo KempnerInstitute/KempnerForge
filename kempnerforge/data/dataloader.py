@@ -330,7 +330,9 @@ class StreamingDataLoader:
     0's copy instead, a ``checkpoint.load_path`` warm start or a resume that
     ``checkpoint.ignore_rank_state_mismatch`` lets onto another layout, is exact
     while every rank started its current pass on the same step, so in practice
-    until the first rank finishes a pass; past that, ``load_state_dict`` warns.
+    until the first rank finishes a pass. Past that, each rank that took another
+    rank's position warns, with a record every rank's log shows, since rank 0
+    holds its own position and stays silent.
 
     Args:
         dataset: The streaming dataset.
@@ -486,8 +488,8 @@ class StreamingDataLoader:
                 f"data-parallel ranks from {whose}, which is right for data-parallel rank "
                 f"{self.dataset.rank} only while all ranks started this pass on the same "
                 f"step. Ranks whose parts of the stream differ in length start later passes "
-                f"on different steps, so this rank may skip or repeat up to that difference. "
-                f"An auto-resume on the saved layout restores each rank's own position"
+                f"on different steps, so this rank may skip or repeat up to that difference",
+                extra={"every_rank": True},
             )
         logger.info(
             f"Resumed streaming DataLoader: epoch={self._epoch}, replaying "

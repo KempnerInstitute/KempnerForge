@@ -1025,7 +1025,7 @@
           ]
         },
         "StreamingDataLoader": {
-          "purpose": "DataLoader over a StreamingHuggingFaceDataset that resumes by replaying the saved batch count, logging progress; refuses a stream whose source files, shard count or settings changed, and starts fresh workers when a pass restarts midway; each rank saves its own count with its data-parallel rank, and a later pass warns only when a rank takes another rank's count",
+          "purpose": "DataLoader over a StreamingHuggingFaceDataset that resumes by replaying the saved batch count, logging progress; refuses a stream whose source files, shard count or settings changed, and starts fresh workers when a pass restarts midway; each rank saves its own count with its data-parallel rank, and past the first pass a rank that takes another rank's count, or one with no recorded rank, warns in every rank's log",
           "methods": [
             "__iter__()",
             "_restart_workers()",
