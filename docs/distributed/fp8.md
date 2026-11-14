@@ -78,7 +78,10 @@ because the FP8 weight gradient multiplies over the micro-batch's
 tokens. If a model passes both checks and still converts no `Linear`,
 for example `dim = 64` with `n_heads = 4`, `head_dim_override = 10`,
 `ffn_hidden_dim = 200` and `vocab_size = 50257`, `apply_float8` raises
-a `ValueError` rather than let an FP8 run train entirely in bf16.
+a `ValueError` rather than let an FP8 run train entirely in bf16. A
+packed VLM run (`data.pack_sequences = true`) is refused with FP8 when
+`JobConfig` is built, because its head's token count changes from
+batch to batch.
 
 **Embeddings & norms**: not `Linear` — `convert_to_float8_training`
 skips them automatically (no filter entry needed).

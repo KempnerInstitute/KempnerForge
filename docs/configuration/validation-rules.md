@@ -358,8 +358,8 @@ whose token count is not a multiple of 16 fails in its first backward,
 with an error such as `Expected trailing dimension of mat1 to be
 divisible by 16 but got mat1 shape: (<out_features>x<tokens>)`. A
 packed VLM run (`data.pack_sequences = true`) is refused with FP8 when
-the config is validated, because its head runs over the batch's text
-tokens, a count that changes from batch to batch. With
+`JobConfig` is built (`__post_init__`), because its head runs over the
+batch's text tokens, a count that changes from batch to batch. With
 `data.hf_streaming`, the last batch of each pass over the stream can be
 short, so keep `train.seq_len` itself a multiple of 16 there.
 
