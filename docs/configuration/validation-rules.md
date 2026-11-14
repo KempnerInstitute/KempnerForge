@@ -248,9 +248,9 @@ These run when `JobConfig` is built, with the per-dataclass checks:
   The image tokens count every view of a sample (each frame of a clip,
   or each view of a tiled image) after the adapter, and none under
   Cross-Attention, whose residual stream carries text only.
-- An HF-backed encoder (`siglip2`, `clip`) with `feature_dim` or
-  `num_tokens` above 0 logs a warning: the values override the ones the
-  encoder probes.
+- On a VLM run, an HF-backed encoder (`siglip2`, `clip`) with
+  `feature_dim` or `num_tokens` above 0 logs a warning: the values
+  override the ones the encoder probes.
 - `data.pack_sequences` on a VLM run needs `vlm.arch = "joint_decoder"`
   and takes neither `[video]` nor `train.mixed_precision = "fp8"`.
 - A nonempty `optimizer.lr_multipliers` needs a `[vlm]` section whose
