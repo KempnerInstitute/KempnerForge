@@ -1288,6 +1288,7 @@
         "tests/unit/test_checkpoint.py::TestLoadVLMFreezeCompare",
         "tests/unit/test_checkpoint.py::TestIntersectFreezeMetaByModule",
         "tests/unit/test_checkpoint.py::TestFreshIfUnheld",
+        "tests/unit/test_checkpoint.py::TestMuonResume",
         "tests/unit/test_checkpoint_security.py::TestLoadTrainStateOwnershipGate",
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
         "tests/unit/test_ep_checkpoint.py",
@@ -1318,7 +1319,8 @@
           "purpose": "Translates a DCP state dict between one EP rank's experts and all of them: unpacked experts under their global index, packed weights as views over the FSDP mesh and ep holding every expert's rows, with optimizer state and param-group lists to match",
           "methods": [
             "to_global(state) -> dict",
-            "to_local(state) -> dict"
+            "to_local(state) -> dict",
+            "global_names(names) -> list[str]"
           ]
         }
       },
@@ -1638,17 +1640,33 @@
           "TestRNGState(2)",
           "TestBuildTrainState(4)",
           "TestRestoreTrainState(5)",
-          "TestCheckpointRetention(2)",
+          "TestCheckpointRetention(9)",
           "TestAsyncCheckpointer(7)",
           "TestDataloaderStatePersistence(9)",
           "TestIntersectFreezeMetaByModule(4)",
           "TestPeekSavedStep(5)",
           "TestFlushPendingSave(1)",
           "TestSaveVLMFreezeMetadata(3)",
+          "TestSaveTrackingSidecar(24)",
+          "TestSaveCheckpointRegistration(39)",
+          "TestWeightsOnlyWarmStart(8)",
           "TestLoadVLMFreezeCompare(9)",
-          "TestFreshIfUnheld(9)"
+          "TestAsyncLatestSymlinkSafety(22)",
+          "TestAFailedSaveCommitsNothing(11)",
+          "TestSyncBarrierGroup(6)",
+          "TestCheckpointManagerLoad(3)",
+          "TestResumeWithUnsteppedParameters(18)",
+          "TestFreshIfUnheld(9)",
+          "TestMuonResume(26)",
+          "TestSaveBeforeFirstStep(21)",
+          "TestResumeWithoutTrainState(12)",
+          "TestResumeWithoutTrainStateAcrossRanks(2)",
+          "TestOptimizerChecksAcrossStages(4)",
+          "TestCheckpointEveryOptimizer(8)",
+          "TestComponentSwapOnResume(1)",
+          "TestWeightDecayScopeOnResume(46)"
         ],
-        "count": 60
+        "count": 318
       },
       "tests/unit/test_observability.py": {
         "classes": [
@@ -1760,14 +1778,14 @@
           "TestPlacementCheck(1)",
           "TestFailureOnOneRank(1)",
           "TestResumeAtTheSameLayout(11)",
-          "TestExpertsTheSaveLeftOut(2)",
+          "TestExpertsTheSaveLeftOut(5)",
           "TestPerModuleLearningRates(2)",
           "TestLoadAtAnotherEP(18)",
           "TestUnfixedCheckpoint(8)",
           "TestExportFromAnEPCheckpoint(3)",
           "TestWithoutEP(2)"
         ],
-        "count": 63
+        "count": 66
       },
       "tests/unit/test_expert_layout.py": {
         "classes": [

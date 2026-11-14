@@ -564,25 +564,32 @@ def _restore_never_stepped(
     optim_state["state"].update({fqn: {} for fqn in never_stepped})
 
 
-def _params_the_save_left_out(fqns: Iterable[str], saved_keys: Iterable[str]) -> set[str]:
+def _params_the_save_left_out(
+    fqns: Iterable[str], saved_keys: Iterable[str], layout: ExpertLayout | None = None
+) -> set[str]:
     """Return the names in ``fqns`` that a checkpoint's optimizer did not hold.
 
     Names are compared without the activation-checkpoint wrapper's prefix, as DCP writes
-    them. A checkpoint that stores the optimizer as one opaque entry leaves none out.
+    them, and under ``layout`` by the global names the checkpoint keeps each expert under,
+    since a rank's local name for an expert names another expert on another rank. A
+    checkpoint that stores the optimizer as one opaque entry leaves none out.
 
     Args:
-        fqns: Parameter names of the uncompiled model, with or without the
+        fqns: This rank's parameter names of the uncompiled model, with or without the
             activation-checkpoint wrapper's prefix.
         saved_keys: The keys the checkpoint's DCP index lists.
+        layout: The model's expert-parallel layout, or None without expert parallelism.
 
     Returns:
-        The names, without the wrapper's prefix, that have neither saved optimizer state
-        nor a never-stepped record.
+        The names, without the wrapper's prefix and as this rank spells them, that have
+        neither saved optimizer state nor a never-stepped record.
     """
     keys = list(saved_keys)
     if "optimizer" in keys:
         return set()
-    needed = {fqn.replace(_CHECKPOINT_PREFIX, "") for fqn in fqns}
+    local = sorted({fqn.replace(_CHECKPOINT_PREFIX, "") for fqn in fqns})
+    saved_names = layout.global_names(local) if layout is not None else local
+    needed = set(saved_names)
     covered: set[str] = set()
     for key in keys:
         if key.startswith(_NEVER_STEPPED_PREFIX):
@@ -592,7 +599,7 @@ def _params_the_save_left_out(fqns: Iterable[str], saved_keys: Iterable[str]) ->
             while fqn and fqn not in needed:
                 fqn = fqn.rpartition(".")[0]
             covered.add(fqn)
-    return needed - covered
+    return {name for name, saved in zip(local, saved_names, strict=True) if saved not in covered}
 
 
 def _restore_left_out(
@@ -1773,9 +1780,9 @@ class CheckpointManager:
         elif load_optim:
             dcp_state["optimizer"] = get_optimizer_state_dict(self.model, optimizers)
             template = cast("dict[str, Any]", dcp_state["optimizer"])
-            left_out = _params_the_save_left_out(fresh_if_unheld, saved_keys) & set(
-                template["state"]
-            )
+            left_out = _params_the_save_left_out(
+                fresh_if_unheld, saved_keys, expert_layout(self.model)
+            ) & set(template["state"])
             positions = [(o, k) for o in optimizers for k in range(len(o.param_groups))]
             owners = [optimizer for optimizer, _ in positions]
             positional = scheduler is not None and not isinstance(

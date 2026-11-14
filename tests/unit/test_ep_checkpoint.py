@@ -331,6 +331,51 @@ def _resume_experts_the_save_left_out(rank, world, port, names, sizes, overrides
         dist.destroy_process_group()
 
 
+def _resume_some_experts_fresh(rank, world, port, names, sizes, overrides, root) -> None:
+    """Resume at this layout the checkpoint in ``root``, whose optimizer held some experts.
+
+    ``root`` holds ``ckpt`` and ``reference.pt``, the saving model's weights and AdamW
+    moments under the unsharded names. Each rank loads with every expert allowed to resume
+    fresh, then writes ``mismatches{rank}.pt``: the names, with each expert's global index,
+    whose weight differs from the reference or whose moments are not the reference's, held
+    or not. Each rank checks its own experts, whose moments the ranks hold unevenly.
+    """
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+        model, optimizer = _build(mesh, _config(overrides), seed=1)
+        experts = [name for name, _ in model.named_parameters() if _is_expert(name)]
+        ckpt = CheckpointConfig(dir=str(Path(root) / "ckpt"))
+        manager = CheckpointManager(ckpt, model, optimizer)
+        manager.load(path=str(_step_dir(Path(root))), fresh_if_unheld=experts)
+        reference = torch.load(Path(root) / "reference.pt")
+        starts = {
+            layer: moe.local_expert_start for layer, moe in expert_layout_module.moe_layers(model)
+        }
+        wrong: list[str] = []
+        for name, p in model.named_parameters():
+            match = UNPACKED_EXPERT.fullmatch(name)
+            saved_name = name
+            if match is not None:
+                index = starts[match["layer"]] + int(match["index"])
+                saved_name = f"{match['layer']}.experts.{index}.{match['rest']}"
+            state = optimizer.state.get(p, {})
+            got = {saved_name: p.detach()}
+            got.update({f"{saved_name}.{m}": state[m] for m in MOMENTS if m in state})
+            want = {saved_name} | {
+                f"{saved_name}.{m}" for m in MOMENTS if f"{saved_name}.{m}" in reference
+            }
+            wrong += sorted(got.keys() ^ want)
+            for key in sorted(got.keys() & want):
+                t = got[key]
+                full = t.full_tensor() if isinstance(t, DTensor) else t
+                if not torch.equal(full, reference[key]):
+                    wrong.append(key)
+        torch.save(wrong, Path(root) / f"mismatches{rank}.pt")
+    finally:
+        dist.destroy_process_group()
+
+
 def _save_on_two_meshes(rank, world, port, names, sizes, overrides, root) -> None:
     """Save and resume twice at one layout, each time on a new mesh.
 
@@ -614,6 +659,39 @@ class TestExpertsTheSaveLeftOut:
         reference = torch.load(tmp_path / "reference.pt")
         assert _mismatches(torch.load(tmp_path / "resumed.pt"), reference) == []
         assert torch.load(tmp_path / "with_state.pt") == []
+
+    @pytest.mark.parametrize(
+        ("frozen", "target"),
+        [
+            pytest.param((0, 1), LAYOUTS["ep2"][:2], id="first_half_at_ep2"),
+            pytest.param((2, 3), LAYOUTS["ep2"][:2], id="second_half_at_ep2"),
+            pytest.param((1, 2), EP4, id="middle_two_at_ep4"),
+        ],
+    )
+    def test_a_save_that_held_some_experts_resumes_at_another_ep(self, frozen, target, tmp_path):
+        """Each EP rank leaves out the experts the save did not hold, by their global index.
+
+        One process saves from an optimizer without the experts in ``frozen``. At another
+        ``ep`` a rank's local name for an expert names another expert in the checkpoint, so
+        the resume must load the held experts' moments and leave out the others by the
+        names the checkpoint keeps them under.
+        """
+        model, _ = _build(None, _config({}), seed=0)
+        indices = "|".join(map(str, frozen))
+        held_out = re.compile(rf"layers\.\d+\.mlp\.experts\.({indices})\.")
+        for name, p in model.named_parameters():
+            p.requires_grad_(held_out.match(name) is None)
+        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-2)
+        _train(model, optimizer, None)
+        torch.save(_gathered(model, optimizer, None), tmp_path / "reference.pt")
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path / "ckpt")), model, optimizer).save(STEP)
+        _spawn(_resume_some_experts_fresh, *target, {}, str(tmp_path))
+        world = 1
+        for size in target[1]:
+            world *= size
+        assert [torch.load(tmp_path / f"mismatches{rank}.pt") for rank in range(world)] == [
+            []
+        ] * world
 
 
 class TestPerModuleLearningRates:
