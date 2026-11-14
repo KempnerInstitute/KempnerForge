@@ -212,10 +212,8 @@ different mechanisms:
   `checkpoint.ignore_rank_state_mismatch = true` (see
   [Resharding](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)).
 - **HF streaming (Path B)**: wrapped in `StreamingDataLoader`, which
-  saves how many batches training took and on resume replays the stream
-  to that point. That is exact on one data-parallel rank, and on several
-  until the first rank finishes a pass over its part of the stream; after
-  that, a resume can skip or repeat data on some ranks (see
+  saves how many batches each rank took and on resume replays each
+  rank's stream to that point, exact in every pass (see
   [Stateful dataloader § Streaming loader](../data/stateful-dataloader.md#streaming-loader)).
   The replay reads the consumed part of the stream again, and the
   data-parallel size, batch size and `num_workers` must stay the same.

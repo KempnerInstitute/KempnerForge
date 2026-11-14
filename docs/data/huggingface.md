@@ -92,9 +92,10 @@ processes fork after HF has already spawned its own threads.
 
 ### Resumption in streaming mode
 
-`StreamingDataLoader` saves `{"epoch", "batches_yielded", "stream"}`:
-how many batches training took in the current pass, and what decides the
-stream's order (the source's data files by name and size, or its Hub
+`StreamingDataLoader` saves
+`{"epoch", "batches_yielded", "stream", "data_parallel_rank"}`: how many
+batches training took in the current pass, the rank that took them, and
+what decides the stream's order (the source's data files by name and size, or its Hub
 name and config, with its shard count; the data-parallel size, seed and
 shuffle buffer, `seq_len`, tokenizer, `pack_sequences`, batch size and
 `num_workers`). On resume it rebuilds the pass and discards that many
@@ -118,10 +119,11 @@ is refused before the position is applied (see
 [Resharding](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)).
 Hugging Face's own
 `IterableDataset.state_dict()` is not used: it drops the examples in the
-shuffle buffer on resume. On several ranks the checkpoint holds rank 0's
-count, which is exact until the first rank finishes a pass. See
+shuffle buffer on resume. On several ranks an auto-resume gives every
+rank its own count; a load that gives every rank rank 0's count is exact
+until the first rank finishes a pass. See
 [Stateful dataloader § Streaming loader](stateful-dataloader.md#streaming-loader)
-for the replay cost and for how the ranks share the saved count.
+for the replay cost and for how the ranks' counts differ.
 
 ## Packing and document boundaries
 

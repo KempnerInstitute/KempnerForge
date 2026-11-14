@@ -354,20 +354,30 @@ def test_the_same_files_in_another_directory_are_accepted(corpus, tmp_path):
     assert torch.equal(next(iter(resumed))["input_ids"], expected)
 
 
-def test_a_later_pass_on_several_ranks_warns(corpus, caplog, monkeypatch):
-    """Past the first pass, rank 0's count may not fit the other ranks; say so.
+def test_a_later_pass_on_another_ranks_position_warns(corpus, caplog, monkeypatch):
+    """Past the first pass, another rank's count may not fit this rank; say so.
 
-    The ``kempnerforge`` logger stops propagation once configured, so the test lets
-    records reach ``caplog``.
+    A rank's own count, which an auto-resume restores, fits in every pass, and any
+    count fits in the first pass. A count saved before the rank was recorded may be
+    another rank's. The ``kempnerforge`` logger stops propagation once configured,
+    so the test lets records reach ``caplog``.
     """
     monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
     state = _stream_loader(corpus, world_size=2).state_dict()
+    assert state["data_parallel_rank"] == 0
+    later = {**state, "epoch": 1}
     with caplog.at_level(logging.WARNING, logger="kempnerforge.data.dataloader"):
-        _stream_loader(corpus, world_size=2).load_state_dict(state)
-        assert "holds one rank's position" not in caplog.text
-        _stream_loader(corpus, world_size=2).load_state_dict({**state, "epoch": 1})
-    assert "pass 1 on 2 data-parallel ranks" in caplog.text
-    assert "holds one rank's position" in caplog.text
+        _stream_loader(corpus, rank=1, world_size=2).load_state_dict(state)
+        _stream_loader(corpus, world_size=2).load_state_dict(later)
+        assert "Resuming the stream in pass" not in caplog.text
+        _stream_loader(corpus, rank=1, world_size=2).load_state_dict(later)
+        assert "pass 1 on 2 data-parallel ranks from data-parallel rank 0's position" in (
+            caplog.text
+        )
+        caplog.clear()
+        unrecorded = {k: v for k, v in later.items() if k != "data_parallel_rank"}
+        _stream_loader(corpus, world_size=2).load_state_dict(unrecorded)
+    assert "from a position that predates the saved rank" in caplog.text
 
 
 def test_restarting_a_pass_midway_with_workers_reads_the_same_epoch(corpus, tmp_path):

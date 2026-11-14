@@ -1025,7 +1025,7 @@
           ]
         },
         "StreamingDataLoader": {
-          "purpose": "DataLoader over a StreamingHuggingFaceDataset that resumes by replaying the saved batch count, logging progress; refuses a stream whose source files, shard count or settings changed, and starts fresh workers when a pass restarts midway",
+          "purpose": "DataLoader over a StreamingHuggingFaceDataset that resumes by replaying the saved batch count, logging progress; refuses a stream whose source files, shard count or settings changed, and starts fresh workers when a pass restarts midway; each rank saves its own count with its data-parallel rank, and a later pass warns only when a rank takes another rank's count",
           "methods": [
             "__iter__()",
             "_restart_workers()",
@@ -2021,7 +2021,7 @@
         "count": 22
       },
       "tests/unit/test_streaming_resume.py": {
-        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning, mid-pass restart with workers, replay progress",
+        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning on another rank's position, mid-pass restart with workers, replay progress",
         "count": 13
       }
     },

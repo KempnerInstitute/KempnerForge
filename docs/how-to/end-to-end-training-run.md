@@ -137,12 +137,10 @@ scheduler, dataloader, and RNG state restored.
 
 On the pre-tokenized path, `StatefulDataLoader` restores the position in
 the epoch's sample order, so the run resumes at the exact sample. This
-tutorial's HF-streaming path uses `StreamingDataLoader`, which replays the
-stream up to the batches already trained on: the resume is exact until
-the first GPU finishes a pass over its part of the stream, and after that
-it can skip or repeat some data on some GPUs. The replay reads the
-consumed part of the stream again, which takes a moment at the start of
-the resumed run. See
+tutorial's HF-streaming path uses `StreamingDataLoader`, which replays
+each GPU's stream up to the batches it already trained on, so the resume
+is exact there too. The replay reads the consumed part of the stream
+again, which takes a moment at the start of the resumed run. See
 [Data § Hugging Face](../data/huggingface.md#resumption-in-streaming-mode),
 [Checkpointing § Auto-resume](../checkpointing/auto-resume.md) and
 [Resilience § SLURM preemption](../resilience/slurm-preemption.md).

@@ -324,9 +324,13 @@ class StreamingDataLoader:
     shard count, or a new version of ``datasets`` or of the tokenizer files; any
     of those can shift the replay.
 
-    A checkpoint holds one rank's position, and every rank replays its own stream
-    by it. That is exact while every rank started its current pass on the same
-    step, so in practice until the first rank finishes a pass.
+    Every rank saves its own position, with the data-parallel rank that saved it,
+    and an exact resume (the training entry's auto-resume) gives every rank its
+    own, so the replay is exact in every pass. A load that gives every rank rank
+    0's copy instead, a ``checkpoint.load_path`` warm start or a resume that
+    ``checkpoint.ignore_rank_state_mismatch`` lets onto another layout, is exact
+    while every rank started its current pass on the same step, so in practice
+    until the first rank finishes a pass; past that, ``load_state_dict`` warns.
 
     Args:
         dataset: The streaming dataset.
@@ -435,11 +439,16 @@ class StreamingDataLoader:
         return batch
 
     def state_dict(self) -> dict:
-        """Return checkpoint state: ``epoch``, ``batches_yielded`` and the ``stream`` it counts."""
+        """Return checkpoint state.
+
+        Keys: ``epoch``, ``batches_yielded``, the ``stream`` it counts and the
+        ``data_parallel_rank`` that saved it.
+        """
         return {
             "epoch": self._epoch,
             "batches_yielded": self._batches_yielded,
             "stream": self._identity(),
+            "data_parallel_rank": self.dataset.rank,
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -465,14 +474,20 @@ class StreamingDataLoader:
             )
         self._epoch = state.get("epoch", 0)
         self._batches_yielded = state.get("batches_yielded", 0)
-        if self._epoch > 0 and self.dataset.world_size > 1:
+        saved_rank = state.get("data_parallel_rank")
+        if self._epoch > 0 and self.dataset.world_size > 1 and saved_rank != self.dataset.rank:
+            whose = (
+                "a position that predates the saved rank"
+                if saved_rank is None
+                else f"data-parallel rank {saved_rank}'s position"
+            )
             logger.warning(
                 f"Resuming the stream in pass {self._epoch} on {self.dataset.world_size} "
-                f"data-parallel ranks: the checkpoint holds one rank's position, which is "
-                f"right for every rank only while all ranks started this pass on the same "
+                f"data-parallel ranks from {whose}, which is right for data-parallel rank "
+                f"{self.dataset.rank} only while all ranks started this pass on the same "
                 f"step. Ranks whose parts of the stream differ in length start later passes "
-                f"on different steps, so a rank may skip or repeat up to that difference "
-                f"until checkpoints hold each rank's own loader state"
+                f"on different steps, so this rank may skip or repeat up to that difference. "
+                f"An auto-resume on the saved layout restores each rank's own position"
             )
         logger.info(
             f"Resumed streaming DataLoader: epoch={self._epoch}, replaying "

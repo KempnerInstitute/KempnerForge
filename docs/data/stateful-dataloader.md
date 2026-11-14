@@ -221,18 +221,25 @@ replay. Pre-tokenized data resumes without a replay.
 
 ### Several ranks
 
-The checkpoint holds rank 0's count, and every rank replays its own
-stream by it. Every rank takes the same number of batches per step, so
-the count is right on every rank while every rank started its current
-pass on the same step, which in practice means until the first rank
-finishes a pass. The ranks' parts of the stream can differ by many
-batches: a rank reads whole shards when the shard count divides by the
-data-parallel size, and shards differ in size. A checkpoint saved after
-that resumes every rank at rank 0's pass and count, so a rank that had
-fallen behind rank 0 skips data and a rank that was ahead reads data
-again, up to the difference between their parts of the stream. A resume
-past the first pass on several ranks logs a warning. Saving each rank's
-own loader state removes this.
+Every rank saves its own pass and count, with the data-parallel rank that
+saved them, in the checkpoint's per-rank state
+([Train state](../checkpointing/train-state.md#per-rank-state-schema-v1)).
+An auto-resume restores each rank's own, so every rank replays its own
+stream to where it stopped, in any pass. The ranks' parts of the stream
+can differ by many batches: a rank reads whole shards when the shard
+count divides by the data-parallel size, and shards differ in size. So
+once the first rank finishes a pass, the ranks are in different passes
+or at different counts, which their own saved positions record.
+
+A load that gives every rank rank 0's position instead, a
+`checkpoint.load_path` warm start or an auto-resume that
+`checkpoint.ignore_rank_state_mismatch` lets onto another layout of the
+same data-parallel size, is exact only while every rank started its
+current pass on the same step, which in practice means until the first
+rank finishes a pass. Past that, a rank that had fallen behind rank 0
+skips data and a rank that was ahead reads data again, up to the
+difference between their parts of the stream, and every rank that takes
+another rank's position past the first pass logs a warning.
 
 ## Worker RNG
 
