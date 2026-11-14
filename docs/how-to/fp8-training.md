@@ -194,7 +194,9 @@ makes the product a multiple of 16; a `seq_len` that is one works with
 any `batch_size`. VLM runs skip this check because their token counts
 depend on the data; there the symptom is an error in the first backward
 such as `Expected trailing dimension of mat1 to be divisible by 16 but
-got mat1 shape: (<out_features>x<tokens>)`.
+got mat1 shape: (<out_features>x<tokens>)`. A packed VLM run
+(`data.pack_sequences = true`) is refused with FP8 when the config is
+validated.
 
 **`ValueError: Float8 converted 0 of N Linear layers`.** Every `Linear`
 is either excluded by name or has a dimension that is not a multiple of

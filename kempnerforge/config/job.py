@@ -135,7 +135,7 @@ class JobConfig:
                     "data.pack_sequences on a VLM run does not support "
                     "train.mixed_precision='fp8': the packed head runs over the batch's text "
                     "tokens, whose count is the inner dimension of the head's FP8 "
-                    "weight-gradient GEMM and must be a multiple of 16"
+                    f"weight-gradient GEMM and must be a multiple of {FP8_DIM_MULTIPLE}"
                 )
 
         if self.optimizer.lr_multipliers:
