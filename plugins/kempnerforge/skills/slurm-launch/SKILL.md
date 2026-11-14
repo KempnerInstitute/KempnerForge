@@ -31,7 +31,7 @@ Interactive script: scripts/slurm/interactive.sh (salloc wrapper for debugging)
 Requeue-aware template: scripts/slurm/7b_requeue.sh (SIGTERM@120, --requeue, auto-resume via latest symlink)
 Example: scripts/slurm/13b_validation.sh (large-model multi-node config reference)
 Config fields consumed: [slurm].{account, partition, qos, default_time, default_nodes, default_gpus_per_node}
-Env vars set by scripts: MASTER_ADDR, MASTER_PORT, NCCL_SOCKET_IFNAME, GLOO_SOCKET_IFNAME, NCCL_IB_*, NCCL_TIMEOUT
+Env vars set by scripts: MASTER_ADDR, MASTER_PORT, NCCL_SOCKET_IFNAME, GLOO_SOCKET_IFNAME, NCCL_IB_*
 <!-- context-end -->
 
 ## Procedure
@@ -87,8 +87,8 @@ Assume preflight has passed. Read `configs/cluster/local.toml` to pull `[slurm].
 ## Gotchas
 - The `#SBATCH --partition=<partition-name>` placeholders in the shipped scripts will cause submission failures unless overridden on the `sbatch` command line. Do NOT edit those lines in the committed file; override at submit time so the scripts stay user-agnostic.
 - `multinode.sh` is NOT a torchrun wrapper. Each `srun` task maps to one GPU, and rank info flows from SLURM env vars via `init_distributed()`. Do not add `torchrun` inside the multi-node script.
-- A run killed with `scancel` exits immediately (SIGKILL after 30 s). A run preempted by SLURM gets `SIGTERM` 120 s before the wall-time cutoff (see `--signal=B:SIGTERM@120`), which the training loop catches and saves a checkpoint. Use `--requeue` for automatic restart.
-- Interactive sessions: never `scancel` the job allocation. `Ctrl-C` kills only the `srun` process; the allocation stays up for reuse. `scancel $JOB` kills the entire allocation and forces requeue from disk.
+- A job that reaches its time limit gets `SIGTERM` 120 to 180 s earlier (`--signal=SIGTERM@120`, sent to the srun ranks through `uv run`; `singlenode.sh` keeps `--signal=B:SIGTERM@120` and forwards one `SIGTERM` to `uv run torchrun`, whose workers then have 30 s), and the training loop saves an emergency checkpoint and exits; resubmit to resume. Plan for that save to finish before the limit: at the limit the ranks get `SIGTERM` again and may be killed at once. A preempted job gets no lead: SLURM sends `SIGTERM` and kills the job within KillWait (30 s); `--requeue` puts it back in the queue and it resumes from the last checkpoint. To stop a run with a checkpoint, use `scancel --signal=USR1 $JOB` (`scancel --batch --signal=USR1 $JOB` for `singlenode.sh`); plain `scancel` sends `SIGTERM` and kills the job within KillWait.
+- Interactive sessions: never `scancel` the job allocation. `Ctrl-C` kills only the `srun` process; the allocation stays up for reuse. `scancel $JOB` ends the entire allocation; it does not requeue the job, and the next run resumes from the last checkpoint on disk.
 - `logs/` must exist before submission. The scripts create it, but if the repo root is read-only (rare), submission fails late.
 
 ## Related skills

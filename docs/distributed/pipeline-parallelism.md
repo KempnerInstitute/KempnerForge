@@ -208,8 +208,10 @@ and [JobConfig](../configuration/validation-rules.md)):
 - `pp > 1` is incompatible with `tie_embeddings=True` — the tied
   weights live on both stage 0 and the last stage, which PP can't
   reconcile. See [Tie embeddings vs pipeline parallel](../configuration/validation-rules.md#tie-embeddings-vs-pipeline-parallel).
-- `pp > 1` + MoE requires the MoE layer to fit on one stage — see
-  [Validation rules](../configuration/validation-rules.md) (the
+- `pp > 1` with MoE (`num_experts > 0`) is rejected by
+  `JobConfig.validate`: MoE routing is data-dependent and incompatible
+  with pipeline stage splitting, so use FSDP, TP, or EP for MoE models.
+  See [Validation rules](../configuration/validation-rules.md) (the
   **MoE + PP** section).
 
 ## Example: `70b_32gpu_tp4_pp4.toml`
