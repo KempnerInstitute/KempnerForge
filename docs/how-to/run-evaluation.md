@@ -32,7 +32,8 @@ token_dtype          = "uint32"     # .bin dtype; "" reads metadata.yaml, not da
 ```
 
 Every `interval` steps, the training loop pauses the optimizer,
-switches the model to eval mode, iterates `steps` batches of held-out
+switches the model to eval mode (and, under `schedule_free_adamw`, to
+the averaged weights `x`), iterates `steps` batches of held-out
 data, and logs `eval/loss` and `eval/perplexity` through
 [`MetricsTracker.log_eval`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/tracker.py).
 The stdout backend renders one compact line per call:

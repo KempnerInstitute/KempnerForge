@@ -4113,6 +4113,43 @@ class TestLoopPeriodicWork:
         config.eval = EvalConfig(enabled=True, interval=1, steps=1, dataset_path="/x")
         run_training_loop(make_session(config, eval_dataloader=None))
 
+    def test_eval_runs_at_the_optimizers_evaluation_point(self, monkeypatch):
+        """A schedule-free run evaluates its averaged weights x and trains on at y, bit for bit."""
+        import kempnerforge.training.loop as loop
+        from kempnerforge.config.eval import EvalConfig
+        from kempnerforge.training.optimizer import ScheduleFreeAdamW
+
+        def build():
+            torch.manual_seed(0)
+            model = TinyTextModel()
+            return model, ScheduleFreeAdamW(model.parameters(), lr=0.05)
+
+        seen: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
+
+        def recording_eval(model, *args, **kwargs):
+            params = list(model.parameters())
+            x = [optimizer.state[p]["x"] for p in params]
+            seen.append(([p.detach().clone() for p in params], [t.clone() for t in x]))
+            return {}
+
+        monkeypatch.setattr(loop, "run_eval", recording_eval)
+        config = make_config(max_steps=4)
+        config.eval = EvalConfig(enabled=True, interval=2, steps=1, dataset_path="/x")
+        model, optimizer = build()
+        run_training_loop(
+            make_session(config, model=model, optimizer=optimizer, eval_dataloader=["BATCH"])
+        )
+        assert len(seen) == 2
+        for at_eval, x in seen:
+            assert all(torch.equal(a, b) for a, b in zip(at_eval, x, strict=True))
+
+        plain, plain_opt = build()
+        run_training_loop(
+            make_session(config, model=plain, optimizer=plain_opt, eval_dataloader=None)
+        )
+        for a, b in zip(model.parameters(), plain.parameters(), strict=True):
+            assert torch.equal(a, b), "evaluating at x changed the training run"
+
     def test_profiler_is_started_stepped_and_stopped(self):
         class CountingProfiler:
             def __init__(self) -> None:

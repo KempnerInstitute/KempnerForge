@@ -28,17 +28,6 @@ from kempnerforge.training.optimizer import build_optimizer
 
 CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=128, max_seq_len=32)
 OPTIMIZERS = sorted(registry.list("optimizer"))
-RESUMABLE_OPTIMIZERS = [
-    pytest.param(
-        name,
-        marks=pytest.mark.xfail(
-            raises=ZeroDivisionError, strict=True, reason="#236: schedule_free_adamw cannot resume"
-        ),
-    )
-    if name == "schedule_free_adamw"
-    else name
-    for name in OPTIMIZERS
-]
 
 
 def _free_port() -> int:
@@ -163,9 +152,13 @@ class TestAutocastDtype:
 
 
 class TestCheckpointAcrossMasterDtypes:
-    """A checkpoint saved with one master dtype loads into the other, cast by DCP."""
+    """A checkpoint saved with one master dtype loads into the other, cast by DCP.
 
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    Schedule-free AdamW rebuilds its training point from the cast ``z`` and ``x`` in the new
+    dtype, which is not the saved training point cast once they differ, after a few steps.
+    """
+
+    @pytest.mark.parametrize("name", OPTIMIZERS)
     @pytest.mark.parametrize(
         ("saved", "loaded"),
         [(torch.bfloat16, torch.float32), (torch.float32, torch.bfloat16)],
@@ -180,16 +173,26 @@ class TestCheckpointAcrossMasterDtypes:
             return model, build_optimizer(model, OptimizerConfig(name=name, lr=1e-3, fused=False))
 
         model, opt = build(saved)
-        model(_tokens(0)).float().sum().backward()
-        opt.step()
-        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=1)
+        for seed in range(3):
+            model(_tokens(seed)).float().sum().backward()
+            opt.step()
+            opt.zero_grad()
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=3)
 
         model2, opt2 = build(loaded)
         CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
 
+        beta1 = {p: g["betas"][0] for g in opt2.param_groups if "betas" in g for p in g["params"]}
+        rebuilt = 0
         for src, dst in zip(model.parameters(), model2.parameters(), strict=True):
             assert dst.dtype == loaded
-            assert torch.equal(dst, src.detach().to(loaded))
+            state = opt2.state.get(dst, {})
+            if "x" in state:
+                assert torch.equal(dst, state["z"].clone().lerp_(state["x"], beta1[dst]))
+                rebuilt += not torch.equal(state["z"], state["x"])
+            else:
+                assert torch.equal(dst, src.detach().to(loaded))
+        assert rebuilt or name != "schedule_free_adamw", "fixture: z equals x everywhere"
         for src_opt, dst_opt in zip(
             (opt, *getattr(opt, "inner_optimizers", ())),
             (opt2, *getattr(opt2, "inner_optimizers", ())),

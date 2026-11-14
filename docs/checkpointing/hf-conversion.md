@@ -70,7 +70,11 @@ The script logs the dtype and where it came from, e.g.
 they were written in.
 
 No optimizer / scheduler / RNG — only weights. If you need those,
-keep the DCP checkpoint; HF format doesn't carry them.
+keep the DCP checkpoint; HF format doesn't carry them. A
+`schedule_free_adamw` checkpoint's weights are its averaged weights `x`,
+the point to evaluate and deploy (see
+[Optimizers](../training/optimizers.md)); one written before checkpoints
+held `x` has the training point `y` instead.
 
 ### With PP
 

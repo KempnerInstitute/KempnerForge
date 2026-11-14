@@ -25,6 +25,7 @@ onto the new topology while data order and random streams restart fresh.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import logging
@@ -309,6 +310,32 @@ def _recorded_weight_decay_scope(meta: Mapping[str, Any], metadata_path: Path) -
     return scope
 
 
+@contextlib.contextmanager
+def _evaluation_point(optimizer: torch.optim.Optimizer) -> Iterator[None]:
+    """Hold the parameters at ``optimizer``'s evaluation point inside the block.
+
+    An optimizer that evaluates at another point than it trains at, as schedule-free AdamW
+    does, has ``eval_params`` and ``train_params``: the block runs between them, and the
+    parameters leave it at the training point again, bit for bit, also when the swap or
+    the block raises. Any other optimizer leaves them as they are.
+
+    ``kempnerforge.training.optimizer.evaluation_point`` does the same for the training
+    loop; importing it here would close an import cycle. This one takes no model: no
+    forward runs in a save, and FSDP2's state-dict hooks reshard every unit before the
+    state is read.
+    """
+    to_eval = getattr(optimizer, "eval_params", None)
+    to_train = getattr(optimizer, "train_params", None)
+    if to_eval is None or to_train is None:
+        yield
+        return
+    try:
+        to_eval()
+        yield
+    finally:
+        to_train()
+
+
 def _canonical_patterns(record: object) -> dict[str, list[str]]:
     """Return a ``{module: patterns}`` record with each module's patterns sorted and unique.
 
@@ -453,7 +480,13 @@ def _restore_never_stepped(
 def _check_saved_state_matches(
     optim_state: dict[str, Any], saved_keys: Iterable[str], where: Path
 ) -> None:
-    """Fail if a parameter was saved with another optimizer's state than the one it now has."""
+    """Fail if a parameter's saved optimizer state is not the state its optimizer now keeps.
+
+    The save holds either another optimizer's state, or only part of this one's, as a
+    ``schedule_free_adamw`` checkpoint written before each parameter kept its own ``step``
+    does. Either way the run cannot continue exactly, so the load stops before DCP reads
+    anything and says how to continue from the weights alone.
+    """
     kept = {fqn: set(state) for fqn, state in optim_state["state"].items()}
     saved: dict[str, set[str]] = {}
     for key in saved_keys:
@@ -479,6 +512,19 @@ def _check_saved_state_matches(
             "To continue from these weights with a fresh optimizer, set "
             "checkpoint.load_path to this checkpoint and checkpoint.exclude_from_loading = "
             '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
+        )
+    short = sorted(fqn for fqn, entries in saved.items() if kept[fqn] - entries)
+    if short:
+        first = short[0]
+        raise RuntimeError(
+            f"{where} holds partial optimizer state for {len(short)} parameters: "
+            f"{short[:8]}. {first} was saved without {sorted(kept[first] - saved[first])}, "
+            "which its optimizer now keeps: an earlier version of the optimizer saved it, "
+            "e.g. schedule_free_adamw before each parameter kept its own step count, so "
+            "the run cannot continue exactly. To continue from these weights with a fresh "
+            "optimizer, set checkpoint.load_path to this checkpoint and "
+            'checkpoint.exclude_from_loading = ["optimizer"], with a checkpoint.dir that '
+            "holds no checkpoint yet."
         )
 
 
@@ -1176,6 +1222,17 @@ class CheckpointManager:
     ) -> None:
         """Save a checkpoint at the given step.
 
+        An optimizer that evaluates at another point than it trains at, as schedule-free
+        AdamW does, has the model saved at its evaluation point, the averaged weights ``x``,
+        so every reader of the model entry alone gets them; the parameters are back at the
+        training point when this returns, and ``load`` rebuilds that point. The swap back
+        runs as soon as ``AsyncCheckpointer.save`` returns, which is safe only because the
+        state is staged by then: ``dcp.async_save`` without a stager uses torch's
+        ``DefaultStager(StagingOptions(False, False, False, False))``, which copies every
+        tensor into new CPU storage before it returns. An asynchronous stager would let
+        the write read the parameters after the swap back, so adding one means moving the
+        swap back after staging completes.
+
         Under expert parallelism each EP rank holds a copy of every weight outside the
         routed experts, and the copies can drift apart on GPU (#482). DCP writes each
         chunk that several ranks hold from one of them, by default the one with the least
@@ -1198,24 +1255,25 @@ class CheckpointManager:
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
         dcp_dir.mkdir(parents=True, exist_ok=True)
 
-        dcp_state: dict[str, Any] = {"model": get_model_state_dict(self.model)}
-        if any(optimizer.state for optimizer in self.checkpointed_optimizers):
-            optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
-            dcp_state["optimizer"] = optim_state
-            dcp_state[_NEVER_STEPPED_KEY] = _never_stepped_record(optim_state)
-        dcp_state, layout = self._present_experts(dcp_state)
-        save = self._async_ckpt.save
-        if layout is not None:
-            save = partial(save, planner=DefaultSavePlanner(dedup_save_to_lowest_rank=True))
-        flush_error = _attempt(self._async_ckpt.wait)
-        error = flush_error
-        if flush_error is None:
-            error = _attempt(
-                save,
-                dcp_state,
-                checkpoint_id=str(dcp_dir),
-                process_group=self._process_group,
-            )
+        with _evaluation_point(self.optimizer):
+            dcp_state: dict[str, Any] = {"model": get_model_state_dict(self.model)}
+            if any(optimizer.state for optimizer in self.checkpointed_optimizers):
+                optim_state = get_optimizer_state_dict(self.model, self.checkpointed_optimizers)
+                dcp_state["optimizer"] = optim_state
+                dcp_state[_NEVER_STEPPED_KEY] = _never_stepped_record(optim_state)
+            dcp_state, layout = self._present_experts(dcp_state)
+            save = self._async_ckpt.save
+            if layout is not None:
+                save = partial(save, planner=DefaultSavePlanner(dedup_save_to_lowest_rank=True))
+            flush_error = _attempt(self._async_ckpt.wait)
+            error = flush_error
+            if flush_error is None:
+                error = _attempt(
+                    save,
+                    dcp_state,
+                    checkpoint_id=str(dcp_dir),
+                    process_group=self._process_group,
+                )
 
         sync_mode = self.config.async_mode == AsyncCheckpointMode.disabled
 
@@ -1345,6 +1403,9 @@ class CheckpointManager:
         exact_resume: bool = False,
     ) -> tuple[int, int, dict[str, Any]]:
         """Load a checkpoint and restore all state.
+
+        A load that restores optimizer state then calls the optimizer's ``train_params``, if
+        it has one, so a schedule-free run resumes at the training point it was saved at.
 
         Args:
             path: Checkpoint path. If None, loads from ``config.load_path``
@@ -1558,6 +1619,9 @@ class CheckpointManager:
                 set_optimizer_state_dict(
                     self.model, optimizers, optim_state_dict=dcp_state["optimizer"]
                 )
+                to_train = getattr(self.optimizer, "train_params", None)
+                if to_train is not None:
+                    to_train()
             if planner.never_stepped:
                 logger.info(
                     f"{len(planner.never_stepped)} parameters the saved optimizer held were never "

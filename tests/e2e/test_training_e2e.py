@@ -492,23 +492,23 @@ def _check_resume_determinism(tmp_path, nproc: int, overrides: tuple[str, ...] =
 
 
 _MUON_OVERRIDES = ("--optimizer.name=muon", "--optimizer.lr=0.02", "--model.vocab_size=4096")
-_RESUMABLE_OPTIMIZERS = [
-    pytest.param(
-        name, marks=pytest.mark.xfail(strict=True, reason="#236: schedule_free_adamw cannot resume")
-    )
-    if name == "schedule_free_adamw"
-    else name
-    for name in sorted(registry.list("optimizer"))
-]
+_SCHEDULE_FREE_OVERRIDES = ("--optimizer.name=schedule_free_adamw", "--scheduler.name=none")
 
 
 def _optimizer_overrides(name: str) -> tuple[str, ...]:
-    """Overrides that train with the registered optimizer ``name``."""
-    return _MUON_OVERRIDES if name == "muon" else (f"--optimizer.name={name}",)
+    """Overrides that train with the registered optimizer ``name``.
+
+    Schedule-free AdamW runs under the ``none`` scheduler, the pairing its docs require.
+    """
+    if name == "muon":
+        return _MUON_OVERRIDES
+    if name == "schedule_free_adamw":
+        return _SCHEDULE_FREE_OVERRIDES
+    return (f"--optimizer.name={name}",)
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize("name", _RESUMABLE_OPTIMIZERS)
+@pytest.mark.parametrize("name", sorted(registry.list("optimizer")))
 def test_resume_determinism_single_gpu(tmp_path, name):
     """Single GPU: resumed run must match the uninterrupted reference bit-for-bit."""
     _check_resume_determinism(tmp_path, nproc=1, overrides=_optimizer_overrides(name))
@@ -516,7 +516,7 @@ def test_resume_determinism_single_gpu(tmp_path, name):
 
 @pytest.mark.e2e
 @requires_gpus(2)
-@pytest.mark.parametrize("name", _RESUMABLE_OPTIMIZERS)
+@pytest.mark.parametrize("name", sorted(registry.list("optimizer")))
 def test_resume_determinism_2gpu_fsdp(tmp_path, name):
     """2 GPU FSDP: resumed run must match the uninterrupted reference bit-for-bit."""
     _check_resume_determinism(tmp_path, nproc=2, overrides=_optimizer_overrides(name))

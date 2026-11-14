@@ -2693,16 +2693,13 @@ class TestResumeWithUnsteppedParameters:
         self._assert_same_run(model, optimizer, model2, optimizer2, stepped=("used.", "unused."))
 
     def test_a_stepped_parameter_missing_part_of_its_state_still_fails(self, tmp_path):
-        from torch.distributed.checkpoint.api import CheckpointException
-
         model, optimizer, manager = self._build(0, tmp_path)
         self._step(model, optimizer, 1)
         del optimizer.state[model.used.weight]["exp_avg_sq"]
         manager.save(step=1)
 
         _, _, manager2 = self._build(1, tmp_path)
-        missing = r"Missing key in checkpoint state_dict: optimizer\.state\.used\.weight\."
-        with pytest.raises(CheckpointException, match=missing + "exp_avg_sq"):
+        with pytest.raises(RuntimeError, match=r"used\.weight was saved without \['exp_avg_sq'\]"):
             manager2.load()
 
     @pytest.mark.parametrize(
@@ -3261,17 +3258,6 @@ class TestMuonResume:
 
 
 REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
-RESUMABLE_OPTIMIZERS = [
-    pytest.param(
-        name,
-        marks=pytest.mark.xfail(
-            raises=ZeroDivisionError, strict=True, reason="#236: schedule_free_adamw cannot resume"
-        ),
-    )
-    if name == "schedule_free_adamw"
-    else name
-    for name in REGISTERED_OPTIMIZERS
-]
 
 
 class TestSaveBeforeFirstStep:
@@ -3737,7 +3723,7 @@ class TestCheckpointEveryOptimizer:
         for (n, ref), p in zip(reference.named_parameters(), model.parameters(), strict=True):
             assert torch.equal(ref, p), f"{n} differs from the run that never saved"
 
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_resume_restores_the_optimizer_exactly(self, tmp_path, name):
         """A resume restores the saved optimizer state bit for bit and continues the run exactly."""
         from kempnerforge.checkpoint.manager import CheckpointManager
@@ -3758,6 +3744,122 @@ class TestCheckpointEveryOptimizer:
         _assert_same_state_dict(ref_opt.state_dict(), opt2.state_dict())
         for (n, ref), p in zip(reference.named_parameters(), model2.parameters(), strict=True):
             assert torch.equal(ref, p), f"{n} differs from the uninterrupted run"
+
+
+class TestScheduleFreeCheckpoint:
+    """What a schedule-free checkpoint holds, and what a resume from one restores."""
+
+    MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
+
+    def _build(self, seed):
+        torch.manual_seed(seed)
+        model = Transformer(self.MODEL_CONFIG)
+        config = OptimizerConfig(name="schedule_free_adamw", lr=1e-2, fused=False)
+        return model, build_optimizer(model, config)
+
+    @staticmethod
+    def _train(model, opt, steps):
+        g = torch.Generator().manual_seed(1)
+        for _ in range(steps):
+            tokens = torch.randint(0, 256, (2, 32), generator=g)
+            logits = model(tokens)
+            torch.nn.functional.cross_entropy(logits.flatten(0, 1), tokens.flatten()).backward()
+            opt.step()
+            opt.zero_grad()
+
+    @staticmethod
+    def _points(model, opt):
+        y = [p.detach().clone() for p in model.parameters()]
+        x = [opt.state[p]["x"].clone() for p in model.parameters()]
+        assert not all(torch.equal(a, b) for a, b in zip(x, y, strict=True)), "fixture: x == y"
+        return x, y
+
+    @pytest.mark.parametrize("mode", [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_])
+    def test_the_model_entry_is_x_and_the_run_stays_at_y(self, tmp_path, mode):
+        """``save`` writes x as the model and returns with the parameters at y, bit for bit."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 4)
+        x, y = self._points(model, opt)
+        config = CheckpointConfig(dir=str(tmp_path), async_mode=mode)
+        manager = CheckpointManager(config, model, opt)
+        manager.save(step=4)
+        assert all(torch.equal(a, p) for a, p in zip(y, model.parameters(), strict=True))
+        manager.wait()
+
+        torch.manual_seed(5)
+        fresh = Transformer(self.MODEL_CONFIG)
+        dummy = torch.optim.SGD(fresh.parameters(), lr=0.0)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), fresh, dummy).load(
+            exclude_keys=["optimizer"]
+        )
+        assert all(torch.equal(a, p) for a, p in zip(x, fresh.parameters(), strict=True))
+
+    def test_a_resume_puts_the_parameters_back_at_y(self, tmp_path):
+        """Loading the optimizer rebuilds y from z and x, the exact point the run trained at."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 4)
+        _, y = self._points(model, opt)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=4)
+
+        model2, opt2 = self._build(1)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        assert all(torch.equal(a, p) for a, p in zip(y, model2.parameters(), strict=True))
+
+    def test_a_save_that_fails_inside_the_swap_leaves_the_run_at_y(self, tmp_path, monkeypatch):
+        """An error while the parameters hold x still puts every one back at y."""
+        from kempnerforge.checkpoint import manager as mgr_mod
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 4)
+        _, y = self._points(model, opt)
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("state dict failed")
+
+        monkeypatch.setattr(mgr_mod, "get_optimizer_state_dict", fail)
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt)
+        with pytest.raises(RuntimeError, match="state dict failed"):
+            manager.save(step=4)
+        assert all(torch.equal(a, p) for a, p in zip(y, model.parameters(), strict=True))
+
+    def test_a_save_whose_swap_in_fails_partway_leaves_the_run_at_y(self, tmp_path):
+        """A swap to x that raises after moving some parameters leaves every one at y."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 4)
+        _, y = self._points(model, opt)
+        params = list(model.parameters())
+
+        def swap_half_then_fail():
+            for p in params[: len(params) // 2]:
+                p.data.copy_(opt.state[p]["x"])
+            raise RuntimeError("swap failed")
+
+        opt.eval_params = swap_half_then_fail
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt)
+        with pytest.raises(RuntimeError, match="swap failed"):
+            manager.save(step=4)
+        assert all(torch.equal(a, p) for a, p in zip(y, params, strict=True))
+
+    def test_a_checkpoint_from_before_the_per_parameter_step_is_refused(self, tmp_path):
+        """A checkpoint saved without each parameter's ``step`` cannot continue the run."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 2)
+        for state in opt.state.values():
+            del state["step"]
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=2)
+
+        model2, opt2 = self._build(1)
+        with pytest.raises(RuntimeError, match=r"saved without \['step'\]"):
+            CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
 
 
 class TestComponentSwapOnResume:
@@ -3871,7 +3973,7 @@ class TestWeightDecayScopeOnResume:
         assert not any(o.state for o in manager.checkpointed_optimizers)
 
     @pytest.mark.parametrize("scope", [DEFAULT_SCOPE, ALL_SCOPE])
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_the_same_scope_resumes_exactly(self, tmp_path, name, scope):
         """A resume under the saved scope restores all optimizer state and continues exactly."""
         model, opt = self._build(name, scope, seed=0)
