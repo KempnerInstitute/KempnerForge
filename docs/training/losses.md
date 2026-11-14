@@ -155,6 +155,11 @@ With `z_loss_weight = 0.0`, `build_loss_fn` returns the base loss
 without the wrap; called directly, `z_loss(logits, 0.0)` returns `0.0`
 without computing `logsumexp`.
 
+Logits with no rows (the head's output for a packed VLM micro-batch
+without text) give an exact fp32 zero that stays on the autograd graph
+of the logits at any `chunk_size`, so there is no NaN from averaging
+over zero tokens.
+
 ## MoE auxiliary loss is separate
 
 The MoE load-balancing loss is **not** part of this pipeline. It

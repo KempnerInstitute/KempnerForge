@@ -260,9 +260,10 @@ class TestZLoss:
         yield
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
-    def test_logits_without_rows_give_zero_on_the_graph(self):
+    @pytest.mark.parametrize("chunk_size", [None, 1, 4096])
+    def test_logits_without_rows_give_zero_on_the_graph(self, chunk_size):
         logits = torch.randn(1, 0, 100, requires_grad=True)
-        result = z_loss(logits, weight=1e-4)
+        result = z_loss(logits, weight=1e-4, chunk_size=chunk_size)
         assert result.item() == 0.0
         result.backward()
         assert logits.grad is not None and logits.grad.shape == (1, 0, 100)
