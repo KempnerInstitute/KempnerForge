@@ -924,7 +924,8 @@
         "tests/unit/test_train_entry.py::TestMoEMetrics",
         "tests/unit/test_train_entry.py::TestSelectStepFn",
         "tests/unit/test_train_entry.py::TestCheckpointExtra",
-        "tests/e2e/test_training_e2e.py"
+        "tests/e2e/test_training_e2e.py",
+        "tests/unit/test_shutdown_agreement.py::TestLoopStopsOnEveryRank"
       ]
     },
     "kempnerforge/training/entry.py": {
@@ -1203,10 +1204,13 @@
     "kempnerforge/distributed/utils.py": {
       "functions": [
         "get_dp_info(device_mesh) -> (dp_rank, dp_size)",
-        "clip_grad_norm_(model, max_norm, foreach, pp_group) -> Tensor"
+        "clip_grad_norm_(model, max_norm, foreach, pp_group) -> Tensor",
+        "new_control_group(timeout_sec) -> ProcessGroup | None",
+        "any_rank(flag, group) -> bool"
       ],
       "tested_by": [
         "tests/unit/test_distributed.py::TestClipGradNorm",
+        "tests/unit/test_shutdown_agreement.py::TestAnyRank",
         "tests/unit/test_ep_gradients.py::TestClipUnderExpertParallelism"
       ]
     },
@@ -1439,8 +1443,11 @@
           ],
           "methods": [
             "register()",
+            "reinstall()",
             "unregister()",
+            "cancel_watchdog()",
             "should_shutdown()",
+            "request()",
             "finish()"
           ]
         }
@@ -1597,13 +1604,20 @@
       },
       "tests/unit/test_resilience.py": {
         "classes": [
-          "TestShutdownHandler(8)",
+          "TestShutdownHandler(16)",
           "TestNaNDetector(17)",
           "TestGPUHealth(2)",
           "TestSLURM(13)",
           "TestResumePathResolution(9)"
         ],
-        "count": 49
+        "count": 57
+      },
+      "tests/unit/test_shutdown_agreement.py": {
+        "classes": [
+          "TestAnyRank(4)",
+          "TestLoopStopsOnEveryRank(6)"
+        ],
+        "count": 10
       },
       "tests/unit/test_checkpoint.py": {
         "classes": [

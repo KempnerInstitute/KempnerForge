@@ -46,11 +46,31 @@ device before `.item()` reads the result.
 if (
     tc.nccl_health_check_interval > 0
     and step % tc.nccl_health_check_interval == 0
-    and not check_nccl_health()
+    and any_rank(not check_nccl_health(), session.control_group)
 ):
     logger.error(f"NCCL health check failed at step {step} — stopping")
+    nccl_failed_at = step
     break
+...
+# training/loop.py::run_training_loop, after the loop
+ckpt_mgr.wait()
+if nccl_failed_at is not None:
+    raise RuntimeError(f"NCCL health check failed at step {nccl_failed_at} ...")
 ```
+
+Each rank's probe answers for itself. A rank whose all-reduce times out
+returns `False`, while a late rank, whose call completes that same
+all-reduce, can return `True`. Acting on its own answer, the first rank
+would leave the loop while the late one went on into the next step's
+collectives, and both would hang. So the ranks vote: `any_rank`
+all-reduces the answers over `session.control_group`, a gloo group the
+loop makes when it starts, and every rank stops if the probe failed on
+any rank. The vote runs on gloo, not NCCL, so it still completes when
+NCCL is the problem. The stop saves nothing, since NCCL may be
+unusable, and fails the run: once any pending async save is drained,
+the loop raises `RuntimeError` on every rank, so the job ends as failed
+rather than as completed. The shutdown check votes the same way (see
+[SLURM preemption](slurm-preemption.md)).
 
 `train.nccl_health_check_interval` defaults to **0** (disabled). Set it
 to a positive integer to enable:

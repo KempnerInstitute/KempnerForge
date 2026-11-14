@@ -421,12 +421,17 @@ def run_training(
     ``scripts/train.py`` uses. A custom ``step_fn`` must run its forward and
     loss under ``session.autocast()``, which casts fp32 master weights to the
     compute dtype when no FSDP2 wrap does (one GPU, a pp-only mesh).
+
+    The shutdown handler stays registered, and its forced-exit timer armed,
+    until the process group is destroyed, so a second signal cannot cut the
+    emergency checkpoint's flush or the teardown short. On the exception path
+    nothing retires it, so the timer still bounds the exit.
     """
     runtime = setup_distributed(config)
     tracker: MetricsTracker | None = None
+    shutdown_handler = ShutdownHandler(timeout_sec=config.train.shutdown_timeout_sec)
     finished = False
     try:
-        shutdown_handler = ShutdownHandler(timeout_sec=config.train.shutdown_timeout_sec)
         shutdown_handler.register()
         nan_detector = NaNDetector(action="warn", max_consecutive=10)
 
@@ -496,3 +501,4 @@ def run_training(
             tracker.close()
         if finished:
             destroy_distributed()
+            shutdown_handler.finish()

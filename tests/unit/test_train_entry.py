@@ -100,11 +100,19 @@ class FakeShutdownHandler:
     def __init__(self, after_steps: int | None = None) -> None:
         self.after_steps = after_steps
         self.checks = 0
+        self.reinstalls = 0
         self.registered = False
+        self.requested = False
         self.finished = False
 
     def register(self) -> None:
         self.registered = True
+
+    def request(self) -> None:
+        self.requested = True
+
+    def reinstall(self) -> None:
+        self.reinstalls += 1
 
     def should_shutdown(self) -> bool:
         self.checks += 1
@@ -713,7 +721,7 @@ class TestRunTrainingLoop:
         for old, new in zip(before, session.model.parameters(), strict=True):
             assert torch.equal(old, new)
 
-    def test_shutdown_writes_an_emergency_checkpoint_and_finishes(self):
+    def test_shutdown_writes_an_emergency_checkpoint_and_leaves_the_handler_armed(self):
         config = make_config(max_steps=10)
         config.checkpoint.interval = 100
         handler = FakeShutdownHandler(after_steps=2)
@@ -722,7 +730,7 @@ class TestRunTrainingLoop:
         ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
         assert step == 2
         assert ckpt.saved_steps == [2]
-        assert handler.finished is True
+        assert handler.finished is False
         assert ckpt.waits == 1
 
     def test_shutdown_on_a_scheduled_step_saves_it_once(self):
@@ -739,11 +747,11 @@ class TestRunTrainingLoop:
         assert step == 2
         assert ckpt.saved_steps == [2]
         assert hook.saves == [2]
-        assert handler.finished is True
+        assert handler.finished is False
         assert ckpt.waits == 2
 
-    def test_shutdown_on_a_scheduled_step_waits_for_it_before_finishing(self, monkeypatch):
-        """The scheduled save is flushed while the shutdown watchdog is still armed."""
+    def test_every_wait_runs_while_the_shutdown_watchdog_is_armed(self, monkeypatch):
+        """Neither the scheduled save's wait nor the final flush runs after ``finish()``."""
         config = make_config(max_steps=10)
         config.checkpoint.interval = 2
         ckpt = FakeCheckpointManager()
@@ -758,7 +766,8 @@ class TestRunTrainingLoop:
         monkeypatch.setattr(ckpt, "wait", wait)
         session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
         run_training_loop(session)
-        assert finished_at_wait == [False, True]
+        assert finished_at_wait == [False, False]
+        assert handler.finished is False
 
     def test_shutdown_after_a_scheduled_save_still_saves_its_own_step(self):
         """Step 2 is saved on the schedule; a shutdown at step 3 must still save step 3."""
@@ -770,7 +779,7 @@ class TestRunTrainingLoop:
         step, _ = run_training_loop(session)
         assert step == 3
         assert ckpt.saved_steps == [2, 3]
-        assert handler.finished is True
+        assert handler.finished is False
 
     @pytest.mark.parametrize(
         "after_steps,expected",
@@ -788,7 +797,7 @@ class TestRunTrainingLoop:
         step, _ = run_training_loop(session)
         assert step == after_steps
         assert ckpt.saved_steps == expected
-        assert handler.finished is True
+        assert handler.finished is False
 
     @pytest.mark.parametrize("mode", ["disabled", "async", "async_with_pinned_mem"])
     def test_shutdown_on_a_scheduled_step_commits_that_one_save(self, monkeypatch, tmp_path, mode):
@@ -816,6 +825,14 @@ class TestRunTrainingLoop:
         assert saved == [2]
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
         assert (tmp_path / "step_2" / ".metadata").is_file()
+
+    def test_the_signal_handlers_are_reinstalled_at_every_step(self):
+        """A compile can replace them below Python (#448); a skipped step reinstalls too."""
+        config = make_config(max_steps=4)
+        handler = FakeShutdownHandler()
+        session = make_session(config, shutdown_handler=handler, step_fn=_nan_on({1}))
+        run_training_loop(session)
+        assert handler.reinstalls == 4
 
     def test_hooks_fire_for_every_step_and_save(self):
         config = make_config(max_steps=4)
@@ -1032,7 +1049,7 @@ class TestNanSkippedStep:
         assert step == 1
         assert handler.checks == 1
         assert ckpt.saved_steps == [1]
-        assert handler.finished is True
+        assert handler.finished is False
         assert ckpt.waits == 1
 
     def test_shutdown_on_a_skipped_scheduled_step_saves_it_once(self, monkeypatch):
@@ -1057,7 +1074,7 @@ class TestNanSkippedStep:
         assert ckpt.saves == [(2, tokens_seen, {})]
         assert ckpt.waits == 1
         assert epochs == [2]
-        assert handler.finished is True
+        assert handler.finished is False
 
     def test_nan_stop_is_not_saved_even_with_a_shutdown_pending(self):
         """The NaN that trips the stop ends the run before the shutdown check: no save."""
@@ -1174,7 +1191,7 @@ class TestNanSkippedStep:
         with caplog.at_level(logging.ERROR, logger="kempnerforge"):
             step, handler = self._keep_last_one(tmp_path, _bad_update_on(2), mode)
         assert step == 4
-        assert handler.finished is True
+        assert handler.finished is False
         assert sorted(d.name for d in tmp_path.glob("step_*")) == ["step_2"]
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
         errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
@@ -1192,7 +1209,7 @@ class TestNanSkippedStep:
         """A NaN loss alone leaves the weights finite, so skipped step 4 is saved as ``latest``."""
         step, handler = self._keep_last_one(tmp_path, _nan_on({3}))
         assert step == 4
-        assert handler.finished is True
+        assert handler.finished is False
         assert (tmp_path / "step_4" / ".metadata").is_file()
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_4").resolve()
 
@@ -1373,6 +1390,40 @@ class TestRunTraining:
         )
         assert destroys == [1]
         assert closes == [1, 1]
+
+    def test_finish_runs_after_the_emergency_flush_and_the_teardown(self, monkeypatch):
+        """The handler and its timer outlive the last ``wait()`` and the teardown (#313)."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+
+        events: list[str] = []
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        handler = FakeShutdownHandler(after_steps=2)
+        monkeypatch.setattr(handler, "finish", lambda: events.append("finish"))
+        monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: handler)
+        monkeypatch.setattr(ckpt, "wait", lambda: events.append("wait"))
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: events.append("destroy"))
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 100
+        run_training(config)
+        assert ckpt.saved_steps == [2]
+        assert events == ["wait", "destroy", "finish"]
+
+    def test_a_failed_run_does_not_finish_the_shutdown_handler(self, monkeypatch):
+        """On the exception path nothing calls ``finish()``; a real timer bounds the exit."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+
+        _stub_entry(monkeypatch, TinyTextModel())
+        handler = FakeShutdownHandler()
+        monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: handler)
+
+        def boom(_session, _step):
+            raise RuntimeError("step blew up")
+
+        with pytest.raises(RuntimeError, match="step blew up"):
+            run_training(make_config(max_steps=2), step_fn=boom)
+        assert handler.finished is False
 
     def test_checkpoint_manager_reads_the_trackers_live_runs(self, monkeypatch):
         import kempnerforge.training.entry as entry
@@ -4012,17 +4063,20 @@ class TestPerDatasetMetrics:
 
 
 class TestLoopPeriodicWork:
-    def test_nccl_failure_stops_the_run_without_a_final_save(self, monkeypatch):
+    def test_nccl_failure_fails_the_run_without_a_final_save(self, monkeypatch):
+        """The pending save is drained, then the run raises so the job does not end as done."""
         import kempnerforge.training.loop as loop
 
         monkeypatch.setattr(loop, "check_nccl_health", lambda: False)
         config = make_config(max_steps=6)
         config.train.nccl_health_check_interval = 1
         session = make_session(config)
-        step, _ = run_training_loop(session)
-        ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
-        assert step == 1
+        with pytest.raises(RuntimeError, match="NCCL health check failed at step 1"):
+            run_training_loop(session)
+        ckpt = session.checkpointer
+        assert isinstance(ckpt, FakeCheckpointManager)
         assert ckpt.saves == []
+        assert ckpt.waits == 1
 
     def test_healthy_nccl_does_not_stop_the_run(self, monkeypatch):
         import kempnerforge.training.loop as loop

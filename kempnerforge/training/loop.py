@@ -20,7 +20,7 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
-from kempnerforge.distributed.utils import clip_grad_norm_
+from kempnerforge.distributed.utils import any_rank, clip_grad_norm_, new_control_group
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
 from kempnerforge.model.vlm import inner_transformer
@@ -184,6 +184,7 @@ class TrainingSession:
     eval_dataloader: Any | None = None
     profiler: Any | None = None
     autocast_dtype: torch.dtype | None = None
+    control_group: Any | None = field(default=None, repr=False)
     _batch_stream: BatchStream | None = field(default=None, init=False, repr=False)
 
     @property
@@ -608,7 +609,18 @@ def _shutdown_if_requested(
     saved_this_step: bool,
     nan_skipped: bool = False,
 ) -> bool:
-    """Write the emergency checkpoint and finish when a shutdown is pending.
+    """Write the emergency checkpoint when a shutdown is pending on any rank.
+
+    Every rank must call this at the same step. It first reinstalls the
+    signal handlers, which native code can replace below Python (Triton's
+    LLVM does on its first in-process compile, after which SIGUSR1 does
+    nothing). The ranks then agree over ``session.control_group`` whether any
+    of them was signaled, so they all stop or all go on, whichever ranks the
+    signal reached and whenever. A rank that learns of the shutdown only from
+    the vote calls ``request()``, so every rank that stops has its forced-exit
+    timer armed. The handler is left armed: the timer still bounds the flush
+    that ``run_training_loop`` ends with and the caller's teardown, and the
+    caller calls ``finish()`` after both.
 
     Returns True when the loop must stop. With ``saved_this_step``, the
     scheduled save of ``step`` is the emergency checkpoint, so it is drained
@@ -619,8 +631,13 @@ def _shutdown_if_requested(
     become ``latest`` and count toward ``keep_last_n``, which can prune the
     last good one.
     """
-    if not session.shutdown_handler.should_shutdown():
+    session.shutdown_handler.reinstall()
+    requested_here = session.shutdown_handler.should_shutdown()
+    if not any_rank(requested_here, session.control_group):
         return False
+    if not requested_here:
+        session.shutdown_handler.request()
+        logger.warning(f"Shutdown requested on another rank at step {step}")
     ckpt_mgr = session.checkpointer
     if saved_this_step:
         logger.warning(
@@ -643,7 +660,6 @@ def _shutdown_if_requested(
             dataloader=session.data.dataloader,
             extra=checkpoint_extra(session.config, step, session.phases),
         )
-    session.shutdown_handler.finish()
     return True
 
 
@@ -656,6 +672,14 @@ def run_training_loop(
     checkpoint before returning so the caller can tear down the process
     group safely. ``session.data`` is read once and must stay fixed for the
     duration; only its ``dataloader`` may be swapped mid-run.
+
+    Every rank must call it: the shutdown and NCCL-health stops are agreed
+    over ``session.control_group``. When that is ``None`` the loop makes the
+    group, and destroys it when it returns or raises. It never calls
+    ``shutdown_handler.finish()``; the handler's owner does, once teardown is
+    done. After an NCCL-health stop it saves nothing, drains any pending async
+    save and raises ``RuntimeError`` on every rank, so the job fails rather
+    than ending as if it completed.
     """
     config = session.config
     tc = config.train
@@ -697,6 +721,10 @@ def run_training_loop(
 
     completed_normally = False
     ckpt_extra: dict = {}
+    nccl_failed_at: int | None = None
+    owns_control_group = session.control_group is None
+    if owns_control_group:
+        session.control_group = new_control_group(config.distributed.nccl_timeout_sec)
 
     try:
         while step < tc.max_steps:
@@ -757,9 +785,10 @@ def run_training_loop(
             if (
                 tc.nccl_health_check_interval > 0
                 and step % tc.nccl_health_check_interval == 0
-                and not check_nccl_health()
+                and any_rank(not check_nccl_health(), session.control_group)
             ):
                 logger.error(f"NCCL health check failed at step {step} — stopping")
+                nccl_failed_at = step
                 break
 
             if (
@@ -811,6 +840,9 @@ def run_training_loop(
             if runtime.rank == 0:
                 print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
         session.batches.close()
+        if owns_control_group and session.control_group is not None:
+            dist.destroy_process_group(session.control_group)
+            session.control_group = None
 
     if completed_normally and not config.checkpoint.should_save(step):
         ckpt_mgr.save(
@@ -823,6 +855,11 @@ def run_training_loop(
         hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
     ckpt_mgr.wait()
+    if nccl_failed_at is not None:
+        raise RuntimeError(
+            f"NCCL health check failed at step {nccl_failed_at} on at least one rank; "
+            "every rank stopped without a final save"
+        )
 
     logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")
     hooks.on_train_end(step, tokens_seen)
