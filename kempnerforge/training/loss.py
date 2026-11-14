@@ -189,11 +189,14 @@ def z_loss(logits: torch.Tensor, weight: float) -> torch.Tensor:
         weight: Regularization weight (PaLM uses 1e-4).
 
     Returns:
-        Scalar z-loss term to add to the main loss.
+        Scalar z-loss term to add to the main loss; zero on the graph for logits
+        with no rows (a packed micro-batch without text).
     """
     if weight == 0.0:
         return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
     flat = logits.view(-1, logits.shape[-1]).float()
+    if flat.shape[0] == 0:
+        return flat.sum()
     lse = torch.logsumexp(flat, dim=-1)
     return weight * (lse**2).mean()
 

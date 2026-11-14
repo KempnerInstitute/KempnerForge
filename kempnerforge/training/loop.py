@@ -20,7 +20,7 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
-from kempnerforge.distributed.utils import clip_grad_norm_
+from kempnerforge.distributed.utils import any_rank, clip_grad_norm_, new_control_group
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
 from kempnerforge.model.vlm import inner_transformer
@@ -144,7 +144,10 @@ class StepResult:
 
     The per-dataset fields stay empty for step bodies that don't produce
     them; ``text_tokens`` stays None, which a VLM run treats as an error
-    rather than logging a zero.
+    rather than logging a zero. ``tokens`` is what this rank ran when the
+    batch decides it (packed VLM rows), counted as row slots like the unpacked
+    ``batch_size × seq_len``, image slots and padding included; None means
+    the configured batch per micro-step.
     """
 
     loss: float
@@ -153,6 +156,7 @@ class StepResult:
     dataset_token_counts: dict[str, int] = field(default_factory=dict)
     dataset_loss_sums: dict[str, float] = field(default_factory=dict)
     dataset_loss_counts: dict[str, int] = field(default_factory=dict)
+    tokens: int | None = None
 
 
 StepFn = Callable[["TrainingSession", int], StepResult]
@@ -180,6 +184,7 @@ class TrainingSession:
     eval_dataloader: Any | None = None
     profiler: Any | None = None
     autocast_dtype: torch.dtype | None = None
+    control_group: Any | None = field(default=None, repr=False)
     _batch_stream: BatchStream | None = field(default=None, init=False, repr=False)
 
     @property
@@ -305,8 +310,27 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     return StepResult(loss=loss_tensor.item(), grad_norm=grad_norm_val)
 
 
+_PACKED_BATCH_KEYS = (
+    "doc_ids",
+    "position_ids",
+    "attention_group_ids",
+    "image_rows",
+    "image_starts",
+    "text_rows",
+    "text_positions",
+)
+
+
 def vlm_step(session: TrainingSession, step: int) -> StepResult:
-    """VLM step (no PP): pixel_values + input_ids forward, with a text-token count."""
+    """VLM step (no PP): pixel_values + input_ids forward, with a text-token count.
+
+    A packed batch (one with ``image_rows``) also carries ``doc_ids``,
+    ``position_ids``, the image placement (``image_starts``, ``image_tokens``)
+    and the text positions, all passed through to the wrapper, with
+    ``attention_group_ids`` when a collator emits them. Its row count varies,
+    so the step reports the tokens it ran and marks the leading dims dynamic
+    for ``torch.compile``.
+    """
     config = session.config
     tc, mc = config.train, config.model
     device = session.runtime.device
@@ -315,6 +339,7 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
 
     total_loss = 0.0
     total_text_tokens = 0
+    packed_tokens: int | None = None
 
     for micro_step in range(tc.grad_accum_steps):
         if not batches.has_data:
@@ -327,12 +352,23 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         frame_mask = batch["frame_mask"].to(device) if "frame_mask" in batch else None
+        extras: dict[str, Any] = {
+            key: batch[key].to(device) for key in _PACKED_BATCH_KEYS if key in batch
+        }
+        if "image_tokens" in batch:
+            extras["image_tokens"] = int(batch["image_tokens"])
+        if "image_rows" in extras:
+            packed_tokens = (packed_tokens or 0) + input_ids.numel()
+            if tc.compile_model:
+                _mark_rows_dynamic(pixel_values, input_ids, labels, *extras.values())
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
                 inner_transformer(model).set_moe_step(step, tc.max_steps)  # type: ignore[attr-defined]
             with session.autocast():
-                logits, labels_out = model(pixel_values, input_ids, labels, frame_mask=frame_mask)
+                logits, labels_out = model(
+                    pixel_values, input_ids, labels, frame_mask=frame_mask, **extras
+                )
                 loss = session.loss_fn(logits, labels_out)
 
             total_text_tokens += int((labels_out != -100).sum().item())
@@ -348,7 +384,34 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         loss=total_loss / tc.grad_accum_steps,
         grad_norm=clip_grads(model, tc.grad_clip_norm),
         text_tokens=total_text_tokens,
+        tokens=packed_tokens,
     )
+
+
+def _mark_rows_dynamic(*tensors: Any) -> None:
+    """Mark each tensor's leading dim dynamic so a new packed row count does not recompile."""
+    from torch._dynamo import maybe_mark_dynamic
+
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor):
+            maybe_mark_dynamic(tensor, 0)
+
+
+def _sum_over_data_ranks(session: TrainingSession, value: int) -> int:
+    """Sum a per-rank count over the data-parallel ranks; tp and pp peers hold the same batch."""
+    if not dist.is_initialized():
+        return value * session.data.dp_size
+    t = torch.tensor([value], device=session.runtime.device, dtype=torch.long)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return int(t.item()) * session.data.dp_size // session.runtime.world_size
+
+
+def _tokens_in_step(session: TrainingSession, result: StepResult) -> int:
+    """Tokens the step ran across the data-parallel ranks, from the step's count or the config."""
+    tc = session.config.train
+    if result.tokens is None:
+        return tc.batch_size * tc.seq_len * tc.grad_accum_steps * session.data.dp_size
+    return _sum_over_data_ranks(session, result.tokens)
 
 
 def text_step(session: TrainingSession, step: int) -> StepResult:
@@ -473,11 +536,7 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
                 "VLM run: the step body reported no text-token count, so "
                 "data/text_tokens_trained would be logged as zero"
             )
-        global_text_tokens = result.text_tokens
-        if dist.is_initialized():
-            t = torch.tensor([result.text_tokens], device=session.runtime.device, dtype=torch.long)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            global_text_tokens = int(t.item())
+        global_text_tokens = _sum_over_data_ranks(session, result.text_tokens)
         tracker.log_eval({"data/text_tokens_trained": float(global_text_tokens)}, step)
 
     if session.data.mixture_dataset is not None and result.dataset_loss_sums:
@@ -550,7 +609,18 @@ def _shutdown_if_requested(
     saved_this_step: bool,
     nan_skipped: bool = False,
 ) -> bool:
-    """Write the emergency checkpoint and finish when a shutdown is pending.
+    """Write the emergency checkpoint when a shutdown is pending on any rank.
+
+    Every rank must call this at the same step. It first reinstalls the
+    signal handlers, which native code can replace below Python (Triton's
+    LLVM does on its first in-process compile, after which SIGUSR1 does
+    nothing). The ranks then agree over ``session.control_group`` whether any
+    of them was signaled, so they all stop or all go on, whichever ranks the
+    signal reached and whenever. A rank that learns of the shutdown only from
+    the vote calls ``request()``, so every rank that stops has its forced-exit
+    timer armed. The handler is left armed: the timer still bounds the flush
+    that ``run_training_loop`` ends with and the caller's teardown, and the
+    caller calls ``finish()`` after both.
 
     Returns True when the loop must stop. With ``saved_this_step``, the
     scheduled save of ``step`` is the emergency checkpoint, so it is drained
@@ -561,8 +631,13 @@ def _shutdown_if_requested(
     become ``latest`` and count toward ``keep_last_n``, which can prune the
     last good one.
     """
-    if not session.shutdown_handler.should_shutdown():
+    session.shutdown_handler.reinstall()
+    requested_here = session.shutdown_handler.should_shutdown()
+    if not any_rank(requested_here, session.control_group):
         return False
+    if not requested_here:
+        session.shutdown_handler.request()
+        logger.warning(f"Shutdown requested on another rank at step {step}")
     ckpt_mgr = session.checkpointer
     if saved_this_step:
         logger.warning(
@@ -585,7 +660,6 @@ def _shutdown_if_requested(
             dataloader=session.data.dataloader,
             extra=checkpoint_extra(session.config, step, session.phases),
         )
-    session.shutdown_handler.finish()
     return True
 
 
@@ -598,6 +672,14 @@ def run_training_loop(
     checkpoint before returning so the caller can tear down the process
     group safely. ``session.data`` is read once and must stay fixed for the
     duration; only its ``dataloader`` may be swapped mid-run.
+
+    Every rank must call it: the shutdown and NCCL-health stops are agreed
+    over ``session.control_group``. When that is ``None`` the loop makes the
+    group, and destroys it when it returns or raises. It never calls
+    ``shutdown_handler.finish()``; the handler's owner does, once teardown is
+    done. After an NCCL-health stop it saves nothing, drains any pending async
+    save and raises ``RuntimeError`` on every rank, so the job fails rather
+    than ending as if it completed.
     """
     config = session.config
     tc = config.train
@@ -639,6 +721,10 @@ def run_training_loop(
 
     completed_normally = False
     ckpt_extra: dict = {}
+    nccl_failed_at: int | None = None
+    owns_control_group = session.control_group is None
+    if owns_control_group:
+        session.control_group = new_control_group(config.distributed.nccl_timeout_sec)
 
     try:
         while step < tc.max_steps:
@@ -646,6 +732,7 @@ def run_training_loop(
 
             tracker.start_step()
             result = session.step_fn(session, step)
+            tokens_in_step = _tokens_in_step(session, result)
 
             if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
                 optimizer.zero_grad()
@@ -667,7 +754,6 @@ def run_training_loop(
             optimizer.zero_grad()
 
             step += 1
-            tokens_in_step = tc.batch_size * tc.seq_len * tc.grad_accum_steps * data.dp_size
             tokens_seen += tokens_in_step
 
             _apply_step_transitions(session, step)
@@ -699,9 +785,10 @@ def run_training_loop(
             if (
                 tc.nccl_health_check_interval > 0
                 and step % tc.nccl_health_check_interval == 0
-                and not check_nccl_health()
+                and any_rank(not check_nccl_health(), session.control_group)
             ):
                 logger.error(f"NCCL health check failed at step {step} — stopping")
+                nccl_failed_at = step
                 break
 
             if (
@@ -753,6 +840,9 @@ def run_training_loop(
             if runtime.rank == 0:
                 print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
         session.batches.close()
+        if owns_control_group and session.control_group is not None:
+            dist.destroy_process_group(session.control_group)
+            session.control_group = None
 
     if completed_normally and not config.checkpoint.should_save(step):
         ckpt_mgr.save(
@@ -765,6 +855,11 @@ def run_training_loop(
         hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
     ckpt_mgr.wait()
+    if nccl_failed_at is not None:
+        raise RuntimeError(
+            f"NCCL health check failed at step {nccl_failed_at} on at least one rank; "
+            "every rank stopped without a final save"
+        )
 
     logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")
     hooks.on_train_end(step, tokens_seen)

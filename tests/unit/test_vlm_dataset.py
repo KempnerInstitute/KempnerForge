@@ -16,11 +16,13 @@ from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
     HuggingFaceVLMDataset,
+    PackedVLMCollator,
     VLMCollator,
     _tokenize_and_mask,
     check_prompt_fits,
     frames_to_clip_tensor,
     image_to_views,
+    pack_vlm_samples,
     pil_to_tensor,
     tile_image,
 )
@@ -162,7 +164,7 @@ class _MockTokenizer:
 class TestTokenizeAndMask:
     def test_shape_and_pad(self):
         tok = _MockTokenizer()
-        ids, labels = _tokenize_and_mask(tok, "abc", max_text_len=8, prompt=None)
+        ids, labels, _ = _tokenize_and_mask(tok, "abc", max_text_len=8, prompt=None)
         assert ids.shape == (8,)
         assert labels.shape == (8,)
         assert ids[:4].tolist() == [1, 2, 3, 28]
@@ -172,7 +174,7 @@ class TestTokenizeAndMask:
 
     def test_prompt_masks_labels(self):
         tok = _MockTokenizer()
-        ids, labels = _tokenize_and_mask(tok, text="xyz", max_text_len=8, prompt="ab")
+        ids, labels, _ = _tokenize_and_mask(tok, text="xyz", max_text_len=8, prompt="ab")
         assert ids[:6].tolist() == [1, 2, 24, 25, 26, 28]
         assert labels[0].item() == -100
         assert labels[1:5].tolist() == [24, 25, 26, 28]
@@ -180,7 +182,7 @@ class TestTokenizeAndMask:
 
     def test_truncation(self):
         tok = _MockTokenizer()
-        ids, labels = _tokenize_and_mask(tok, text="abcdefghij", max_text_len=4, prompt=None)
+        ids, labels, _ = _tokenize_and_mask(tok, text="abcdefghij", max_text_len=4, prompt=None)
         assert ids.tolist() == [1, 2, 3, 28]
         assert labels.tolist() == [2, 3, 28, -100]
 
@@ -188,7 +190,7 @@ class TestTokenizeAndMask:
         """A one-token caption still yields a supervised target (the appended
         EOS), so it is never an all--100 row."""
         tok = _MockTokenizer()
-        ids, labels = _tokenize_and_mask(tok, "a", max_text_len=8, prompt=None)
+        ids, labels, _ = _tokenize_and_mask(tok, "a", max_text_len=8, prompt=None)
         assert ids[:2].tolist() == [1, 28]
         assert labels[0].item() == 28
         assert (labels[1:] == -100).all()
@@ -196,7 +198,7 @@ class TestTokenizeAndMask:
     def test_empty_caption_all_masked(self):
         """An empty caption has no target (a lone EOS has no successor)."""
         tok = _MockTokenizer()
-        _, labels = _tokenize_and_mask(tok, "", max_text_len=8, prompt=None)
+        _, labels, _ = _tokenize_and_mask(tok, "", max_text_len=8, prompt=None)
         assert (labels == -100).all()
 
     def test_no_eos_tokenizer_appends_nothing(self):
@@ -204,7 +206,7 @@ class TestTokenizeAndMask:
         max_text_len caption tokens (the no-EOS branch of the append)."""
         tok = _MockTokenizer()
         tok.eos_token_id = None
-        ids, labels = _tokenize_and_mask(tok, "abcde", max_text_len=4, prompt=None)
+        ids, labels, _ = _tokenize_and_mask(tok, "abcde", max_text_len=4, prompt=None)
         assert ids.tolist() == [1, 2, 3, 4]
         assert labels.tolist() == [2, 3, 4, -100]
 
@@ -228,7 +230,7 @@ class TestTokenizeAndMask:
         expected_ids = prompt_ids + text_ids
         n = len(expected_ids)
 
-        ids, labels = _tokenize_and_mask(tok, text, max_text_len=32, prompt=prompt)
+        ids, labels, _ = _tokenize_and_mask(tok, text, max_text_len=32, prompt=prompt)
 
         assert ids[:n].tolist() == expected_ids
         assert (labels[: len(prompt_ids) - 1] == -100).all()
@@ -249,7 +251,7 @@ class TestTokenizeAndMask:
         prompt_ids = list(tok(prompt, add_special_tokens=False)["input_ids"])
         text_ids = list(tok(text, add_special_tokens=False)["input_ids"])
 
-        ids, labels = _tokenize_and_mask(tok, text, max_text_len=16, prompt=prompt)
+        ids, labels, _ = _tokenize_and_mask(tok, text, max_text_len=16, prompt=prompt)
 
         split_total = len(prompt_ids) + len(text_ids)
         assert ids[:split_total].tolist() == prompt_ids + text_ids
@@ -306,7 +308,7 @@ class TestNextTokenLabelContract:
         tok = _MockTokenizer()
         if not with_eos:
             tok.eos_token_id = None
-        ids, labels = _tokenize_and_mask(tok, text, max_text_len, prompt)
+        ids, labels, _ = _tokenize_and_mask(tok, text, max_text_len, prompt)
 
         real = list(tok(text)["input_ids"])
         prompt_ids = list(tok(prompt)["input_ids"]) if prompt is not None else []
@@ -338,7 +340,7 @@ class TestNextTokenLabelContract:
         tok = _MockTokenizer()
         prompt, text = "abcd", "xyz"
         prompt_len = len(tok(prompt)["input_ids"])
-        ids, labels = _tokenize_and_mask(tok, text, max_text_len=16, prompt=prompt)
+        ids, labels, _ = _tokenize_and_mask(tok, text, max_text_len=16, prompt=prompt)
 
         first_caption_id = tok(text)["input_ids"][0]
         assert ids[prompt_len].item() == first_caption_id
@@ -349,7 +351,7 @@ class TestNextTokenLabelContract:
     def test_eos_is_a_supervised_target(self):
         """The last caption token predicts EOS, so captions learn to stop."""
         tok = _MockTokenizer()
-        _, labels = _tokenize_and_mask(tok, "hello", max_text_len=16, prompt="ab")
+        _, labels, _ = _tokenize_and_mask(tok, "hello", max_text_len=16, prompt="ab")
         supervised = labels[labels != -100].tolist()
         assert supervised[-1] == tok.eos_token_id
         assert supervised.count(tok.eos_token_id) == 1
@@ -358,7 +360,7 @@ class TestNextTokenLabelContract:
         """Truncation reserves the EOS slot, so a caption longer than the budget
         still ends in a supervised stop target rather than a dropped one."""
         tok = _MockTokenizer()
-        ids, labels = _tokenize_and_mask(tok, "abcdefghij", max_text_len=5, prompt=None)
+        ids, labels, _ = _tokenize_and_mask(tok, "abcdefghij", max_text_len=5, prompt=None)
         assert ids[-1].item() == tok.eos_token_id
         assert labels[-2].item() == tok.eos_token_id
         assert labels[-1].item() == -100
@@ -369,7 +371,9 @@ class TestNextTokenLabelContract:
         every label is masked, so it adds no loss instead of training on EOS alone."""
         tok = _MockTokenizer()
         for prompt_chars in (7, 8, 12):
-            ids, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt="a" * prompt_chars)
+            ids, labels, _ = _tokenize_and_mask(
+                tok, "xyz", max_text_len=8, prompt="a" * prompt_chars
+            )
             assert ids.shape == labels.shape == (8,)
             assert (labels == -100).all()
 
@@ -393,7 +397,7 @@ class TestNextTokenLabelContract:
             random.seed(rank)
             torch.manual_seed(rank)
             tok = AutoTokenizer.from_pretrained("gpt2")
-            ids, labels = _tokenize_and_mask(
+            ids, labels, _ = _tokenize_and_mask(
                 tok, captions[index], max_text_len=16, prompt="Describe: "
             )
             return ids.numpy().tobytes(), labels.numpy().tobytes()
@@ -480,7 +484,7 @@ class TestPromptRoom:
         tok = _MockTokenizer()
         tok.eos_token_id = eos_token_id
         prompt = "a" * prompt_tokens
-        _, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt=prompt)
+        _, labels, _ = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt=prompt)
         assert labels[labels != -100].tolist() == supervised
         check_prompt_fits(tok, prompt, max_text_len=8)
 
@@ -491,7 +495,7 @@ class TestPromptRoom:
         tok = _MockTokenizer()
         tok.eos_token_id = eos_token_id
         prompt = "a" * prompt_tokens
-        ids, labels = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt=prompt)
+        ids, labels, _ = _tokenize_and_mask(tok, "xyz", max_text_len=8, prompt=prompt)
         assert ids.shape == (8,)
         assert (labels == -100).all()
         with pytest.raises(
@@ -504,7 +508,7 @@ class TestPromptRoom:
         monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
         tok = _MockTokenizer()
         with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
-            _, labels = _tokenize_and_mask(tok, "xyzxyzxyz", max_text_len=8, prompt="ab")
+            _, labels, _ = _tokenize_and_mask(tok, "xyzxyzxyz", max_text_len=8, prompt="ab")
         assert labels[labels != -100].tolist() == [24, 25, 26, 24, 25, 28]
         assert caplog.records == []
 
@@ -634,7 +638,9 @@ class TestPromptColumnType:
         ds = _prompted_dataset(tmp_path, monkeypatch, prompts, prompt_dtype=dtype)
         assert ds._ds.features["prompt"].dtype == dtype
         for i, prompt in enumerate(prompts):
-            _, labels = _tokenize_and_mask(_MockTokenizer(), "xyz", max_text_len=8, prompt=prompt)
+            _, labels, _ = _tokenize_and_mask(
+                _MockTokenizer(), "xyz", max_text_len=8, prompt=prompt
+            )
             assert torch.equal(ds[i]["labels"], labels)
 
 
@@ -739,6 +745,10 @@ class TestHuggingFaceVLMDataset:
         assert item["input_ids"].shape == (16,)
         assert item["labels"].shape == (16,)
         assert item["input_ids"].dtype == torch.long
+        text_len = int(item["text_len"])
+        assert 0 < text_len <= 16
+        assert item["labels"][text_len - 1].item() == -100
+        assert (item["labels"][: text_len - 1] == item["input_ids"][1:text_len]).all()
 
     @pytest.mark.parametrize(("tile_global", "views"), [(True, 5), (False, 4)])
     def test_tiling_yields_one_view_per_crop(self, tiny_hf_dataset, tile_global, views):
@@ -903,7 +913,7 @@ class TestHuggingFaceVLMDataset:
     def test_missing_prompt_trains_as_an_unprompted_caption(self, tmp_path, monkeypatch):
         """``None`` is how a string column stores a missing value: that row has no prompt."""
         ds = _prompted_dataset(tmp_path, monkeypatch, ["ab", None])
-        _, unprompted = _tokenize_and_mask(_MockTokenizer(), "xyz", max_text_len=8, prompt=None)
+        _, unprompted, _ = _tokenize_and_mask(_MockTokenizer(), "xyz", max_text_len=8, prompt=None)
         assert torch.equal(ds[1]["labels"], unprompted)
 
     def test_collator_wired_through_stateful_dataloader(self, tiny_hf_dataset):
@@ -992,3 +1002,126 @@ class TestFramesToClipTensor:
         pv, mask = frames_to_clip_tensor(frames, max_frames=3, frame_size=16)
         assert pv.shape == (3, 3, 16, 16)
         assert mask.all()
+
+
+def _doc(text_len: int, first: int, views: int = 1, padded_to: int = 8) -> dict[str, torch.Tensor]:
+    """A document of ``text_len`` real tokens ``first, first+1, ...`` padded to ``padded_to``."""
+    ids = torch.zeros(padded_to, dtype=torch.long)
+    ids[:text_len] = torch.arange(first, first + text_len)
+    labels = torch.full((padded_to,), -100, dtype=torch.long)
+    labels[: text_len - 1] = ids[1:text_len]
+    pixels = (
+        torch.full((3, 4, 4), float(first))
+        if views == 1
+        else torch.full((views, 3, 4, 4), float(first))
+    )
+    return {
+        "pixel_values": pixels,
+        "input_ids": ids,
+        "labels": labels,
+        "text_len": torch.tensor(text_len),
+    }
+
+
+class TestPackVLMSamples:
+    def test_first_fit_layout(self):
+        """Footprints 5, 6 and 7 with seq_len 12: the first two share a row, the third opens one."""
+        batch = pack_vlm_samples(
+            [_doc(3, 10), _doc(4, 20), _doc(5, 30)], seq_len=12, tokens_per_image=2, pad_id=0
+        )
+        assert batch["input_ids"].shape == (2, 12)
+        assert batch["input_ids"][0].tolist() == [0, 0, 10, 11, 12, 0, 0, 20, 21, 22, 23, 0]
+        assert batch["labels"][0].tolist() == [
+            -100,
+            -100,
+            11,
+            12,
+            -100,
+            -100,
+            -100,
+            21,
+            22,
+            23,
+            -100,
+            -100,
+        ]
+        assert batch["doc_ids"][0].tolist() == [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2]
+        assert batch["input_ids"][1].tolist() == [0, 0, 30, 31, 32, 33, 34, 0, 0, 0, 0, 0]
+        assert batch["doc_ids"][1].tolist() == [0] * 7 + [1] * 5
+        assert batch["position_ids"][0].tolist() == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 5, 0]
+        assert batch["position_ids"][1].tolist() == list(range(7)) + list(range(5))
+        assert batch["text_rows"].tolist() == [0] * 7 + [1] * 5
+        assert batch["text_positions"].tolist() == [2, 3, 4, 7, 8, 9, 10, 2, 3, 4, 5, 6]
+        assert batch["image_rows"].tolist() == [0, 0, 1]
+        assert batch["image_starts"].tolist() == [0, 5, 0]
+        assert batch["pixel_values"].shape == (3, 3, 4, 4)
+        assert batch["pixel_values"][:, 0, 0, 0].tolist() == [10.0, 20.0, 30.0]
+        assert int(batch["image_tokens"]) == 2
+
+    def test_a_later_document_fills_an_earlier_row(self):
+        batch = pack_vlm_samples(
+            [_doc(6, 10), _doc(6, 20), _doc(2, 30)], seq_len=12, tokens_per_image=2, pad_id=0
+        )
+        assert batch["input_ids"].shape == (2, 12)
+        assert batch["image_rows"].tolist() == [0, 1, 0]
+        assert batch["image_starts"].tolist() == [0, 0, 8]
+        assert batch["doc_ids"][0].tolist() == [0] * 8 + [1] * 4
+
+    def test_views_take_consecutive_slots(self):
+        batch = pack_vlm_samples([_doc(2, 10, views=3)], seq_len=12, tokens_per_image=2, pad_id=0)
+        assert batch["pixel_values"].shape == (3, 3, 4, 4)
+        assert batch["image_starts"].tolist() == [0, 2, 4]
+        assert batch["input_ids"][0, 6:8].tolist() == [10, 11]
+
+    def test_without_text_len_raises(self):
+        doc = _doc(3, 10)
+        del doc["text_len"]
+        with pytest.raises(ValueError, match="every sample needs text_len"):
+            pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)
+
+    def test_oversize_document_raises(self):
+        with pytest.raises(ValueError, match="does not fit a row"):
+            pack_vlm_samples([_doc(8, 10)], seq_len=9, tokens_per_image=2, pad_id=0)
+
+    def test_empty_and_bad_sizes_raise(self):
+        with pytest.raises(ValueError, match="no samples"):
+            pack_vlm_samples([], seq_len=8, tokens_per_image=2, pad_id=0)
+        with pytest.raises(ValueError, match="must be positive"):
+            pack_vlm_samples([_doc(2, 1)], seq_len=8, tokens_per_image=0, pad_id=0)
+
+    def test_collator_packs_the_batch(self):
+        collator = PackedVLMCollator(pad_id=7, seq_len=12, tokens_per_image=2)
+        batch = collator([_doc(3, 10), _doc(4, 20)])
+        assert batch["input_ids"].shape == (1, 12)
+        assert batch["input_ids"][0, 11].item() == 7
+        with pytest.raises(ValueError, match="no samples"):
+            collator([])
+
+    def test_a_document_without_text_packs_its_image_alone(self):
+        doc = _doc(3, 10)
+        doc["text_len"] = torch.tensor(0)
+        batch = pack_vlm_samples([doc, _doc(2, 20)], seq_len=12, tokens_per_image=2, pad_id=0)
+        assert batch["image_starts"].tolist() == [0, 2]
+        assert batch["doc_ids"][0].tolist() == [0, 0, 1, 1, 1, 1] + [2] * 6
+        assert batch["text_rows"].tolist() == [0, 0]
+        assert batch["text_positions"].tolist() == [4, 5]
+
+    def test_a_trimmed_document_leaves_its_last_label_unsupervised(self):
+        doc = _doc(5, 10)
+        doc["text_len"] = torch.tensor(3)
+        batch = pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)
+        assert batch["input_ids"][0, 2:5].tolist() == [10, 11, 12]
+        assert batch["labels"][0, 2:5].tolist() == [11, 12, -100]
+
+    @pytest.mark.parametrize("text_len", [40, -1])
+    def test_text_len_outside_the_ids_raises(self, text_len):
+        doc = _doc(3, 10)
+        doc["text_len"] = torch.tensor(text_len)
+        with pytest.raises(ValueError, match=f"text_len \\({text_len}\\) must lie within"):
+            pack_vlm_samples([doc], seq_len=64, tokens_per_image=2, pad_id=0)
+
+    def test_a_document_without_an_image_raises(self):
+        doc = _doc(3, 10)
+        doc["pixel_values"] = torch.zeros(0, 3, 4, 4)
+        with pytest.raises(ValueError, match="at least one image"):
+            pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)

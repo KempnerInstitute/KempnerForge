@@ -65,9 +65,15 @@ so an exported `DATABRICKS_TOKEN` overrides the profile's token. With none selec
 `databricks` URI and no `$DATABRICKS_CONFIG_PROFILE`), an exported `DATABRICKS_HOST`,
 `DATABRICKS_TOKEN` or other credential variable makes the SDK ignore `~/.databrickscfg`. To
 combine a profile with exported variables, select it. For token auth with none selected, export
-both `DATABRICKS_HOST` and a token, or neither. `databricks://<profile>` also exports the profile
-as `DATABRICKS_CONFIG_PROFILE` for the SDK and artifact calls, unless that variable is already
-set; if you set it yourself, keep it equal to the URI's profile.
+both `DATABRICKS_HOST` and a token, or neither.
+
+`databricks://<profile>` also exports the profile as `DATABRICKS_CONFIG_PROFILE`, when that
+variable is unset or empty, for SDK clients built from the environment alone, which never see
+the tracking URI: MLflow uploads run artifacts, the `config.json` and launch TOML among them,
+through such a client first. A `DATABRICKS_CONFIG_PROFILE` you exported that names another
+profile is kept, and the backend warns, naming both. MLflow's tracking calls and the automatic
+experiment lookup below then use the URI's profile, while those SDK clients use yours, so unset
+the variable or set it to the URI's profile.
 
 ```{warning}
 `DATABRICKS_API_TOKEN` is not a name the SDK reads. The training backend and the
@@ -89,8 +95,15 @@ variable takes the environment route, which passes on `DATABRICKS_HOST` plus a t
 either name, a username and password, or a client id and secret; with no credential variable
 set it reads the file and uses the SDK's default profile. Anything else warns without failing,
 naming the three routes, because it cannot verify OAuth, a CLI login or a metadata service
-offline. It parses the whole file, as the SDK does, but no value from the file reaches a
-message. It looks at the environment, not at `mlflow_tracking_uri` in a config. Add
+offline. On the profile route it also counts the auth methods behind the profile's own key
+names and the credential variables set, as the SDK does, and warns when there is more than one,
+such as a `token` in the section beside an exported `DATABRICKS_CLIENT_ID` or a stray
+`ARM_CLIENT_ID`, unless `$DATABRICKS_AUTH_TYPE` or a non-empty `auth_type` key in the profile
+picks one: the SDK refuses such a profile, and the backend disables itself. On that route,
+when `$MLFLOW_TRACKING_URI` selects one profile and `$DATABRICKS_CONFIG_PROFILE` names another,
+it warns, naming both, as the backend does; one warning says both problems when both apply. It
+parses the whole file, as the SDK does, but no value from the file reaches a message. It looks
+at the environment, not at `mlflow_tracking_uri` in a config. Add
 `--check-credentials` to also call the workspace through the SDK by that same resolution,
 naming a profile only when one is selected; it calls whenever the offline check passes or leaves
 an environment route unsettled. A failure is reported by exception class only,
@@ -122,9 +135,13 @@ On Databricks the experiment name **must be an absolute workspace path**
 experiment is rejected. `MetricsConfig.__post_init__` aborts at config-load time for the config
 field, and the backend disables with a clear message if `$MLFLOW_EXPERIMENT` is not absolute at
 runtime. When none is set, auto derives `/Users/<databricks-username>/<wandb_project>` through
-the Databricks SDK (off Databricks, the bare `wandb_project` name). It needs working
-credentials: when the user cannot be resolved the backend disables itself and asks for an
-explicit path.
+the Databricks SDK (off Databricks, the bare `wandb_project` name), with the profile a
+`databricks://<profile>` URI names, as MLflow's tracking client does, so the path belongs to
+the user the run logs as. It needs working credentials: when the user cannot be resolved the
+backend disables itself and asks for an explicit path. The secret-scope form
+`databricks://<scope>:<prefix>` is not supported by the automatic path: MLflow builds that
+URI's client from the secret scope, which the lookup does not read, so it may resolve another
+user. Set `mlflow_experiment` or `$MLFLOW_EXPERIMENT` with that form.
 
 ## Checking the server from a compute node
 
@@ -179,11 +196,17 @@ if config.metrics.mlflow_run_id:
     extra["mlflow_run_id"] = config.metrics.mlflow_run_id
 ```
 
-On resume it is restored right after `ckpt_mgr.load(...)`:
+On an auto-resume from `checkpoint.dir` it is restored right after `ckpt_mgr.load(...)`:
 
 ```python
-if ckpt_extra_loaded.get("mlflow_run_id"):
-    config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
+# training/entry.py::restore_checkpoint
+if resume_path is not None:
+    if ckpt_extra_loaded.get("wandb_run_id"):
+        config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
+    if ckpt_extra_loaded.get("mlflow_run_id"):
+        config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
+elif rank_zero:
+    _tag_warm_start_run(config, ckpt_extra_loaded)
 ```
 
 `start_run(run_id=...)` then reattaches to the same run, so metrics continue on one curve across
@@ -194,6 +217,24 @@ re-logging the steps the run already holds: every metric at or below the highest
 step in the run's history is dropped, so re-executing the steps between the last checkpoint and
 the crash does not duplicate points. If that history cannot be read, nothing is skipped. The
 params, tags and artifacts are not written again.
+
+**Warm start.** A `checkpoint.load_path` warm start, which runs only while `checkpoint.dir`
+holds no checkpoint, is a new run: the run ids its checkpoint carries are not restored, so the
+backend starts a new MLflow run with its own params, tags and artifacts, and the run that saved
+the checkpoint keeps its name and its steps. Rank 0 adds two tags to the new run through
+`metrics.mlflow_tags` (a configured tag of the same name wins):
+`kempnerforge.warm_start.checkpoint`, the real path of the step directory it loaded, and
+`kempnerforge.warm_start.source_run_id`, the MLflow run that saved it, read from the
+checkpoint's `metadata.json` (else from its `train_state.pt`) and left out when neither records
+one. The warm start's checkpoints record its new run from its first logged step on, since the
+backend starts the run lazily, so a requeue from one of them auto-resumes that run. A warm
+start preempted before its first save starts over as another warm start, with another new run.
+A checkpoint saved before its first logged step records no run: a warm start from step 5 first
+logs at step 10 with the default `metrics.log_interval`, so an emergency save or a
+`dyn_ckpt_window` milestone before then is such a checkpoint. A requeue from it opens another
+new run, as a fresh run would, and that run carries no warm-start tags. To log a warm start
+into an existing run on purpose, set `metrics.mlflow_run_id`: a run id the config sets is kept,
+and the resume rules above apply to it.
 
 ## Finding a checkpoint's run
 
@@ -207,9 +248,9 @@ Each checkpoint's `metadata.json` names the live run in its `tracking` list
 All four fields are always present and non-empty, or the entry is left out. `tracking_uri` is
 the URI the backend resolved (config, then `$MLFLOW_TRACKING_URI`, then `"databricks"`) with
 any `user:token@` credentials stripped, and `experiment` the name it set the run up under. The
-entry comes from `MLflowBackend.tracking_entry()`; resume is unaffected and still restores
-`mlflow_run_id` from `train_state.pt`. Offline tools select on it, as the
-[publisher](#publishing-eval-results) does.
+entry comes from `MLflowBackend.tracking_entry()`; an auto-resume still restores
+`mlflow_run_id` from `train_state.pt`, and a warm start reads this entry to tag its new run.
+Offline tools select on it, as the [publisher](#publishing-eval-results) does.
 
 ## Registering checkpoints
 
@@ -308,8 +349,9 @@ environment, as described under credentials below.
 - **Credentials.** It prepares auth from the [routes above](#authentication) the way the
   training backend does: it uses the recorded `tracking_uri` as written, a
   `databricks://<profile>` entry selects that profile (exported as `DATABRICKS_CONFIG_PROFILE`
-  unless already set, so artifact uploads a harness makes later in the same process
-  authenticate too), and `DATABRICKS_API_TOKEN` stands in for an unset or empty
+  when that is unset or empty, so artifact uploads a harness makes later in the same process
+  authenticate too; another profile already there is kept, with the warning above, once per
+  process), and `DATABRICKS_API_TOKEN` stands in for an unset or empty
   `DATABRICKS_TOKEN`. `user:token@` credentials in a tracking URI are stripped before the
   sidecar is written, so that route does not carry over. Give the machine that publishes a profile of the
   same name.
@@ -336,8 +378,10 @@ evaluation.
   directory as `mlflow.source.git.commit`, with `mlflow.source.git.dirty` (`true` when tracked
   files differ from it), skipped quietly when git or a repository is missing;
   `metrics.mlflow_description` as the run description (`mlflow.note.content`); and every entry
-  of `metrics.mlflow_tags`. Configured tags are applied last, so one replaces an automatic tag
-  of the same key.
+  of `metrics.mlflow_tags`, which on a `checkpoint.load_path` warm start also holds
+  `kempnerforge.warm_start.checkpoint` and `kempnerforge.warm_start.source_run_id`
+  ([warm start](#run-id-and-resume)). Configured tags are applied last, so one replaces an
+  automatic tag of the same key.
 - **Artifacts**, also when a new run starts: `config.json`, the resolved `JobConfig` (TOML, CLI
   overrides and defaults applied), and the launch TOML under its own file name when the first
   command-line argument names a `.toml` file (how `scripts/train.py` takes its config); without
@@ -383,6 +427,35 @@ Databricks SDK transport retries for at most 60 s
 itself, to resolve an automatic experiment path, keeps the SDK's own 300 s retry default, so
 only the 60 s init deadline bounds it. Other MLflow clients, the publisher and the connectivity
 check included, run with MLflow's own defaults.
+
+## Usage telemetry
+
+MLflow collects anonymous usage telemetry unless told not to. The training backend turns it
+off: before it imports `mlflow` it sets `MLFLOW_DISABLE_TELEMETRY=true`, unless the variable is
+already set. MLflow's telemetry draws from Python's global `random`: the first call MLflow
+records starts a background thread that fetches the telemetry config and, when the fetch
+succeeds, calls `random.randint`. A resumed run makes that call after the checkpoint restored
+the RNG, so with telemetry on, a hook or a custom step function that draws from `random` would
+get a stream one draw ahead of the uninterrupted run's, and in a fresh run the draw would land
+at an unpredictable point among the training thread's own draws. Export
+`MLFLOW_DISABLE_TELEMETRY=false` to keep MLflow's telemetry at that cost.
+
+MLflow reads the variable at each call it records, so the default also holds when your code
+imports `mlflow` before the backend does, except for autologging (`mlflow.autolog()` and the
+flavor integrations), whose events MLflow records without reading it: a job that does both
+should export `MLFLOW_DISABLE_TELEMETRY=true` itself. The [publisher](#publishing-eval-results)
+runs outside training and restores no RNG, so it leaves telemetry as MLflow sets it, unless it
+inherits the training process's environment.
+
+Two other kinds of draw from `random` remain in the tracking stack. MLflow, urllib3 and the
+Databricks SDK draw a random jitter for the wait before they retry a failed request, and a SQL
+store (SQLite included) before it retries a run-tag write that collided with a concurrent
+writer's, at times that depend on the network and the server. A local file or SQLite store
+draws a random name for a new run that has no
+`mlflow_run_name` (a file store can also draw when it creates an experiment), which a resume
+that reattaches its run never does. KempnerForge's own training path draws nothing from
+`random`, so the model, loss and grad norm are unaffected either way; a hook that needs a
+reproducible stream should own a `random.Random(seed)`.
 
 ## Failure modes
 

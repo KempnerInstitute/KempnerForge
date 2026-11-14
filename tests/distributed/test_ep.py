@@ -13,9 +13,12 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
 
-from kempnerforge.config.schema import ModelConfig
+from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.config.schema import CheckpointConfig, ModelConfig
 from kempnerforge.distributed.expert_parallel import apply_expert_parallel
 from kempnerforge.distributed.parallel import apply_fsdp2
 from kempnerforge.model.moe import MoEMLP
@@ -81,6 +84,18 @@ class TestEPApply:
             if isinstance(layer.mlp, MoEMLP):
                 assert layer.mlp.local_expert_start == ep_rank * experts_per_rank
                 assert layer.mlp.ep_group is not None
+
+    def test_apply_records_the_ep_mesh(self, ep_only_mesh):
+        """The EP mesh, which a checkpoint places each rank's experts by, is recorded."""
+        model = Transformer(EP_CONFIG).cuda()
+        apply_expert_parallel(model, ep_only_mesh)
+
+        for layer in model.layers.values():
+            if isinstance(layer.mlp, MoEMLP):
+                ep_mesh = layer.mlp.ep_mesh
+                assert ep_mesh is not None
+                assert ep_mesh.mesh_dim_names == ("ep",)
+                assert ep_mesh.get_group() is layer.mlp.ep_group
 
     def test_apply_noop_without_ep_dim(self):
         """Should be a no-op when mesh has no EP dimension."""
@@ -275,3 +290,53 @@ class TestEPPacked:
         loss = out.sum()
         assert torch.isfinite(torch.tensor(loss.item()))
         loss.backward()
+
+
+def _local(t: torch.Tensor) -> torch.Tensor:
+    return t.to_local() if isinstance(t, DTensor) else t
+
+
+class TestEPCheckpoint:
+    """A checkpoint holds every rank's experts once, and each rank resumes its own."""
+
+    @pytest.mark.skipif(
+        int(os.environ.get("WORLD_SIZE", "1")) < 4,
+        reason="EP+FSDP requires >= 4 GPUs (dp=2, ep=2)",
+    )
+    @pytest.mark.parametrize("config", [EP_CONFIG, EP_CONFIG_PACKED], ids=["unpacked", "packed"])
+    def test_every_expert_is_saved_and_each_rank_resumes_its_own(self, shared_tmp_dir, config):
+        world_size = dist.get_world_size()
+        mesh = init_device_mesh("cuda", (world_size // 2, 2), mesh_dim_names=("dp_shard", "ep"))
+
+        def build(seed: int) -> tuple[torch.nn.Module, torch.optim.Optimizer]:
+            torch.manual_seed(seed)
+            model = Transformer(config).cuda()
+            apply_expert_parallel(model, mesh)
+            apply_fsdp2(model, mesh)
+            return model, torch.optim.AdamW(model.parameters(), lr=1e-2)
+
+        model, optimizer = build(seed=0)
+        tokens = torch.randint(0, config.vocab_size, (2, 32), device="cuda")
+        model(tokens).float().pow(2).mean().backward()
+        optimizer.step()
+        live = {name: _local(p).clone() for name, p in model.named_parameters()}
+        ckpt = CheckpointConfig(dir=shared_tmp_dir)
+        CheckpointManager(ckpt, model, optimizer).save(1)
+
+        index = dcp.FileSystemReader(f"{shared_tmp_dir}/step_1").read_metadata()
+        for layer in range(config.n_layers):
+            prefix = f"model.layers.{layer}.mlp"
+            if config.moe_packed_experts:
+                assert index.state_dict_metadata[f"{prefix}.up_w"].size[0] == config.num_experts
+            else:
+                held = {
+                    int(key.split(".")[5])
+                    for key in index.state_dict_metadata
+                    if key.startswith(f"{prefix}.experts.")
+                }
+                assert held == set(range(config.num_experts))
+
+        resumed, resumed_optimizer = build(seed=1)
+        CheckpointManager(ckpt, resumed, resumed_optimizer).load()
+        for name, p in resumed.named_parameters():
+            assert torch.equal(_local(p), live[name]), name

@@ -11,8 +11,8 @@
 
 | Field | Value |
 |-------|-------|
-| Total params | ~4B |
-| Active params/token | ~1.8B |
+| Total params | ~9.2B |
+| Active params/token | ~2.9B (with the embedding and output head) |
 | dim | 2048 |
 | layers | 24 |
 | heads | 16 |
@@ -100,7 +100,7 @@ for layer in model.layers.values():
 
 MFU of 1.5% is expected. The model is too small for 32 H200 GPUs:
 
-- **Active params per GPU**: ~1.8B / 32 = ~56M. Each H200 is designed for billions.
+- **Active params per GPU**: ~2.9B / 32 = ~90M. Each H200 is designed for billions.
 - **Theoretical peak**: 32 x 990 TFLOPS (bf16) = 31,680 TFLOPS cluster-wide.
 - **Communication overhead dominates**: EP all-to-all, FSDP all-gather/reduce-scatter, and TP collectives dwarf compute at this model size.
 
