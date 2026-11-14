@@ -32,7 +32,7 @@ from collections.abc import Iterable, Mapping
 
 import torch.nn as nn
 
-from kempnerforge.config.vlm import FreezeSpec, FreezeStage, VLMConfig
+from kempnerforge.config.vlm import FreezeSpec, FreezeStage, VLMConfig, is_parameter_pattern
 
 
 def freeze_params(
@@ -111,19 +111,24 @@ def effective_freeze(
 
     - When ``valid_modules`` is provided, every ``spec.module``
       referenced in ``base`` or in any applied stage must appear in
-      the set; otherwise ``ValueError``. This catches typos at load
-      time rather than at the next step boundary.
+      the set or be a parameter pattern (see ``is_parameter_pattern``),
+      as the build accepts; otherwise ``ValueError``. This catches typos
+      at load time rather than at the next step boundary.
 
     Returns the list of active specs (one per module key).
     """
     by_module: dict[str, FreezeSpec] = {}
 
     def _check(spec: FreezeSpec, where: str) -> None:
-        if valid_modules is not None and spec.module not in valid_modules:
-            raise ValueError(
-                f"FreezeSpec.module={spec.module!r} (from {where}) "
-                f"not in known module aliases {sorted(valid_modules)}"
-            )
+        if valid_modules is None or spec.module in valid_modules:
+            return
+        if is_parameter_pattern(spec.module):
+            return
+        raise ValueError(
+            f"FreezeSpec.module={spec.module!r} (from {where}) is neither a known module "
+            f"alias {sorted(valid_modules)} nor a parameter pattern, which holds a dot or "
+            "one of *?["
+        )
 
     for spec in base:
         _check(spec, "base")

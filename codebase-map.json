@@ -195,7 +195,7 @@
       "purpose": "VLM (vision-language model) configuration. Discriminated union over `arch`: joint_decoder | cross_attention | mot. Each subclass registered via @registry.register_vlm_config",
       "classes": {
         "FreezeSpec": {
-          "purpose": "Single freeze directive (module alias or fnmatch pattern, frozen flag). Consumed by training/freeze.py"
+          "purpose": "Single freeze directive (module alias or fnmatch pattern, frozen flag; a pattern holds a dot or one of *?[, see is_parameter_pattern, and VLMConfig refuses a bare word that is no alias). Consumed by training/freeze.py"
         },
         "FreezeStage": {
           "purpose": "Step-boundary freeze transition (start_step + tuple of FreezeSpecs). Strictly monotonic in start_step"
@@ -1913,9 +1913,10 @@
           "TestFreezeParams(6)",
           "TestApplyFreezeSpecs(3)",
           "TestCanonicalFreezeMeta(4)",
-          "TestEffectiveFreeze(7)"
+          "TestEffectiveFreeze(7)",
+          "TestFreezeNames(6)"
         ],
-        "count": 20
+        "count": 26
       },
       "tests/unit/test_check_env.py": {
         "classes": [

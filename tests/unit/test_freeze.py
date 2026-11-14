@@ -224,3 +224,77 @@ class TestEffectiveFreeze:
         base = [FreezeSpec("anything", True)]
         out = effective_freeze(step=0, base=base, schedule=[], valid_modules=None)
         assert out == base
+
+
+class TestFreezeNames:
+    """A name is an alias or a parameter pattern on the build, save and resume paths (#514)."""
+
+    def test_validation_accepts_parameter_patterns(self):
+        from kempnerforge.config.vlm import FreezeStage
+        from kempnerforge.training.freeze import effective_freeze
+
+        base = [FreezeSpec("transformer", True), FreezeSpec("transformer.layers.1.*", False)]
+        stage = FreezeStage(
+            start_step=10,
+            specs=(FreezeSpec("vision_encoder.proj.bias", False), FreezeSpec("adapter*", True)),
+        )
+        out = effective_freeze(
+            step=20,
+            base=base,
+            schedule=[stage],
+            valid_modules={"vision_encoder", "adapter", "transformer"},
+        )
+        assert [s.module for s in out] == [
+            "transformer",
+            "transformer.layers.1.*",
+            "vision_encoder.proj.bias",
+            "adapter*",
+        ]
+
+    def test_freeze_meta_takes_a_raw_pattern_the_build_applies(self):
+        from kempnerforge.config.vlm import VLMConfig
+        from kempnerforge.training.freeze import freeze_meta_at_step
+
+        vlm = VLMConfig(
+            max_text_len=8,
+            freeze=[FreezeSpec("transformer"), FreezeSpec("transformer.layers.1.*", False)],
+        )
+        assert {"module": "transformer.layers.1.*", "frozen": False} in freeze_meta_at_step(1, vlm)
+
+    def test_a_bare_word_that_is_no_alias_is_refused_at_config_time(self):
+        from kempnerforge.config.vlm import VLMConfig
+
+        with pytest.raises(ValueError, match=r"\['vison_encoder'\], which are neither module"):
+            VLMConfig(freeze=[FreezeSpec("vison_encoder")])
+
+    def test_a_typo_in_a_stage_is_refused_at_config_time(self):
+        from kempnerforge.config.vlm import FreezeStage, VLMConfig
+
+        with pytest.raises(ValueError, match="adaptor"):
+            VLMConfig(freeze_schedule=[FreezeStage(5, (FreezeSpec("adaptor", True),))])
+
+    def test_patterns_and_custom_aliases_pass_config(self):
+        from kempnerforge.config.vlm import VLMConfig
+
+        patterns = {**DEFAULT_MODULE_PATTERNS, "enc0": ["vision_encoder.layers.0.*"]}
+        config = VLMConfig(
+            freeze=[
+                FreezeSpec("enc0"),
+                FreezeSpec("adapter.*"),
+                FreezeSpec("transformer.layers.[01].*", False),
+            ],
+            module_patterns=patterns,
+        )
+        assert [s.module for s in config.freeze] == [
+            "enc0",
+            "adapter.*",
+            "transformer.layers.[01].*",
+        ]
+
+    def test_a_typo_in_toml_fails_when_the_config_loads(self, tmp_path):
+        from kempnerforge.config.loader import load_config
+
+        path = tmp_path / "config.toml"
+        path.write_text('[vlm]\narch = "joint_decoder"\nfreeze = [{module = "adaptor"}]\n')
+        with pytest.raises(ValueError, match="adaptor"):
+            load_config(str(path), cli_args=[])
