@@ -24,7 +24,9 @@ restart fresh, while the data position the saved rank 0 reached, which a
 ``StatefulDataLoader`` counts across all data-parallel ranks, carries over
 where the loader can place it on the new layout and restarts at the first
 sample where it cannot. An envelope the flag lets through for another reason
-(unreadable or incomplete) restores neither loader nor RNG state.
+(unreadable or incomplete) restores neither loader nor RNG state. A checkpoint
+saved before per-rank state was recorded cannot show whether the topology
+changed, so under the flag it resumes as if it had.
 """
 
 from __future__ import annotations
@@ -1149,8 +1151,8 @@ class CheckpointManager:
         it to a warning (see ``_resume_past_mismatch``). The envelope check
         reads only state every rank shares, so all ranks restore, refuse, keep
         the data position or discard together. A legacy checkpoint (no
-        envelope) keeps its old behavior: rank 0's single copy restores on
-        every rank.
+        envelope) keeps its old behavior, rank 0's single copy restoring on
+        every rank, unless that flag is set (see ``_resume_without_rank_state``).
 
         Returns:
             The view, and whether its ``dataloader`` state is the saved rank 0's
@@ -1159,6 +1161,8 @@ class CheckpointManager:
         """
         envelope = train_state.get(PER_RANK_KEY)
         if envelope is None:
+            if self.config.ignore_rank_state_mismatch:
+                return self._resume_without_rank_state(train_state)
             if self._world_size > 1 and self._rank == 0:
                 logger.info(
                     "Checkpoint has no per-rank state (legacy format); rank 0's "
@@ -1196,15 +1200,17 @@ class CheckpointManager:
         the position together.
         """
         position = None
+        reason = str(error)
         if isinstance(error, RankStateMismatchError):
+            reason = error.mismatch
             try:
                 position = saved_data_position(envelope)
             except ValueError as e:
-                error = e
+                reason = str(e)
         if position is None:
             logger.warning(
                 f"Discarding saved per-rank dataloader/RNG state because "
-                f"checkpoint.ignore_rank_state_mismatch=true: {error}. Data order and "
+                f"checkpoint.ignore_rank_state_mismatch=true: {reason}. Data order and "
                 f"random streams restart fresh; model/optimizer/scheduler/step "
                 f"still resume."
             )
@@ -1212,12 +1218,41 @@ class CheckpointManager:
         view["dataloader"] = position
         logger.warning(
             f"Resuming on a changed topology because checkpoint.ignore_rank_state_mismatch="
-            f"true: {error}. Kept: the saved data position, which every rank resumes from "
+            f"true: {reason}. Kept: the saved data position, which every rank resumes from "
             f"where its loader can place it on this layout. Dropped: every rank's saved RNG "
             f"state, so the random streams restart from this run's seeds. Model, optimizer, "
             f"scheduler and step resume."
         )
         return view, True
+
+    def _resume_without_rank_state(
+        self, train_state: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        """The view of a checkpoint with no per-rank state under ``ignore_rank_state_mismatch``.
+
+        Such a checkpoint, saved before per-rank state was recorded, cannot show
+        whether the world size or data-parallel layout changed, so the flag
+        resumes it as if they had: the view keeps rank 0's single-copy data
+        position, which ``apply_dataloader_state`` resumes on every rank where
+        the loader can place it on this layout and restarts where it cannot, and
+        drops rank 0's RNG state, so the random streams restart from this run's
+        seeds. Reads only the broadcast train state, so every rank resumes alike.
+        """
+        view = {k: v for k, v in train_state.items() if k != "rng"}
+        carried = "dataloader" in view
+        kept = (
+            "Kept: rank 0's data position, which every rank resumes from where its loader "
+            "can place it on this layout. "
+            if carried
+            else ""
+        )
+        logger.warning(
+            f"The checkpoint holds no per-rank state, so whether the world size or "
+            f"data-parallel layout changed is unknown, and checkpoint."
+            f"ignore_rank_state_mismatch=true resumes it as if they did. {kept}Dropped: "
+            f"rank 0's saved RNG state, so the random streams restart from this run's seeds."
+        )
+        return view, carried
 
     def save(
         self,
@@ -1430,8 +1465,9 @@ class CheckpointManager:
                 dataloader/RNG state from the per-rank envelope, which must
                 match this run's world size and data-parallel layout unless
                 ``checkpoint.ignore_rank_state_mismatch`` is set: a changed
-                topology then keeps the saved data position where the loader
-                can place it and restarts the random streams. Every
+                topology, or a checkpoint with no per-rank state, then keeps
+                the saved data position where the loader can place it and
+                restarts the random streams. Every
                 rank must pass the same value. False (a ``load_path`` warm
                 start, evaluation, any other load) restores the single-copy
                 ``rng``/``dataloader`` keys (rank 0's) on every rank with no
@@ -1877,8 +1913,9 @@ class CheckpointManager:
         ``load_state_dict`` (e.g., a plain torch DataLoader). A position the
         loader cannot carry over raises ``DataPositionError`` on a resume; after
         a ``warm_start`` load, or an exact resume that
-        ``checkpoint.ignore_rank_state_mismatch`` let onto a changed topology,
-        the data starts at its first sample instead, with a warning that names
+        ``checkpoint.ignore_rank_state_mismatch`` let onto a changed topology or
+        past a checkpoint with no per-rank state, the data starts at its first
+        sample instead, with a warning that names
         the reason. On such a resume only a ``StatefulDataLoader`` or
         ``StreamingDataLoader`` takes the saved rank 0's position, since they
         check that it fits the new layout; another loader's state may be rank

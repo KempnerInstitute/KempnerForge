@@ -163,8 +163,8 @@ ignore_rank_state_mismatch = true
 
 or pass `--checkpoint.ignore_rank_state_mismatch=true` on the command
 line. Every rank then resumes from the rest of the checkpoint, keeps
-the data position, drops its saved RNG state, and logs a warning that
-names the mismatch, what it kept and what it dropped:
+the data position and drops its saved RNG state, and a warning names
+the mismatch, what was kept and what was dropped:
 
 | State | With the flag set |
 |-------|-------------------|
@@ -196,6 +196,14 @@ Two cases keep no data position. A loader other than
 its rank, so that state is dropped with a warning. An envelope that the
 flag lets through for another reason, unreadable or incomplete, keeps
 neither the data position nor the RNG state.
+
+A checkpoint saved before per-rank state was recorded holds no envelope
+to compare, so it cannot show whether the topology changed. Without the
+flag every rank applies rank 0's data position and RNG streams, and a
+position that cannot carry over stops the resume with a
+`DataPositionError`; with the flag the resume goes on as if the topology
+changed, with rank 0's data position by the rule above and fresh RNG
+streams.
 
 Resharding model and optimizer state never needs the flag; it is
 untouched by the per-rank state. Nor do the loads that are not an

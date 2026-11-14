@@ -140,10 +140,12 @@ starts the data at its first sample (see
 [Auto-resume](../checkpointing/auto-resume.md#where-its-called)).
 An auto-resume onto another world size or data-parallel layout stops
 earlier, before any rank applies a position, unless
-`checkpoint.ignore_rank_state_mismatch` is set. With it, every rank applies
-the position the saved rank 0 reached by the rules above and, where it
-cannot carry over, starts the data at its first sample with a warning, as a
-warm start does (see
+`checkpoint.ignore_rank_state_mismatch` is set. A checkpoint saved before
+per-rank state was recorded cannot show the change, so without the flag its
+position meets the rules above and raises where it cannot carry over. With
+the flag, every rank applies the position the saved rank 0 reached by the
+rules above and, where it cannot carry over, starts the data at its first
+sample with a warning, as a warm start does (see
 [Resharding § Scaling a run to a different world size](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)).
 
 ## Save and restore

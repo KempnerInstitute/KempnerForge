@@ -125,10 +125,12 @@ switch of `data.hf_streaming`, a changed stream, or a checkpoint saved
 before the loader recorded its batch size on another data-parallel size,
 the warm start logs a warning that names the reason and starts the data
 at its first sample. A resume from `checkpoint.dir` raises
-`DataPositionError` in those cases instead, with one exception: a resume
-onto another world size or data-parallel layout is refused before the
-data position is applied, and with `checkpoint.ignore_rank_state_mismatch`
-set it goes on and treats the data position as a warm start does (see
+`DataPositionError` in those cases instead. With
+`checkpoint.ignore_rank_state_mismatch` set, a resume onto another world
+size or data-parallel layout, or of a checkpoint saved before per-rank
+state was recorded, treats the data position as a warm start does;
+without it, a checkpoint with per-rank state refuses a resume onto
+another world size or layout before the data position is applied (see
 [Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size)).
 
 If both are set, `resume_path` wins (auto-resume takes precedence

@@ -119,8 +119,9 @@ all ranks restore, refuse, keep the data position or discard together.
 To proceed past a refusal, set
 `checkpoint.ignore_rank_state_mismatch = true`. Model, optimizer,
 scheduler and step still resume, no rank restores saved RNG state, so
-the random streams restart fresh, and every rank logs a warning. What
-happens to the data position depends on the refusal:
+the random streams restart fresh, and a warning names what was kept and
+what was dropped. What happens to the data position depends on the
+refusal:
 
 - **A changed world size or data-parallel layout**: when the envelope
   is sound on the topology that saved it, every rank keeps the data
@@ -144,7 +145,10 @@ Compatibility:
 
 - **Old checkpoint, new reader**: no `per_rank` key, so rank 0's
   single-copy `rng`/`dataloader` keys restore on every rank, exactly
-  as before.
+  as before. Such a checkpoint cannot show whether the topology
+  changed, so with `checkpoint.ignore_rank_state_mismatch = true` an
+  auto-resume treats it as changed: rank 0's data position carries over
+  where the loader can place it, and the RNG streams restart.
 - **New checkpoint, old reader**: the single-copy keys (rank 0's)
   are still written beside the envelope, so pre-envelope readers
   keep loading. Their documented limitation is unchanged: they

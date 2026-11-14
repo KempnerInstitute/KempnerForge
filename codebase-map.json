@@ -1243,15 +1243,16 @@
     "kempnerforge/checkpoint/state.py": {
       "classes": {
         "RankStateMismatchError": {
-          "purpose": "ValueError for per-rank state saved under another world size or data-parallel layout; every rank raises it together, and checkpoint.ignore_rank_state_mismatch resumes past it keeping the data position"
+          "purpose": "ValueError for per-rank state saved under another world size or data-parallel layout; every rank raises it together, mismatch holds what changed without the way out, and checkpoint.ignore_rank_state_mismatch resumes past it keeping the data position"
         }
       },
       "functions": [
         "get_rng_state() -> dict",
         "set_rng_state(state)",
         "build_train_state(step, tokens_seen, scheduler, dataloader, extra, per_rank) -> dict (records scheduler_group_modules when a param group names a module, and the per-rank envelope under per_rank)",
-        "restore_train_state(state, scheduler, dataloader, lr_multipliers) -> (step, tokens_seen)",
+        "restore_train_state(state, scheduler, dataloader, lr_multipliers) -> (step, tokens_seen, extra)",
         "capture_rank_state(dataloader) -> dict (this rank's RNG capture and loader state)",
+        "dp_coordinates(value) -> (dp_rank, dp_size) | None (a valid pair of ints with 0 <= dp_rank < dp_size, else None)",
         "build_per_rank_envelope(entries, world_size, data_parallel) -> dict (versioned envelope of every rank's payload and the data-parallel layout)",
         "select_rank_state(envelope, rank, world_size, data_parallel) -> dict (this rank's payload; ValueError for an unsound envelope, RankStateMismatchError for another world size or layout, the same verdict on every rank)",
         "saved_data_position(envelope) -> dict | None (the saved rank 0's loader state, checked on the topology that saved it, for a resume onto another topology)",
@@ -1278,8 +1279,9 @@
             "flush_pending_save()",
             "peek_saved_step(path)",
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected, warm_start, exact_resume)",
-            "_per_rank_view(train_state) -> (view, carried) (on an exact resume, this rank's own envelope entry over the single-copy keys; a mismatch refuses unless ignore_rank_state_mismatch)",
+            "_per_rank_view(train_state) -> (view, carried) (on an exact resume, this rank's own envelope entry over the single-copy keys; a mismatch refuses unless ignore_rank_state_mismatch, and a checkpoint with no envelope restores rank 0's copy unless that flag is set)",
             "_resume_past_mismatch(view, envelope, error) -> (view, carried) (with ignore_rank_state_mismatch: a changed topology keeps the saved rank 0's data position if the envelope is sound where it was saved, else drops it; never restores RNG)",
+            "_resume_without_rank_state(train_state) -> (view, carried) (with ignore_rank_state_mismatch, a checkpoint with no per-rank state resumes as if the topology changed: rank 0's data position kept, its RNG dropped)",
             "_read_saved_keys(dcp_dir) -> (keys, restored_on_any_rank) (this rank's DCP keys; with a scope or multipliers an all-reduce on the gloo group tells every rank whether any rank's index holds optimizer state)",
             "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope, multipliers and group-layout checks all decide from it)",
             "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
@@ -1681,13 +1683,13 @@
           "TestGatherMustCoverTheWorld(2)",
           "TestAFailedCaptureFailsEveryRank(4)",
           "TestFourRankSaveLoad(6)",
-          "TestLegacyAndTopology(7)",
+          "TestLegacyAndTopology(10)",
           "TestDataParallelLayout(11)",
           "TestLoadsThatAreNotAResume(2)",
           "TestWeightsOnlyWarmStart(3)",
           "TestMidSaveInterruption(1)"
         ],
-        "count": 58
+        "count": 61
       },
       "tests/unit/test_observability.py": {
         "classes": [

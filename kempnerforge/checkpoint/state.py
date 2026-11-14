@@ -62,9 +62,15 @@ _SAME_RATE_REL_TOL = 1e-9
 class RankStateMismatchError(ValueError):
     """Per-rank state saved under another world size or data-parallel layout.
 
-    ``select_rank_state`` raises it on every rank alike. Every other refusal of
-    an envelope is a plain ``ValueError``.
+    ``select_rank_state`` raises it on every rank alike. ``mismatch`` says what
+    changed, without the way out the message adds, for a warning when
+    ``checkpoint.ignore_rank_state_mismatch`` lets the resume go on. Every other
+    refusal of an envelope is a plain ``ValueError``.
     """
+
+    def __init__(self, message: str, mismatch: str | None = None) -> None:
+        super().__init__(message)
+        self.mismatch = mismatch or message
 
 
 def get_rng_state() -> dict[str, Any]:
@@ -206,11 +212,14 @@ def _check_envelope(
     if not _is_int(saved_world) or saved_world < 1:
         raise ValueError(f"per-rank state envelope has invalid world_size {saved_world!r}")
     if saved_world != world_size:
-        raise RankStateMismatchError(
+        mismatch = (
             f"checkpoint per-rank state was saved with world_size={saved_world} but "
-            f"this run has world_size={world_size}. Restoring each rank's own loader "
-            f"and RNG state needs the saved topology: resume with {saved_world} ranks, "
-            f"or {_MISMATCH_HINT}"
+            f"this run has world_size={world_size}"
+        )
+        raise RankStateMismatchError(
+            f"{mismatch}. Restoring each rank's own loader and RNG state needs the saved "
+            f"topology: resume with {saved_world} ranks, or {_MISMATCH_HINT}",
+            mismatch,
         )
 
     ranks = envelope["ranks"]
@@ -272,12 +281,16 @@ def _check_envelope(
             f"rank {r} saved {tuple(saved_layout[r])} now {data_parallel[r]}" for r in changed[:4]
         )
         more = f"; {len(changed) - 4} more" if len(changed) > 4 else ""
-        raise RankStateMismatchError(
+        mismatch = (
             f"checkpoint per-rank state was saved under a different data-parallel "
             f"layout: {len(changed)} of {world_size} ranks now read another data "
-            f"partition, as (dp_rank, dp_size): {examples}{more}. Restoring each rank's "
-            f"own loader and RNG state needs the partition it was saved on: resume with "
-            f"the saved data-parallel layout, or {_MISMATCH_HINT}"
+            f"partition, as (dp_rank, dp_size): {examples}{more}"
+        )
+        raise RankStateMismatchError(
+            f"{mismatch}. Restoring each rank's own loader and RNG state needs the "
+            f"partition it was saved on: resume with the saved data-parallel layout, "
+            f"or {_MISMATCH_HINT}",
+            mismatch,
         )
 
 

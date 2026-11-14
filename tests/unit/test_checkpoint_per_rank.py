@@ -807,6 +807,73 @@ class TestLegacyAndTopology:
             assert mgr._pending_dataloader_state == {"epoch": 2, "batches_yielded": 50}
             assert _draw() == expected
 
+    def test_legacy_checkpoint_under_the_flag_keeps_the_position_and_drops_rng(
+        self, tmp_path, monkeypatch
+    ):
+        """Without per-rank state a changed topology cannot be seen, so the flag assumes one.
+
+        The manager is built before the reference draw because module init itself
+        consumes torch RNG.
+        """
+        self._write_legacy_ckpt(tmp_path, step=3)
+        for r in (0, 1):
+            mgr = _mock_mgr(tmp_path, monkeypatch, ignore_rank_state_mismatch=True)
+            mgr._rank = r
+            mgr._world_size = 2
+            _seed_all(555)
+            fresh = _draw()
+            _seed_all(555)
+            step, tokens, _ = mgr.load(path=str(Path(tmp_path) / "step_3"), exact_resume=True)
+            assert (step, tokens) == (3, 99)
+            assert mgr._pending_dataloader_state == {"epoch": 2, "batches_yielded": 50}
+            assert mgr._pending_dataloader_carried
+            assert _draw() == fresh, f"rank {r} restored rank 0's RNG under the flag"
+
+    @pytest.mark.parametrize("lenient", [True, False], ids=["flag", "no_flag"])
+    def test_legacy_position_that_cannot_carry_over(self, tmp_path, monkeypatch, caplog, lenient):
+        """A pre-envelope position saved on 4 ranks, resumed on 2: restarts under the flag.
+
+        Without the flag the loader's ``DataPositionError`` stops the resume, as for any
+        resume of the run's own checkpoint. The ``kempnerforge`` logger stops propagation
+        once configured, so the test lets records reach ``caplog``.
+        """
+        import logging
+
+        from kempnerforge.config.schema import DataConfig
+        from kempnerforge.data.dataloader import DataPositionError, StatefulDataLoader
+        from kempnerforge.data.sampler import DistributedSampler
+
+        d = Path(tmp_path) / "step_3"
+        d.mkdir(parents=True)
+        legacy_loader = {
+            "epoch": 0,
+            "batches_yielded": 5,
+            "sampler": {"epoch": 0, "seed": 1, "num_replicas": 4, "rank": 0},
+        }
+        torch.save(
+            {"step": 3, "tokens_seen": 99, "rng": get_rng_state(), "dataloader": legacy_loader},
+            d / "train_state.pt",
+        )
+        dataset = list(range(64))
+
+        def loader() -> StatefulDataLoader:
+            sampler = DistributedSampler(dataset, num_replicas=2, rank=1, seed=1)
+            config = DataConfig(num_workers=0, pin_memory=False)
+            return StatefulDataLoader(dataset, batch_size=2, sampler=sampler, config=config)
+
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        cfg = {"ignore_rank_state_mismatch": True} if lenient else {}
+        mgr, _ = _load_as_rank(tmp_path, monkeypatch, rank=1, step=3, world_size=2, **cfg)
+        resumed = loader()
+        if not lenient:
+            with pytest.raises(DataPositionError, match="predates the saved batch size"):
+                mgr.apply_dataloader_state(resumed)
+            return
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
+            mgr.apply_dataloader_state(resumed)
+        assert "does not carry over to the changed topology" in caplog.text
+        assert next(iter(resumed)).tolist() == next(iter(loader())).tolist()
+
     def test_new_checkpoint_keeps_legacy_single_copy_keys(self, tmp_path, monkeypatch):
         """Old readers keep working: the single-copy keys sit beside the envelope.
 
@@ -851,6 +918,28 @@ class TestLegacyAndTopology:
         assert mgr._pending_dataloader_state == {"cursor": 100, "prefetch_depth": 1}
         assert mgr._pending_dataloader_carried
         assert _draw() == untouched, "RNG must stay untouched on a changed topology"
+
+    def test_the_kept_position_warning_does_not_ask_for_the_flag(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The warning names the mismatch, what was kept and dropped, not the way out.
+
+        The ``kempnerforge`` logger stops propagation once configured, so the test lets
+        records reach ``caplog``.
+        """
+        import logging
+
+        payloads, _ = _mk_payloads(seed_base=1000, cursor_base=100)
+        _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step=7)
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
+            _load_as_rank(
+                tmp_path, monkeypatch, rank=1, step=7, world_size=2, ignore_rank_state_mismatch=True
+            )
+        assert "world_size=4 but this run has world_size=2. Kept: the saved data position" in (
+            caplog.text
+        )
+        assert "to resume anyway" not in caplog.text
 
     @pytest.mark.parametrize("defect", ["missing_entry", "empty_entry"])
     def test_world_size_mismatch_ignored_on_an_unsound_envelope_discards_both(
