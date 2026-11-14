@@ -1,6 +1,6 @@
 # 24-GPU MoE stress test: saturate 6x4 H200 GPUs
 #
-# ~7B total params (8 experts), ~1.8B active. TP=4 (intra-node), DP=6 (inter-node).
+# ~9.2B total params (8 experts, top-2), ~2.9B active. TP=4 (intra-node), DP=6 (inter-node).
 # Large batch + long seq_len + gradient accumulation to keep GPUs busy.
 #
 # Usage (interactive salloc):

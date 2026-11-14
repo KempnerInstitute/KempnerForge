@@ -67,7 +67,8 @@ warmup_steps = 5
 min_lr_ratio = 0.1
 
 [data]
-# 30-sample COCO val substitute (sayakpaul/coco-30-val-2014). For a real
+# sayakpaul/coco-30-val-2014: 30,000 image-caption pairs sampled from the
+# COCO 2014 val split, about 4.9 GB to download on first use. For a real
 # training run, override via CLI: --data.hf_dataset_name=<your-dataset>
 hf_dataset_name = "sayakpaul/coco-30-val-2014"
 hf_dataset_split = "train"

@@ -33,7 +33,8 @@ Everything in the first column is importable from
 
 ```toml
 [train]
-shutdown_timeout_sec       = 600.0   # ShutdownHandler hard deadline (0 = disabled)
+shutdown_timeout_sec       = 600.0   # forced exit this long after a rank starts shutting down (0 = disabled);
+                                     # fires before SLURM's SIGKILL only if below the signal lead
 nccl_health_check_interval = 0       # NCCL ping every N steps (0 = disabled)
 ```
 
@@ -49,7 +50,7 @@ The reference preemption-resilient launch script is
 [`scripts/slurm/7b_requeue.sh`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/slurm/7b_requeue.sh):
 
 ```bash
-#SBATCH --signal=B:SIGTERM@120   # SIGTERM 120s before hard kill
+#SBATCH --signal=SIGTERM@120     # SIGTERM to the ranks before the time limit
 #SBATCH --requeue                # auto-resubmit on preempt
 
 srun --kill-on-bad-exit=1 uv run python scripts/train.py "${CONFIG}"
