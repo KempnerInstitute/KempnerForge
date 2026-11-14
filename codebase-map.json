@@ -188,7 +188,8 @@
         "tests/unit/test_mixing.py::TestDatasetSource",
         "tests/unit/test_mixing.py::TestDataConfigMixing",
         "tests/unit/test_annealing.py::TestTrainingPhase",
-        "tests/unit/test_annealing.py::TestDataConfigPhases"
+        "tests/unit/test_annealing.py::TestDataConfigPhases",
+        "tests/unit/test_fp8.py::TestFP8Config"
       ]
     },
     "kempnerforge/config/vlm.py": {
@@ -697,7 +698,7 @@
       "functions": [
         "cross_entropy_loss(logits, labels) -> Tensor",
         "chunked_cross_entropy_loss(logits, labels, chunk_size) -> Tensor",
-        "z_loss(logits, weight) -> Tensor",
+        "z_loss(logits, weight, chunk_size=None) -> Tensor",
         "build_loss_fn(config) -> Callable"
       ],
       "registry": [
@@ -1124,6 +1125,7 @@
         "tests/distributed/test_fsdp.py::TestActivationCheckpointing",
         "tests/distributed/test_fsdp.py::TestGetDpMesh",
         "tests/unit/test_fp8.py::TestApplyFloat8",
+        "tests/unit/test_fp8.py::TestFloat8Alignment",
         "tests/unit/test_distributed.py::TestDefaultMpPolicy",
         "tests/unit/test_distributed.py::TestApplyFsdpVLMGuards",
         "tests/unit/test_distributed.py::TestBuildParallelModelVLM",
@@ -1652,10 +1654,12 @@
         "classes": [
           "TestCrossEntropy(2)",
           "TestChunkedCrossEntropy(6)",
-          "TestZLoss(5)",
-          "TestBuildLossFn(5)"
+          "TestFp32CrossEntropy(8)",
+          "TestZLoss(11)",
+          "TestBuildLossFn(12)",
+          "TestAllMaskedBatch(3)"
         ],
-        "count": 18
+        "count": 42
       },
       "tests/unit/test_moe.py": {
         "classes": [
@@ -1749,10 +1753,11 @@
       },
       "tests/unit/test_fp8.py": {
         "classes": [
-          "TestFP8Config(7)",
-          "TestApplyFloat8(4)"
+          "TestFP8Config(10)",
+          "TestApplyFloat8(5)",
+          "TestFloat8Alignment(4)"
         ],
-        "count": 11
+        "count": 19
       },
       "tests/unit/test_packing.py": {
         "classes": [

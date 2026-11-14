@@ -17,6 +17,7 @@ from torch.distributed.fsdp import fully_shard
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import TrainConfig
+from kempnerforge.training import loss as loss_module
 from kempnerforge.training.loss import (
     build_loss_fn,
     chunked_cross_entropy_loss,
@@ -250,10 +251,21 @@ class TestFp32CrossEntropy:
 
 
 class TestZLoss:
-    def test_logits_without_rows_give_zero_on_the_graph(self):
-        logits = torch.randn(1, 0, 100, requires_grad=True)
-        result = z_loss(logits, weight=1e-4)
-        assert result.item() == 0.0
+    @pytest.fixture(autouse=True)
+    def _nan_filled_empty(self):
+        """Deterministic mode fills ``torch.empty`` with NaN, so a row left unwritten shows."""
+        enabled = torch.are_deterministic_algorithms_enabled()
+        warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(True)
+        yield
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("chunk_size", [None, 1, 4096])
+    def test_logits_without_rows_give_zero_on_the_graph(self, chunk_size, dtype):
+        logits = torch.randn(1, 0, 100, dtype=dtype, requires_grad=True)
+        result = z_loss(logits, weight=1e-4, chunk_size=chunk_size)
+        assert result.item() == 0.0 and result.dtype == torch.float32
         result.backward()
         assert logits.grad is not None and logits.grad.shape == (1, 0, 100)
 
@@ -289,6 +301,67 @@ class TestZLoss:
         logits = torch.randn(2, 8, 100)
         result = z_loss(logits, weight=1e-4)
         assert result.item() > 0
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("chunk_size", [None, 1, 3, 7, 4096])
+    def test_value_equals_the_unchunked_formula_exactly(self, chunk_size, dtype):
+        """68 tokens: chunks of 3 and 7 leave a short last chunk (issue #335)."""
+        torch.manual_seed(0)
+        logits = (torch.randn(2, 34, 1000) * 4).to(dtype)
+        expected = 1e-4 * (torch.logsumexp(logits.view(-1, 1000).float(), dim=-1) ** 2).mean()
+        assert torch.equal(z_loss(logits, 1e-4, chunk_size=chunk_size), expected)
+
+    @pytest.mark.parametrize(("dtype", "rtol"), [(torch.float32, 1e-5), (torch.bfloat16, 2**-7)])
+    @pytest.mark.parametrize("chunk_size", [None, 1, 7, 4096])
+    def test_gradient_matches_the_unchunked_formula(self, chunk_size, dtype, rtol):
+        torch.manual_seed(0)
+        base = (torch.randn(2, 33, 1000) * 4).to(dtype)
+        ref = base.clone().requires_grad_(True)
+        got = base.clone().requires_grad_(True)
+        (1e-4 * (torch.logsumexp(ref.view(-1, 1000).float(), dim=-1) ** 2).mean()).backward()
+        z_loss(got, 1e-4, chunk_size=chunk_size).backward()
+        assert got.grad is not None and got.grad.dtype == dtype
+        torch.testing.assert_close(got.grad, ref.grad, rtol=rtol, atol=0.0)
+
+    @pytest.mark.parametrize("chunk_size", [None, 7])
+    def test_backward_saves_no_fp32_copy_of_the_logits(self, chunk_size):
+        logits = torch.randn(64, 300).bfloat16().requires_grad_(True)
+        saved: list[torch.Tensor] = []
+
+        def pack(t: torch.Tensor) -> torch.Tensor:
+            saved.append(t)
+            return t
+
+        kwargs = {} if chunk_size is None else {"chunk_size": chunk_size}
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+            loss = z_loss(logits, 1e-4, **kwargs)
+        loss.backward()
+        assert all(t.data_ptr() == logits.data_ptr() or t.numel() <= 64 for t in saved)
+
+    @pytest.mark.parametrize("chunk_size", [0, -1])
+    def test_rejects_a_non_positive_chunk_size(self, chunk_size):
+        with pytest.raises(ValueError, match="chunk_size must be positive"):
+            z_loss(torch.randn(4, 10), 1e-4, chunk_size=chunk_size)
+
+    @pytest.mark.gpu
+    def test_peak_memory_holds_no_full_fp32_copy(self):
+        """The peak holds the bf16 gradient, three float32 chunks and per-token vectors."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        tokens, vocab, chunk = 8192, 32768, 1024
+        logits = torch.randn(tokens, vocab, device="cuda", dtype=torch.bfloat16)
+        logits.requires_grad_(True)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
+        z_loss(logits, 1e-4, chunk_size=chunk).backward()
+        torch.cuda.synchronize()
+        extra = torch.cuda.max_memory_allocated() - before
+        grad_bytes = tokens * vocab * 2
+        chunk_fp32_bytes = chunk * vocab * 4
+        per_token_fp32_bytes = tokens * 4
+        assert extra <= grad_bytes + 3 * chunk_fp32_bytes + 4 * per_token_fp32_bytes
+        assert extra < tokens * vocab * 4
 
 
 class TestBuildLossFn:
@@ -372,6 +445,61 @@ class TestBuildLossFn:
         result = fn(logits, labels)
         base = cross_entropy_loss(logits, labels)
         torch.testing.assert_close(result, base)
+
+    @pytest.mark.parametrize(
+        ("loss_fn", "ce_chunk_size", "chunk"),
+        [
+            ("chunked_cross_entropy", 16, 16),
+            ("chunked_cross_entropy", 0, 4096),
+            ("cross_entropy", 0, 128),
+        ],
+    )
+    def test_z_loss_runs_in_the_ce_chunk_size(self, monkeypatch, loss_fn, ce_chunk_size, chunk):
+        """The composed z-loss takes ce_chunk_size tokens at a time with chunked CE, and
+        every token (128 here) at once with unchunked CE."""
+        seen: list[int] = []
+        real = loss_module._ChunkedLogSumExp.apply
+
+        def spy(flat: torch.Tensor, size: int) -> torch.Tensor:
+            seen.append(size)
+            return real(flat, size)
+
+        monkeypatch.setattr(loss_module._ChunkedLogSumExp, "apply", spy)
+        config = TrainConfig(loss_fn=loss_fn, ce_chunk_size=ce_chunk_size, z_loss_weight=1e-4)
+        build_loss_fn(config)(torch.randn(4, 32, 256), torch.randint(0, 256, (4, 32)))
+        assert seen == [chunk]
+
+    @pytest.mark.parametrize("fp32", [False, True])
+    def test_chunked_ce_chunks_z_loss_too(self, fp32):
+        """With chunked CE, the composed z-loss keeps no float32 copy of the logits (#335).
+
+        Tokens labeled -100 leave the cross-entropy mean but stay in the z-loss mean.
+        """
+        config = TrainConfig(
+            loss_fn="chunked_cross_entropy",
+            ce_chunk_size=16,
+            z_loss_weight=1e-4,
+            fp32_cross_entropy=fp32,
+        )
+        fn = build_loss_fn(config)
+        logits = (torch.randn(4, 32, 256) * 4).bfloat16().requires_grad_(True)
+        labels = torch.randint(0, 256, (4, 32))
+        labels[:, :8] = -100
+        saved: list[torch.Tensor] = []
+
+        def pack(t: torch.Tensor) -> torch.Tensor:
+            saved.append(t)
+            return t
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+            loss = fn(logits, labels)
+        loss.backward()
+        assert not any(t.dtype == torch.float32 and t.numel() >= logits.numel() for t in saved)
+        expected = (
+            chunked_cross_entropy_loss(logits, labels, chunk_size=16, fp32=fp32)
+            + 1e-4 * (torch.logsumexp(logits.view(-1, 256).float(), dim=-1) ** 2).mean()
+        )
+        assert torch.equal(loss, expected)
 
 
 def _free_port() -> int:

@@ -80,11 +80,14 @@ The filter function excludes any FQN containing `"experts"`,
 `Linear.forward`); the shared expert is a plain `Linear` call, excluded
 with them by convention; routers have small output dims (often not a
 multiple of 16, which `torch._scaled_mm` requires) and aren't
-compute-bound.
+compute-bound. It also keeps any `Linear` with a dimension not
+divisible by 16 in bf16, since `torch._scaled_mm` rejects it.
 
-**Note:** `enable_fsdp_float8_all_gather=True` is incompatible with TP
-because the float8 weight wrapper calls `aten.is_pinned` on `DTensor`s
-and that op has no sharding strategy yet.
+**Note:** config validation rejects FP8 with `distributed.tp > 1`, so
+FP8 runs only with TP off today. Outside the config check,
+`enable_fsdp_float8_all_gather=True` also fails with TP, because the
+float8 weight wrapper calls `aten.is_pinned` on `DTensor`s and that op
+has no sharding strategy yet.
 
 ### 4 · Activation Checkpointing before FSDP
 
@@ -164,7 +167,7 @@ that exercises the new mode in combination with the adjacent ones.
 | FSDP before TP | TP finds no `nn.Linear` to shard; run "works" with wrong gradients |
 | AC after FSDP | FSDP bucket boundaries break; reduce-scatter misfires |
 | Float8 after FSDP | FSDP cannot all-gather in float8; comms revert to bf16 |
-| FP8 + TP + `enable_fsdp_float8_all_gather=True` | Crash from `aten.is_pinned` on `DTensor` with no sharding strategy |
+| FP8 + TP | Rejected at config validation; outside it, `apply_float8` with the float8 all-gather fails on `aten.is_pinned` for `DTensor` |
 | MoE+EP with per-block FSDP wrap | Backward deadlock between EP all-to-all and FSDP reduce-scatter |
 | MoE + Pipeline Parallelism | Rejected at config validation — data-dependent routing is incompatible with static stage splitting |
 
