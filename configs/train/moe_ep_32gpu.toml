@@ -2,7 +2,7 @@
 #
 # 8 nodes × 4 H200 141GB GPUs.
 # TP=4 (intra-node NVLink), EP=2 (cross-node IB), DP_shard=4 (FSDP).
-# 8 experts, top-2: ~4B total params, ~1.8B active per token.
+# 8 experts, top-2: ~9.2B total params, ~2.9B active per token.
 # All layers MoE (moe_frequency=1).
 #
 # Usage:

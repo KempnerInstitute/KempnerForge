@@ -14,6 +14,8 @@ examples/image_understanding/
 ├── README.md
 ├── train.py              # training entry point
 ├── image_text/           # image-text dataset readers and chat renderer (below)
+├── scripts/
+│   └── convert_finevision_to_arrow.py  # FineVision parquet -> memory-mappable Arrow
 └── tests/
     ├── test_image_understanding_entry.py   # the entry point loads a config and hands it off
     └── image_text/       # reader and renderer tests (CPU)
@@ -55,9 +57,36 @@ samples `VLMCollator` batches.
   budget cuts away), up to `max_attempts` in a row; `skipped` counts them with
   the reader's skips, per rank, and loader workers forked from the training
   process add to its count.
+- `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
+  `points.py` writes the point answers.
+- `finevision.py`: FineVision subsets from their memory-mappable Arrow copy.
 
 Every sample the renderer builds carries one image, resized square to `image_size`,
-with no tiling or packing.
+with no tiling or packing. PixMo-Count stores its points in pixels; they are
+converted to percent of the image, the unit the other PixMo sources use. A
+counting answer lists its points before the count, so a row with many points
+outruns `max_text_len` and trains only the leading points. `max_points` retains
+the count only when the cap is small enough for the label and the text budget:
+with a 40-point `dot` row at 256 tokens, a cap of 30 still cuts the count, while
+a cap of 3 keeps it.
+
+`FineVisionArrow` keeps only the rows with one image (`max_images`, which `None`
+lifts), using the per-row image counts `index.npz` stores; an index written
+without them takes the counts from `num_images`, and `text_only` keeps the rows
+without images. A conversation keeps its turns up to the first one missing its
+user message or reply, so a row whose first turn is incomplete is not kept.
+
+Convert FineVision once; any number of `convert` processes can share the work,
+a file that fails to convert is listed at the end without stopping the others,
+and `index` refuses a subset with a file missing or whose parquet file changed
+size since its conversion:
+
+```bash
+uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py convert \
+    --src path-to-FineVision --dst path-to-FineVision-arrow --procs 8
+uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py index \
+    --src path-to-FineVision --dst path-to-FineVision-arrow
+```
 
 ## Tile images
 
@@ -154,9 +183,9 @@ uv run python examples/vlm/scripts/convert_hf_backbone.py \
 
 Then pass it as `--checkpoint.load_path` with
 `checkpoint.exclude_from_loading = ["optimizer"]`, so the converted weights load
-and the optimizer starts fresh. Stage 2 should start from a stage-1 checkpoint
-the same way, as weights alone with its own warmup from step 0; a warm start
-today also restores the saved step and schedule, so that is on the roadmap.
+and the optimizer starts fresh. Stage 2 starts from a stage-1 checkpoint as
+weights alone with `checkpoint.exclude_from_loading = ["optimizer", "train_state"]`,
+so its step and schedule start again from 0.
 
 ## Roadmap
 
@@ -167,11 +196,9 @@ or in core where it belongs:
   DataComp), chat-template rendering with the loss on the assistant turns only,
   and the mixture loader
 - Typed stage contract and pinned source manifest, which fix the stage presets
-- Starting stage 2 from stage 1's weights alone, with a fresh step and schedule
 - Text-only documents in image-text batches
 - Documents with several images
 - Per-module learning rates and schedules
-- Vision-encoder precision separate from the backbone's
 - Evaluation parity: chat-template prompts, image attention, the recipe's scorers
 - Run-comparison metrics: documents seen, token counts, MFU with the encoder
 

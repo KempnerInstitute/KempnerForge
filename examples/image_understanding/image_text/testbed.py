@@ -11,28 +11,11 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
-from PIL import Image
 from torch.utils.data import Dataset
 
+from .decode import decode_rgb
 from .document import Document, Turn, is_text
-from .skip import MAX_ATTEMPTS, SkipLog, UnusableRowError, check_max_attempts, first_usable
-
-DECODE_ERRORS = (OSError, ValueError, SyntaxError, Image.DecompressionBombError)
-
-
-def _decode(path: Path) -> Image.Image:
-    """The RGB image at ``path``; one that does not decode is an unusable row.
-
-    A file the system cannot open (missing, unreadable) raises its own ``OSError``,
-    which carries an errno where a decoding failure does not.
-    """
-    try:
-        with Image.open(path) as image:
-            return image.convert("RGB")
-    except DECODE_ERRORS as exc:
-        if isinstance(exc, OSError) and exc.errno is not None:
-            raise
-        raise UnusableRowError(f"{path}: {type(exc).__name__}: {exc}") from exc
+from .skip import MAX_ATTEMPTS, SkipLog, check_max_attempts, first_usable
 
 
 class ImageTextRows(Dataset):
@@ -41,9 +24,10 @@ class ImageTextRows(Dataset):
     The table is shared with forked loader workers without the per-row copies that
     touching Python objects would cause. Blank answers are dropped, and with them
     any row left without an answer or without a user message; answers lose their
-    surrounding whitespace, which would otherwise be trained. A row whose image
-    does not decode is passed over for the next one, up to ``max_attempts`` in a
-    row, and ``skipped`` counts them. A missing image file is an error.
+    surrounding whitespace, which would otherwise be trained. Images are decoded
+    upright; a row whose image does not decode is passed over for the next one,
+    up to ``max_attempts`` in a row, and ``skipped`` counts them. A missing image
+    file is an error.
     """
 
     def __init__(
@@ -81,13 +65,23 @@ class ImageTextRows(Dataset):
 
     def _read(self, index: int) -> Document:
         row = self._rows.slice(index, 1).to_pylist()[0]
-        image = _decode(self.image_root / row["image"])
+        image = decode_rgb(self.image_root / row["image"])
         return Document(images=(image,), turns=(Turn(row["user"], tuple(row["answers"])),))
 
-    def __getitem__(self, index: int) -> Document:
+    def read_with_index(self, index: int) -> tuple[int, Document]:
+        """The actual row index and document after passing over unusable rows."""
         if not 0 <= index < len(self):
             raise IndexError(f"index {index} is out of range for {len(self)} rows")
-        return first_usable(index, len(self), self.max_attempts, self._read, self._skips)
+        return first_usable(
+            index,
+            len(self),
+            self.max_attempts,
+            lambda row: (row, self._read(row)),
+            self._skips,
+        )
+
+    def __getitem__(self, index: int) -> Document:
+        return self.read_with_index(index)[1]
 
 
 def _load_json(path: str | Path) -> Any:

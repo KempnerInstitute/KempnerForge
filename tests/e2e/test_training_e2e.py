@@ -18,6 +18,7 @@ Each test verifies:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import signal
@@ -25,6 +26,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -663,6 +665,152 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
     )
 
 
+def _descendants(pid: int) -> list[int]:
+    """Every process below ``pid``, read from ``/proc``."""
+    found: list[int] = []
+    for task in Path(f"/proc/{pid}/task").glob("*"):
+        try:
+            children = (task / "children").read_text().split()
+        except OSError:
+            continue
+        for child in map(int, children):
+            found += [child, *_descendants(child)]
+    return found
+
+
+def _rank_pid(launcher: subprocess.Popen, local_rank: int) -> int:
+    """The PID of the training process ``torch.distributed.run`` started for ``local_rank``."""
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        for pid in _descendants(launcher.pid):
+            try:
+                environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if f"LOCAL_RANK={local_rank}".encode() in environ:
+                return pid
+        time.sleep(0.5)
+    raise AssertionError(f"no process with LOCAL_RANK={local_rank} below {launcher.pid}")
+
+
+def _wait_for_log(log: Path, text: str, proc: subprocess.Popen, timeout: float) -> None:
+    """Wait until ``text`` is in ``log``; fail if ``proc`` exits first or time runs out."""
+    deadline = time.monotonic() + timeout
+    while text not in log.read_text():
+        if proc.poll() is not None or time.monotonic() > deadline:
+            pytest.fail(
+                f"{text!r} not logged (exit code {proc.poll()}):\n"
+                f"{traceback_or_tail(log.read_text(), 2000)}"
+            )
+        time.sleep(1)
+
+
+def _signal_and_wait(
+    cmd: list[str],
+    log: Path,
+    pid_of: Callable[[subprocess.Popen], int],
+    sig: signal.Signals,
+    env: dict[str, str],
+) -> str:
+    """Start ``cmd``, send ``sig`` to ``pid_of(proc)`` after step 5, and return the log.
+
+    At the end the launcher and every process below it are killed: ``torchrun``
+    starts each rank in a session of its own, so killing the launcher's
+    process group would leave the ranks of a hung run on their GPUs.
+    """
+    with log.open("w") as out:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(PROJECT_ROOT),
+            start_new_session=True,
+        )
+    returncode: int | None = None
+    try:
+        _wait_for_log(log, "[step 5]", proc, timeout=900)
+        os.kill(pid_of(proc), sig)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            returncode = proc.wait(timeout=120)
+    finally:
+        for pid in [*_descendants(proc.pid), proc.pid]:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        proc.wait()
+    output = log.read_text()
+    excerpt = traceback_or_tail(output, 2000)
+    assert returncode is not None, f"training still running 120s after {sig.name}:\n{excerpt}"
+    assert returncode == 0, f"training failed (exit {returncode}):\n{excerpt}"
+    return output
+
+
+@pytest.mark.e2e
+@requires_gpus(2)
+def test_sigusr1_to_one_rank_stops_every_rank(tmp_path):
+    """Only local rank 1 gets SIGUSR1; both ranks stop at one step and save it (#307)."""
+    ckpt_dir = tmp_path / "ckpt"
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nproc_per_node=2",
+        f"--master_port={_find_free_port()}",
+        TRAIN_SCRIPT,
+        DEBUG_CONFIG,
+        "--train.max_steps=100000",
+        "--metrics.log_interval=1",
+        f"--checkpoint.dir={ckpt_dir}",
+        "--checkpoint.interval=100000",
+    ]
+    output = _signal_and_wait(
+        cmd,
+        tmp_path / "train.log",
+        lambda launcher: _rank_pid(launcher, local_rank=1),
+        signal.SIGUSR1,
+        os.environ.copy(),
+    )
+    excerpt = traceback_or_tail(output, 2000)
+    assert "Shutdown requested on another rank" in output, f"rank 0 did not stop:\n{excerpt}"
+    assert "Checkpoint committed" in output, f"no emergency checkpoint:\n{excerpt}"
+    shards = sorted(p.name for p in (ckpt_dir / "latest").resolve().glob("*.distcp"))
+    assert shards == ["__0_0.distcp", "__1_0.distcp"], shards
+
+
+@pytest.mark.e2e
+@requires_gpus(1)
+def test_sigusr1_after_a_compile_writes_the_emergency_checkpoint(tmp_path):
+    """An in-process Triton compile replaces the handlers below Python (#448).
+
+    Empty Triton and Inductor caches and one compile thread make the run compile
+    its kernels in its own process, where LLVM installs its handlers.
+    """
+    ckpt_dir = tmp_path / "ckpt"
+    env = os.environ.copy()
+    env.setdefault("WORLD_SIZE", "1")
+    env.setdefault("RANK", "0")
+    env.setdefault("LOCAL_RANK", "0")
+    env["TRITON_CACHE_DIR"] = str(tmp_path / "triton-cache")
+    env["TORCHINDUCTOR_CACHE_DIR"] = str(tmp_path / "inductor-cache")
+    env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+    cmd = [
+        sys.executable,
+        TRAIN_SCRIPT,
+        DEBUG_CONFIG,
+        "--train.max_steps=100000",
+        "--train.compile_model=true",
+        "--metrics.log_interval=1",
+        f"--checkpoint.dir={ckpt_dir}",
+        "--checkpoint.interval=100000",
+    ]
+    output = _signal_and_wait(
+        cmd, tmp_path / "train.log", lambda proc: proc.pid, signal.SIGUSR1, env
+    )
+    excerpt = traceback_or_tail(output, 2000)
+    assert "Received SIGUSR1" in output, f"SIGUSR1 never reached the handler:\n{excerpt}"
+    assert "Checkpoint committed" in output, f"no emergency checkpoint:\n{excerpt}"
+
+
 @pytest.mark.e2e
 def test_final_checkpoint_on_clean_completion(tmp_path):
     """A clean finish at an off-schedule step must still persist a final
@@ -778,6 +926,123 @@ def test_moe_checkpoint_resume(tmp_path):
     _assert_training_complete(result, expected_steps=15)
     output = result.stdout + result.stderr
     assert "step=10" in output, "MoE did not resume from step 10"
+
+
+_EP_RESUME_TOLERANCE = 0.05
+
+
+def _ep_moe_args(tmp_path, *overrides: str) -> list[str]:
+    """``debug_moe.toml`` on the learnable shard, logging every step's loss."""
+    return [
+        DEBUG_MOE_CONFIG,
+        "--metrics.log_interval=1",
+        "--train.seed=1234",
+        "--model.vocab_size=256",
+        f"--data.dataset_path={_make_learnable_shard(tmp_path)}",
+        "--data.file_pattern=*.npy",
+        *overrides,
+    ]
+
+
+def _assert_losses_close(reference: str, resumed: str, steps: range) -> None:
+    """The resumed run logs every step in ``steps`` within the tolerance of the reference."""
+    ref_losses = _parse_losses_by_step(reference)
+    res_losses = _parse_losses_by_step(resumed)
+    gaps = {
+        step: abs(float(res_losses[step]) - float(ref_losses[step]))
+        for step in steps
+        if step in ref_losses and step in res_losses
+    }
+    assert sorted(gaps) == list(steps), f"steps logged by both runs: {sorted(gaps)}"
+    worst = max(gaps, key=gaps.__getitem__)
+    assert gaps[worst] <= _EP_RESUME_TOLERANCE, (
+        f"step {worst}: resumed loss {res_losses[worst]} against {ref_losses[worst]} "
+        "uninterrupted; the resume did not give each EP rank its own experts"
+    )
+
+
+@pytest.mark.e2e
+@requires_gpus(4)
+@pytest.mark.parametrize("packed", ["false", "true"], ids=["unpacked", "packed"])
+def test_moe_ep_resume_matches_uninterrupted(tmp_path, packed):
+    """An ep=2 run resumed from its own step-20 checkpoint goes on as the run did.
+
+    The resume has the run's schedule, data and RNG, so with each EP rank's experts back
+    the losses match up to GPU nondeterminism: EP runs are not bit-reproducible, and a
+    checkpoint keeps one of the EP copies of the other weights, which drift apart (#482).
+    One rank's experts on every rank lands far outside the tolerance.
+    """
+    common = _ep_moe_args(
+        tmp_path,
+        "--distributed.ep=2",
+        "--distributed.dp_shard=2",
+        f"--model.moe_packed_experts={packed}",
+        "--train.max_steps=40",
+    )
+    straight = _run_training(
+        common + [f"--checkpoint.dir={tmp_path}/straight", "--checkpoint.interval=20"],
+        nproc=4,
+        timeout=300,
+    )
+    _assert_training_complete(straight, expected_steps=40)
+    resumed = _run_training(
+        common
+        + [
+            f"--checkpoint.dir={tmp_path}/resumed",
+            "--checkpoint.interval=1000",
+            f"--checkpoint.load_path={tmp_path}/straight/step_20",
+        ],
+        nproc=4,
+        timeout=300,
+    )
+    _assert_training_complete(resumed, expected_steps=40)
+    output = resumed.stdout + resumed.stderr
+    assert "step=20" in output, "did not resume from step 20"
+    _assert_losses_close(straight.stdout + straight.stderr, output, range(21, 41))
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize(
+    ("ep", "nproc"),
+    [
+        pytest.param(1, 1, id="ep1", marks=requires_gpus(2)),
+        pytest.param(4, 4, id="ep4", marks=requires_gpus(4)),
+    ],
+)
+def test_moe_ep_checkpoint_resumes_at_another_ep(tmp_path, ep, nproc):
+    """An ep=2 checkpoint resumes at another ``ep`` with every expert's weights and moments.
+
+    Every run has one DP rank, so each reads the same batches. The steps after the resume
+    run the saved weights and AdamW moments on the batches the ep=2 run took, so their
+    losses match it within the tolerance.
+    """
+    common = _ep_moe_args(tmp_path, "--train.max_steps=25")
+    straight = _run_training(
+        common
+        + [
+            "--distributed.ep=2",
+            f"--checkpoint.dir={tmp_path}/straight",
+            "--checkpoint.interval=20",
+        ],
+        nproc=2,
+        timeout=300,
+    )
+    _assert_training_complete(straight, expected_steps=25)
+    resumed = _run_training(
+        common
+        + [
+            f"--distributed.ep={ep}",
+            f"--checkpoint.dir={tmp_path}/resumed",
+            "--checkpoint.interval=1000",
+            f"--checkpoint.load_path={tmp_path}/straight/step_20",
+        ],
+        nproc=nproc,
+        timeout=300,
+    )
+    _assert_training_complete(resumed, expected_steps=25)
+    output = resumed.stdout + resumed.stderr
+    assert "step=20" in output, "did not resume from step 20"
+    _assert_losses_close(straight.stdout + straight.stderr, output, range(21, 26))
 
 
 _SIGMOID_MOE_OVERRIDES = [
