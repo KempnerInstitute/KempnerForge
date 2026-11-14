@@ -240,10 +240,26 @@ class RenderedDataset(Dataset):
     def __len__(self) -> int:
         return len(self.reader)
 
-    def _render(self, index: int) -> dict[str, torch.Tensor]:
-        return self.renderer(self.reader[index], random.Random(f"{self.seed}:{index}"))
-
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         if not 0 <= index < len(self):
             raise IndexError(f"index {index} is out of range for {len(self)} documents")
-        return first_usable(index, len(self), self.max_attempts, self._render, self._skips)
+        next_index = index + 1
+
+        def render(row: int) -> dict[str, torch.Tensor]:
+            nonlocal next_index
+            next_index = row + 1
+            read_with_index = getattr(self.reader, "read_with_index", None)
+            actual, document = (
+                read_with_index(row) if read_with_index is not None else (row, self.reader[row])
+            )
+            next_index = actual + 1
+            return self.renderer(document, random.Random(f"{self.seed}:{row}"))
+
+        return first_usable(
+            index,
+            len(self),
+            self.max_attempts,
+            render,
+            self._skips,
+            lambda row, error: next_index,
+        )

@@ -302,7 +302,7 @@
     "kempnerforge/model/modality.py": {
       "classes": {
         "ModalityContext": {
-          "purpose": "Frozen dataclass bundling all modality-injection inputs flowing into Transformer.forward (inputs_embeds, prefix_embeds, output_slice, image_features, image_mask, modality_ids, key_padding_mask, position_ids, attention_group_ids, rope_cos, rope_sin). Intra-context invariants enforced in __post_init__; cross-arg invariants vs kv_caches enforced at the top of Transformer.forward",
+          "purpose": "Frozen dataclass bundling all modality-injection inputs flowing into Transformer.forward (inputs_embeds, prefix_embeds, output_slice, image_features, image_mask, modality_ids, key_padding_mask, position_ids, attention_group_ids, rope_cos, rope_sin, inline_embeds + inline_rows + inline_positions, output_rows + output_positions). Intra-context invariants enforced in __post_init__; cross-arg invariants vs kv_caches enforced at the top of Transformer.forward",
           "methods": [
             "__post_init__()"
           ]
@@ -402,12 +402,12 @@
         "ModalityStrategy (Protocol)": {
           "purpose": "Composes raw VLM inputs into a ModalityContext. Stateless (holds no parameters); read submodules off the VLMWrapper. NOT registered as a submodule, so FSDP2 does not wrap them and DCP does not serialize them",
           "methods": [
-            "prepare(wrapper, pixel_values, input_ids) -> ModalityContext",
+            "prepare(wrapper, pixel_values, input_ids, frame_mask=None, *, image_rows=None, image_starts=None, image_tokens=None, text_rows=None, text_positions=None) -> ModalityContext",
             "num_image_tokens(wrapper) -> int"
           ]
         },
         "JointDecoderStrategy": {
-          "purpose": "Joint-Decoder: image embeds prepended to text. Fills prefix_embeds + output_slice"
+          "purpose": "Joint-Decoder: image embeds prepended to text. Fills prefix_embeds + output_slice; a packed batch (image_rows/image_starts/image_tokens, text_rows/text_positions) takes the inline route instead: inline_embeds over the placeholder slots, output_rows/output_positions so the head runs on the text positions"
         },
         "CrossAttentionStrategy": {
           "purpose": "Cross-Attention: image embeds flow as K/V into separate CA blocks. Fills image_features + image_mask"
@@ -418,7 +418,7 @@
         "VLMWrapper(nn.Module)": {
           "purpose": "VLM wrapper composing vision_encoder + adapter + transformer + strategy. Strategy is a plain Python object, not an nn.Module submodule",
           "methods": [
-            "forward(pixel_values, input_ids, labels) -> (logits, labels)"
+            "forward(pixel_values, input_ids, labels, frame_mask, *, doc_ids, position_ids, attention_group_ids, image_rows, image_starts, image_tokens, text_rows, text_positions) -> (logits, labels)"
           ],
           "properties": [
             "num_image_tokens"
@@ -430,7 +430,8 @@
         "build_modality_strategy(vlm) -> ModalityStrategy",
         "_is_encoder_frozen(specs) -> bool",
         "build_vlm_wrapper(model_config) -> VLMWrapper",
-        "inner_transformer(model) -> nn.Module"
+        "inner_transformer(model) -> nn.Module",
+        "packed_tokens_per_image(model) -> int  # slots one image takes in a packed row, read off the built VLMWrapper"
       ],
       "registry": [
         "@registry.register_modality_strategy('joint_decoder')",
@@ -483,7 +484,8 @@
     "kempnerforge/model/masking.py": {
       "functions": [
         "flex_attention_fn(compiled) -> Callable  # torch.compile'd on CUDA, eager on CPU",
-        "build_doc_causal_block_mask(doc_ids, device) -> BlockMask  # block-diagonal causal"
+        "build_doc_causal_block_mask(doc_ids, device) -> BlockMask  # block-diagonal causal",
+        "use_dynamic_flex_shapes(enabled) -> None  # select the flex pair compiled for a varying batch size (packed VLM runs) or the pinned-shape pair"
       ],
       "purpose": "FlexAttention BlockMask builders for packed sequences (model.attention_backend='flex'); replaces the dense (B, 1, S, S) SDPA mask",
       "tested_by": [
@@ -884,7 +886,7 @@
         }
       },
       "functions": [
-        "build_data_pipeline(config, runtime) -> DataPipeline",
+        "build_data_pipeline(config, runtime, *, tokens_per_image=None) -> DataPipeline",
         "build_eval_dataloader(config, runtime) -> DataLoader | None",
         "build_phase_state(config, data, step) -> PhaseState",
         "advance_phases(state, data, step) -> bool"
@@ -1064,11 +1066,18 @@
           "methods": [
             "__call__(samples)"
           ]
+        },
+        "PackedVLMCollator": {
+          "purpose": "Packs a micro-batch's documents into rows of seq_len via pack_vlm_samples; the row count varies with the documents, so train.batch_size is documents per micro-batch",
+          "methods": [
+            "__call__(samples)"
+          ]
         }
       },
       "functions": [
         "_pil_to_tensor(image, image_size, image_mean, image_std) -> Tensor",
-        "_tokenize_and_mask(tokenizer, text, max_text_len, prompt) -> (input_ids, labels)"
+        "_tokenize_and_mask(tokenizer, text, max_text_len, prompt) -> (input_ids, labels, text_len)",
+        "pack_vlm_samples(samples, *, seq_len, tokens_per_image, pad_id) -> dict: first-fit documents into rows; emits doc_ids, position_ids, image_rows/image_starts/image_tokens and text_rows/text_positions"
       ],
       "tested_by": [
         "tests/unit/test_vlm_dataset.py::TestPILToTensor",
@@ -1231,6 +1240,7 @@
             "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope, multipliers and group-layout checks all decide from it)",
             "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
             "_check_lr_multipliers(metadata, ckpt_dir) -> saved group modules | None (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
+            "_present_experts(dcp_state, load_from, saved_keys) (EP experts placed among all of them before DCP; a load refuses a checkpoint of fewer experts than the model; the ranks agree before DCP)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
             "_cleanup()"
@@ -1259,6 +1269,7 @@
         "tests/unit/test_checkpoint.py::TestIntersectFreezeMetaByModule",
         "tests/unit/test_checkpoint_security.py::TestLoadTrainStateOwnershipGate",
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
+        "tests/unit/test_ep_checkpoint.py",
         "tests/unit/test_checkpoint.py::TestCheckpointManagerLoad",
         "tests/distributed/test_checkpoint.py"
       ]
@@ -1271,13 +1282,34 @@
             "is_pending"
           ],
           "methods": [
-            "save(state_dict, checkpoint_id, process_group)",
+            "save(state_dict, checkpoint_id, process_group, planner)",
             "wait()"
           ]
         }
       },
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestAsyncCheckpointer"
+      ]
+    },
+    "kempnerforge/checkpoint/expert_layout.py": {
+      "classes": {
+        "ExpertLayout": {
+          "purpose": "Translates a DCP state dict between one EP rank's experts and all of them: unpacked experts under their global index, packed weights as views over the FSDP mesh and ep holding every expert's rows, with optimizer state and param-group lists to match",
+          "methods": [
+            "to_global(state) -> dict",
+            "to_local(state) -> dict"
+          ]
+        }
+      },
+      "functions": [
+        "moe_layers(model) -> Iterator[(state-dict name, MoEMLP)]",
+        "expert_layout(model) -> ExpertLayout | None (None without expert parallelism)",
+        "check_saved_experts(model, saved, where) (refuses a checkpoint holding fewer experts than the model, as one saved with ep > 1 before #202 does)"
+      ],
+      "tested_by": [
+        "tests/unit/test_expert_layout.py",
+        "tests/unit/test_ep_checkpoint.py",
+        "tests/distributed/test_ep.py::TestEPCheckpoint"
       ]
     },
     "kempnerforge/metrics/tracker.py": {
@@ -1452,7 +1484,10 @@
     },
     "scripts/generate.py": {
       "purpose": "Text generation — load model, sample from prompts, interactive REPL",
-      "entry": "main()"
+      "entry": "main()",
+      "tested_by": [
+        "tests/unit/test_ep_checkpoint.py::TestUnfixedCheckpoint"
+      ]
     },
     "scripts/convert_checkpoint.py": {
       "purpose": "KempnerForge <-> HuggingFace checkpoint conversion",
@@ -1462,7 +1497,8 @@
         "_build_hf_config()"
       ],
       "tested_by": [
-        "tests/unit/test_convert_checkpoint.py"
+        "tests/unit/test_convert_checkpoint.py",
+        "tests/unit/test_ep_checkpoint.py::TestExportFromAnEPCheckpoint"
       ]
     },
     "scripts/prepare_data.py": {
@@ -1683,6 +1719,33 @@
           "TestMoERoundTrip(1)"
         ],
         "count": 29
+      },
+      "tests/unit/test_ep_checkpoint.py": {
+        "classes": [
+          "TestCheckpointHoldsEveryExpert(12)",
+          "TestSecondMeshOfOneLayout(1)",
+          "TestDriftedCopies(2)",
+          "TestPlacementCheck(1)",
+          "TestFailureOnOneRank(1)",
+          "TestResumeAtTheSameLayout(11)",
+          "TestPerModuleLearningRates(2)",
+          "TestLoadAtAnotherEP(18)",
+          "TestUnfixedCheckpoint(8)",
+          "TestExportFromAnEPCheckpoint(3)",
+          "TestWithoutEP(2)"
+        ],
+        "count": 61
+      },
+      "tests/unit/test_expert_layout.py": {
+        "classes": [
+          "TestMoELayers(2)",
+          "TestUnpackedNames(8)",
+          "TestPackedWithoutMesh(3)",
+          "TestOlderTorch(1)",
+          "TestCheckSavedExperts(6)",
+          "TestRootLayer(5)"
+        ],
+        "count": 25
       },
       "tests/unit/test_fp8.py": {
         "classes": [
@@ -1974,7 +2037,7 @@
         "note": "MoE with FSDP/TP"
       },
       "tests/distributed/test_ep.py": {
-        "note": "Expert parallelism"
+        "note": "Expert parallelism, and an EP checkpoint round trip on four GPUs"
       },
       "tests/distributed/test_optimizer_distributed.py": {
         "note": "Lion, Schedule-Free AdamW, optimizer-scheduler compat under FSDP2"

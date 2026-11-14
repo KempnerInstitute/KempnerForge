@@ -155,13 +155,17 @@ all-reduce. If the sum ≠ `world_size`, the training loop logs
 See
 [Resilience § NCCL liveness](../resilience/nccl-liveness.md#periodic-check-in-the-loop).
 
-The check catches **partial-participation bugs**, not true deadlocks —
-the all-reduce itself hangs forever if one rank is genuinely dead
-(which is why SLURM's `NCCL_TIMEOUT` is load-bearing). Combine both:
+The check catches **partial-participation bugs**. The probe itself waits
+at most `timeout_sec` (10 seconds) and returns `False` on a timeout, but a
+rank that is genuinely dead usually stalls the step's own collectives
+before the probe runs. Those wait out their process group's timeout:
+`distributed.nccl_timeout_sec` (default 1800 seconds) on the default
+group, which plain FSDP uses, and PyTorch's 30-minute default on the
+groups `init_device_mesh` creates for the other mesh dimensions. To fail
+faster on the default group, lower it:
 
 ```bash
-# In the SLURM script
-export NCCL_TIMEOUT=1800   # 30 min — kills the job if NCCL hangs
+sbatch scripts/slurm/multinode.sh configs/train/7b.toml --distributed.nccl_timeout_sec=600
 ```
 
 ### When it fires
@@ -263,7 +267,7 @@ Symptom
    │
    ├─ Loss NaN      → train/grad_norm + last-good checkpoint → restart lower LR
    ├─ OOM           → allocated_gb trace → snapshot → memory_viz
-   ├─ Rank hang     → NCCL liveness + NCCL_TIMEOUT → inspect rank-specific code
+   ├─ Rank hang     → NCCL liveness + nccl_timeout_sec → inspect rank-specific code
    ├─ Slowdown      → step_time_sec → torch.profiler → kernel summary
    └─ Bad eval      → re-run eval on baseline → audit data / LR / tokenizer
 ```
@@ -278,7 +282,7 @@ hundred MB per rank.
 - [Resilience § NaN detection](../resilience/nan-detection.md) —
   detector internals and the three `action` modes.
 - [Resilience § NCCL liveness](../resilience/nccl-liveness.md) —
-  what the periodic probe checks and why `NCCL_TIMEOUT` matters.
+  what the periodic probe checks and which timeouts bound a hang.
 - [Resilience § GPU health](../resilience/gpu-health.md) — on-demand
   compute/memory probe for a specific device.
 - [Metrics § Memory monitor](../metrics-and-profiling/memory-monitor.md)

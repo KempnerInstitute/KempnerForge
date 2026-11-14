@@ -248,6 +248,13 @@ class TestFp32CrossEntropy:
 
 
 class TestZLoss:
+    def test_logits_without_rows_give_zero_on_the_graph(self):
+        logits = torch.randn(1, 0, 100, requires_grad=True)
+        result = z_loss(logits, weight=1e-4)
+        assert result.item() == 0.0
+        result.backward()
+        assert logits.grad is not None and logits.grad.shape == (1, 0, 100)
+
     def test_zero_weight_returns_zero(self):
         logits = torch.randn(2, 8, 100)
         result = z_loss(logits, weight=0.0)

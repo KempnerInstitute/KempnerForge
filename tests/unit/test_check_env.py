@@ -420,6 +420,58 @@ class TestCheckMlflow:
         assert r.status == check_env.WARN
         assert "no [from-uri] section" in r.message
 
+    @pytest.mark.parametrize("check_credentials", [False, True], ids=["offline", "probe"])
+    def test_a_config_profile_naming_another_profile_than_the_uri_is_a_warn(
+        self, home, monkeypatch, check_credentials
+    ):
+        """The backend keeps the variable, so the run would use two profiles (#463); a probe,
+        which would test only the URI's, is not run."""
+        (home / ".databrickscfg").write_text(
+            "[prod]\nhost = h\ntoken = t\n[dev]\nhost = h\ntoken = u\n"
+        )
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "dev")
+        seen: list[dict] = []
+        self._fake_sdk(monkeypatch, self._recording_client(seen))
+        r = check_env.check_mlflow(check_credentials=check_credentials)
+        assert r.status == check_env.WARN
+        assert "selects profile prod but $DATABRICKS_CONFIG_PROFILE is dev" in r.message
+        assert "unset DATABRICKS_CONFIG_PROFILE or set it to prod" in r.message
+        assert seen == []
+
+    @pytest.mark.parametrize("value", ["prod", ""], ids=["same-profile", "empty"])
+    def test_a_config_profile_equal_to_the_uris_or_empty_passes(self, home, monkeypatch, value):
+        (home / ".databrickscfg").write_text("[prod]\nhost = h\ntoken = t\n")
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", value)
+        r = check_env.check_mlflow()
+        assert r.status == check_env.OK
+        assert "profile prod found" in r.message
+
+    def test_a_profile_mismatch_without_a_profile_file_is_not_a_warn(self, monkeypatch):
+        """With no file the SDK reads no profile at all, so every client takes the environment."""
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "dev")
+        monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-xxx")
+        assert check_env.check_mlflow().status == check_env.OK
+
+    def test_a_profile_mismatch_beside_two_auth_methods_is_one_warn_naming_both(
+        self, home, monkeypatch
+    ):
+        (home / ".databrickscfg").write_text(
+            "[prod]\nhost = h\ntoken = t\n[dev]\nhost = h\ntoken = u\n"
+        )
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "dev")
+        monkeypatch.setenv("DATABRICKS_CLIENT_ID", "i")
+        monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "s")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "more than one auth method" in r.message and "token in [prod]" in r.message
+        assert "selects profile prod but $DATABRICKS_CONFIG_PROFILE is dev" in r.message
+        assert r.message.endswith(check_env._MLFLOW_AUTH_ROUTES)
+
     def test_profile_not_in_file_is_informational(self, home):
         (home / ".databrickscfg").write_text("[other]\nhost = h\n")
         r = check_env.check_mlflow()
@@ -912,6 +964,168 @@ class TestCheckMlflow:
         assert r.status == check_env.WARN
         assert "DATABRICKS_AUTH_TYPE" in r.message
 
+    @pytest.mark.parametrize(
+        ("section", "env", "method"),
+        [
+            (
+                "token = t\n",
+                {"DATABRICKS_CLIENT_ID": "i", "DATABRICKS_CLIENT_SECRET": "s"},
+                "oauth",
+            ),
+            ("token = t\n", {"ARM_CLIENT_ID": "i"}, "azure"),
+            ("client_id = i\nclient_secret = s\n", {"DATABRICKS_TOKEN": "t"}, "pat"),
+            ("client_id = i\nclient_secret = s\n", {"DATABRICKS_API_TOKEN": "t"}, "pat"),
+            ("token =\n", {"DATABRICKS_CLIENT_ID": "i", "DATABRICKS_CLIENT_SECRET": "s"}, "oauth"),
+        ],
+        ids=[
+            "token-and-oauth-env",
+            "token-and-azure-env",
+            "oauth-and-token-env",
+            "oauth-and-token-alias",
+            "empty-token-key",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "selector",
+        [("MLFLOW_TRACKING_URI", "databricks://prod"), ("DATABRICKS_CONFIG_PROFILE", "prod")],
+        ids=["tracking-uri", "config-profile"],
+    )
+    def test_a_selected_profile_beside_another_auth_method_is_a_warn(
+        self, home, monkeypatch, section, env, method, selector
+    ):
+        """The SDK fills the profile in under the environment and refuses two methods (#466)."""
+        (home / ".databrickscfg").write_text(f"[prod]\nhost = h\n{section}")
+        monkeypatch.setenv(*selector)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "more than one auth method" in r.message and method in r.message
+        assert "DATABRICKS_AUTH_TYPE" in r.message and "auth_type key" in r.message
+
+    @pytest.mark.parametrize(
+        ("section", "env"),
+        [
+            ("token = t\n", {"DATABRICKS_AUTH_TYPE": "pat"}),
+            ("token = t\nauth_type = pat\n", {}),
+        ],
+        ids=["env-pin", "profile-pin"],
+    )
+    def test_an_auth_type_pin_lets_a_profile_beside_another_method_pass(
+        self, home, monkeypatch, section, env
+    ):
+        (home / ".databrickscfg").write_text(f"[prod]\nhost = h\n{section}")
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        monkeypatch.setenv("DATABRICKS_CLIENT_ID", "i")
+        monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "s")
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        assert check_env.check_mlflow().status == check_env.OK
+
+    def test_an_empty_auth_type_key_pins_nothing(self, home, monkeypatch):
+        """The SDK pins a method only on a non-empty auth_type."""
+        (home / ".databrickscfg").write_text("[prod]\nhost = h\ntoken = t\nauth_type =\n")
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        monkeypatch.setenv("DATABRICKS_CLIENT_ID", "i")
+        monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "s")
+        assert check_env.check_mlflow().status == check_env.WARN
+
+    def test_one_method_from_the_profile_and_the_environment_passes(self, home, monkeypatch):
+        (home / ".databrickscfg").write_text("[prod]\nhost = h\ntoken = t\n")
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "other")
+        assert check_env.check_mlflow().status == check_env.OK
+
+    def test_default_section_keys_are_not_counted_for_a_named_profile(self, home, monkeypatch):
+        """The SDK reads a named profile's own keys and never merges [DEFAULT] into it."""
+        (home / ".databrickscfg").write_text(
+            "[DEFAULT]\nclient_id = i\nclient_secret = s\n[prod]\nhost = h\ntoken = t\n"
+        )
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        assert check_env.check_mlflow().status == check_env.OK
+
+    def test_a_default_profile_with_two_auth_methods_is_a_warn(self, home):
+        """With none selected and no credential variable, the default profile alone decides."""
+        (home / ".databrickscfg").write_text("[DEFAULT]\nhost = h\ntoken = t\nclient_id = i\n")
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "more than one auth method" in r.message
+        assert "client_id in [DEFAULT]" in r.message and "token in [DEFAULT]" in r.message
+
+    def test_a_settings_default_profile_with_two_auth_methods_is_named_by_its_role(self, home):
+        """default_profile is a value from the file, so the conflict does not quote it."""
+        (home / ".databrickscfg").write_text(
+            "[__settings__]\ndefault_profile = my-work\n[my-work]\nhost = h\ntoken = t\n"
+            "client_id = i\n"
+        )
+        r = check_env.check_mlflow()
+        assert r.status == check_env.WARN
+        assert "token in the profile [__settings__] default_profile names" in r.message
+        assert "my-work" not in r.message
+
+    def test_a_conflict_names_keys_and_variables_but_no_value(self, home, monkeypatch):
+        secret = "dapi-never-quote-me"
+        (home / ".databrickscfg").write_text(f"[prod]\nhost = h\ntoken = {secret}\n")
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        monkeypatch.setenv("DATABRICKS_CLIENT_ID", "client-never-quote-me")
+        monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "secret-never-quote-me")
+        r = check_env.check_mlflow()
+        assert "token in [prod]" in r.message and "$DATABRICKS_CLIENT_ID" in r.message
+        assert "never-quote-me" not in json.dumps(r.to_dict()) + check_env.format_text([r])
+
+    def test_the_auth_maps_match_the_installed_sdk(self):
+        """Every auth attribute the SDK declares is known by its profile key and its variables,
+        so an auth method a later SDK adds fails here instead of passing the preflight."""
+        sdk_config = pytest.importorskip("databricks.sdk.config")
+        attributes = [a for a in sdk_config.Config.attributes() if a.auth]
+        assert {a.name: a.auth for a in attributes} == check_env._DATABRICKS_PROFILE_KEY_AUTH
+        variables = {name: a.auth for a in attributes for name in (a.env, *a.env_aliases)}
+        variables["DATABRICKS_API_TOKEN"] = "pat"
+        assert variables == check_env._DATABRICKS_CREDENTIAL_VAR_AUTH
+
+    @pytest.mark.parametrize(
+        ("section", "env"),
+        [
+            ("token = t\n", {"DATABRICKS_CLIENT_ID": "i", "DATABRICKS_CLIENT_SECRET": "s"}),
+            ("token = t\n", {"ARM_CLIENT_ID": "i"}),
+            ("client_id = i\nclient_secret = s\n", {"DATABRICKS_TOKEN": "t"}),
+            ("token =\n", {"DATABRICKS_CLIENT_ID": "i", "DATABRICKS_CLIENT_SECRET": "s"}),
+            ("token = t\nauth_type = pat\n", {"DATABRICKS_CLIENT_ID": "i"}),
+            ("token = t\nauth_type =\n", {"DATABRICKS_CLIENT_ID": "i"}),
+            ("token = t\n", {"DATABRICKS_TOKEN": "u"}),
+            ("token = t\n", {}),
+        ],
+        ids=[
+            "token-and-oauth-env",
+            "token-and-azure-env",
+            "oauth-and-token-env",
+            "empty-token-key",
+            "profile-pin",
+            "empty-profile-pin",
+            "one-method-twice",
+            "one-method",
+        ],
+    )
+    def test_the_preflight_agrees_with_the_sdk(self, home, monkeypatch, section, env):
+        """The installed SDK, offline: its host-metadata probe is stubbed, so no workspace is
+        contacted, and every other step is its own."""
+        sdk_config = pytest.importorskip("databricks.sdk.config")
+
+        def offline(host, client=None):
+            raise ConnectionError("offline")
+
+        monkeypatch.setattr(sdk_config, "get_host_metadata", offline, raising=False)
+        (home / ".databrickscfg").write_text(f"[prod]\nhost = https://h.invalid\n{section}")
+        monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks://prod")
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        try:
+            sdk_config.Config(profile="prod")
+            accepted = True
+        except ValueError:
+            accepted = False
+        assert (check_env.check_mlflow().status == check_env.OK) == accepted
+
     def test_auth_type_picks_one_of_two_auth_methods(self, monkeypatch):
         monkeypatch.setenv("DATABRICKS_HOST", "https://x.cloud.databricks.com")
         monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-xxx")
@@ -1144,7 +1358,7 @@ class TestCheckMlflow:
     def test_check_credentials_does_not_force_a_profile_when_none_is_selected(
         self, home, monkeypatch
     ):
-        """The backend never passes profile=, so neither does the probe."""
+        """With no profile selected the backend passes no profile=, so neither does the probe."""
         (home / ".databrickscfg").write_text("[DEFAULT]\nhost = h\n")
         seen: list[dict] = []
         self._fake_sdk(monkeypatch, self._recording_client(seen))

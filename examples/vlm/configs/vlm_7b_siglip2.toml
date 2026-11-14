@@ -26,10 +26,12 @@
 #   uv run torchrun --nproc_per_node=4 examples/vlm/train.py examples/vlm/configs/vlm_7b_siglip2.toml
 #
 # Data:
-#   Default hf_dataset_name is a 30-sample COCO val substitute
-#   (sayakpaul/coco-30-val-2014) so a fresh clone runs without external
-#   setup. This config runs 5000 steps; the 30-sample default will
-#   memorize in <1 epoch. Override via CLI for real training, e.g.:
+#   Default hf_dataset_name is sayakpaul/coco-30-val-2014: 30,000
+#   image-caption pairs sampled from the COCO 2014 val split, about 4.9 GB
+#   to download on first use, so a fresh clone runs without external setup.
+#   On 4 GPUs a step takes 64 samples (batch_size 4 x grad_accum_steps 4 x
+#   4 ranks), so the 5000 steps pass over the default data about 11 times.
+#   Override via CLI for real training, e.g.:
 #     --data.hf_dataset_name=<larger-dataset-or-local-path>
 #   For a local Karpathy-split COCO dataset, see examples/vlm/scripts/prep_vlm_coco.py
 #   which writes a save_to_disk directory you can point this field at.
