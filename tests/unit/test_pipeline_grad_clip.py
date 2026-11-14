@@ -3,29 +3,21 @@
 from __future__ import annotations
 
 import math
-import socket
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, parallelize_module
 
 from kempnerforge.distributed.utils import clip_grad_norm_
+from tests.gloo_ranks import gloo_group, spawn
 
 N_LAYERS = 8
 DIM = 16
 MAX_NORM = 1.0
-
-
-def _free_port() -> int:
-    """An unused local TCP port for the gloo rendezvous."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _model() -> nn.Sequential:
@@ -86,10 +78,7 @@ def _check_stage(
     dtype: torch.dtype = torch.float32,
 ) -> None:
     """Clip this rank's stage and compare with one process clipping the whole model."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         ref_norm, reference = _reference(world, no_grads, dtype)
         stage = _stage(_model().to(dtype), rank, world)
         if rank == no_grads:
@@ -109,18 +98,13 @@ def _check_stage(
                 assert p.grad is None
             else:
                 _assert_grads_close(p.grad, q.grad)
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_sharded_stage(
     rank: int, world: int, port: int, dtype: torch.dtype = torch.float32
 ) -> None:
     """pp=2 x dp_shard=2: each stage's parameters are row-sharded DTensors, as under FSDP2."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("pp", "dp_shard"))
         pp_rank = mesh.get_local_rank("pp")
         ref_norm, reference = _reference(2, None, dtype)
@@ -137,8 +121,6 @@ def _check_sharded_stage(
         expected = _stage(reference, pp_rank, 2).parameters()
         for p, q in zip(stage.parameters(), expected, strict=True):
             _assert_grads_close(p.grad.full_tensor(), q.grad)
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_tp_stage(rank: int, world: int, port: int, pp: int, dtype: torch.dtype) -> None:
@@ -147,10 +129,7 @@ def _check_tp_stage(rank: int, world: int, port: int, pp: int, dtype: torch.dtyp
     The stage's other layers stay plain tensors, as norms and embeddings do under
     TP, so its gradients live on two meshes. With ``pp=1`` no group is passed.
     """
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (pp, 2), mesh_dim_names=("pp", "tp"))
         pp_rank = mesh.get_local_rank("pp")
         ref_norm, reference = _reference(pp, None, dtype)
@@ -170,24 +149,17 @@ def _check_tp_stage(rank: int, world: int, port: int, pp: int, dtype: torch.dtyp
         for p, q in zip(stage.parameters(), expected, strict=True):
             grad = p.grad.full_tensor() if isinstance(p.grad, DTensor) else p.grad
             _assert_grads_close(grad, q.grad)
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_fp64_stage(rank: int, world: int, port: int) -> None:
     """fp64 gradients keep an fp64 norm, since ``vector_norm`` cannot narrow them to fp32."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         stage = _stage(_model().double(), rank, world)
         norm_sq = torch.stack([p.grad.pow(2).sum() for p in stage.parameters()]).sum()
         dist.all_reduce(norm_sq)
         norm = clip_grad_norm_(stage, MAX_NORM, pp_group=dist.group.WORLD)
         assert norm.dtype == torch.float64
         torch.testing.assert_close(norm, norm_sq.sqrt())
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_pipeline_step(rank: int, world: int, port: int) -> None:
@@ -208,10 +180,7 @@ def _check_pipeline_step(rank: int, world: int, port: int) -> None:
         return F.cross_entropy(out.flatten(0, 1).float(), target.flatten())
 
     n_micro, per_dp_batch, seq = 2, 4, 32
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("pp", "dp_shard"))
         pp_rank, dp_rank = mesh.get_local_rank("pp"), mesh.get_local_rank("dp_shard")
         config = ModelConfig(dim=64, n_layers=4, n_heads=4, vocab_size=128, max_seq_len=seq)
@@ -252,43 +221,41 @@ def _check_pipeline_step(rank: int, world: int, port: int) -> None:
             torch.testing.assert_close(
                 p.grad.full_tensor(), reference.get_parameter(name).grad, rtol=2e-4, atol=2e-5
             )
-    finally:
-        dist.destroy_process_group()
 
 
 class TestClipAcrossPipelineStages:
     @pytest.mark.parametrize("world", [2, 4])
     def test_every_stage_clips_with_the_whole_model_norm(self, world):
         """Each stage returns the model's norm, and the clipped model norm is ``max_norm``."""
-        mp.spawn(_check_stage, args=(world, _free_port(), True, None), nprocs=world)
+        spawn(_check_stage, world, True, None)
 
     def test_without_the_group_each_stage_clips_alone(self):
         """Alone, each stage reaches ``max_norm``, so the model ends at sqrt(pp) times it."""
-        mp.spawn(_check_stage, args=(2, _free_port(), False, None), nprocs=2)
+        spawn(_check_stage, 2, False, None)
 
     def test_a_stage_without_gradients_still_joins(self):
         """A stage with no gradients takes part in the sum instead of hanging the others."""
-        mp.spawn(_check_stage, args=(2, _free_port(), True, 1), nprocs=2)
+        spawn(_check_stage, 2, True, 1)
 
     def test_one_stage_matches_the_plain_path(self):
-        mp.spawn(_check_stage, args=(1, _free_port(), True, None), nprocs=1)
+        spawn(_check_stage, 1, True, None)
 
     def test_row_sharded_stages_match_one_process(self):
         """With pp=2 x dp_shard=2 the norm is reduced over the shards and over the stages."""
-        mp.spawn(_check_sharded_stage, args=(4, _free_port()), nprocs=4)
+        spawn(_check_sharded_stage, 4)
 
     def test_pipeline_step_with_fsdp2_matches_one_process(self):
         """Gradients from a real pipeline step with FSDP2 clip exactly as one process's do."""
-        mp.spawn(_check_pipeline_step, args=(4, _free_port()), nprocs=4)
+        spawn(_check_pipeline_step, 4)
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
     def test_half_precision_stages_clip_with_the_fp32_norm(self, dtype):
         """Stage norms far above 256 neither overflow in fp16 nor round in bf16."""
-        mp.spawn(_check_stage, args=(2, _free_port(), True, None, dtype), nprocs=2)
+        spawn(_check_stage, 2, True, None, dtype)
 
     def test_half_precision_row_sharded_stages_clip_with_the_fp32_norm(self):
         """fp16 DTensor gradients reduce their partial norms in fp32 as well."""
-        mp.spawn(_check_sharded_stage, args=(4, _free_port(), torch.float16), nprocs=4)
+        spawn(_check_sharded_stage, 4, torch.float16)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=["fp32", "fp16"])
     @pytest.mark.parametrize("pp", [1, 2])
@@ -297,8 +264,8 @@ class TestClipAcrossPipelineStages:
 
         With ``pp=1`` there is no group, and the two meshes take the mixed-mesh path.
         """
-        mp.spawn(_check_tp_stage, args=(2 * pp, _free_port(), pp, dtype), nprocs=2 * pp)
+        spawn(_check_tp_stage, 2 * pp, pp, dtype)
 
     def test_fp64_stages_keep_an_fp64_norm(self):
         """fp64 gradients clip with an fp64 norm instead of failing to narrow to fp32."""
-        mp.spawn(_check_fp64_stage, args=(2, _free_port()), nprocs=2)
+        spawn(_check_fp64_stage, 2)

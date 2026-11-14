@@ -5,7 +5,9 @@ from __future__ import annotations
 import importlib.metadata
 
 project = "KempnerForge"
-author = "Kempner Institute for the Study of Natural and Artificial Intelligence at Harvard University"
+author = (
+    "Kempner Institute for the Study of Natural and Artificial Intelligence at Harvard University"
+)
 
 try:
     release = importlib.metadata.version("kempnerforge")
@@ -13,7 +15,7 @@ except importlib.metadata.PackageNotFoundError:
     release = "0.0.0"
 version = ".".join(release.split(".")[:2])
 
-copyright = f"2026, Kempner Institute for the Study of Natural and Artificial Intelligence at Harvard University · v{release}"
+copyright = f"2026, {author} · v{release}"
 
 extensions = [
     "sphinx.ext.autodoc",

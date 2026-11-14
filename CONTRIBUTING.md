@@ -30,8 +30,8 @@ Run all three checks that CI will run on your PR:
 
 ```bash
 # Lint + format + type check
-uv run ruff check kempnerforge/ tests/ scripts/
-uv run ruff format --check kempnerforge/ tests/ scripts/
+uv run ruff check .
+uv run ruff format --check .
 uv run pyright kempnerforge/
 
 # Unit tests (no GPU needed)
@@ -115,10 +115,10 @@ Write your code. Write tests. Then run the pre-push checklist:
 
 ```bash
 # 1. Format (auto-fix)
-uv run ruff format kempnerforge/ tests/ scripts/
+uv run ruff format .
 
 # 2. Lint (auto-fix what it can)
-uv run ruff check --fix kempnerforge/ tests/ scripts/
+uv run ruff check --fix .
 
 # 3. Type check
 uv run pyright kempnerforge/
@@ -185,10 +185,10 @@ Include `Closes #N` to auto-close the issue on merge.
 
 ```bash
 # Auto-fix lint issues
-uv run ruff check --fix kempnerforge/ tests/ scripts/
+uv run ruff check --fix .
 
 # Auto-format
-uv run ruff format kempnerforge/ tests/ scripts/
+uv run ruff format .
 
 # Type check (must be zero errors)
 uv run pyright kempnerforge/
@@ -203,9 +203,9 @@ CI runs on every push to `main` and every PR. All jobs must pass before merge.
 | `lint` | `ruff check` + `ruff format --check` + `pyright` | Every push/PR |
 | `unit-tests` | `pytest tests/unit/ -v --timeout=60` | Every push/PR |
 | `gpu-tests` | `pytest tests/integration/` | Manual dispatch |
-| `<example>-tests` | `examples/<example>/tests` in one pytest session, manual-only tiers excluded | Pushes/PRs touching `examples/<example>/` |
+| `<example>-tests` | `examples/<example>/tests` in one pytest session, manual-only tiers excluded | Pushes/PRs touching `examples/<example>/`, `kempnerforge/`, `pyproject.toml`, `uv.lock` or the workflow |
 
-The most common CI failure is `ruff format --check`. Run `uv run ruff format --check kempnerforge/ tests/ scripts/` locally before pushing.
+The most common CI failure is `ruff format --check`. Run `uv run ruff format --check .` locally before pushing.
 
 ## Testing
 
@@ -259,6 +259,8 @@ class TestMyFeature:
 - Test the happy path, edge cases, and invalid inputs.
 - Every config field with constraints needs both a default-value test and a rejection test.
 - Use `pytest.raises(ValueError, match="...")` with a match pattern for validation tests.
+
+**Multi-process tests** run real collectives on CPU ranks over gloo. Use `tests/gloo_ranks.py`: `spawn(fn, world, *args)` starts `fn(rank, world, port, *args)` on every rank, and the rank does its work inside `with gloo_group(rank, world, port):`. The test process holds the rendezvous port open until the ranks finish, and a rank leaves the group only once every rank has finished its block (a block that raises leaves at once). The wait to leave gives up after 45 s, or the `timeout` given to `gloo_group`, and names the ranks still in their block. Leaving tears the group down, so finish background collectives, such as an async save's, before the block returns. Never pick a free port and release it for the ranks to bind later: another process can take it in between. To time one part of the ranks' work, such as a save, without counting their start-up and exit, use `run_to_outcomes`.
 
 ### Running Specific Tests
 
@@ -495,8 +497,8 @@ Always use `uv` — never pip, conda, or venv. PyTorch is pinned to the CUDA 12.
 uv sync
 
 # Pre-push checklist (run all before every push)
-uv run ruff format kempnerforge/ tests/ scripts/
-uv run ruff check kempnerforge/ tests/ scripts/
+uv run ruff format .
+uv run ruff check .
 uv run pyright kempnerforge/
 uv run pytest tests/unit/ -v --timeout=60
 

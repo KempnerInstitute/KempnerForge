@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import socket
 
 import pytest
 import torch
@@ -11,6 +10,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from kempnerforge.training.eval import run_eval, should_build_eval_dataloader
+from tests.gloo_ranks import gloo_group, spawn
 
 VOCAB_SIZE = 64
 DIM = 32
@@ -141,12 +141,6 @@ class TestShouldBuildEvalDataloader:
         assert should_build_eval_dataloader(False, True) == (False, False)
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def _check_pipeline_eval(
     rank: int, world: int, port: int, schedule_name: str, keep_grads: bool
 ) -> None:
@@ -155,7 +149,6 @@ def _check_pipeline_eval(
     than the loader holds, so it starts the loader over. With ``keep_grads`` the training
     gradients stay on the stage through eval; otherwise they are cleared first, as the
     loop does."""
-    import torch.distributed as dist
     import torch.nn.functional as F
     from torch.distributed.device_mesh import init_device_mesh
 
@@ -171,10 +164,7 @@ def _check_pipeline_eval(
         return F.cross_entropy(out.flatten(0, 1).float(), target.flatten())
 
     n_micro, micro_batch, seq = max(2, world), 2, 16
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("pp",))
         config = ModelConfig(
             dim=32, n_layers=world, n_heads=2, vocab_size=VOCAB_SIZE, max_seq_len=seq
@@ -250,8 +240,6 @@ def _check_pipeline_eval(
 
         train_step()
         assert all(p.grad is not None for p in stage_module.parameters())
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_two_stage_fsdp_eval(
@@ -260,7 +248,6 @@ def _check_two_stage_fsdp_eval(
     """PP 2 x FSDP2 dp_shard 2: a training step, eval, then a step whose gradients match the
     whole model's, so eval between steps leaves the sharded state and gradients alone. With
     ``keep_grads`` the sharded training gradients stay on the stage through eval."""
-    import torch.distributed as dist
     import torch.nn.functional as F
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -279,10 +266,7 @@ def _check_two_stage_fsdp_eval(
 
     n_micro, micro_batch, seq = 2, 2, 16
     per_dp_batch = n_micro * micro_batch
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("pp", "dp_shard"))
         pp_rank, dp_rank = mesh.get_local_rank("pp"), mesh.get_local_rank("dp_shard")
         config = ModelConfig(dim=32, n_layers=2, n_heads=2, vocab_size=VOCAB_SIZE, max_seq_len=seq)
@@ -362,8 +346,6 @@ def _check_two_stage_fsdp_eval(
                 rtol=2e-4,
                 atol=2e-5,
             )
-    finally:
-        dist.destroy_process_group()
 
 
 class _NoBatchSchedule:
@@ -387,18 +369,13 @@ class TestRunEvalPipeline:
         stages the batches go through the schedule a training step's microbatches at a time;
         eval starts the loader over when it runs out, computes no gradients, and the
         schedule trains again afterward."""
-        import torch.multiprocessing as mp
-
-        args = (n_stages, _free_port(), schedule_name, False)
-        mp.spawn(_check_pipeline_eval, args=args, nprocs=n_stages)
+        spawn(_check_pipeline_eval, n_stages, schedule_name, False)
 
     @pytest.mark.parametrize("schedule_name", ["1f1b", "gpipe"])
     def test_eval_leaves_the_gradients_on_the_stage_unchanged(self, schedule_name):
         """The schedule's gradient reduction runs after each eval() call; with its scaling
         off, gradients left on the stage keep their values over all three calls."""
-        import torch.multiprocessing as mp
-
-        mp.spawn(_check_pipeline_eval, args=(2, _free_port(), schedule_name, True), nprocs=2)
+        spawn(_check_pipeline_eval, 2, schedule_name, True)
 
     @pytest.mark.parametrize("keep_grads", [False, True])
     @pytest.mark.parametrize("schedule_name", ["1f1b", "gpipe"])
@@ -408,10 +385,7 @@ class TestRunEvalPipeline:
         """With FSDP2 inside each stage, the schedule's gradient reduction still runs in
         eval(): sharded gradients left on the stage keep their values, and after clearing
         them the next step's sharded gradients equal the whole model's."""
-        import torch.multiprocessing as mp
-
-        args = (4, _free_port(), schedule_name, keep_grads)
-        mp.spawn(_check_two_stage_fsdp_eval, args=args, nprocs=4)
+        spawn(_check_two_stage_fsdp_eval, 4, schedule_name, keep_grads)
 
     def test_eval_steps_must_fill_whole_schedule_calls(self):
         with pytest.raises(ValueError, match="multiple of the pipeline schedule's 2 microbatches"):

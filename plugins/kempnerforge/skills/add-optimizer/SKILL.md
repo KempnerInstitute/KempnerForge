@@ -81,8 +81,8 @@ Assume preflight has passed.
 
 ## Verification
 - `uv run pytest tests/unit/test_optimizer.py tests/unit/test_additional_optimizers.py -v` passes.
-- `uv run ruff check kempnerforge/ tests/` is clean.
-- `uv run ruff format --check kempnerforge/ tests/` passes (CI runs this too).
+- `uv run ruff check .` is clean.
+- `uv run ruff format --check .` passes (CI runs this too).
 - Smoke test with the new optimizer: `uv run python scripts/train.py configs/train/debug.toml --data.dataset_path=<path> --optimizer.name=my_opt --train.max_steps=20`. Loss must decrease.
 
 ## Gotchas

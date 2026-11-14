@@ -10,16 +10,16 @@ the same experts.
 
 from __future__ import annotations
 
+import contextlib
 import re
-import socket
 import sys
+from collections.abc import Iterator
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 from safetensors.torch import load_file
 from torch.distributed.checkpoint import FileSystemReader
@@ -42,6 +42,7 @@ from kempnerforge.config.optimizer import OptimizerConfig
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig, JobConfig
 from kempnerforge.distributed.parallel import build_parallel_model
 from kempnerforge.training.optimizer import build_optimizer
+from tests.gloo_ranks import gloo_group, spawn
 
 SEQ = 16
 STEP = 1
@@ -71,27 +72,16 @@ LAYOUTS = {
 }
 
 
-def _free_port() -> int:
-    """An unused local TCP port for the gloo rendezvous."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _init(rank: int, world: int, port: int) -> None:
-    """Join a ``world``-rank gloo group with one intra-op thread per rank.
+@contextlib.contextmanager
+def _group(rank: int, world: int, port: int) -> Iterator[None]:
+    """Be ``rank`` of a ``world``-rank gloo group for the block, with one intra-op thread.
 
     The group's timeout ends a stuck collective after two minutes, so a deadlock cannot
     hold the test job for the default half hour.
     """
     torch.set_num_threads(1)
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=120),
-    )
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=120)):
+        yield
 
 
 def _spawn(fn, names: tuple[str, ...], sizes: tuple[int, ...], *args) -> None:
@@ -99,7 +89,7 @@ def _spawn(fn, names: tuple[str, ...], sizes: tuple[int, ...], *args) -> None:
     world = 1
     for size in sizes:
         world *= size
-    mp.spawn(fn, args=(world, _free_port(), names, sizes, *args), nprocs=world)
+    spawn(fn, world, names, sizes, *args)
 
 
 def _config(overrides: dict) -> ModelConfig:
@@ -209,8 +199,7 @@ def _save(rank, world, port, names, sizes, overrides, root, async_mode, unfixed)
     Rank 0 writes the reference and what the load gave. With ``unfixed`` the save leaves
     the experts as each rank holds them, as before the fix.
     """
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         if unfixed:
             manager_module.expert_layout = lambda model: None
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
@@ -231,14 +220,11 @@ def _save(rank, world, port, names, sizes, overrides, root, async_mode, unfixed)
         loaded = _gathered(resumed, resumed_optimizer, mesh)
         if rank == 0:
             torch.save(loaded, Path(root) / "resumed.pt")
-    finally:
-        dist.destroy_process_group()
 
 
 def _load(rank, world, port, names, sizes, overrides, step_dir, out) -> None:
     """Load ``step_dir`` at this layout; rank 0 writes what every rank's model then holds."""
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         model, optimizer = _build(mesh, _config(overrides), seed=1)
         CheckpointManager(CheckpointConfig(dir=str(Path(out).parent)), model, optimizer).load(
@@ -247,8 +233,6 @@ def _load(rank, world, port, names, sizes, overrides, step_dir, out) -> None:
         loaded = _gathered(model, optimizer, mesh)
         if rank == 0:
             torch.save(loaded, out)
-    finally:
-        dist.destroy_process_group()
 
 
 def _save_with_lr_groups(rank, world, port, names, sizes, overrides, root) -> None:
@@ -256,8 +240,7 @@ def _save_with_lr_groups(rank, world, port, names, sizes, overrides, root) -> No
 
     Rank 0 writes the reference, what the resume gave, and both optimizers' groups.
     """
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         config = _config(overrides)
         optimizer_config = OptimizerConfig(lr=1e-2, fused=False, lr_multipliers=LR_MULTIPLIERS)
@@ -287,8 +270,6 @@ def _save_with_lr_groups(rank, world, port, names, sizes, overrides, root) -> No
             torch.save(reference, Path(root) / "reference.pt")
             torch.save(loaded, Path(root) / "resumed.pt")
             torch.save(groups, Path(root) / "groups.pt")
-    finally:
-        dist.destroy_process_group()
 
 
 def _save_on_two_meshes(rank, world, port, names, sizes, overrides, root) -> None:
@@ -298,8 +279,7 @@ def _save_on_two_meshes(rank, world, port, names, sizes, overrides, root) -> Non
     to the second's but are other objects. Rank 0 writes each save's reference and what its
     load gave.
     """
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         for run in range(2):
             mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
             config = _config(overrides)
@@ -313,8 +293,6 @@ def _save_on_two_meshes(rank, world, port, names, sizes, overrides, root) -> Non
             loaded = _gathered(resumed, resumed_optimizer, mesh)
             if rank == 0:
                 torch.save((reference, loaded), Path(root) / f"run{run}.pt")
-    finally:
-        dist.destroy_process_group()
 
 
 def _save_drifted(rank, world, port, names, sizes, overrides, root, async_mode) -> None:
@@ -323,8 +301,7 @@ def _save_drifted(rank, world, port, names, sizes, overrides, root, async_mode) 
     The EP copies then differ, as they drift apart on GPU (#482). Rank 0, which is EP rank
     0, writes its copy. The save runs in ``async_mode`` and is waited for.
     """
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         model, optimizer = _build(mesh, _config(overrides), seed=0)
         _train(model, optimizer, mesh)
@@ -340,8 +317,6 @@ def _save_drifted(rank, world, port, names, sizes, overrides, root, async_mode) 
         manager.wait()
         if rank == 0:
             torch.save(copy, Path(root) / "reference.pt")
-    finally:
-        dist.destroy_process_group()
 
 
 def _save_misplaced(rank, world, port, names, sizes, overrides, root) -> None:
@@ -351,8 +326,7 @@ def _save_misplaced(rank, world, port, names, sizes, overrides, root) -> None:
     strided shard. Ranks whose rows would land elsewhere refuse the save, and the others
     raise with them.
     """
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         expert_layout_module._rows_after_ep = lambda placements, ep, name: tuple(placements)
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         model, optimizer = _build(mesh, _config(overrides), seed=0)
@@ -366,8 +340,6 @@ def _save_misplaced(rank, world, port, names, sizes, overrides, root) -> None:
             expected = pytest.raises(RuntimeError, match="failed on ranks")
         with expected:
             manager.save(STEP)
-    finally:
-        dist.destroy_process_group()
 
 
 def _fail_on_rank_one(rank, world, port, names, sizes, overrides, root) -> None:
@@ -376,8 +348,7 @@ def _fail_on_rank_one(rank, world, port, names, sizes, overrides, root) -> None:
     Rank 1 raises its own error. Every other rank raises too, naming the operation and
     rank 1, rather than wait in DCP's collectives for a rank that has left.
     """
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         model, optimizer = _build(mesh, _config(overrides), seed=0)
         _train(model, optimizer, mesh)
@@ -408,14 +379,11 @@ def _fail_on_rank_one(rank, world, port, names, sizes, overrides, root) -> None:
             setattr(target, attribute, original)
             if what == "save":
                 manager.save(STEP)
-    finally:
-        dist.destroy_process_group()
 
 
 def _refuse(rank, world, port, names, sizes, overrides, step_dir) -> None:
     """Every rank refuses to load ``step_dir`` at this layout, naming what it holds."""
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         model, optimizer = _build(mesh, _config(overrides), seed=1)
         manager = CheckpointManager(
@@ -423,8 +391,6 @@ def _refuse(rank, world, port, names, sizes, overrides, step_dir) -> None:
         )
         with pytest.raises(ValueError, match="holds 2 of the 4 experts"):
             manager.load(path=step_dir)
-    finally:
-        dist.destroy_process_group()
 
 
 def _load_one_process(

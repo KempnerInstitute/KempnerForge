@@ -8,12 +8,9 @@ dimension names and order ``init_distributed`` builds: ``pp``, ``dp_replicate``,
 
 from __future__ import annotations
 
-import socket
-
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -29,6 +26,7 @@ from kempnerforge.distributed.utils import clip_grad_norm_, get_dp_info
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.data_pipeline import build_data_pipeline, build_eval_dataloader
 from kempnerforge.training.runtime import RuntimeContext
+from tests.gloo_ranks import gloo_group, spawn
 
 HSDP_LAYOUTS = {
     "dp_replicate2_dp_shard2": (
@@ -69,28 +67,13 @@ OTHER_LAYOUTS = {
 }
 
 
-def _free_port() -> int:
-    """An unused local TCP port for the gloo rendezvous."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _init(rank: int, world: int, port: int) -> None:
-    """Join a ``world``-rank gloo group."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-
-
 def _check_layouts(rank: int, world: int, port: int, layouts: list) -> None:
     """Build each ``(names, sizes, expected)`` mesh and compare this rank's DP info.
 
     Every mesh is checked even after one fails, and the failure names each mesh
     whose DP info was wrong or whose ``get_dp_info`` raised.
     """
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         wrong = []
         for names, sizes, expected in layouts:
             mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
@@ -101,8 +84,6 @@ def _check_layouts(rank: int, world: int, port: int, layouts: list) -> None:
             if got != expected[rank]:
                 wrong.append(f"mesh {names} of {sizes}: {got}, expected {expected[rank]}")
         assert not wrong, f"rank {rank}:\n" + "\n".join(wrong)
-    finally:
-        dist.destroy_process_group()
 
 
 def _by_world(layouts: dict) -> dict[int, list]:
@@ -115,8 +96,7 @@ def _by_world(layouts: dict) -> dict[int, list]:
 
 def _check_data_partition(rank: int, world: int, port: int, data_dir: str) -> None:
     """Build the training and eval loaders on a 2 x 2 HSDP mesh; each rank reads its own part."""
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp_replicate", "dp_shard"))
         runtime = RuntimeContext(
             rank=rank,
@@ -145,8 +125,6 @@ def _check_data_partition(rank: int, world: int, port: int, data_dir: str) -> No
                 f"loader {loader}: {len(seen)} samples, {len(set(seen))} distinct, "
                 f"expected {world * len(samples)} disjoint"
             )
-    finally:
-        dist.destroy_process_group()
 
 
 def _loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -161,8 +139,7 @@ def _check_hsdp_step(rank: int, world: int, port: int) -> None:
     ``get_dp_info``, so a DP rank shared by two ranks repeats rows and drops others.
     """
     seq = 16
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp_replicate", "dp_shard"))
         config = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=128, max_seq_len=seq)
         torch.manual_seed(0)
@@ -191,8 +168,6 @@ def _check_hsdp_step(rank: int, world: int, port: int) -> None:
             torch.testing.assert_close(
                 grad, reference.get_parameter(name).grad, rtol=1e-5, atol=1e-7
             )
-    finally:
-        dist.destroy_process_group()
 
 
 class TestGetDpInfoOnRealMeshes:
@@ -205,13 +180,13 @@ class TestGetDpInfoOnRealMeshes:
         ``tp`` or ``ep`` share it, and the DP size is dp_replicate x dp_shard.
         """
         layouts = _by_world(HSDP_LAYOUTS)[world]
-        mp.spawn(_check_layouts, args=(world, _free_port(), layouts), nprocs=world)
+        spawn(_check_layouts, world, layouts)
 
     @pytest.mark.parametrize("world", sorted(_by_world(OTHER_LAYOUTS)))
     def test_meshes_without_hsdp_keep_their_dp_ranks(self, world):
         """One DP dim, or none under pure PP, gives the same DP info as before HSDP."""
         layouts = _by_world(OTHER_LAYOUTS)[world]
-        mp.spawn(_check_layouts, args=(world, _free_port(), layouts), nprocs=world)
+        spawn(_check_layouts, world, layouts)
 
 
 class TestDataPipelineOnHsdp:
@@ -221,7 +196,7 @@ class TestDataPipelineOnHsdp:
         The loaders are built where training builds them, from ``get_dp_info``,
         so a rank that shared another's part would repeat its samples.
         """
-        mp.spawn(_check_data_partition, args=(4, _free_port(), mmap_data_dir), nprocs=4)
+        spawn(_check_data_partition, 4, mmap_data_dir)
 
 
 class TestHsdpTrainingStep:
@@ -231,4 +206,4 @@ class TestHsdpTrainingStep:
         Each rank trains on the rows its DP rank selects, and the clipped gradients,
         averaged over all four ranks, equal one process's on every row.
         """
-        mp.spawn(_check_hsdp_step, args=(4, _free_port()), nprocs=4)
+        spawn(_check_hsdp_step, 4)

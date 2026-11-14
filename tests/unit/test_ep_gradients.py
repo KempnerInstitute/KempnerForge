@@ -9,15 +9,15 @@ forward passes on the same rows.
 
 from __future__ import annotations
 
+import contextlib
 import re
-import socket
+from collections.abc import Iterator
 from datetime import timedelta
 from typing import NamedTuple
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -29,6 +29,7 @@ from kempnerforge.distributed.utils import clip_grad_norm_
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.grad import maybe_no_sync
 from kempnerforge.training.loop import add_moe_losses
+from tests.gloo_ranks import gloo_group, spawn
 
 SEQ = 16
 ROWS = 2
@@ -62,28 +63,17 @@ class _Step(NamedTuple):
     reference_loss: float
 
 
-def _free_port() -> int:
-    """An unused local TCP port for the gloo rendezvous."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _init(rank: int, world: int, port: int) -> None:
-    """Join a ``world``-rank gloo group, with one intra-op thread per rank.
+@contextlib.contextmanager
+def _group(rank: int, world: int, port: int) -> Iterator[None]:
+    """Be ``rank`` of a ``world``-rank gloo group for the block, with one intra-op thread.
 
     The ranks share the CPU, and one thread each keeps the step fast and its sums in
     a fixed order. The group's timeout ends a stuck collective after two minutes, so a
     deadlock cannot hold the test job for the default half hour.
     """
     torch.set_num_threads(1)
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=120),
-    )
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=120)):
+        yield
 
 
 def _spawn(fn, names: tuple[str, ...], sizes: tuple[int, ...], *args) -> None:
@@ -91,7 +81,7 @@ def _spawn(fn, names: tuple[str, ...], sizes: tuple[int, ...], *args) -> None:
     world = 1
     for size in sizes:
         world *= size
-    mp.spawn(fn, args=(world, _free_port(), names, sizes, *args), nprocs=world)
+    spawn(fn, world, names, sizes, *args)
 
 
 def _is_expert(name: str) -> bool:
@@ -219,17 +209,13 @@ def _assert_grads_match(step: _Step) -> None:
 
 def _check_gradients(rank, world, port, names, sizes, overrides, micro_steps) -> None:
     """The step's gradients, unclipped, against one process."""
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         _assert_grads_match(_step(names, sizes, overrides, micro_steps))
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_norm(rank, world, port, names, sizes, overrides) -> None:
     """Every rank returns one process's norm, and the EP ranks the very same value."""
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         step = _step(names, sizes, overrides)
         norm = clip_grad_norm_(step.model, 1e9)
         ref_norm = torch.nn.utils.clip_grad_norm_(step.reference.parameters(), 1e9)
@@ -237,8 +223,6 @@ def _check_norm(rank, world, port, names, sizes, overrides) -> None:
         peers = [torch.empty_like(norm) for _ in range(_ep_size(step.mesh))]
         dist.all_gather(peers, norm, group=step.mesh["ep"].get_group())
         assert all(torch.equal(peer, norm) for peer in peers), peers
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_clipping(rank, world, port, names, sizes, overrides) -> None:
@@ -247,8 +231,7 @@ def _check_clipping(rank, world, port, names, sizes, overrides) -> None:
     The copies of the parameters every EP rank holds must agree to fp32 rounding:
     clipped by different coefficients they would differ by the coefficients' ratio.
     """
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         step = _step(names, sizes, overrides)
         norm = clip_grad_norm_(step.model, MAX_NORM)
         assert norm > 2 * MAX_NORM, f"the clip does not bind: norm {float(norm)}"
@@ -270,34 +253,26 @@ def _check_clipping(rank, world, port, names, sizes, overrides) -> None:
                     atol=1e-5 * scale,
                     msg=lambda m, name=name: f"{name}: {m}",
                 )
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_without_ep(rank, world, port, names, sizes, overrides) -> None:
     """Without ``ep``, an MoE model's clipped norm and gradients match one process."""
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         step = _step(names, sizes, overrides)
         norm = clip_grad_norm_(step.model, MAX_NORM)
         ref_norm = torch.nn.utils.clip_grad_norm_(step.reference.parameters(), MAX_NORM)
         torch.testing.assert_close(norm, ref_norm, rtol=1e-5, atol=0.0)
         _assert_grads_match(step)
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_gradient_scale(rank, world, port, names, sizes, overrides) -> None:
     """With ``moe_gradient_scale`` the loss and gradients still match one process."""
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         step = _step(names, sizes, overrides)
         assert abs(step.loss - step.reference_loss) <= 1e-6 * abs(step.reference_loss), (
             f"loss {step.loss} against one process's {step.reference_loss}"
         )
         _assert_grads_match(step)
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_gradient_scale_modes(rank, world, port, names, sizes, overrides) -> None:
@@ -306,8 +281,7 @@ def _check_gradient_scale_modes(rank, world, port, names, sizes, overrides) -> N
     Training mode scales the expert outputs with or without gradients and eval mode
     never does, so the logits match in all four combinations.
     """
-    _init(rank, world, port)
-    try:
+    with _group(rank, world, port):
         model, reference, mesh = _build(names, sizes, overrides)
         dp_rank, dp_size = _dp(mesh)
         generator = torch.Generator().manual_seed(7)
@@ -330,8 +304,6 @@ def _check_gradient_scale_modes(rank, world, port, names, sizes, overrides) -> N
                     f"training={training}, grad_enabled={grad_enabled}: {m}"
                 ),
             )
-    finally:
-        dist.destroy_process_group()
 
 
 class TestExpertParallelGradients:
