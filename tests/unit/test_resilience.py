@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import signal
 import socket
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -56,6 +58,52 @@ def _check_ranks_agree(rank: int, world: int, port: int, nan_rank: int | None) -
         assert params_are_finite(model, "cpu") is (nan_rank is None)
     finally:
         dist.destroy_process_group()
+
+
+_TRITON_COMPILE_CHILD = """
+import importlib.util
+import os
+import signal
+import sys
+
+try:
+    import triton
+    import triton.language as tl
+    from triton.backends.compiler import GPUTarget
+    from triton.backends.nvidia.compiler import get_ptxas
+
+    if not os.access(get_ptxas(90).path, os.X_OK):
+        raise RuntimeError("no executable ptxas")
+except Exception as e:
+    print(f"skip: {type(e).__name__}: {e}")
+    sys.exit(0)
+
+spec = importlib.util.spec_from_file_location("signal_handler", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+@triton.jit
+def add_one(x_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(x_ptr + offs, tl.load(x_ptr + offs, mask=mask) + 1, mask=mask)
+
+
+handler = module.ShutdownHandler(timeout_sec=0)
+handler.register()
+source = triton.compiler.ASTSource(
+    fn=add_one,
+    signature={"x_ptr": "*fp32", "n": "i32", "BLOCK": "constexpr"},
+    constexprs={"BLOCK": 128},
+)
+triton.compile(source, target=GPUTarget("cuda", 90, 32))
+os.kill(os.getpid(), signal.SIGUSR1)
+swallowed = not handler.should_shutdown()
+handler.reinstall()
+os.kill(os.getpid(), signal.SIGUSR1)
+print(f"swallowed={swallowed} delivered={handler.should_shutdown()}")
+"""
 
 
 class TestShutdownHandler:
@@ -140,6 +188,134 @@ class TestShutdownHandler:
             for timer in started:
                 timer.cancel()
             handler.finish()
+
+    def test_unregister_leaves_the_forced_exit_timer_armed(self, monkeypatch):
+        """Restoring the handlers does not retire the watchdog (#313)."""
+        original = signal.getsignal(signal.SIGTERM)
+        handler = ShutdownHandler(timeout_sec=300)
+        monkeypatch.setattr(handler, "_force_exit", lambda: None)
+        handler.register()
+        os.kill(os.getpid(), signal.SIGTERM)
+        try:
+            handler.unregister()
+            assert signal.getsignal(signal.SIGTERM) is original
+            assert handler._timer is not None
+        finally:
+            handler.cancel_watchdog()
+        assert handler._timer is None
+
+    def test_cancel_watchdog_leaves_the_handlers_installed(self, monkeypatch):
+        handler = ShutdownHandler(timeout_sec=300)
+        monkeypatch.setattr(handler, "_force_exit", lambda: None)
+        handler.register()
+        os.kill(os.getpid(), signal.SIGTERM)
+        try:
+            handler.cancel_watchdog()
+            assert handler._timer is None
+            assert signal.getsignal(signal.SIGTERM) == handler._handle_signal
+        finally:
+            handler.finish()
+
+    def test_reinstall_restores_a_handler_replaced_below_python(self):
+        """Native code can swap the C handler while ``signal.getsignal`` names ours (#448)."""
+        import ctypes
+
+        libc = ctypes.CDLL(None)
+        libc.signal.restype = ctypes.c_void_p
+        libc.signal.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        handler = ShutdownHandler(timeout_sec=0)
+        handler.register()
+        try:
+            libc.signal(signal.SIGUSR1, 1)
+            assert signal.getsignal(signal.SIGUSR1) == handler._handle_signal
+            os.kill(os.getpid(), signal.SIGUSR1)
+            assert not handler.should_shutdown()
+            handler.reinstall()
+            os.kill(os.getpid(), signal.SIGUSR1)
+            assert handler.should_shutdown()
+        finally:
+            handler.unregister()
+
+    def test_reinstall_restores_the_handlers_after_a_real_triton_compile(self, tmp_path):
+        """A Triton compile that misses the cache installs LLVM's handlers below Python (#448).
+
+        The compile runs in a child process, so LLVM's handlers never reach this
+        one, with a cache of its own, since a kernel served from the cache skips
+        LLVM. The child loads the module by path, without torch, to stay quick.
+        """
+        child = tmp_path / "compile_child.py"
+        child.write_text(_TRITON_COMPILE_CHILD)
+        module_path = sys.modules[ShutdownHandler.__module__].__file__
+        env = {**os.environ, "TRITON_CACHE_DIR": str(tmp_path / "triton-cache")}
+        result = subprocess.run(
+            [sys.executable, str(child), str(module_path)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=50,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        if result.stdout.startswith("skip:"):
+            pytest.skip(result.stdout.strip())
+        assert result.stdout.split() == ["swallowed=True", "delivered=True"]
+
+    def test_reinstall_is_a_noop_unless_registered(self):
+        before = signal.getsignal(signal.SIGUSR1)
+        handler = ShutdownHandler(timeout_sec=0)
+        handler.reinstall()
+        assert signal.getsignal(signal.SIGUSR1) is before
+        handler.register()
+        handler.finish()
+        handler.reinstall()
+        assert signal.getsignal(signal.SIGUSR1) is before
+
+    def test_reinstall_does_nothing_off_the_main_thread(self):
+        """A training loop run on another thread must not raise at its first step."""
+        handler = ShutdownHandler(timeout_sec=0)
+        handler.register()
+        errors: list[BaseException] = []
+
+        def reinstall() -> None:
+            try:
+                handler.reinstall()
+            except BaseException as e:
+                errors.append(e)
+
+        try:
+            thread = threading.Thread(target=reinstall)
+            thread.start()
+            thread.join()
+            assert errors == []
+            assert signal.getsignal(signal.SIGUSR1) == handler._handle_signal
+        finally:
+            handler.unregister()
+
+    def test_request_arms_the_forced_exit_timer_without_a_signal(self, monkeypatch):
+        """A rank stopped by another rank's signal is bounded by a timer of its own."""
+        handler = ShutdownHandler(timeout_sec=300)
+        monkeypatch.setattr(handler, "_force_exit", lambda: None)
+        try:
+            handler.request()
+            timer = handler._timer
+            handler.request()
+            assert handler.should_shutdown()
+            assert handler.signal_received is None
+            assert timer is not None
+            assert handler._timer is timer
+        finally:
+            handler.cancel_watchdog()
+
+    def test_finish_logs_completion_only_after_a_shutdown(self, caplog, monkeypatch):
+        import logging
+
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        with caplog.at_level(logging.INFO, logger="kempnerforge"):
+            ShutdownHandler(timeout_sec=0).finish()
+            stopped = ShutdownHandler(timeout_sec=0)
+            stopped.request()
+            stopped.finish()
+        done = [r for r in caplog.records if r.getMessage() == "Graceful shutdown complete"]
+        assert len(done) == 1
 
 
 class TestNaNDetector:
