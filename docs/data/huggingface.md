@@ -111,7 +111,12 @@ samples, so a streaming run keeps its data-parallel size, batch size and
 `num_workers` across resumes. Moving the same files to another directory
 is fine; a new version of the dataset or of `datasets` can shift the
 replay unnoticed. A `checkpoint.load_path` warm start starts the stream at
-its first document instead of raising. Hugging Face's own
+its first document instead of raising, and so does an auto-resume onto
+another data-parallel size with
+`checkpoint.ignore_rank_state_mismatch = true`, which without the flag
+is refused before the position is applied (see
+[Resharding](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)).
+Hugging Face's own
 `IterableDataset.state_dict()` is not used: it drops the examples in the
 shuffle buffer on resume. On several ranks the checkpoint holds rank 0's
 count, which is exact until the first rank finishes a pass. See

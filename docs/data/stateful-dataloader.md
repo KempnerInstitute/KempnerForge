@@ -138,6 +138,13 @@ every rank raises together and none is left waiting on the others.
 A `checkpoint.load_path` warm start does not raise: it logs the reason and
 starts the data at its first sample (see
 [Auto-resume](../checkpointing/auto-resume.md#where-its-called)).
+An auto-resume onto another world size or data-parallel layout stops
+earlier, before any rank applies a position, unless
+`checkpoint.ignore_rank_state_mismatch` is set. With it, every rank applies
+the position the saved rank 0 reached by the rules above and, where it
+cannot carry over, starts the data at its first sample with a warning, as a
+warm start does (see
+[Resharding § Scaling a run to a different world size](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)).
 
 ## Save and restore
 

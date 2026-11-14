@@ -20,6 +20,12 @@ partition its loader read, or is None when the saving manager was not given it.
 The legacy single-copy ``"rng"``/``"dataloader"`` keys (always rank 0's) are
 still written beside the envelope, so readers that predate it keep loading,
 with their documented limitation that they restore rank 0's copy everywhere.
+
+An envelope saved on another world size or data-parallel layout is refused
+with ``RankStateMismatchError``. Its RNG captures cannot follow the change, but
+the data position a ``StatefulDataLoader`` saves with a ``DistributedSampler``
+is the same on every rank, so ``saved_data_position`` reads it for a resume
+that continues anyway.
 """
 
 from __future__ import annotations
@@ -41,16 +47,24 @@ PER_RANK_VERSION = 1
 _RNG_STREAMS = ("python", "numpy", "torch_cpu")
 
 _MISMATCH_HINT = (
-    "set checkpoint.ignore_rank_state_mismatch=true to discard the saved "
-    "loader/RNG state and continue from model/optimizer/scheduler state "
-    "(data order and random streams restart fresh; model/optimizer "
-    "resharding is unaffected)"
+    "set checkpoint.ignore_rank_state_mismatch=true to resume anyway: model, "
+    "optimizer, scheduler and step continue, the saved data position carries "
+    "over where the loader can place it on this layout (otherwise the data "
+    "restarts), and the random streams restart fresh"
 )
 
 _GROUP_MODULES_KEY = "scheduler_group_modules"
 _PER_GROUP_KEYS = ("base_lrs", "_last_lr", "lr_lambdas")
 _PER_GROUP_RATE_KEYS = ("base_lrs", "_last_lr")
 _SAME_RATE_REL_TOL = 1e-9
+
+
+class RankStateMismatchError(ValueError):
+    """Per-rank state saved under another world size or data-parallel layout.
+
+    ``select_rank_state`` raises it on every rank alike. Every other refusal of
+    an envelope is a plain ``ValueError``.
+    """
 
 
 def get_rng_state() -> dict[str, Any]:
@@ -192,11 +206,11 @@ def _check_envelope(
     if not _is_int(saved_world) or saved_world < 1:
         raise ValueError(f"per-rank state envelope has invalid world_size {saved_world!r}")
     if saved_world != world_size:
-        raise ValueError(
+        raise RankStateMismatchError(
             f"checkpoint per-rank state was saved with world_size={saved_world} but "
-            f"this run has world_size={world_size}. Exact dataloader/RNG continuity "
-            f"exists only on the saved topology: resume with {saved_world} ranks, or "
-            f"{_MISMATCH_HINT}"
+            f"this run has world_size={world_size}. Restoring each rank's own loader "
+            f"and RNG state needs the saved topology: resume with {saved_world} ranks, "
+            f"or {_MISMATCH_HINT}"
         )
 
     ranks = envelope["ranks"]
@@ -258,12 +272,12 @@ def _check_envelope(
             f"rank {r} saved {tuple(saved_layout[r])} now {data_parallel[r]}" for r in changed[:4]
         )
         more = f"; {len(changed) - 4} more" if len(changed) > 4 else ""
-        raise ValueError(
+        raise RankStateMismatchError(
             f"checkpoint per-rank state was saved under a different data-parallel "
             f"layout: {len(changed)} of {world_size} ranks now read another data "
-            f"partition, as (dp_rank, dp_size): {examples}{more}. A loader cursor is "
-            f"valid only on the partition it was saved on: resume with the saved "
-            f"data-parallel layout, or {_MISMATCH_HINT}"
+            f"partition, as (dp_rank, dp_size): {examples}{more}. Restoring each rank's "
+            f"own loader and RNG state needs the partition it was saved on: resume with "
+            f"the saved data-parallel layout, or {_MISMATCH_HINT}"
         )
 
 
@@ -276,12 +290,12 @@ def select_rank_state(
     """Return ``rank``'s own payload from a per-rank envelope, or refuse.
 
     Refuses with ``ValueError`` rather than guessing when the envelope is
-    malformed or incomplete, written by a newer schema version, or saved
-    under a different world size or data-parallel layout: a loader/RNG
-    payload restored onto the wrong rank or data partition silently changes
-    the data order and random streams of the resumed run. The whole envelope
-    is checked before ``rank``'s entry is selected, so every rank reaches the
-    same verdict.
+    malformed or incomplete, or written by a newer schema version, and with
+    ``RankStateMismatchError`` when it was saved under a different world size
+    or data-parallel layout: a loader/RNG payload restored onto the wrong rank
+    or data partition silently changes the data order and random streams of
+    the resumed run. The whole envelope is checked before ``rank``'s entry is
+    selected, so every rank reaches the same verdict.
 
     Args:
         envelope: The broadcast ``per_rank`` envelope.
@@ -292,6 +306,25 @@ def select_rank_state(
     """
     _check_envelope(envelope, world_size, data_parallel)
     return envelope["ranks"][rank]
+
+
+def saved_data_position(envelope: Any) -> dict[str, Any] | None:
+    """The saved rank 0's ``"dataloader"`` state, for a resume onto another topology.
+
+    The position a ``StatefulDataLoader`` saves with a ``DistributedSampler``
+    counts the samples all data-parallel ranks consumed, the same on every
+    rank, so rank 0's copy serves every rank of the new layout. The loader's
+    ``load_state_dict`` raises ``DataPositionError`` for a position that does
+    not fit it, such as a mixture's on another data-parallel size. Returns
+    None when the saved loaders kept no state.
+
+    The envelope is checked against the world size and layout that saved it,
+    as ``select_rank_state`` checks it against this run's, so a malformed or
+    incomplete one raises ``ValueError`` on every rank alike.
+    """
+    saved_world = envelope.get("world_size") if isinstance(envelope, dict) else None
+    _check_envelope(envelope, saved_world if _is_int(saved_world) else 0, None)
+    return envelope["ranks"][0].get("dataloader")
 
 
 def _group_modules(scheduler: Any) -> list[str | None] | None:

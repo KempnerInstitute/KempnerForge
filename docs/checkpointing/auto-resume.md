@@ -125,7 +125,11 @@ switch of `data.hf_streaming`, a changed stream, or a checkpoint saved
 before the loader recorded its batch size on another data-parallel size,
 the warm start logs a warning that names the reason and starts the data
 at its first sample. A resume from `checkpoint.dir` raises
-`DataPositionError` in those cases instead.
+`DataPositionError` in those cases instead, with one exception: a resume
+onto another world size or data-parallel layout is refused before the
+data position is applied, and with `checkpoint.ignore_rank_state_mismatch`
+set it goes on and treats the data position as a warm start does (see
+[Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size)).
 
 If both are set, `resume_path` wins (auto-resume takes precedence
 over the static config). This is deliberate: SLURM requeues should
@@ -146,7 +150,9 @@ start restores rank 0's single copy on every rank on any topology, and
 a weights-only one (below) restores neither
 (see [Train state](train-state.md#per-rank-state-schema-v1)). To
 auto-resume onto a different topology anyway, set
-`checkpoint.ignore_rank_state_mismatch`: see
+`checkpoint.ignore_rank_state_mismatch`: the data position then carries
+over where the loader can place it on the new layout, and the RNG
+streams restart. See
 [Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size).
 
 A training checkpoint also holds `train_state.pt`, and `load_path` restores

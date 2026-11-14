@@ -86,7 +86,8 @@ the layout gather.
 
 Dataloader cursors and RNG streams are rank-local: pipeline stages
 seed `seed + pp_rank`, CUDA streams diverge during training, and a
-stateful loader's position is its own rank's. The gather spans every
+stateful loader's state can be its own rank's, such as a mixture's
+position in this rank's list of samples. The gather spans every
 rank of every pipeline stage, so each stage resumes its own streams
 rather than stage 0's. The `per_rank` envelope records each rank's
 payload:
@@ -95,13 +96,13 @@ payload:
   the running code understands refuses to load.
 - `world_size`: the topology that saved the checkpoint. Resuming
   under a **different world size raises** with an actionable error:
-  exact data/RNG continuity only exists on the saved topology, while
-  model/optimizer resharding via DCP is unaffected.
+  every rank's own data and RNG state exists only on the saved
+  topology, while model/optimizer resharding via DCP is unaffected.
 - `data_parallel`: every global rank's `(dp_rank, dp_size)`, the data
   partition its loader read. The same world size can split into a
   different partition per rank (for example DP=4 vs DP=2 x TP=2), so
-  resuming under a **different layout also raises**: a loader cursor
-  is only valid on the partition it was saved on. `None` when the saving
+  resuming under a **different layout also raises**: a rank's saved
+  loader and RNG state belong to the partition it read. `None` when the saving
   `CheckpointManager` was built without `dp_info` (the training entry
   always passes it); the layout check is then skipped and only the
   world size is checked.
@@ -114,12 +115,28 @@ missing, extra or incomplete entry (no full `rng` capture, an RNG
 stream such as `torch_cuda` or `dataloader` state on only some ranks)
 refuses the resume. The check reads only what every rank shares (the
 broadcast envelope, the world size, the gathered current layout), so
-all ranks restore, refuse, or discard together. To proceed past a
-refusal, set
-`checkpoint.ignore_rank_state_mismatch = true`: the saved loader/RNG
-state is discarded on every rank with a warning and data order /
-random streams restart fresh (model, optimizer, scheduler and step
-still resume). See
+all ranks restore, refuse, keep the data position or discard together.
+To proceed past a refusal, set
+`checkpoint.ignore_rank_state_mismatch = true`. Model, optimizer,
+scheduler and step still resume, no rank restores saved RNG state, so
+the random streams restart fresh, and every rank logs a warning. What
+happens to the data position depends on the refusal:
+
+- **A changed world size or data-parallel layout**: when the envelope
+  is sound on the topology that saved it, every rank keeps the data
+  position the saved rank 0 reached, `per_rank["ranks"][0]["dataloader"]`.
+  With a `DistributedSampler` that position counts the samples all
+  data-parallel ranks consumed, so it means the same on every rank.
+  The loader applies it where it fits the new layout and otherwise
+  starts at its first sample with a warning (see
+  [Stateful dataloader § Resuming on another data-parallel size](../data/stateful-dataloader.md#resuming-on-another-data-parallel-size)).
+  Only `StatefulDataLoader` and `StreamingDataLoader` take it, since
+  they check the fit; another loader's state is dropped.
+- **A malformed or incomplete envelope**, or one written by a newer
+  schema version: the loader state is discarded as well, and the data
+  restarts from its first sample.
+
+See
 [Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size)
 for the scale-up recipe and what it costs.
 

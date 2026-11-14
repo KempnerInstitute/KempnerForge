@@ -4,16 +4,21 @@ Ranks are simulated with explicit ``num_replicas`` and ``rank``; the gloo tests 
 real process group through ``CheckpointManager``. The resize tests compare the samples
 consumed before and after a resume against the epoch's global order: together they
 must be one prefix of it, with no sample skipped and none read twice. The mixture,
-legacy, state and warm-start tests check refusals and what a resume restores.
+legacy, state and warm-start tests check refusals and what a resume restores. The
+changed-topology tests auto-resume each rank's per-rank state, as the training entry
+does, with and without ``checkpoint.ignore_rank_state_mismatch``.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import random
 import socket
+from datetime import timedelta
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -40,9 +45,11 @@ class _Indices(torch.utils.data.Dataset):
         return i
 
 
-def _loader(dataset, replicas: int, rank: int, batch: int) -> StatefulDataLoader:
+def _loader(
+    dataset, replicas: int, rank: int, batch: int, cls: type = StatefulDataLoader
+) -> StatefulDataLoader:
     sampler = DistributedSampler(dataset, num_replicas=replicas, rank=rank, seed=SEED)
-    return StatefulDataLoader(dataset, batch_size=batch, sampler=sampler, config=_CONFIG)
+    return cls(dataset, batch_size=batch, sampler=sampler, config=_CONFIG)
 
 
 def _order(n: int, epoch: int = 0) -> dict[int, int]:
@@ -161,11 +168,13 @@ def test_state_records_the_batch_size_and_the_global_position():
     assert state["sampler"]["num_replicas"] == 2
 
 
-def _mixture(replicas: int, rank: int, batch: int) -> StatefulDataLoader:
+def _mixture(
+    replicas: int, rank: int, batch: int, cls: type = StatefulDataLoader
+) -> StatefulDataLoader:
     sampler = MixtureSampler(
         [0, 600, 1000], [0.5, 0.5], num_replicas=replicas, rank=rank, seed=SEED
     )
-    return StatefulDataLoader(_Indices(1_000), batch_size=batch, sampler=sampler, config=_CONFIG)
+    return cls(_Indices(1_000), batch_size=batch, sampler=sampler, config=_CONFIG)
 
 
 def test_mixture_on_another_data_parallel_size_is_refused():
@@ -451,3 +460,235 @@ def test_checkpoint_resume_on_another_world_size(tmp_path, before, after):
     assert _positions(json.loads(Path(resumed).read_text()), order) == list(
         range(reached, reached + after[0] * after[1] * 5)
     )
+
+
+class _Recording(StatefulDataLoader):
+    """A ``StatefulDataLoader`` that keeps the sampler rank of every state it loads."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.loaded_from: list[int] = []
+
+    def load_state_dict(self, state: dict) -> None:
+        self.loaded_from.append(state["sampler"]["rank"])
+        super().load_state_dict(state)
+
+
+class _Collect(logging.Handler):
+    """Keeps the message of every warning it handles."""
+
+    def __init__(self, messages: list[str]) -> None:
+        super().__init__(logging.WARNING)
+        self.messages = messages
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+def _seed_all(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def _draw() -> list[float]:
+    """One draw from each generator a checkpoint captures on CPU."""
+    return [random.random(), float(np.random.random()), float(torch.rand(()))]
+
+
+def _kind_loader(kind: str, world: int, rank: int) -> _Recording:
+    if kind == "mixture":
+        return _mixture(world, rank, 4, cls=_Recording)
+    return _loader(_Indices(4_096), world, rank, 4, cls=_Recording)
+
+
+def _init_gloo(rank: int, world: int, port: int) -> None:
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"tcp://127.0.0.1:{port}",
+        timeout=timedelta(seconds=120),
+    )
+
+
+def _manager(root: str, kind: str, rank: int, world: int, lenient: bool = False):
+    """A manager that records this rank's data-parallel coordinates, as the training entry's."""
+    from kempnerforge.checkpoint.manager import CheckpointManager
+    from kempnerforge.config.checkpoint import CheckpointConfig
+
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    config = CheckpointConfig(dir=str(Path(root) / kind), ignore_rank_state_mismatch=lenient)
+    return CheckpointManager(config, model, optimizer, dp_info=(rank, world))
+
+
+def _save_both_kinds(rank: int, world: int, port: int, root: str, out: str) -> None:
+    """One rank of a gloo job that saves a single-dataset and a mixture checkpoint.
+
+    Each rank seeds its generators with ``1000 + rank`` and takes 50 batches before
+    each save. Rank 0 writes every rank's samples and its next random draw after
+    each save, the draw an exact resume of that rank reproduces.
+    """
+    _init_gloo(rank, world, port)
+    try:
+        report = {}
+        for kind in ("single", "mixture"):
+            manager = _manager(root, kind, rank, world)
+            loader = _kind_loader(kind, world, rank)
+            _seed_all(1_000 + rank)
+            iterator = iter(loader)
+            read = [i for _ in range(50) for i in next(iterator).tolist()]
+            manager.save(step=1, dataloader=loader)
+            report[kind] = {"read": read, "draw": _draw()}
+        gathered: list = [None] * world
+        dist.all_gather_object(gathered, report)
+        if rank == 0:
+            Path(out).write_text(json.dumps(gathered))
+    finally:
+        dist.destroy_process_group()
+
+
+def _auto_resume(
+    rank: int, world: int, port: int, root: str, out: str, kind: str, lenient: bool, direct: bool
+) -> None:
+    """One rank of a gloo job that auto-resumes ``kind``'s checkpoint.
+
+    It loads with ``exact_resume=True``, as the training entry's auto-resume does, and
+    then applies the data position with ``apply_dataloader_state``, or hands the loader
+    to ``load`` when ``direct``; ``lenient`` sets
+    ``checkpoint.ignore_rank_state_mismatch``. The rank seeds its generators with
+    ``555 + rank`` just before the load. Rank 0 writes every rank's report: the error
+    the load raised or the 5 batches read after it, the next random draw and the one
+    the fresh seeds give, the sampler ranks of the states the loader loaded, and the
+    warnings logged.
+    """
+    _init_gloo(rank, world, port)
+    warnings: list[str] = []
+    try:
+        manager = _manager(root, kind, rank, world, lenient)
+        loader = _kind_loader(kind, world, rank)
+        logging.getLogger("kempnerforge").addHandler(_Collect(warnings))
+        _seed_all(555 + rank)
+        report: dict = {"fresh": _draw(), "error": None, "read": []}
+        _seed_all(555 + rank)
+        try:
+            if direct:
+                manager.load(exact_resume=True, dataloader=loader)
+            else:
+                manager.load(exact_resume=True)
+                manager.apply_dataloader_state(loader)
+        except ValueError as e:
+            report["error"] = f"{type(e).__name__}: {e}"
+        report["draw"] = _draw()
+        if report["error"] is None:
+            iterator = iter(loader)
+            report["read"] = [i for _ in range(5) for i in next(iterator).tolist()]
+        report["loaded_from"] = loader.loaded_from
+        report["warnings"] = warnings
+        gathered: list = [None] * world
+        dist.all_gather_object(gathered, report)
+        if rank == 0:
+            Path(out).write_text(json.dumps(gathered))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.fixture(scope="module")
+def four_rank_checkpoints(tmp_path_factory) -> tuple[str, list[dict]]:
+    """A single-dataset and a mixture checkpoint saved by a 4-rank gloo job, and its reports."""
+    root = tmp_path_factory.mktemp("topology")
+    out = str(root / "saved.json")
+    mp.spawn(_save_both_kinds, args=(4, _free_port(), str(root), out), nprocs=4)
+    return str(root), json.loads(Path(out).read_text())
+
+
+def _resume_job(root: str, world: int, kind: str, lenient: bool, direct: bool = False):
+    out = str(Path(root) / f"resumed_{world}_{kind}_{lenient}_{direct}.json")
+    mp.spawn(
+        _auto_resume,
+        args=(world, _free_port(), root, out, kind, lenient, direct),
+        nprocs=world,
+    )
+    return json.loads(Path(out).read_text())
+
+
+def test_a_changed_topology_with_the_flag_keeps_the_exact_data_position(four_rank_checkpoints):
+    """Saved on 4 ranks, auto-resumed on 2 with ``ignore_rank_state_mismatch``.
+
+    Every rank takes the saved rank 0's position, the samples all 4 ranks consumed,
+    so the 2 ranks continue the global order at sample 800; the RNG streams restart
+    from this run's seeds; and every rank warns what was kept and what was dropped.
+    """
+    root, saved = four_rank_checkpoints
+    resumed = _resume_job(root, 2, "single", lenient=True)
+    order = _order(4_096)
+    assert _positions([r["single"]["read"] for r in saved], order) == list(range(800))
+    assert [r["error"] for r in resumed] == [None, None]
+    assert _positions([r["read"] for r in resumed], order) == list(range(800, 840))
+    for rank, report in enumerate(resumed):
+        assert report["loaded_from"] == [0], f"rank {rank} did not take the saved position"
+        assert report["draw"] == report["fresh"], f"rank {rank} restored a saved RNG stream"
+        kept = [w for w in report["warnings"] if "Kept: the saved data position" in w]
+        assert kept and "Dropped: every rank's saved RNG state" in kept[0], report["warnings"]
+        assert "world_size=4" in kept[0] and "world_size=2" in kept[0]
+
+
+def test_a_changed_topology_without_the_flag_refuses_on_every_rank(four_rank_checkpoints):
+    """The same resume without the flag refuses on every rank before any rank loads.
+
+    The loader goes to ``load`` itself, so a rank that restored its position before
+    refusing would show it; no rank does, and no rank restores a random stream.
+    """
+    root, _ = four_rank_checkpoints
+    resumed = _resume_job(root, 2, "single", lenient=False, direct=True)
+    for rank, report in enumerate(resumed):
+        assert report["error"] is not None, f"rank {rank} resumed onto a changed topology"
+        assert report["error"].startswith("RankStateMismatchError: ")
+        assert "world_size=4" in report["error"] and "world_size=2" in report["error"]
+        assert report["loaded_from"] == [], f"rank {rank} loaded a data position"
+        assert report["draw"] == report["fresh"], f"rank {rank} restored a saved RNG stream"
+    assert len({r["error"] for r in resumed}) == 1, "the ranks refused for different reasons"
+
+
+def test_a_mixture_on_a_changed_topology_with_the_flag_restarts_the_data(four_rank_checkpoints):
+    """A mixture's position has no counterpart on 2 ranks, so the data restarts.
+
+    The flag opts in, so the resume does not raise: every rank warns and reads its
+    first batches, as a fresh loader does.
+    """
+    root, _ = four_rank_checkpoints
+    resumed = _resume_job(root, 2, "mixture", lenient=True)
+    for rank, report in enumerate(resumed):
+        assert report["error"] is None, report["error"]
+        fresh = _mixture(2, rank, 4)
+        iterator = iter(fresh)
+        assert report["read"] == [i for _ in range(5) for i in next(iterator).tolist()]
+        assert report["draw"] == report["fresh"], f"rank {rank} restored a saved RNG stream"
+        restarted = [w for w in report["warnings"] if "does not carry over" in w]
+        assert restarted and "starts at its first sample" in restarted[0], report["warnings"]
+        assert "draws each rank's samples" in restarted[0]
+
+
+@pytest.mark.parametrize("lenient", [True, False], ids=["flag", "no_flag"])
+def test_the_saved_layout_restores_each_ranks_own_state(four_rank_checkpoints, lenient):
+    """On the 4 ranks that saved it, each rank restores its own entry, the flag set or not.
+
+    Each rank loads the state its own rank saved and continues its own RNG streams,
+    together the ranks continue the global order at sample 800, and nothing is logged
+    about a mismatch or a moved data position.
+    """
+    root, saved = four_rank_checkpoints
+    resumed = _resume_job(root, 4, "single", lenient=lenient)
+    order = _order(4_096)
+    assert _positions([r["read"] for r in resumed], order) == list(range(800, 880))
+    for rank, report in enumerate(resumed):
+        assert report["error"] is None, report["error"]
+        assert report["loaded_from"] == [rank], f"rank {rank} took another rank's state"
+        assert report["draw"] == saved[rank]["single"]["draw"], f"rank {rank} lost its RNG"
+        about_the_position = [
+            w
+            for w in report["warnings"]
+            if "ignore_rank_state_mismatch" in w or "data position" in w.lower()
+        ]
+        assert about_the_position == [], about_the_position

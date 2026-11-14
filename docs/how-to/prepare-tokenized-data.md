@@ -208,7 +208,9 @@ different mechanisms:
   `DistributedSampler.set_position()`. A job that preempts at step 3,500
   of its first epoch picks up at sample
   `3500 × grad_accum_steps × batch_size × data-parallel size` without
-  replay, also when it resumes on a different number of GPUs.
+  replay. A resume on a different number of GPUs does too, with
+  `checkpoint.ignore_rank_state_mismatch = true` (see
+  [Resharding](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)).
 - **HF streaming (Path B)**: wrapped in `StreamingDataLoader`, which
   saves how many batches training took and on resume replays the stream
   to that point. That is exact on one data-parallel rank, and on several

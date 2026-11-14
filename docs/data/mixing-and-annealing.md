@@ -235,8 +235,10 @@ Exposed names come from `DatasetSource.name` (auto-derived from
   the sampler honors, but mid-epoch exact reproducibility across
   weight changes is not guaranteed.
 - A mixture's resume position counts this rank's samples, so it resumes
-  only on the data-parallel size that saved it; another size raises
-  `DataPositionError` (see
+  only on the data-parallel size that saved it; on another size the
+  loader raises `DataPositionError`, and a warm start, or an auto-resume
+  with `checkpoint.ignore_rank_state_mismatch = true`, starts the data at
+  its first sample with a warning instead (see
   [Stateful dataloader § Resuming on another data-parallel size](stateful-dataloader.md#resuming-on-another-data-parallel-size)).
 - All sub-datasets share the same global `tokenizer_path` and
   `pack_sequences` setting. Multiple tokenizers in one run is not
