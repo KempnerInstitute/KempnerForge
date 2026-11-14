@@ -274,12 +274,20 @@ A reasonable starting point for a 9.2B-total / 2.9B-active MoE on
 
 ```toml
 [model]
+dim                     = 2048
+n_layers                = 24
+n_heads                 = 16
+n_kv_heads              = 4
+vocab_size              = 128256
+ffn_dim_multiplier      = 1.3
+max_seq_len             = 4096
+rope_theta              = 500000.0
 num_experts             = 8
 moe_top_k               = 2
 moe_router              = "softmax_topk"    # or "sigmoid_topk" for DeepSeek-V3
 moe_frequency           = 1
 moe_aux_loss_weight     = 0.01
-moe_capacity_factor     = 1.25              # because EP is on
+moe_capacity_factor     = 0.0               # no cap, as benchmarked
 moe_packed_experts      = false             # 8 experts: not worth it
 moe_gradient_scale      = false             # baseline only
 

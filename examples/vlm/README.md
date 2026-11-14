@@ -41,6 +41,9 @@ examples/vlm/
 they need no pretrained weights, but on first use they download the default
 dataset, `sayakpaul/coco-30-val-2014` (30,000 image-caption pairs, about 4.9 GB),
 and the `gpt2` tokenizer. The `vlm_7b*` presets are 4-8 GPU starting points.
+The two `vlm_7b_siglip2*` presets use the `meta-llama/Meta-Llama-3-8B`
+tokenizer, which is gated: it needs access granted on its Hugging Face page and
+a token (`HF_TOKEN` or `hf auth login`) before the first run.
 
 | Config | Arch | Encoder | For |
 | --- | --- | --- | --- |

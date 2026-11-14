@@ -6,6 +6,8 @@
 # family uses the Llama-3 vocab to match a real Llama-3 + SigLIP2
 # production target. Other configs in this folder use gpt2 (vocab_size =
 # 50257) for fast smoke iteration.
+# The Llama-3 tokenizer is gated: it needs access granted on its Hugging
+# Face page and a token (HF_TOKEN or hf auth login) before the first run.
 #
 # max_seq_len allocation (JD/MoT): residual_image_tokens + max_text_len.
 # Image tokens prepend the text sequence in the residual stream, so the
@@ -28,7 +30,7 @@
 # Data:
 #   Default hf_dataset_name is sayakpaul/coco-30-val-2014: 30,000
 #   image-caption pairs sampled from the COCO 2014 val split, about 4.9 GB
-#   to download on first use, so a fresh clone runs without external setup.
+#   to download on first use.
 #   On 4 GPUs a step takes 64 samples (batch_size 4 x grad_accum_steps 4 x
 #   4 ranks), so the 5000 steps pass over the default data about 11 times.
 #   Override via CLI for real training, e.g.:

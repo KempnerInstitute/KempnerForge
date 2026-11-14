@@ -54,27 +54,19 @@ world size, `dp_shard`, `dp_replicate`, `tp` or `ep`) needs one extra config
 line on resume: see
 [Scaling a run to a different world size](#scaling-a-run-to-a-different-world-size).
 
-## PP — the one special case
+## PP: the one special case
 
 PP stores shards per-stage under `pp0/`, `pp1/`, …. A checkpoint saved
-at `pp=4` is **not loadable at `pp=2`** directly — DCP has no way to
-reassemble the stage boundaries. You have one of two paths:
+at `pp=4` is **not loadable at `pp=2`**: each stage loads only its own
+`pp{N}/` subdirectory, and a different `pp` gives each stage different
+layers. Keep the same `pp` on resume. Auto-resume never changes the
+parallelism shape, so a straight restart always works.
 
-1. **Convert first.** Use
-   [`scripts/convert_checkpoint.py dcp-to-hf`](hf-conversion.md) to
-   flatten the per-stage shards into a single HF state dict, then
-   `hf-to-dcp` to re-emit a single-stage DCP checkpoint. This works
-   because the HF conversion reads every `pp{i}/` subdirectory and
-   merges them. The round trip keeps the weights only: the result has
-   no optimizer state and no `train_state.pt`, so a run that loads it
-   starts at step 0 with a fresh optimizer, LR schedule and data
-   position.
-2. **Keep the same `pp` on resume.** Auto-resume never changes the
-   parallelism shape, so a straight restart always works.
-
-The conversion path is what shipped configs use in practice: PP is
-chosen for the largest runs where memory forces it, and those runs
-typically don't need to rebalance mid-training.
+No path changes `pp` today. `dcp-to-hf` cannot export a PP checkpoint
+([#450](https://github.com/KempnerInstitute/KempnerForge/issues/450)),
+and a PP run cannot load a checkpoint saved without PP, such as the
+output of `hf-to-dcp`
+([#317](https://github.com/KempnerInstitute/KempnerForge/issues/317)).
 
 ## EP: every expert under its global index
 
@@ -103,8 +95,9 @@ checkpoint loads into an EP run. Packed experts under FSDP need torch
   `exclude_from_loading` skips the whole model or the whole optimizer,
   not single tensors. For a change `ModelConfig` can express that adds
   tensors without resizing existing ones (more layers, for example),
-  the weights-only round trip in [HF conversion](hf-conversion.md)
-  carries the old weights over:
+  in a run without PP (see [PP](#pp-the-one-special-case)), the
+  weights-only round trip in [HF conversion](hf-conversion.md) carries
+  the old weights over:
   `dcp-to-hf` with the old config, then `hf-to-dcp` with the new one,
   which leaves the new parameters at their initial values with a
   warning. The export casts the weights to the export dtype, bfloat16
@@ -211,11 +204,11 @@ if you need to keep the global batch size constant.
 
 ## See also
 
-- [DCP model + optimizer](dcp-model.md) — what's in each shard and
+- [DCP model + optimizer](dcp-model.md): what's in each shard and
   why `state_dict()` has to describe the target shape on load.
-- [Auto-resume](auto-resume.md) — how the training script chooses
+- [Auto-resume](auto-resume.md): how the training script chooses
   which checkpoint to reshard.
-- [HF conversion](hf-conversion.md) — the escape hatch for
-  re-emitting a checkpoint with different PP.
-- [Device mesh](../distributed/device-mesh.md) — the mesh construction
+- [HF conversion](hf-conversion.md): the weights-only round trip
+  for a run without PP that adds parameters.
+- [Device mesh](../distributed/device-mesh.md): the mesh construction
   that determines the target shard layout.
