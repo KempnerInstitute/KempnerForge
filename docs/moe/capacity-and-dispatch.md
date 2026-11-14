@@ -3,8 +3,8 @@
 After routing, each token has a `top_k` list of expert indices and
 weights. The dispatch layer has to:
 
-1. Optionally cap how many tokens each expert can receive
-   (`capacity_factor`).
+1. Optionally drop the tokens past each expert's capacity
+   (`capacity_factor`) by zeroing their routing weights.
 2. Actually run each expert on its assigned tokens — either in a
    Python loop (sequential) or via one batched `torch._grouped_mm`
    call (grouped GEMM).
@@ -20,8 +20,8 @@ Capacity and dispatch both live in
 moe_capacity_factor = 0.0   # 0 = no cap, >0 = cap per expert
 ```
 
-With `capacity_factor > 0`, each expert can only accept a bounded
-number of tokens per forward:
+With `capacity_factor > 0`, each expert keeps a bounded number of
+tokens per forward:
 
 ```python
 # kempnerforge/model/moe.py — _apply_capacity
@@ -64,15 +64,18 @@ as if it skipped the MLP entirely.
 
 ### When to use capacity
 
-**With EP**: sometimes necessary. All-to-all buffers are sized for
-the *worst-case* token distribution. Without a cap, one rank can
-overflow its dispatch buffer when many tokens happen to prefer
-experts on that rank. A capacity factor of 1.25 bounds the buffer
-size predictably.
+A cap changes which expert outputs count, not how much work runs.
+Dropped tokens keep their expert indices, so the local path still
+computes them and the EP all-to-all still sends and computes them,
+and the zero weight discards their output. A cap saves no compute,
+memory or communication.
 
-**Without EP**: usually leave at 0. All experts live on the same
-rank and the sequential/grouped path handles any distribution.
-Setting a cap just costs throughput.
+**With EP**: nothing overflows without a cap.
+`ep_dispatch_and_compute` exchanges the token counts first and sizes
+each receive buffer to the count it gets, dropped tokens included.
+
+Leave it at 0, with or without EP, unless you want the drops
+themselves, e.g. to match a baseline trained with capacity.
 
 **Caveats**: the inner loop is O(num_experts × top_k) Python and
 non-vectorized. At `num_experts = 64 × top_k = 8 = 512` Python
@@ -222,9 +225,9 @@ else:
     output = self._local_forward(x_flat, weights, indices)
 ```
 
-The capacity factor still applies before this branch — the `weights`
+The capacity factor still applies before this branch: the `weights`
 tensor handed to `ep_dispatch_and_compute` has dropped-token weights
-already zeroed. See
+already zeroed, and those tokens are dispatched with the rest. See
 [Expert parallelism § Dispatch / combine flow](../distributed/expert-parallelism.md#dispatch--combine-flow)
 for the all-to-all mechanics.
 

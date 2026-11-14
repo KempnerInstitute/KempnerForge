@@ -178,26 +178,29 @@ dp_shard = 4    # unchanged
 See [Expert parallelism](../distributed/expert-parallelism.md) for the
 all-to-all mechanics and throughput measurements.
 
-## Capacity factor: only when EP is on
+## Capacity factor
 
-`moe_capacity_factor` caps tokens per expert. It's almost always the
-wrong knob to turn on without EP:
+`moe_capacity_factor` caps the tokens each expert keeps: the rest get
+routing weight 0 and pass through the layer on the residual. It changes
+the model, and it saves no memory, compute or communication, with or
+without EP:
 
-- **Without EP**: capacity factor drops tokens (residual still flows),
-  which is wasted compute with no memory upside. Leave at `0.0`.
-- **With EP**: dispatch all-to-all buffers are sized for the
-  *worst-case* token distribution. Without a cap, one rank can
-  overflow its buffer when many tokens happen to prefer its experts.
-  `moe_capacity_factor = 1.25` (Switch default) bounds the buffer
-  predictably.
+- Dropped tokens are still dispatched and computed. `_apply_capacity`
+  zeroes their weights and leaves their expert indices alone, so the
+  local path computes them and the EP all-to-all sends them like any
+  other token, and the zero weight discards their output.
+- Nothing overflows without a cap. The EP dispatch exchanges token
+  counts first and sizes each receive buffer to the count it gets.
+
+Leave it at `0.0` unless you want the drops themselves, e.g. to match
+a baseline trained with capacity:
 
 ```toml
 [model]
-moe_capacity_factor = 1.25   # only meaningful with distributed.ep > 1
+moe_capacity_factor = 1.25
 ```
 
-Start at 1.25; raise to 1.5 if you see ~5%+ token drop in metrics,
-lower to 1.0 if throughput is buffer-bound. See
+See
 [Capacity and dispatch § When to use capacity](../moe/capacity-and-dispatch.md#when-to-use-capacity).
 
 ## Packed experts: on if `num_experts ≥ 16`
