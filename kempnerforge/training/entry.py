@@ -9,6 +9,7 @@ phase — without editing the shared script.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -31,11 +32,13 @@ from kempnerforge.distributed.parallel import (
 )
 from kempnerforge.distributed.setup import destroy_distributed
 from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
+from kempnerforge.distributed.utils import get_dp_info
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
+from kempnerforge.model.masking import use_dynamic_flex_shapes
 from kempnerforge.model.mot import mot_warm_start_from_text_stack
 from kempnerforge.model.transformer import Transformer
-from kempnerforge.model.vlm import inner_transformer
+from kempnerforge.model.vlm import inner_transformer, packed_tokens_per_image
 from kempnerforge.profiling.profiler import build_profiler
 from kempnerforge.resilience.elastic import resolve_resume_path
 from kempnerforge.resilience.health import NaNDetector
@@ -178,6 +181,8 @@ def build_checkpoint_manager(
     With PP, each stage has different parameters — DCP needs a group scoped
     to ranks within the same PP stage (all non-PP mesh dimensions), and each
     stage saves DCP shards to its own subdirectory to avoid file collisions.
+    The manager records each rank's data-parallel coordinates, the partition
+    ``build_data_pipeline`` reads, with the per-rank loader/RNG state.
     """
     ckpt_pg = None
     ckpt_pp_rank = None
@@ -193,6 +198,7 @@ def build_checkpoint_manager(
         optimizer,
         process_group=ckpt_pg,
         pp_rank=ckpt_pp_rank,
+        dp_info=get_dp_info(device_mesh),
         weight_decay_scope=config.optimizer.weight_decay_scope,
         lr_multipliers=config.optimizer.lr_multipliers,
         module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
@@ -261,6 +267,63 @@ def _load_path_is_the_resume(config: JobConfig, resume_path: Path) -> bool:
     return os.path.realpath(str(ckpt.load_path)) == os.path.realpath(str(resume_path))
 
 
+WARM_START_CHECKPOINT_TAG = "kempnerforge.warm_start.checkpoint"
+WARM_START_SOURCE_RUN_TAG = "kempnerforge.warm_start.source_run_id"
+
+
+def _source_mlflow_run_id(source: Path, extra: dict) -> str | None:
+    """The MLflow run that saved ``source``: its ``metadata.json`` record, else the train state's.
+
+    The sidecar comes first because a load that skips ``train_state.pt`` still has it. A sidecar
+    that is missing, unreadable or of another shape falls back to the ``mlflow_run_id`` in
+    ``extra``. Nothing here raises: only rank 0 runs it, and a raise would leave the other ranks
+    waiting in the next collective.
+    """
+    with contextlib.suppress(OSError, ValueError, AttributeError, TypeError, RecursionError):
+        meta = json.loads((source / "metadata.json").read_text())
+        for record in meta.get("tracking") or []:
+            run_id = record.get("run_id") if record.get("backend") == "mlflow" else None
+            if isinstance(run_id, str) and run_id.strip():
+                return run_id
+    run_id = extra.get("mlflow_run_id")
+    return run_id if isinstance(run_id, str) and run_id.strip() else None
+
+
+def _tag_warm_start_run(config: JobConfig, extra: dict) -> None:
+    """Point a ``load_path`` warm start's new MLflow run at the checkpoint it starts from.
+
+    A warm start is a new run, so the run ids its checkpoint carries are not restored and each
+    enabled tracking backend opens a run of its own, unless the config names one. Rank 0 says
+    which saved runs it does not continue and, with MLflow on, adds the tags
+    ``kempnerforge.warm_start.checkpoint`` (the checkpoint's real path) and, when the run that
+    saved it is known, ``kempnerforge.warm_start.source_run_id`` to ``metrics.mlflow_tags``; a
+    tag of the same name already there wins.
+    """
+    metrics = config.metrics
+    source = Path(os.path.realpath(str(config.checkpoint.load_path)))
+    mlflow_source = _source_mlflow_run_id(source, extra) if metrics.enable_mlflow else None
+    unused = [
+        f"{key}={run_id}"
+        for key, run_id, enabled, named in (
+            ("mlflow_run_id", mlflow_source, metrics.enable_mlflow, metrics.mlflow_run_id),
+            ("wandb_run_id", extra.get("wandb_run_id"), metrics.enable_wandb, metrics.wandb_run_id),
+        )
+        if enabled and not named and run_id
+    ]
+    if unused:
+        logger.info(
+            f"Warm start from {source}: not continuing the tracking runs that saved it "
+            f"({', '.join(unused)}); set metrics.mlflow_run_id or metrics.wandb_run_id to "
+            f"continue one"
+        )
+    if not metrics.enable_mlflow:
+        return
+    tags = {WARM_START_CHECKPOINT_TAG: str(source)}
+    if mlflow_source is not None:
+        tags[WARM_START_SOURCE_RUN_TAG] = mlflow_source
+    metrics.mlflow_tags = {**tags, **metrics.mlflow_tags}
+
+
 def restore_checkpoint(
     config: JobConfig,
     model: torch.nn.Module,
@@ -278,6 +341,11 @@ def restore_checkpoint(
     requeued warm start resumes rather than starting over; rank 0 then warns that
     ``load_path`` is not used, naming both paths, unless ``load_path`` names the resumed
     checkpoint and excludes nothing.
+
+    Only that auto-resume restores the metrics run ids. A ``load_path`` warm start is a new run:
+    each enabled tracking backend opens a run of its own unless ``metrics.mlflow_run_id`` or
+    ``metrics.wandb_run_id`` names one, and with MLflow on, rank 0 tags the new run with the
+    checkpoint and the MLflow run that saved it (``_tag_warm_start_run``).
     """
     num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
@@ -318,11 +386,15 @@ def restore_checkpoint(
         scheduler=scheduler,
         exclude_keys=warm_start_exclude,
         vlm_freeze_expected=vlm_freeze_expected,
+        exact_resume=resume_path is not None,
     )
-    if ckpt_extra_loaded.get("wandb_run_id"):
-        config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
-    if ckpt_extra_loaded.get("mlflow_run_id"):
-        config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
+    if resume_path is not None:
+        if ckpt_extra_loaded.get("wandb_run_id"):
+            config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
+        if ckpt_extra_loaded.get("mlflow_run_id"):
+            config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
+    elif rank_zero:
+        _tag_warm_start_run(config, ckpt_extra_loaded)
 
     if warm_start_exclude is not None and "model" in warm_start_exclude:
         _mot_text_warm_start(vlm_cfg, model, ckpt_mgr.agree)
@@ -359,6 +431,7 @@ def run_training(
         nan_detector = NaNDetector(action="warn", max_consecutive=10)
 
         loss_fn = build_loss_fn(config.train)
+        use_dynamic_flex_shapes(config.is_vlm and config.data.pack_sequences)
         model, pipeline = build_model(config, runtime, loss_fn)
         amp_dtype = autocast_dtype(model, config.train.master_dtype, config.train.param_dtype)
         if amp_dtype is not None:
@@ -384,7 +457,10 @@ def run_training(
 
         prof = build_profiler(config.profiling, rank=runtime.rank)
 
-        data = build_data_pipeline(config, runtime)
+        tokens_per_image = (
+            packed_tokens_per_image(model) if config.is_vlm and config.data.pack_sequences else None
+        )
+        data = build_data_pipeline(config, runtime, tokens_per_image=tokens_per_image)
         if data.dataloader is not None:
             ckpt_mgr.apply_dataloader_state(data.dataloader)
 
@@ -415,6 +491,7 @@ def run_training(
         run_training_loop(session, step=step, tokens_seen=tokens_seen)
         finished = True
     finally:
+        use_dynamic_flex_shapes(False)
         if tracker is not None:
             tracker.close()
         if finished:

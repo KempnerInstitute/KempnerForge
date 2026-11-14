@@ -182,7 +182,7 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `hf_dataset_prompt_field` | `str` | `""` | VLM only: prompt column (`""` = no prompt mask) |
 | `hf_image_size` | `int` | `224` | VLM only: target square image size |
 | `hf_streaming` | `bool` | `False` | use `IterableDataset` for large corpora |
-| `pack_sequences` | `bool` | `False` | document-aware packing with cross-doc isolation (feeds `doc_ids` to attention) |
+| `pack_sequences` | `bool` | `False` | document-aware packing with cross-doc isolation (feeds `doc_ids` to attention); on a Joint-Decoder VLM run, packs `train.batch_size` image-text documents per micro-batch into rows of `train.seq_len`, each document's image tokens before its text, positions restarting per document |
 | `datasets` | `list[DatasetSource]` | `[]` | multi-dataset mixture (overrides `dataset_path`/`hf_dataset_name` when non-empty) |
 | `mix_temperature` | `float` | `1.0` | weight scaling; `1.0` → as-is, larger → more uniform |
 | `phases` | `list[TrainingPhase]` | `[]` | multi-phase schedule with weight/LR transitions |
@@ -269,6 +269,7 @@ DCP-based checkpointing.
 | `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py dcp-to-hf` when its `--dtype` flag is not given; the flag wins and also takes `float16` (see [HuggingFace conversion](../checkpointing/hf-conversion.md#dtypes)) |
 | `exclude_from_loading` | `list[str]` | `[]` | state to skip when warm-starting from `load_path`: `"model"` and/or `"optimizer"`, or exactly `["optimizer", "train_state"]` for a weights-only warm start that loads the model alone and skips `train_state.pt` (step, scheduler, dataloader position, RNG) and the saved freeze comparison, so a new stage starts fresh from the weights; ignored on a resume, which always restores full state |
 | `ignore_freeze_mismatch` | `bool` | `False` | load a checkpoint whose VLM freeze metadata disagrees with the configured freeze specs, downgrading the error to a warning |
+| `ignore_rank_state_mismatch` | `bool` | `False` | resume when the saved per-rank dataloader/RNG state does not fit this run (changed world size or data-parallel layout, unreadable or incomplete envelope): discard that state on every rank with a warning instead of raising, so data order and random streams restart fresh while step, model, optimizer and scheduler continue (see [Resharding](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)) |
 
 ### `[checkpoint.dyn_ckpt_window]` — `DynamicCheckpointWindow`
 
@@ -331,7 +332,7 @@ enabled in one run config.
 | `enable_tensorboard` | `bool` | `False` | turn on TensorBoard backend |
 | `wandb_project` | `str` | `"kempnerforge"` | WandB project name |
 | `wandb_run_name` | `str \| None` | `None` | `None` → auto-generated |
-| `wandb_run_id` | `str` | `""` | restored from checkpoint on resume; empty = new run |
+| `wandb_run_id` | `str` | `""` | restored from the checkpoint on an auto-resume, never on a `checkpoint.load_path` warm start; empty = new run |
 | `tensorboard_dir` | `str` | `"tb_logs"` | TB log directory |
 | `enable_mlflow` | `bool` | `False` | turn on MLflow backend (Databricks or local) |
 | `mlflow_tracking_uri` | `str \| None` | `None` | tracking URI; `None` → `$MLFLOW_TRACKING_URI`, else `"databricks"`; `databricks://<profile>` selects a `~/.databrickscfg` profile |
@@ -339,7 +340,7 @@ enabled in one run config.
 | `mlflow_run_name` | `str \| None` | `None` | `None` → auto-generated |
 | `mlflow_description` | `str \| None` | `None` | run description (Markdown, the `mlflow.note.content` tag), set on a new run |
 | `mlflow_tags` | `dict[str, str]` | `{}` | extra run tags, set on a new run after the automatic ones; keys and values must be non-empty strings |
-| `mlflow_run_id` | `str` | `""` | restored from checkpoint on resume; empty = new run |
+| `mlflow_run_id` | `str` | `""` | restored from the checkpoint on an auto-resume, never on a `checkpoint.load_path` warm start; empty = new run |
 | `mlflow_log_system_metrics` | `bool` | `True` | sample CPU/GPU/memory on a background thread |
 | `mlflow_system_metrics_interval` | `float` | `10.0` | seconds between system-metric samples |
 | `mlflow_register_checkpoints` | `bool` | `False` | register each committed checkpoint as an MLflow external model on the background worker; `metadata.json` records its `model_name` at save and its `model_id` once registered; requires `enable_mlflow` |

@@ -18,7 +18,7 @@ Entry points, both in
 {
     "step":        int,                   # current training step
     "tokens_seen": int,                   # cumulative token count across DP ranks
-    "rng": {                              # full RNG capture (see below)
+    "rng": {                              # rank 0's RNG capture (see below)
         "python":     random.getstate(),
         "numpy":      np.random.get_state(),
         "torch_cpu":  torch.random.get_rng_state(),
@@ -26,7 +26,16 @@ Entry points, both in
     },
     "scheduler":   scheduler.state_dict(),            # present if scheduler passed
     "scheduler_group_modules": [None, "adapter", ...],  # if a param group names a module
-    "dataloader":  dataloader.state_dict(),           # present if dataloader passed
+    "dataloader":  dataloader.state_dict(),           # rank 0's; present if dataloader passed
+    "per_rank": {                         # schema v1: every rank's own state
+        "version": 1,
+        "world_size": W,
+        "data_parallel": {0: (dp_rank, dp_size), ...},  # or None if unrecorded
+        "ranks": {
+            0: {"rng": {...}, "dataloader": {...}},   # global rank -> payload
+            # ... one entry per global rank 0..W-1
+        },
+    },
     # ... plus whatever was in the `extra` dict
 }
 ```
@@ -34,19 +43,101 @@ Entry points, both in
 ## Who writes it
 
 ```python
-# manager.py, inside save()
-if self._rank == 0:
+# manager.py, inside save() (abridged)
+per_rank, gather_error = self._gather_rank_states(dataloader)  # every rank
+if error is None:
+    error = gather_error
+
+if self._rank == 0 and error is None:
     train_state = build_train_state(
         step=step, tokens_seen=tokens_seen,
         scheduler=scheduler, dataloader=dataloader, extra=extra,
+        per_rank=per_rank,
     )
     torch.save(train_state, ckpt_dir / "train_state.pt")
 ```
 
-Only global rank 0 writes — the file is not sharded. On load, rank
-0 reads and broadcasts it to every rank via
-`dist.broadcast_object_list` so all ranks agree on `step`, scheduler
-LR, RNG seeds, etc.
+Only global rank 0 writes; the file is not sharded. Before the
+write, every rank's own dataloader/RNG payload is gathered
+collectively (on the manager's dedicated gloo group) into the
+versioned `per_rank` envelope, so the single file still carries every
+rank's state. Each rank captures and pickles its payload before the
+gather. A rank whose capture fails (its loader's `state_dict()`
+raises, or the payload cannot be pickled) still enters the gather,
+without a payload, so the save fails on every rank instead of leaving
+the others waiting: that rank raises its own error, every other rank
+raises a `RuntimeError` naming it, rank 0 writes no `train_state.pt`,
+and `latest` stays on the previous checkpoint.
+
+On load, rank 0 reads the file and broadcasts it to every rank
+via `dist.broadcast_object_list`; all ranks agree on `step` and
+scheduler state. On an exact resume (the training entry's auto-resume
+of the run's own checkpoint, `load(..., exact_resume=True)`) each rank
+then restores **its own** entry from `per_rank["ranks"]`, keyed by
+global rank. Any other load (a `load_path` warm start,
+`scripts/eval.py`) restores the single-copy `rng`/`dataloader` keys
+(rank 0's) on every rank with no topology check, exactly as before.
+A weights-only warm start
+(`exclude_from_loading = ["optimizer", "train_state"]`) never reads
+the file, so no rank restores either copy or enters the broadcast or
+the layout gather.
+
+## Per-rank state (schema v1)
+
+Dataloader cursors and RNG streams are rank-local: pipeline stages
+seed `seed + pp_rank`, CUDA streams diverge during training, and a
+stateful loader's position is its own rank's. The gather spans every
+rank of every pipeline stage, so each stage resumes its own streams
+rather than stage 0's. The `per_rank` envelope records each rank's
+payload:
+
+- `version`: schema version, currently `1`. A newer version than
+  the running code understands refuses to load.
+- `world_size`: the topology that saved the checkpoint. Resuming
+  under a **different world size raises** with an actionable error:
+  exact data/RNG continuity only exists on the saved topology, while
+  model/optimizer resharding via DCP is unaffected.
+- `data_parallel`: every global rank's `(dp_rank, dp_size)`, the data
+  partition its loader read. The same world size can split into a
+  different partition per rank (for example DP=4 vs DP=2 x TP=2), so
+  resuming under a **different layout also raises**: a loader cursor
+  is only valid on the partition it was saved on. `None` when the saving
+  `CheckpointManager` was built without `dp_info` (the training entry
+  always passes it); the layout check is then skipped and only the
+  world size is checked.
+- `ranks`: one payload per global rank, holding that rank's `rng`
+  capture plus, when its loader is stateful, its `dataloader` state
+  (on every rank or none).
+
+The whole envelope is checked before any rank selects its entry: a
+missing, extra or incomplete entry (no full `rng` capture, an RNG
+stream such as `torch_cuda` or `dataloader` state on only some ranks)
+refuses the resume. The check reads only what every rank shares (the
+broadcast envelope, the world size, the gathered current layout), so
+all ranks restore, refuse, or discard together. To proceed past a
+refusal, set
+`checkpoint.ignore_rank_state_mismatch = true`: the saved loader/RNG
+state is discarded on every rank with a warning and data order /
+random streams restart fresh (model, optimizer, scheduler and step
+still resume). See
+[Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size)
+for the scale-up recipe and what it costs.
+
+Compatibility:
+
+- **Old checkpoint, new reader**: no `per_rank` key, so rank 0's
+  single-copy `rng`/`dataloader` keys restore on every rank, exactly
+  as before.
+- **New checkpoint, old reader**: the single-copy keys (rank 0's)
+  are still written beside the envelope, so pre-envelope readers
+  keep loading. Their documented limitation is unchanged: they
+  restore rank 0's copy on every rank and ignore `per_rank`.
+- **Not a resume**: a `load_path` warm start or an evaluation load
+  ignores `per_rank` and restores the single-copy keys (rank 0's) on
+  every rank, exactly as before, on any world size or layout. A
+  weights-only warm start skips the whole file, `per_rank` included:
+  every rank keeps the RNG streams seeded at startup and starts its
+  loader from the first sample, on any world size or layout.
 
 ## RNG capture
 
@@ -62,6 +153,13 @@ LR, RNG seeds, etc.
 On load, `set_rng_state()` restores them all. Result: a resumed run
 produces the **exact same loss trajectory** as an uninterrupted run,
 step for step.
+
+That holds only while nothing else draws from these generators after
+the restore. The MLflow backend keeps MLflow's usage telemetry off for
+that reason, since it would draw from `random` on a background thread;
+[MLflow § Usage telemetry](../metrics-and-profiling/mlflow.md#usage-telemetry)
+lists what can still draw and how a hook keeps its own stream
+reproducible.
 
 The one thing the RNG snapshot doesn't cover: multi-process
 dataloader workers spawned by `torch.utils.data.DataLoader` have
@@ -149,27 +247,31 @@ ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=scheduler,
 
 On load, `restore_train_state` strips out the "standard" keys
 (`step`, `tokens_seen`, `rng`, `scheduler`, `scheduler_group_modules`,
-`dataloader`) and returns the rest as the third tuple element:
+`dataloader`, `per_rank`) and returns the rest as the third tuple element:
 
 ```python
 step, tokens_seen, extra = ckpt_mgr.load(path=..., scheduler=scheduler)
-if extra.get("wandb_run_id"):
-    config.metrics.wandb_run_id = extra["wandb_run_id"]
-if extra.get("mlflow_run_id"):
-    config.metrics.mlflow_run_id = extra["mlflow_run_id"]
+if resume_path is not None:
+    if extra.get("wandb_run_id"):
+        config.metrics.wandb_run_id = extra["wandb_run_id"]
+    if extra.get("mlflow_run_id"):
+        config.metrics.mlflow_run_id = extra["mlflow_run_id"]
 ```
 
 KempnerForge uses this for:
 
 - `phase_idx` — current curriculum phase (so training resumes the
   correct data mix without skipping forward).
-- `wandb_run_id` — so resumed runs append to the same W&B run rather
-  than starting a new one.
+- `wandb_run_id`: so an auto-resumed run appends to the same W&B run
+  rather than starting a new one. A `checkpoint.load_path` warm start
+  does not restore it, since it is a new run with runs of its own.
 - `mlflow_run_id`: the same for MLflow; on resume, steps up to the last
   `train/loss` step the run already holds are not logged again (best
-  effort: if reading the run's history fails, nothing is skipped). The
-  checkpoint's `metadata.json` also records the live run as plain JSON,
-  for tools that read it without loading this file.
+  effort: if reading the run's history fails, nothing is skipped). A
+  warm start instead tags its new run with this id, as
+  `kempnerforge.warm_start.source_run_id`. The checkpoint's
+  `metadata.json` also records the live run as plain JSON, for tools
+  that read it without loading this file.
 
 Custom training workflows can use it for anything
 `torch.save`-serializable.
@@ -177,12 +279,14 @@ Custom training workflows can use it for anything
 ## Save failures
 
 `torch.save` uses `pickle` under the hood. If any object in the
-train state isn't picklable, the save raises — the DCP shard is
-already on disk, but the non-distributed state file is missing.
+train state isn't picklable (an `extra` value, or any rank's
+dataloader state), the save raises on every rank: the DCP shard is
+already on disk, but the non-distributed state file is missing and
+`latest` does not move to it.
 
-Practical implication: keep `extra=` values to primitives, lists,
-dicts, and tensors. Don't stuff a live logger, process group, or
-generator in there.
+Practical implication: keep `extra=` values and a custom loader's
+`state_dict()` to primitives, lists, dicts, and tensors. Don't stuff
+a live logger, process group, or generator in there.
 
 ## When `train_state.pt` is missing
 
@@ -226,8 +330,9 @@ data position and RNG state start fresh.
   `train_state.pt` on startup.
 - [Training § Schedulers](../training/schedulers.md) — what's in
   `scheduler.state_dict()`.
-- [Data § Stateful dataloader](../data/index.md) —
-  why the current train.py doesn't pass the dataloader.
+- [Data § Stateful dataloader](../data/stateful-dataloader.md): the
+  loader state the training loop saves at every checkpoint and restores
+  on resume.
 - [Metrics § WandB resume](../metrics-and-profiling/index.md) — how
   `wandb_run_id` in `extra` enables resumed W&B runs.
 - [MLflow backend](../metrics-and-profiling/mlflow.md): how

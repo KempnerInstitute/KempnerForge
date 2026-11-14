@@ -226,14 +226,17 @@ def z_loss(logits: torch.Tensor, weight: float, chunk_size: int | None = None) -
         chunk_size: Tokens per float32 chunk. ``None`` takes every token at once.
 
     Returns:
-        Scalar z-loss term to add to the main loss.
+        Scalar z-loss term to add to the main loss; zero on the graph for logits
+        with no rows (a packed micro-batch without text).
     """
     if chunk_size is not None and chunk_size <= 0:
         raise ValueError(f"z_loss chunk_size must be positive (got {chunk_size})")
     if weight == 0.0:
         return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
     flat = logits.view(-1, logits.shape[-1])
-    size = max(flat.shape[0], 1) if chunk_size is None else chunk_size
+    if flat.shape[0] == 0:
+        return _zero_on_graph(logits)
+    size = flat.shape[0] if chunk_size is None else chunk_size
     lse = _ChunkedLogSumExp.apply(flat, size)
     return weight * (lse**2).mean()
 

@@ -4,17 +4,20 @@ Uses ``dcp.async_save()`` to snapshot state to CPU and write to disk
 in the background, returning control to the training loop immediately.
 
 Modes:
-  - disabled: Synchronous save (simple, for debugging).
+  - disabled: Synchronous save (the default; simple, for debugging).
   - async: Standard async via dcp.async_save().
-  - async_with_pinned_mem: Async with pinned memory staging for faster GPU→CPU.
+  - async_with_pinned_mem: The same dcp.async_save() call as async; no
+    pinned-memory staging is implemented.
 """
 
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import Any
 
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.planner import SavePlanner
 
 from kempnerforge.config.schema import AsyncCheckpointMode
 
@@ -35,7 +38,13 @@ class AsyncCheckpointer:
         self.mode = mode
         self._pending_future: Any = None
 
-    def save(self, state_dict: dict, checkpoint_id: str, process_group=None) -> None:
+    def save(
+        self,
+        state_dict: dict,
+        checkpoint_id: str,
+        process_group=None,
+        planner: SavePlanner | None = None,
+    ) -> None:
         """Save distributed state, potentially asynchronously.
 
         Args:
@@ -44,15 +53,20 @@ class AsyncCheckpointer:
             process_group: Process group for DCP. Required for PP where each
                 stage has a different state dict — pass a group scoped to ranks
                 within the same PP stage. None uses the default global group.
+            planner: DCP save planner. None calls DCP as before, with its default planner.
         """
         self.wait()
+        save, async_save = dcp.save, dcp.async_save
+        if planner is not None:
+            save = partial(save, planner=planner)
+            async_save = partial(async_save, planner=planner)
 
         if self.mode == AsyncCheckpointMode.disabled:
-            dcp.save(state_dict, checkpoint_id=checkpoint_id, process_group=process_group)
+            save(state_dict, checkpoint_id=checkpoint_id, process_group=process_group)
             logger.info(f"Sync checkpoint saved: {checkpoint_id}")
 
         elif self.mode in (AsyncCheckpointMode.async_, AsyncCheckpointMode.async_pinned):
-            self._pending_future = dcp.async_save(
+            self._pending_future = async_save(
                 state_dict,
                 checkpoint_id=checkpoint_id,
                 process_group=process_group,
