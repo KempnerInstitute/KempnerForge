@@ -180,17 +180,19 @@ all-to-all mechanics and throughput measurements.
 
 ## Capacity factor
 
-`moe_capacity_factor` caps the tokens each expert keeps: the rest get
-routing weight 0 and pass through the layer on the residual. It changes
-the model, and it saves no memory, compute or communication, with or
-without EP:
+`moe_capacity_factor` caps the routes each expert keeps: a route past
+the cap gets routing weight 0, so its expert's output no longer counts
+for that token, while the token's other routes, any shared experts and
+the residual still do. It changes the model, and it saves no memory,
+compute or communication, with or without EP:
 
-- Dropped tokens are still dispatched and computed. `_apply_capacity`
+- Dropped routes are still dispatched and computed. `_apply_capacity`
   zeroes their weights and leaves their expert indices alone, so the
   local path computes them and the EP all-to-all sends them like any
-  other token, and the zero weight discards their output.
-- Nothing overflows without a cap. The EP dispatch exchanges token
-  counts first and sizes each receive buffer to the count it gets.
+  other route, and the zero weight discards their output.
+- No fixed-size buffer overflows without a cap. The EP dispatch
+  exchanges token counts first and sizes each receive buffer to the
+  count it gets, so a rank that many routes pick receives more rows.
 
 Leave it at `0.0` unless you want the drops themselves, e.g. to match
 a baseline trained with capacity:
@@ -266,7 +268,8 @@ splitting. Use FSDP, TP, or EP instead.
 ```
 
 Raised in `JobConfig.validate` when `num_experts > 0` and
-`pp > 1`. For very large MoE runs that need PP, you'd need a
+`pp > 1`; with `vlm.arch = "mot"` it offers FSDP alone, since MoT
+runs neither TP nor EP. For very large MoE runs that need PP, you'd need a
 schedule that interleaves all-to-all with pipeline microbatches —
 not in KempnerForge today.
 

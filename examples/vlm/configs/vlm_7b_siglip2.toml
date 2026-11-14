@@ -4,7 +4,7 @@
 #
 # Tokenizer: meta-llama/Meta-Llama-3-8B (vocab_size = 128256). The SigLIP2
 # family uses the Llama-3 vocab to match a real Llama-3 + SigLIP2
-# production target. Other configs in this folder use gpt2 (vocab_size =
+# production target. Most other configs in this folder use gpt2 (vocab_size =
 # 50257) for fast smoke iteration.
 # The Llama-3 tokenizer is gated: it needs access granted on its Hugging
 # Face page and a token (HF_TOKEN or hf auth login) before the first run.

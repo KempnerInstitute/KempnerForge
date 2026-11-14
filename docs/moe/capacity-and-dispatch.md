@@ -50,29 +50,31 @@ for k in range(top_k):
 ```
 
 "First `capacity` tokens wins" — tokens are kept in sequence order,
-later tokens get dropped. If a token's *only* chosen expert is
-overloaded, the token contributes nothing to the MoE output — but
-the residual connection still carries it through unchanged:
+later tokens get dropped. If every expert a token chose drops it,
+its routed experts contribute nothing to the MoE output (shared
+experts, when the layer has them, still run), and the residual
+connection carries it through:
 
 ```python
 # kempnerforge/model/transformer.py — TransformerBlock.forward
 x = x + self.mlp(self.mlp_norm(x))   # MoE output + residual
 ```
 
-So a dropped token is not an error — it passes through the layer
-as if it skipped the MLP entirely.
+So a dropped token is not an error: it passes through the layer
+as if it skipped the routed experts.
 
 ### When to use capacity
 
 A cap changes which expert outputs count, not how much work runs.
-Dropped tokens keep their expert indices, so the local path still
+Dropped routes keep their expert indices, so the local path still
 computes them and the EP all-to-all still sends and computes them,
 and the zero weight discards their output. A cap saves no compute,
 memory or communication.
 
-**With EP**: nothing overflows without a cap.
+**With EP**: no fixed-size buffer overflows without a cap.
 `ep_dispatch_and_compute` exchanges the token counts first and sizes
-each receive buffer to the count it gets, dropped tokens included.
+each receive buffer to the count it gets, dropped routes included, so
+a rank that many routes pick receives more rows.
 
 Leave it at 0, with or without EP, unless you want the drops
 themselves, e.g. to match a baseline trained with capacity.

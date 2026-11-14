@@ -123,6 +123,8 @@ Point a training config at this directory via
 training picks it up like any other DCP checkpoint, as a warm start
 at step 0. `load_path` is used while the run's `checkpoint.dir` holds
 no checkpoint; once the run has saved one, a restart resumes from it.
+A run with PP cannot load it, since it has no `pp{N}/` stages
+([#317](https://github.com/KempnerInstitute/KempnerForge/issues/317)).
 
 ## Key mapping
 

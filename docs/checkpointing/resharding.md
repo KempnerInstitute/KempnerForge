@@ -110,9 +110,13 @@ checkpoint loads into an EP run. Packed experts under FSDP need torch
   want (you removed a module). DCP ignores the extra shard —
   silently, so watch the checkpoint size rather than relying on
   warnings.
-- **`.metadata` disagreement between `pp{i}/` subdirs**: always a
-  bug — different PP stages should save independently. File an
-  issue.
+- **A `pp{i}/` subdir without its own `.metadata`**: each stage saves
+  over its own process group and indexes only its own shards, so the
+  stages' indexes differ by design. A save coordinated over every rank
+  writes one `.metadata` into `pp0/` instead, and the other stages
+  cannot load (see
+  [DCP model § With pipeline parallelism](dcp-model.md#with-pipeline-parallelism)).
+  That is a bug; file an issue.
 - **An EP checkpoint saved before experts had a global index**
   ([#202](https://github.com/KempnerInstitute/KempnerForge/issues/202)):
   it holds `num_experts / ep` experts per layer, one rank's, and the

@@ -249,11 +249,11 @@ These run when `JobConfig` is built, with the per-dataclass checks:
   or each view of a tiled image) after the adapter, and none under
   Cross-Attention, whose residual stream carries text only.
 - An HF-backed encoder (`siglip2`, `clip`) with `feature_dim` or
-  `num_tokens` set logs a warning: the values override the ones the
+  `num_tokens` above 0 logs a warning: the values override the ones the
   encoder probes.
 - `data.pack_sequences` on a VLM run needs `vlm.arch = "joint_decoder"`
   and takes neither `[video]` nor `train.mixed_precision = "fp8"`.
-- `optimizer.lr_multipliers` needs a `[vlm]` section whose
+- A nonempty `optimizer.lr_multipliers` needs a `[vlm]` section whose
   `module_patterns` names every listed module (see
   [`OptimizerConfig`](#optimizerconfig)).
 - `attention_backend = "flex"` needs `train.seq_len ≥ 128` (see
