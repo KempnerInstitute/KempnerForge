@@ -388,6 +388,7 @@ class TestScheduleFreeAdamW:
         params2 = [nn.Parameter(torch.randn(4, 4)) for _ in range(3)]
         optimizer2 = ScheduleFreeAdamW(params2, lr=0.01)
         optimizer2.load_state_dict(sd)
+        assert params2[2] in optimizer2.state
         steps = [optimizer2.state[p].get("step") for p in params2]
         assert [None if s is None else s.item() for s in steps] == [3.0, 5.0, None]
         assert optimizer2.state[params2[2]] == {}
