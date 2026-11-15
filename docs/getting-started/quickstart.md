@@ -135,12 +135,10 @@ are already zeroed when `on_step_end` fires.
 
 - **Understand the run**: {doc}`first-training-run` explains the log line,
   the checkpoint directory layout, and auto-resume.
-- **Scale up**: see
-  [README § Training Configurations](https://github.com/KempnerInstitute/KempnerForge#training-configurations)
-  for 7B / 13B / 70B configs.
-- **Run on SLURM**: see
-  [README § Quick Start](https://github.com/KempnerInstitute/KempnerForge#quick-start)
-  for single- and multi-node launch scripts.
+- **Scale up**: {doc}`../reference/available-configs` lists the
+  7B / 13B / 29B / 70B and MoE configs.
+- **Run on SLURM**: {doc}`../how-to/slurm-distributed-setup` covers the
+  single- and multi-node launch scripts.
 - **Measured performance**: see
   [`benchmarks/mfu_scaling/`](https://github.com/KempnerInstitute/KempnerForge/tree/main/benchmarks/mfu_scaling)
   for MFU / throughput numbers across 1–32 GPUs.

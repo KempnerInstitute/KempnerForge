@@ -113,7 +113,7 @@ Training-loop hyperparameters.
 | `z_loss_weight` | `float` | `0.0` | logit-magnitude regularizer (PaLM uses `1e-4`) |
 | `ce_chunk_size` | `int` | `0` | chunk size for `chunked_cross_entropy` (`0` → auto 4096) |
 | `fp32_cross_entropy` | `bool` | `False` | compute `cross_entropy` / `chunked_cross_entropy` and their gradient in fp32 from bf16 logits, without an fp32 copy of the logits; rejected for any other `loss_fn` — see [Losses § fp32 cross-entropy](../training/losses.md#fp32-cross-entropy) |
-| `shutdown_timeout_sec` | `float` | `600.0` | graceful shutdown timeout before forced exit |
+| `shutdown_timeout_sec` | `float` | `600.0` | seconds a rank has, from the start of its shutdown (the signal, or for a rank the vote stops, the vote), to finish the step in flight, write and flush the emergency checkpoint and tear down, before a forced exit (`0` = disabled); under SLURM it fires first only if shorter than the signal lead |
 | `nccl_health_check_interval` | `int` | `0` | NCCL liveness all-reduce every N steps (`0` = disabled) |
 
 Computed properties: `param_dtype` (compute dtype), `master_dtype` (storage dtype: fp32 with
@@ -333,7 +333,7 @@ enabled in one run config.
 | `enable_tensorboard` | `bool` | `False` | turn on TensorBoard backend |
 | `wandb_project` | `str` | `"kempnerforge"` | WandB project name |
 | `wandb_run_name` | `str \| None` | `None` | `None` → auto-generated |
-| `wandb_run_id` | `str` | `""` | restored from checkpoint on resume; empty = new run |
+| `wandb_run_id` | `str` | `""` | restored from the checkpoint on an auto-resume, never on a `checkpoint.load_path` warm start; empty = new run |
 | `tensorboard_dir` | `str` | `"tb_logs"` | TB log directory |
 | `enable_mlflow` | `bool` | `False` | turn on MLflow backend (Databricks or local) |
 | `mlflow_tracking_uri` | `str \| None` | `None` | tracking URI; `None` → `$MLFLOW_TRACKING_URI`, else `"databricks"`; `databricks://<profile>` selects a `~/.databrickscfg` profile |
@@ -341,7 +341,7 @@ enabled in one run config.
 | `mlflow_run_name` | `str \| None` | `None` | `None` → auto-generated |
 | `mlflow_description` | `str \| None` | `None` | run description (Markdown, the `mlflow.note.content` tag), set on a new run |
 | `mlflow_tags` | `dict[str, str]` | `{}` | extra run tags, set on a new run after the automatic ones; keys and values must be non-empty strings |
-| `mlflow_run_id` | `str` | `""` | restored from checkpoint on resume; empty = new run |
+| `mlflow_run_id` | `str` | `""` | restored from the checkpoint on an auto-resume, never on a `checkpoint.load_path` warm start; empty = new run |
 | `mlflow_log_system_metrics` | `bool` | `True` | sample CPU/GPU/memory on a background thread |
 | `mlflow_system_metrics_interval` | `float` | `10.0` | seconds between system-metric samples |
 | `mlflow_register_checkpoints` | `bool` | `False` | register each committed checkpoint as an MLflow external model on the background worker; `metadata.json` records its `model_name` at save and its `model_id` once registered; requires `enable_mlflow` |

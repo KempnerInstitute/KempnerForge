@@ -4,9 +4,10 @@ Uses ``dcp.async_save()`` to snapshot state to CPU and write to disk
 in the background, returning control to the training loop immediately.
 
 Modes:
-  - disabled: Synchronous save (simple, for debugging).
+  - disabled: Synchronous save (the default; simple, for debugging).
   - async: Standard async via dcp.async_save().
-  - async_with_pinned_mem: Async with pinned memory staging for faster GPU→CPU.
+  - async_with_pinned_mem: The same dcp.async_save() call as async; no
+    pinned-memory staging is implemented.
 """
 
 from __future__ import annotations
