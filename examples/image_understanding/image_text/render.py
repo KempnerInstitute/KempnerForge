@@ -33,9 +33,11 @@ class DocumentSource(Protocol):
 
 
 class DocumentStream(Protocol):
-    """A resumable stream of documents."""
+    """A resumable stream of documents, each with the position ``advance`` records."""
 
-    def __iter__(self) -> Iterator[Document]: ...
+    def __iter__(self) -> Iterator[tuple[list[int], Document]]: ...
+
+    def advance(self, position: list[int]) -> None: ...
 
     def state_dict(self) -> dict[str, Any]: ...
 
@@ -278,10 +280,12 @@ class RenderedDataset(Dataset):
 class RenderedStream(IterableDataset):
     """Renders a stream of documents, passing over the ones the renderer refuses.
 
-    Replies are drawn from a generator seeded by ``seed`` and the loader worker, so
-    a stream's draws do not follow a resume. ``max_attempts`` refusals in a row
-    raise; ``skipped`` counts them with the stream's own skips, and
-    ``state_dict`` and ``load_state_dict`` are the stream's.
+    Replies are drawn from a generator seeded by ``seed``, the data-parallel
+    ``rank`` and the loader worker, started afresh by each pass, so a stream's draws
+    do not follow a resume. ``max_attempts`` refusals in a row raise; ``skipped``
+    counts them with the stream's own skips. Each sample keeps its document's
+    position, and ``advance``, ``state_dict`` and ``load_state_dict`` are the
+    stream's.
     """
 
     def __init__(
@@ -289,11 +293,13 @@ class RenderedStream(IterableDataset):
         documents: DocumentStream,
         renderer: ChatRenderer,
         seed: int | str = 0,
+        rank: int = 0,
         max_attempts: int = MAX_ATTEMPTS,
     ) -> None:
         self.documents = documents
         self.renderer = renderer
         self.seed = seed
+        self.rank = rank
         self.max_attempts = check_max_attempts(max_attempts)
         self._skips = SkipLog("streamed document")
 
@@ -301,15 +307,15 @@ class RenderedStream(IterableDataset):
     def skipped(self) -> int:
         return self._skips.count + getattr(self.documents, "skipped", 0)
 
-    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+    def __iter__(self) -> Iterator[tuple[list[int], dict[str, torch.Tensor]]]:
         info = get_worker_info()
-        rng = random.Random(f"{self.seed}:{0 if info is None else info.id}")
+        rng = random.Random(f"{self.seed}:{self.rank}:{0 if info is None else info.id}")
         in_a_row = 0
-        for position, document in enumerate(self.documents):
+        for count, (position, document) in enumerate(self.documents):
             try:
                 sample = self.renderer(document, rng)
             except UnusableRowError as exc:
-                self._skips(position, exc)
+                self._skips(count, exc)
                 in_a_row += 1
                 if in_a_row >= self.max_attempts:
                     raise RuntimeError(
@@ -317,7 +323,10 @@ class RenderedStream(IterableDataset):
                     ) from exc
                 continue
             in_a_row = 0
-            yield sample
+            yield position, sample
+
+    def advance(self, position: list[int]) -> None:
+        self.documents.advance(position)
 
     def state_dict(self) -> dict[str, Any]:
         return self.documents.state_dict()

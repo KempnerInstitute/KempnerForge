@@ -12,9 +12,10 @@ from typing import Any
 import pytest
 import torch
 from image_text.datacomp import DataCompStream, shard_names, tar_samples
+from image_text.document import Document, Turn
 from image_text.render import ChatRenderer, RenderedStream
+from image_text.stream import StreamLoader
 from PIL import Image
-from torch.utils.data import DataLoader
 
 PROMPT = "Describe the image."
 
@@ -50,8 +51,14 @@ def _shards(root: Path, shards: int, per_shard: int) -> Path:
     return root
 
 
-def _captions(documents: Any, count: int) -> list[str]:
-    return [doc.turns[0].answers[0] for doc in itertools.islice(documents, count)]
+def _captions(documents: Any, count: int, stream: Any = None) -> list[str]:
+    """The next ``count`` captions, each recorded as trained on ``stream`` when given."""
+    captions = []
+    for position, doc in itertools.islice(documents, count):
+        if stream is not None:
+            stream.advance(position)
+        captions.append(doc.turns[0].answers[0])
+    return captions
 
 
 def test_tar_samples_group_members_by_key(tmp_path: Path) -> None:
@@ -64,6 +71,8 @@ def test_tar_samples_group_members_by_key(tmp_path: Path) -> None:
         ("x/2", {"jpg": b"k"}),
         ("1", {"txt": b"t"}),
     ]
+    assert list(tar_samples(shard, skip=2)) == [("1", {"txt": b"t"})]
+    assert list(tar_samples(shard, skip=3)) == []
 
 
 def test_only_tar_files_are_shards(tmp_path: Path) -> None:
@@ -75,7 +84,8 @@ def test_only_tar_files_are_shards(tmp_path: Path) -> None:
 
 def test_reads_captions_with_the_prompt(tmp_path: Path) -> None:
     stream = DataCompStream(_shards(tmp_path, 1, 2), PROMPT)
-    doc = next(iter(stream))
+    position, doc = next(iter(stream))
+    assert position == [0, 0, 0, 1]
     assert doc.turns[0].user == PROMPT
     assert doc.turns[0].answers == ("cap 00-0",)
     assert doc.images[0].size == (6, 4) and doc.images[0].mode == "RGB"
@@ -121,6 +131,44 @@ def test_unusable_samples_and_a_broken_shard_are_passed_over(tmp_path: Path) -> 
     assert stream.skipped >= 5
 
 
+def test_a_damaged_header_after_the_first_raises(tmp_path: Path) -> None:
+    shard = _write_shard(tmp_path / "a.tar", _sample("0") + _sample("1"))
+    with tarfile.open(shard) as tar:
+        offset = tar.getmembers()[3].offset
+    data = bytearray(shard.read_bytes())
+    data[offset + 148 : offset + 156] = b"garbage!"
+    shard.write_bytes(bytes(data))
+    samples = tar_samples(shard)
+    assert next(samples)[0] == "0"
+    with pytest.raises(tarfile.ReadError, match="damaged header"):
+        next(samples)
+
+
+def test_a_tar_cut_at_a_member_boundary_raises(tmp_path: Path) -> None:
+    shard = _write_shard(tmp_path / "a.tar", _sample("0") + _sample("1"))
+    with tarfile.open(shard) as tar:
+        offset = tar.getmembers()[2].offset
+    shard.write_bytes(shard.read_bytes()[:offset])
+    with pytest.raises(tarfile.ReadError, match="without its end marker"):
+        list(tar_samples(shard))
+
+
+def test_empty_and_missing_shards_count_as_skips(tmp_path: Path) -> None:
+    _write_shard(tmp_path / "00000.tar", [])
+    _write_shard(tmp_path / "00001.tar", _sample("1"))
+    stream = DataCompStream(tmp_path, PROMPT, max_attempts=4)
+    stream.worker_shards = lambda epoch, worker: ["00000.tar", "gone.tar", "00001.tar"]
+    assert _captions(iter(stream), 1) == ["cap 1"]
+    assert stream.skipped == 2
+
+
+def test_a_stream_of_empty_shards_raises(tmp_path: Path) -> None:
+    for s in range(2):
+        _write_shard(tmp_path / f"{s:05d}.tar", [])
+    with pytest.raises(RuntimeError, match="4 DataComp samples in a row"):
+        next(iter(DataCompStream(tmp_path, PROMPT, max_attempts=4)))
+
+
 def test_a_run_of_unusable_samples_raises(tmp_path: Path) -> None:
     _write_shard(tmp_path / "00000.tar", [m for i in range(3) for m in _sample(str(i), jpg=b"x")])
     with pytest.raises(RuntimeError, match="3 DataComp samples in a row"):
@@ -147,40 +195,83 @@ def test_a_stream_read_by_another_worker_count_raises(tmp_path: Path) -> None:
         next(iter(stream))
 
 
-def test_a_resume_starts_at_the_shard_being_read(tmp_path: Path) -> None:
-    _shards(tmp_path, 3, 2)
+@pytest.mark.parametrize("read", [1, 4, 5, 9, 10])
+def test_a_resume_starts_at_the_next_sample(tmp_path: Path, read: int) -> None:
+    _shards(tmp_path, 3, 3)
     stream = DataCompStream(tmp_path, PROMPT, seed=4)
-    order = stream.worker_shards(0, 0)
     reader = iter(stream)
-    _captions(reader, 3)
+    _captions(reader, read, stream)
     state = stream.state_dict()
-    assert state["positions"] == [[0, 1]]
+    expected = _captions(reader, 4)
+    assert stream.state_dict() == state
     resumed = DataCompStream(tmp_path, PROMPT, seed=4)
     resumed.load_state_dict(state)
-    shard = int(order[1].split(".")[0])
-    assert _captions(iter(resumed), 2) == [f"cap {shard:02d}-0", f"cap {shard:02d}-1"]
+    assert _captions(iter(resumed), 4) == expected
+
+
+def test_a_resume_passes_over_unusable_samples_it_had_reached(tmp_path: Path) -> None:
+    members = _sample("0") + _sample("1", jpg=b"x") + _sample("2") + _sample("3")
+    _write_shard(tmp_path / "00000.tar", members)
+    stream = DataCompStream(tmp_path, PROMPT)
+    _captions(iter(stream), 2, stream)
+    state = stream.state_dict()
+    assert state["positions"] == [[0, 0, 3]]
+    resumed = DataCompStream(tmp_path, PROMPT)
+    resumed.load_state_dict(state)
+    assert _captions(iter(resumed), 2) == ["cap 3", "cap 0"]
+    assert resumed.skipped == 0
 
 
 @pytest.mark.parametrize(
     ("name", "change"),
-    [("seed", {"seed": 5}), ("rank", {"rank": 1}), ("num_workers", {"num_workers": 2})],
+    [
+        ("seed", {"seed": 5}),
+        ("rank", {"rank": 1}),
+        ("num_workers", {"num_workers": 2}),
+        ("shard_digest", {}),
+    ],
 )
 def test_a_resume_with_another_layout_is_refused(tmp_path: Path, name: str, change: dict) -> None:
     _shards(tmp_path, 4, 1)
     state = DataCompStream(tmp_path, PROMPT, world_size=2).state_dict()
+    if name == "shard_digest":
+        (tmp_path / "00003.tar").rename(tmp_path / "00009.tar")
     with pytest.raises(ValueError, match=f"{name} was"):
         DataCompStream(tmp_path, PROMPT, world_size=2, **change).load_state_dict(state)
 
 
-def test_loader_workers_report_their_shards_to_the_parent(tmp_path: Path) -> None:
-    stream = DataCompStream(_shards(tmp_path, 16, 1), PROMPT, num_workers=2)
-    loader = DataLoader(stream, batch_size=None, num_workers=2, collate_fn=lambda doc: doc)
-    reader = iter(loader)
-    captions = _captions(reader, 6)
-    assert len(set(captions)) == 6
-    positions = stream.state_dict()["positions"]
+def _batch_captions(batch: list[Document]) -> list[str]:
+    return [doc.turns[0].answers[0] for doc in batch]
+
+
+@pytest.mark.parametrize("context", ["fork", "spawn"])
+@pytest.mark.parametrize("trained", [3, 4, 5])
+def test_a_loader_resume_continues_where_training_stopped(
+    tmp_path: Path, context: str, trained: int
+) -> None:
+    _shards(tmp_path, 6, 5)
+
+    def loader() -> StreamLoader:
+        stream = DataCompStream(tmp_path, PROMPT, num_workers=3, seed=2)
+        options = {"num_workers": 3, "multiprocessing_context": context, "prefetch_factor": 4}
+        return StreamLoader(stream, 2, collate_fn=list, **options)
+
+    first = loader()
+    reader = iter(first)
+    for _ in range(trained):
+        next(reader)
+    state = first.state_dict()
+    expected = [_batch_captions(next(reader)) for _ in range(6)]
     del reader
-    assert len(positions) == 2 and all(epoch == 0 and ordinal >= 2 for epoch, ordinal in positions)
+    resumed = loader()
+    resumed.load_state_dict(state)
+    assert [_batch_captions(batch) for batch in itertools.islice(resumed, 6)] == expected
+
+
+def test_a_loader_refuses_persistent_workers(tmp_path: Path) -> None:
+    stream = DataCompStream(_shards(tmp_path, 2, 1), PROMPT, num_workers=2)
+    with pytest.raises(ValueError, match="persistent_workers"):
+        StreamLoader(stream, 2, num_workers=2, persistent_workers=True)
 
 
 def test_a_rendered_stream_trains_the_caption(tmp_path: Path, tokenizer: Any) -> None:
@@ -188,9 +279,40 @@ def test_a_rendered_stream_trains_the_caption(tmp_path: Path, tokenizer: Any) ->
     stream = DataCompStream(tmp_path, PROMPT)
     renderer = ChatRenderer(tokenizer, max_text_len=64, image_size=8, answer_only=True)
     rendered = RenderedStream(stream, renderer)
-    sample = next(iter(rendered))
+    position, sample = next(iter(rendered))
+    assert position == [0, 0, 0, 2]
     labels = sample["labels"]
     assert tokenizer.decode(labels[labels != -100]) == "cap 1<|im_end|>"
     assert sample["pixel_values"].shape[-2:] == torch.Size([8, 8])
     assert rendered.skipped == 1
     assert rendered.state_dict() == stream.state_dict()
+
+
+class _Stream:
+    def __init__(self, count: int) -> None:
+        self.count = count
+
+    def __iter__(self) -> Any:
+        answers = tuple(f"answer {i}" for i in range(8))
+        image = Image.new("RGB", (4, 4))
+        document = Document(images=(image,), turns=(Turn(PROMPT, answers),))
+        return iter([([0, 0, 0, i + 1], document) for i in range(self.count)])
+
+    def advance(self, position: list[int]) -> None:
+        pass
+
+    def state_dict(self) -> dict[str, Any]:
+        return {}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        pass
+
+
+def test_ranks_draw_replies_apart(tokenizer: Any) -> None:
+    renderer = ChatRenderer(tokenizer, max_text_len=64, image_size=8, answer_only=True)
+
+    def replies(rank: int) -> list[str]:
+        stream = RenderedStream(_Stream(12), renderer, seed=3, rank=rank)
+        return [tokenizer.decode(s["labels"][s["labels"] != -100]) for _, s in stream]
+
+    assert replies(0) == replies(0) != replies(1)

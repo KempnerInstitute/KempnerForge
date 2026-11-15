@@ -62,7 +62,8 @@ samples `VLMCollator` batches.
 - `finevision.py`: FineVision subsets from their memory-mappable Arrow copy.
 - `datacomp.py`: DataComp-1B captions, streamed from its webdataset tar shards with
   no index or conversion step (`DataCompStream`); `RenderedStream` renders a
-  stream the way `RenderedDataset` renders a reader.
+  stream the way `RenderedDataset` renders a reader, and `stream.py`'s
+  `StreamLoader` loads it so that a resume continues where training stopped.
 
 Every sample the renderer builds carries one image, resized square to `image_size`,
 with no tiling or packing. PixMo-Count stores its points in pixels; they are
@@ -95,11 +96,12 @@ DataComp has no index, so its reader streams: the shards are listed once,
 reordered every epoch from the seed, and dealt out to data-parallel ranks and
 then to loader workers, each reading its shards front to back without end. A
 sample without a decodable image or a caption is passed over, as is the rest of
-a shard that stops being a readable tar. Its `state_dict` holds the shard each
-worker is reading, so a resume starts each worker at the beginning of that
-shard rather than at the exact sample, and must use the same seed, ranks,
-workers and shard list. Pass the stream's `num_workers` to the `DataLoader`
-too:
+a shard that stops being a readable tar, and a shard with no samples counts as
+one skip. `StreamLoader` records the position of every batch it hands out, so
+the stream's `state_dict` holds where training stopped, and a resume continues
+from the next sample with batches in the order they would have come, whichever
+way the loader workers are started. A resume must use the same seed, ranks,
+workers and shard list. Pass the stream's `num_workers` to the loader too:
 
 ```python
 stream = DataCompStream(
@@ -110,7 +112,8 @@ stream = DataCompStream(
     num_workers=4,
     seed=seed,
 )
-loader = DataLoader(RenderedStream(stream, renderer), batch_size=16, num_workers=4)
+rendered = RenderedStream(stream, renderer, seed=seed, rank=dp_rank)
+loader = StreamLoader(rendered, batch_size=16, num_workers=4)
 ```
 
 ## Tile images
