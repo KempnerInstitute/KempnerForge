@@ -107,14 +107,26 @@ class TestReduceFrameSummary:
 
 
 class TestRegisterFrameSummaryPickling:
-    def test_registers_once_where_frames_hold_code(self, unregistered):
-        """Registered where a frame holds a code object; untouched elsewhere; idempotent."""
+    def test_registers_once_where_frames_hold_code(self, unregistered, monkeypatch):
+        """A ``FrameSummary`` that holds a code object gets the reducer; a second call keeps it."""
+        slots = tuple(s for s in traceback.FrameSummary.__slots__ if s != "_code")
+        monkeypatch.setattr(traceback.FrameSummary, "__slots__", (*slots, "_code"))
         register_frame_summary_pickling()
         register_frame_summary_pickling()
-        if HOLDS_CODE:
-            assert copyreg.dispatch_table[traceback.FrameSummary] is reduce_frame_summary
-        else:
-            assert traceback.FrameSummary not in copyreg.dispatch_table
+        assert copyreg.dispatch_table[traceback.FrameSummary] is reduce_frame_summary
+
+    def test_is_a_no_op_where_frames_hold_no_code(self, unregistered, monkeypatch):
+        """A ``FrameSummary`` without a code object, as on Python 3.12, pickles as before."""
+        slots = tuple(s for s in traceback.FrameSummary.__slots__ if s != "_code")
+        monkeypatch.setattr(traceback.FrameSummary, "__slots__", slots)
+        register_frame_summary_pickling()
+        assert traceback.FrameSummary not in copyreg.dispatch_table
+
+    def test_registers_on_this_interpreter_exactly_when_needed(self, unregistered):
+        """On the running Python the reducer is registered iff its frames hold code objects."""
+        register_frame_summary_pickling()
+        registered = copyreg.dispatch_table.get(traceback.FrameSummary)
+        assert (registered is reduce_frame_summary) == HOLDS_CODE
 
     def test_keeps_a_reducer_registered_before_it(self, monkeypatch):
         """Another reducer already registered for ``FrameSummary`` is left in place."""

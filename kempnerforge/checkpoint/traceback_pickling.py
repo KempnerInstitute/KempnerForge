@@ -27,14 +27,12 @@ def reduce_frame_summary(frame: traceback.FrameSummary) -> tuple[Any, ...]:
     Returns:
         A ``copyreg`` reduce value that rebuilds the frame from its slots.
     """
-    frame.line
+    _ = frame.line
     slots = {
-        name: getattr(frame, name)
+        name: None if name == "_code" else getattr(frame, name)
         for name in traceback.FrameSummary.__slots__
-        if name != "_code" and hasattr(frame, name)
+        if hasattr(frame, name)
     }
-    if "_code" in traceback.FrameSummary.__slots__:
-        slots["_code"] = None
     return copyreg.__newobj__, (type(frame),), (None, slots)
 
 
