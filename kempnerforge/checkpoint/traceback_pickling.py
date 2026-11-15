@@ -17,7 +17,7 @@ from typing import Any
 def reduce_frame_summary(frame: traceback.FrameSummary) -> tuple[Any, ...]:
     """Reduce ``frame`` for pickling without its code object.
 
-    The frame's source lines are resolved first, on the process that raised, so the unpickled
+    The frame's source lines are resolved first, on the pickling process, so the unpickled
     copy formats as the original does. The copy is a plain ``FrameSummary`` whose code object
     is ``None``; unpickling it needs no registration.
 
@@ -33,7 +33,7 @@ def reduce_frame_summary(frame: traceback.FrameSummary) -> tuple[Any, ...]:
         for name in traceback.FrameSummary.__slots__
         if hasattr(frame, name)
     }
-    return copyreg.__newobj__, (type(frame),), (None, slots)
+    return traceback.FrameSummary.__new__, (type(frame),), (None, slots)
 
 
 def register_frame_summary_pickling() -> None:

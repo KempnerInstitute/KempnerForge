@@ -35,10 +35,10 @@ def _wrapped_write_error() -> tuple[BaseException, traceback.StackSummary]:
     raise AssertionError("unreachable")
 
 
-def _round_trip_with_reducer(obj: object) -> object:
+def _round_trip_with_reducer(obj: object, protocol: int | None = None) -> object:
     """Pickle ``obj`` with ``reduce_frame_summary`` in a private dispatch table only."""
     buffer = io.BytesIO()
-    pickler = pickle.Pickler(buffer)
+    pickler = pickle.Pickler(buffer, protocol=protocol)
     pickler.dispatch_table = {
         **copyreg.dispatch_table,
         traceback.FrameSummary: reduce_frame_summary,
@@ -72,10 +72,12 @@ def unregistered():
 
 
 class TestReduceFrameSummary:
-    def test_a_wrapped_write_error_round_trips_with_every_frame_field(self):
-        """The error and each frame's fields survive the reducer; no code object comes back."""
+    @pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+    def test_a_wrapped_write_error_round_trips_with_every_frame_field(self, protocol):
+        """The error and each frame's fields survive the reducer under every pickle protocol;
+        no code object comes back."""
         error, stack = _wrapped_write_error()
-        restored_error, restored_stack = _round_trip_with_reducer((error, stack))
+        restored_error, restored_stack = _round_trip_with_reducer((error, stack), protocol)
         assert isinstance(restored_error, OSError)
         assert restored_error.errno == 28
         assert "No space left on device" in str(restored_error)
