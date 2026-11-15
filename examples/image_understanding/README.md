@@ -226,9 +226,11 @@ roadmap.
     can reach 1, and a single reference scores 0, as in the official evaluation,
     so data with one answer per question needs another scorer.
   - `anls` (DocVQA): the similarity `1 - NL` to the closest reference, where `NL`
-    is the Levenshtein distance over the longer length, and 0 once `NL` reaches
-    0.5. Case is ignored, and whitespace is collapsed first: none at either end,
-    and each run inside one space.
+    is the Levenshtein distance over the longer length, and 0 once `NL` is above
+    0.5. A similarity of exactly 0.5 scores 0.5, as in the docvqa.org evaluation
+    script and lmms-eval; this departs from the recipe's `DOCVQAScorer`, which
+    scores it 0 (`nl < tau`). Case is ignored, and whitespace is collapsed
+    first: none at either end, and each run inside one space.
   - `relaxed_accuracy` (ChartQA): 1 for a number within 5 percent of a numeric
     reference, or for text equal to a reference but for case, surrounding
     whitespace and trailing `?`, `.` and `!`, applied in that order, so

@@ -90,10 +90,10 @@ def _levenshtein(a: str, b: str) -> int:
 
 
 def _similarity(prediction: str, answer: str) -> float:
-    """``1 - NL`` of the two strings, or 0 once ``NL`` reaches ``ANLS_THRESHOLD``."""
+    """``1 - NL`` of the two strings, or 0 once ``NL`` exceeds ``ANLS_THRESHOLD``."""
     longest = max(len(prediction), len(answer))
     distance = _levenshtein(prediction, answer) / longest if longest else 0.0
-    return 1 - distance if distance < ANLS_THRESHOLD else 0.0
+    return 1 - distance if distance <= ANLS_THRESHOLD else 0.0
 
 
 def _collapsed(text: str) -> str:
@@ -108,13 +108,14 @@ def anls(prediction: str, answers: Sequence[str]) -> float:
     either end, and each run inside becomes one space, so ``"123\\nMain  St"``
     equals ``"123 main st"``. The similarity to a reference is ``1 - NL``, where
     ``NL`` is the Levenshtein distance between the collapsed strings divided by
-    the length of the longer one, and it counts only while ``NL`` is below
+    the length of the longer one, and it counts while ``NL`` is at most
     ``ANLS_THRESHOLD``. The score is the best over the references, and its mean
     over a task is ANLS (Biten et al., "Scene Text Visual Question Answering",
     ICCV 2019, equation 1; the DocVQA metric). Equation 1 leaves ``NL`` equal to
-    the threshold open: here a similarity of exactly one half scores 0, as in
-    Pix2Struct, while the evaluation script distributed with the DocVQA datasets
-    (docvqa.org) scores it 0.5. Two empty strings are identical.
+    the threshold open: here a similarity of exactly one half scores 0.5, as in
+    the evaluation script distributed with the DocVQA datasets (docvqa.org) and
+    in lmms-eval. This departs from the recipe's ``DOCVQAScorer``, which scores
+    it 0 (``nl < tau``). Two empty strings are identical.
     """
     references = _references(prediction, answers)
     predicted = _collapsed(prediction)

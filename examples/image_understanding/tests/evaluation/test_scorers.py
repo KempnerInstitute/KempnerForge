@@ -112,9 +112,18 @@ class TestANLS:
 
     @pytest.mark.parametrize(
         ("prediction", "answer"),
-        [("ab", "ax"), ("abcd", "axyd"), ("abc", "abcdef"), ("flaw", "lawn"), ("abcd", "wxyz")],
+        [("ab", "ax"), ("abcd", "axyd"), ("abc", "abcdef"), ("flaw", "lawn")],
     )
-    def test_half_or_more_of_the_longer_string_wrong_scores_zero(
+    def test_exactly_half_of_the_longer_string_wrong_scores_one_half(
+        self, prediction: str, answer: str
+    ) -> None:
+        assert anls(prediction, [answer]) == 0.5
+
+    @pytest.mark.parametrize(
+        ("prediction", "answer"),
+        [("abc", "axy"), ("abcde", "abxyz"), ("abc", "abcdefg"), ("a", "b"), ("abcd", "wxyz")],
+    )
+    def test_more_than_half_of_the_longer_string_wrong_scores_zero(
         self, prediction: str, answer: str
     ) -> None:
         assert anls(prediction, [answer]) == 0.0
