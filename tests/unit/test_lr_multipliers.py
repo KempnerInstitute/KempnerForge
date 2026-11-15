@@ -973,13 +973,16 @@ class TestResume:
     def test_a_read_that_fails_with_any_error_is_refused(self, tmp_path, monkeypatch, exclude):
         """A read that fails with an error other than a ``ValueError`` still refuses the load,
         and the refusal names the error's type."""
-        self._save(tmp_path, {"head": 2.0})
+        record = (self._save(tmp_path, {"head": 2.0}) / "metadata.json").read_text()
         _, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
+        loads = json.loads
 
-        def fail(_ckpt_dir):
-            raise RecursionError("maximum recursion depth exceeded")
+        def fail_on_the_record(text, *args, **kwargs):
+            if text == record:
+                raise RecursionError("maximum recursion depth exceeded")
+            return loads(text, *args, **kwargs)
 
-        monkeypatch.setattr("kempnerforge.checkpoint.manager._read_metadata", fail)
+        monkeypatch.setattr(json, "loads", fail_on_the_record)
         with pytest.raises(ValueError, match="Cannot check the lr_multipliers.*RecursionError"):
             manager.load(scheduler=scheduler, exclude_keys=exclude)
         assert scheduler.last_epoch == 0
