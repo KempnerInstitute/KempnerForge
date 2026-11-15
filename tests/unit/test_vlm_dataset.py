@@ -32,6 +32,35 @@ def _make_image(size: int = 64, color: int = 128) -> Image.Image:
     return Image.new("RGB", (size, size), color=(color, color, color))
 
 
+def _dataset_over(
+    rows,
+    *,
+    image_size: int = 16,
+    max_text_len: int = 8,
+    tile_grid: int = 0,
+    tile_global: bool = True,
+    tokenizer_path: str = "gpt2",
+) -> HuggingFaceVLMDataset:
+    """A ``HuggingFaceVLMDataset`` over in-memory ``rows``, skipping ``__init__``'s loading."""
+    from transformers import AutoTokenizer
+
+    ds = HuggingFaceVLMDataset.__new__(HuggingFaceVLMDataset)
+    ds._ds = rows
+    ds._image_field = "image"
+    ds._text_field = "caption"
+    ds._prompt_field = None
+    ds._image_size = image_size
+    ds._image_mean = DEFAULT_IMAGE_MEAN
+    ds._image_std = DEFAULT_IMAGE_STD
+    ds._tile_grid = tile_grid
+    ds._tile_global = tile_global
+    views = tile_grid * tile_grid + int(tile_global) if tile_grid else 0
+    ds._view_shape = (*((views,) if views else ()), 3, image_size, image_size)
+    ds._max_text_len = max_text_len
+    ds._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    return ds
+
+
 class TestPILToTensor:
     def test_shape_and_dtype(self):
         img = _make_image(48)
@@ -656,6 +685,49 @@ class TestVLMCollator:
             "labels": labels,
         }
 
+    def test_a_text_only_sample_gets_a_blank_image_and_a_frame_mask(self):
+        collator = VLMCollator(pad_id=0, max_text_len=20, frame_mask=True)
+        text_only = self._sample(3)
+        text_only["pixel_values"] = torch.zeros(0, 3, 32, 32)
+        batch = collator([self._sample(5), text_only])
+        assert batch["pixel_values"].shape == (2, 3, 32, 32)
+        assert torch.equal(batch["pixel_values"][1], torch.zeros(3, 32, 32))
+        assert batch["frame_mask"].tolist() == [[True], [False]]
+        assert batch["input_ids"][1, :3].tolist() == [1, 2, 3]
+
+    def test_frame_mask_puts_the_mask_on_every_batch(self):
+        """So the attention mask's shape, and the kernel it selects, never flip between batches."""
+        collator = VLMCollator(pad_id=0, max_text_len=20, frame_mask=True)
+        batch = collator([self._sample(5), self._sample(6)])
+        assert batch["frame_mask"].tolist() == [[True], [True]]
+
+    def test_without_frame_mask_only_a_batch_with_a_text_only_sample_is_masked(self):
+        collator = VLMCollator(pad_id=0, max_text_len=20)
+        assert "frame_mask" not in collator([self._sample(5), self._sample(6)])
+        text_only = self._sample(3)
+        text_only["pixel_values"] = torch.zeros(0, 3, 32, 32)
+        assert collator([self._sample(5), text_only])["frame_mask"].tolist() == [[True], [False]]
+
+    def test_views_stack_on_the_frame_axis_and_a_text_only_sample_matches_them(self):
+        collator = VLMCollator(pad_id=0, max_text_len=20, frame_mask=True)
+        tiled, text_only = self._sample(3), self._sample(4)
+        tiled["pixel_values"] = torch.randn(2, 3, 32, 32)
+        text_only["pixel_values"] = torch.zeros(0, 2, 3, 32, 32)
+        batch = collator([tiled, text_only])
+        assert batch["pixel_values"].shape == (2, 2, 3, 32, 32)
+        assert torch.count_nonzero(batch["pixel_values"][1]) == 0
+        assert batch["frame_mask"].tolist() == [[True, True], [False, False]]
+        only_text = collator([text_only, text_only])
+        assert only_text["pixel_values"].shape == (2, 2, 3, 32, 32)
+        assert only_text["frame_mask"].shape == (2, 2)
+
+    def test_samples_with_different_image_shapes_are_rejected(self):
+        collator = VLMCollator(pad_id=0, max_text_len=20)
+        tiled = self._sample(3)
+        tiled["pixel_values"] = torch.randn(2, 3, 32, 32)
+        with pytest.raises(ValueError, match="share one image shape"):
+            collator([self._sample(5), tiled])
+
     def test_fixed_length_not_batch_max(self):
         collator = VLMCollator(pad_id=0, max_text_len=20)
         batch = collator([self._sample(5), self._sample(10), self._sample(7)])
@@ -722,24 +794,8 @@ class TestHuggingFaceVLMDataset:
     def test_getitem_shapes(self, tiny_hf_dataset):
         from datasets import load_from_disk
 
-        class _Wrapper(HuggingFaceVLMDataset):
-            def __init__(self, ds, tokenizer_path, max_text_len):
-                from transformers import AutoTokenizer
-
-                self._ds = ds
-                self._image_field = "image"
-                self._text_field = "caption"
-                self._prompt_field = None
-                self._image_size = 32
-                self._image_mean = DEFAULT_IMAGE_MEAN
-                self._image_std = DEFAULT_IMAGE_STD
-                self._tile_grid = 0
-                self._tile_global = True
-                self._max_text_len = max_text_len
-                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
         ds = load_from_disk(tiny_hf_dataset)
-        wrapper = _Wrapper(ds, tokenizer_path="gpt2", max_text_len=16)
+        wrapper = _dataset_over(ds, image_size=32, max_text_len=16)
         item = wrapper[0]
         assert item["pixel_values"].shape == (3, 32, 32)
         assert item["input_ids"].shape == (16,)
@@ -876,29 +932,13 @@ class TestHuggingFaceVLMDataset:
         del tiny_hf_dataset
         from datasets import Dataset
 
-        class _Wrapper(HuggingFaceVLMDataset):
-            def __init__(self, ds, tokenizer_path, max_text_len):
-                from transformers import AutoTokenizer
-
-                self._ds = ds
-                self._image_field = "image"
-                self._text_field = "caption"
-                self._prompt_field = None
-                self._image_size = 32
-                self._image_mean = DEFAULT_IMAGE_MEAN
-                self._image_std = DEFAULT_IMAGE_STD
-                self._tile_grid = 0
-                self._tile_global = True
-                self._max_text_len = max_text_len
-                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
         mixed = Dataset.from_dict(
             {
                 "image": [_make_image(32, 100)],
                 "caption": [{"not": "a string"}],  # type: ignore[list-item]
             }
         )
-        wrapper = _Wrapper(mixed, tokenizer_path="gpt2", max_text_len=4)
+        wrapper = _dataset_over(mixed, image_size=32, max_text_len=4)
         with pytest.raises(TypeError, match="must be str"):
             _ = wrapper[0]
 
@@ -930,24 +970,8 @@ class TestHuggingFaceVLMDataset:
         from kempnerforge.data.sampler import DistributedSampler
         from kempnerforge.data.vlm_dataset import VLMCollator
 
-        class _Wrapper(HuggingFaceVLMDataset):
-            def __init__(self, ds, tokenizer_path, max_text_len):
-                from transformers import AutoTokenizer
-
-                self._ds = ds
-                self._image_field = "image"
-                self._text_field = "caption"
-                self._prompt_field = None
-                self._image_size = 16
-                self._image_mean = DEFAULT_IMAGE_MEAN
-                self._image_std = DEFAULT_IMAGE_STD
-                self._tile_grid = 0
-                self._tile_global = True
-                self._max_text_len = max_text_len
-                self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
         ds = load_from_disk(tiny_hf_dataset)
-        wrapper = _Wrapper(ds, tokenizer_path="gpt2", max_text_len=12)
+        wrapper = _dataset_over(ds, image_size=16, max_text_len=12)
         collator = VLMCollator(pad_id=0, max_text_len=12)
         loader = StatefulDataLoader(
             wrapper,
@@ -962,6 +986,110 @@ class TestHuggingFaceVLMDataset:
         assert batch["input_ids"].shape == (2, 12)
         assert batch["labels"].shape == (2, 12)
         assert batch["pixel_values"].shape == (2, 3, 16, 16)
+
+
+def _mixed_image_dataset(tmp_path, images):
+    from datasets import Dataset
+
+    ds = Dataset.from_dict({"image": images, "caption": ["a b"] * len(images)})
+    out = tmp_path / "mixed_ds"
+    ds.save_to_disk(str(out))
+    return str(out)
+
+
+class TestTextOnlyRows:
+    @pytest.mark.parametrize("missing", [None, []])
+    def test_a_row_without_an_image_is_text_only(self, missing):
+        ds = _dataset_over([{"image": missing, "caption": "a b c"}])
+        item = ds[0]
+        assert item["pixel_values"].shape == (0, 3, 16, 16)
+        assert item["input_ids"].shape == (8,)
+        assert 0 < int(item["text_len"]) <= 8
+
+    @pytest.mark.parametrize(
+        "wrap", [lambda image: image, lambda image: [image], lambda image: [None, image]]
+    )
+    def test_a_row_with_an_image_is_unchanged(self, wrap):
+        rows = [{"image": wrap(_make_image(8)), "caption": "a b"}]
+        ds = _dataset_over(rows)
+        assert ds[0]["pixel_values"].shape == (3, 16, 16)
+
+    @pytest.mark.parametrize(("tile_global", "views"), [(True, 5), (False, 4)])
+    def test_a_text_only_row_takes_the_tiled_view_shape(self, tile_global, views):
+        rows = [{"image": None, "caption": "a b"}, {"image": _make_image(8), "caption": "a b"}]
+        ds = _dataset_over(rows, tile_grid=2, tile_global=tile_global)
+        assert ds[0]["pixel_values"].shape == (0, views, 3, 16, 16)
+        assert ds[1]["pixel_values"].shape == (views, 3, 16, 16)
+        batch = VLMCollator(pad_id=0, max_text_len=8, frame_mask=True)([ds[0], ds[1]])
+        assert batch["pixel_values"].shape == (2, views, 3, 16, 16)
+        assert batch["frame_mask"].tolist() == [[False] * views, [True] * views]
+
+    def test_a_list_of_nothing_is_text_only_and_a_list_of_several_raises(self):
+        ds = _dataset_over([{"image": [None, None], "caption": "a b"}])
+        assert ds[0]["pixel_values"].shape == (0, 3, 16, 16)
+        rows = [{"image": [_make_image(8), _make_image(8)], "caption": "a b"}]
+        with pytest.raises(ValueError, match="holds 2 images"):
+            _dataset_over(rows)[0]
+
+    _LOAD = dict(split="train", image_field="image", text_field="caption", tokenizer_path="gpt2")
+
+    def test_imageless_rows_load_as_text_only_documents(self, tmp_path, caplog, monkeypatch):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        path = _mixed_image_dataset(tmp_path, [_make_image(8), None, _make_image(8), None])
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
+            ds = HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
+        assert caplog.records == []
+        assert len(ds) == 4
+        assert ds.has_text_only_rows
+        assert ds[1]["pixel_values"].shape == (0, 3, 224, 224)
+        assert ds[0]["pixel_values"].shape == (3, 224, 224)
+
+    def test_a_dataset_whose_rows_all_have_images_reports_no_text_only_rows(self, tmp_path):
+        path = _mixed_image_dataset(tmp_path, [[_make_image(8)], [_make_image(8)]])
+        ds = HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
+        assert not ds.has_text_only_rows
+
+    def test_rows_with_several_images_are_skipped_when_loaded(self, tmp_path, caplog, monkeypatch):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        images = [[_make_image(8)] * 2, [_make_image(8)], None]
+        path = _mixed_image_dataset(tmp_path, images)
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.data.vlm_dataset"):
+            ds = HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
+        assert len(ds) == 2
+        assert ds.has_text_only_rows
+        assert [r.getMessage() for r in caplog.records] == [
+            "Skipping 1 of 3 rows that hold several images in field 'image'; a document "
+            "takes one image"
+        ]
+
+    def test_a_dataset_without_a_single_image_row_is_rejected(self, tmp_path):
+        path = _mixed_image_dataset(tmp_path, [None, [_make_image(8)] * 2])
+        with pytest.raises(ValueError, match="None of the 2 rows holds one image in field"):
+            HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
+
+    def test_images_per_row_counts_lists_and_single_images(self):
+        from datasets import Dataset, Features, Image, Sequence
+
+        singles = Dataset.from_dict({"image": [_make_image(8), None, _make_image(8)]})
+        assert vlm_dataset._images_per_row(singles, "image").tolist() == [1, 0, 1]
+        one = _make_image(8)
+        lists = Dataset.from_dict(
+            {"image": [[one] * 2, [], None, [one], [None], [one, None]]},
+            features=Features({"image": Sequence(Image())}),
+        )
+        assert vlm_dataset._images_per_row(lists, "image").tolist() == [2, 0, 0, 1, 0, 1]
+        import pyarrow as pa
+
+        pairs = pa.array([[1, 2], [1, None], None], pa.list_(pa.int64(), 2))
+        fixed = Dataset(pa.table({"image": pairs}))
+        assert vlm_dataset._images_per_row(fixed, "image").tolist() == [2, 1, 0]
+        blank = {"bytes": None, "path": None}
+        structs = pa.array(
+            [{"bytes": b"x", "path": None}, blank, None, {"bytes": None, "path": "a.png"}],
+            pa.struct([("bytes", pa.binary()), ("path", pa.string())]),
+        )
+        empties = Dataset(pa.table({"image": structs}))
+        assert vlm_dataset._images_per_row(empties, "image").tolist() == [1, 0, 0, 1]
 
 
 class TestFramesToClipTensor:
@@ -1089,6 +1217,32 @@ class TestPackVLMSamples:
         with pytest.raises(ValueError, match="must be positive"):
             pack_vlm_samples([_doc(2, 1)], seq_len=8, tokens_per_image=0, pad_id=0)
 
+    def test_a_text_only_document_takes_no_image_slots(self):
+        batch = pack_vlm_samples(
+            [_doc(3, 10, views=0), _doc(4, 20)],
+            seq_len=12,
+            tokens_per_image=2,
+            pad_id=0,
+        )
+        assert batch["input_ids"][0].tolist() == [10, 11, 12, 0, 0, 20, 21, 22, 23, 0, 0, 0]
+        assert batch["doc_ids"][0].tolist() == [0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2]
+        assert batch["image_rows"].tolist() == [0]
+        assert batch["image_starts"].tolist() == [3]
+        assert batch["pixel_values"].shape == (1, 3, 4, 4)
+
+    def test_a_batch_of_text_only_documents_carries_no_images(self):
+        batch = pack_vlm_samples(
+            [_doc(3, 10, views=0), _doc(4, 20, views=0)],
+            seq_len=8,
+            tokens_per_image=2,
+            pad_id=0,
+        )
+        assert batch["pixel_values"].shape == (0, 3, 4, 4)
+        assert batch["image_rows"].shape == (0,)
+        assert batch["image_starts"].shape == (0,)
+        assert batch["image_rows"].dtype == torch.long
+        assert batch["input_ids"][0].tolist() == [10, 11, 12, 20, 21, 22, 23, 0]
+
     def test_collator_packs_the_batch(self):
         collator = PackedVLMCollator(pad_id=7, seq_len=12, tokens_per_image=2)
         batch = collator([_doc(3, 10), _doc(4, 20)])
@@ -1120,8 +1274,9 @@ class TestPackVLMSamples:
         with pytest.raises(ValueError, match=f"text_len \\({text_len}\\) must lie within"):
             pack_vlm_samples([doc], seq_len=64, tokens_per_image=2, pad_id=0)
 
-    def test_a_document_without_an_image_raises(self):
-        doc = _doc(3, 10)
-        doc["pixel_values"] = torch.zeros(0, 3, 4, 4)
-        with pytest.raises(ValueError, match="at least one image"):
-            pack_vlm_samples([doc], seq_len=12, tokens_per_image=2, pad_id=0)
+    def test_the_collator_packs_text_only_documents_of_either_image_shape(self):
+        doc = _doc(3, 10, views=0)
+        packed = PackedVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2)
+        assert packed([doc])["pixel_values"].shape == (0, 3, 4, 4)
+        doc["pixel_values"] = torch.zeros(0, 2, 3, 4, 4)
+        assert packed([doc])["pixel_values"].shape == (0, 3, 4, 4)
