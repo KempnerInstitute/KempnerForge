@@ -1159,7 +1159,6 @@ class TestMultiImageRows:
         assert "hf_max_images" not in caplog.text
         assert len(ds) == 3
 
-
     def test_a_sequence_of_images_column_decodes_each_kept_image(self, tmp_path):
         from datasets import Dataset, Features, Image, Sequence, Value
 
@@ -1181,6 +1180,7 @@ class TestMultiImageRows:
         pixels = ds[0]["pixel_values"]
         assert pixels.shape == (2, 3, 224, 224)
         assert pixels[0].mean() < pixels[1].mean()
+
 
 class TestOneDocumentPerRow:
     def test_one_document_per_fixed_row(self):
