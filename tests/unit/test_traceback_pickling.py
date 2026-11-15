@@ -139,6 +139,8 @@ class TestRegisterFrameSummaryPickling:
         def other(frame):
             return traceback.FrameSummary, (frame.filename, frame.lineno, frame.name)
 
+        slots = tuple(s for s in traceback.FrameSummary.__slots__ if s != "_code")
+        monkeypatch.setattr(traceback.FrameSummary, "__slots__", (*slots, "_code"))
         monkeypatch.setitem(copyreg.dispatch_table, traceback.FrameSummary, other)
         register_frame_summary_pickling()
         assert copyreg.dispatch_table[traceback.FrameSummary] is other
