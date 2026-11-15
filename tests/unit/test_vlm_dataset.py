@@ -482,7 +482,7 @@ def _prompted_dataset(
     )
     if prompt_dtype is not None:
         rows = rows.cast_column("prompt", Value(prompt_dtype))
-    rows.save_to_disk(str(tmp_path / "prompted"))
+    rows.save_to_disk(str(tmp_path / "prompted"), num_shards=1)
     tok = tokenizer if tokenizer is not None else _MockTokenizer()
     monkeypatch.setattr(vlm_dataset, "build_tokenizer", lambda path: tok)
     return HuggingFaceVLMDataset(
