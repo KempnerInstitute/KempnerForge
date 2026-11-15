@@ -1160,6 +1160,28 @@ class TestMultiImageRows:
         assert len(ds) == 3
 
 
+    def test_a_sequence_of_images_column_decodes_each_kept_image(self, tmp_path):
+        from datasets import Dataset, Features, Image, Sequence, Value
+
+        rows = {"image": [[_make_image(8, 0), _make_image(8, 255)]], "caption": ["a b"]}
+        features = Features({"image": Sequence(Image()), "caption": Value("string")})
+        assert not isinstance(features["image"], list)
+        path = tmp_path / "sequence_ds"
+        Dataset.from_dict(rows, features=features).save_to_disk(str(path))
+        ds = HuggingFaceVLMDataset(
+            str(path),
+            split="train",
+            image_field="image",
+            text_field="caption",
+            tokenizer_path="gpt2",
+            max_text_len=8,
+            max_images=2,
+        )
+        assert ds._image_feature is not None
+        pixels = ds[0]["pixel_values"]
+        assert pixels.shape == (2, 3, 224, 224)
+        assert pixels[0].mean() < pixels[1].mean()
+
 class TestOneDocumentPerRow:
     def test_one_document_per_fixed_row(self):
         collator = PackedVLMCollator(pad_id=0, seq_len=12, tokens_per_image=2, max_docs_per_row=1)
