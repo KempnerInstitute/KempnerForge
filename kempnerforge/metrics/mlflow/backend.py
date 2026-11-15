@@ -18,7 +18,11 @@ from typing import Any
 
 from kempnerforge.config.schema import JobConfig, MetricsConfig
 from kempnerforge.metrics.logger import get_logger
-from kempnerforge.metrics.mlflow.auth import _auth_hint, _prepare_databricks_auth
+from kempnerforge.metrics.mlflow.auth import (
+    _auth_hint,
+    _databricks_profile,
+    _prepare_databricks_auth,
+)
 from kempnerforge.metrics.mlflow.models import (
     checkpoint_model_name,
     find_or_create_checkpoint_model,
@@ -50,10 +54,18 @@ _MAX_CALL_THREADS = 4
 
 
 def _import_mlflow() -> Any:
-    """Import mlflow with bounded HTTP requests; values already set in the environment win."""
+    """Import mlflow with bounded HTTP requests and its usage telemetry off.
+
+    Values already set in the environment win. The first call MLflow records starts a telemetry
+    thread that fetches a config and, when the fetch succeeds, draws from Python's global
+    ``random``. A resumed run makes that call after the checkpoint restored the RNG, which would
+    leave the stream one draw ahead of the uninterrupted run's, and in a fresh run the draw
+    lands at an unpredictable point among the training thread's own draws.
+    """
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "30")
     os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "3")
     os.environ.setdefault("MLFLOW_DATABRICKS_ENDPOINT_HTTP_RETRY_TIMEOUT", "60")
+    os.environ.setdefault("MLFLOW_DISABLE_TELEMETRY", "true")
     import mlflow
 
     return mlflow
@@ -62,6 +74,13 @@ def _import_mlflow() -> Any:
 def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
     """Experiment name: mlflow_experiment -> $MLFLOW_EXPERIMENT -> auto
     (/Users/<user>/<project> via the SDK on Databricks; bare name locally).
+
+    The auto path's SDK client takes the profile a ``databricks://<profile>`` URI names, as
+    MLflow's tracking client does, so the path names the user the run logs as; with a plain
+    ``databricks`` URI both resolve their profile from the environment. The secret-scope form
+    ``databricks://<scope>:<prefix>`` is not supported here: MLflow builds that URI's client
+    from the secret scope, which this lookup does not read, so it may resolve another user. Set
+    the experiment explicitly with that form.
 
     On Databricks a non-absolute $MLFLOW_EXPERIMENT raises ValueError; the backend
     catches it and disables MLflow with a clear message (the config-field equivalent
@@ -84,7 +103,9 @@ def _resolve_mlflow_experiment(config: MetricsConfig, uri: str) -> str | None:
     try:
         from databricks.sdk import WorkspaceClient
 
-        user = WorkspaceClient().current_user.me().user_name
+        profile = _databricks_profile(uri)
+        client = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
+        user = client.current_user.me().user_name
         return f"/Users/{user}/{project}"
     except Exception as e:
         logger.warning(

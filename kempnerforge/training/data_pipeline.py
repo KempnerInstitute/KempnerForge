@@ -154,7 +154,9 @@ def _build_vlm_pipeline(
         if config.data.pack_sequences:
             assert tokens_per_image is not None
             collator = PackedVLMCollator(
-                pad_id=pad_id, seq_len=tc.seq_len, tokens_per_image=tokens_per_image
+                pad_id=pad_id,
+                seq_len=tc.seq_len,
+                tokens_per_image=tokens_per_image,
             )
             logger.info(
                 f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
@@ -162,8 +164,25 @@ def _build_vlm_pipeline(
                 f"{tc.seq_len}"
             )
         else:
-            collator = VLMCollator(pad_id=pad_id, max_text_len=vlm_cfg.max_text_len)
-            logger.info(f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}")
+            flash = (
+                config.model.sdpa_backend == "flash"
+                and config.model.attention_backend == "sdpa"
+                and vlm_cfg.arch in ("joint_decoder", "moma")
+            )
+            if dataset.has_text_only_rows and flash:
+                raise ValueError(
+                    "A dataset with text-only rows is not supported with model.sdpa_backend='flash'"
+                )
+            collator = VLMCollator(
+                pad_id=pad_id,
+                max_text_len=vlm_cfg.max_text_len,
+                frame_mask=dataset.has_text_only_rows,
+            )
+            rows = "with" if dataset.has_text_only_rows else "without"
+            logger.info(
+                f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
+                f"{rows} text-only rows"
+            )
 
     sampler = DistributedSampler(
         dataset,

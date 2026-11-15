@@ -313,7 +313,9 @@ class MoMaFFN(nn.Module):
             ``(B, S, D)`` tensor with each modality's positions filled
             by its EC-MoE output. Positions whose modality has no tokens
             assigned by any expert get zeros (the outer residual skip
-            preserves them).
+            preserves them). A modality with no routed token adds a
+            zero-valued term from its experts, so their parameters get zero
+            rather than missing gradients and FSDP2 ranks stay in step.
         """
         if x.dim() != 3:
             raise ValueError(f"MoMaFFN.forward expects (B, S, D); got shape {tuple(x.shape)}")
@@ -342,6 +344,9 @@ class MoMaFFN(nn.Module):
                 keep = valid_flat.index_select(0, mod_idx).nonzero(as_tuple=False).squeeze(-1)
                 idx = mod_idx.index_select(0, keep)
             if idx.numel() == 0:
+                params = self.experts[m].parameters()
+                anchor = sum((p.sum() for p in params), out.new_zeros(())) * 0
+                out = out + anchor.to(out.dtype)
                 continue
             x_m = x_flat.index_select(0, idx)
             y_m = self.experts[m](x_m)

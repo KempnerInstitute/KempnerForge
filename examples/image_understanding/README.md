@@ -14,6 +14,8 @@ examples/image_understanding/
 ├── README.md
 ├── train.py              # training entry point
 ├── image_text/           # image-text dataset readers and chat renderer (below)
+├── scripts/
+│   └── convert_finevision_to_arrow.py  # FineVision parquet -> memory-mappable Arrow
 └── tests/
     ├── test_image_understanding_entry.py   # the entry point loads a config and hands it off
     └── image_text/       # reader and renderer tests (CPU)
@@ -57,6 +59,7 @@ samples `VLMCollator` batches.
   process add to its count.
 - `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
   `points.py` writes the point answers.
+- `finevision.py`: FineVision subsets from their memory-mappable Arrow copy.
 - `datacomp.py`: DataComp-1B captions, streamed from its webdataset tar shards with
   no index or conversion step (`DataCompStream`); `RenderedStream` renders a
   stream the way `RenderedDataset` renders a reader.
@@ -69,6 +72,24 @@ outruns `max_text_len` and trains only the leading points. `max_points` retains
 the count only when the cap is small enough for the label and the text budget:
 with a 40-point `dot` row at 256 tokens, a cap of 30 still cuts the count, while
 a cap of 3 keeps it.
+
+`FineVisionArrow` keeps only the rows with one image (`max_images`, which `None`
+lifts), using the per-row image counts `index.npz` stores; an index written
+without them takes the counts from `num_images`, and `text_only` keeps the rows
+without images. A conversation keeps its turns up to the first one missing its
+user message or reply, so a row whose first turn is incomplete is not kept.
+
+Convert FineVision once; any number of `convert` processes can share the work,
+a file that fails to convert is listed at the end without stopping the others,
+and `index` refuses a subset with a file missing or whose parquet file changed
+size since its conversion:
+
+```bash
+uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py convert \
+    --src path-to-FineVision --dst path-to-FineVision-arrow --procs 8
+uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py index \
+    --src path-to-FineVision --dst path-to-FineVision-arrow
+```
 
 DataComp has no index, so its reader streams: the shards are listed once,
 reordered every epoch from the seed, and dealt out to data-parallel ranks and
@@ -170,6 +191,33 @@ least two rows. The views of
 an image attend causally; bidirectional image attention is a follow-up on the
 core's attention groups. A `[video]` run and the other arches do not pack.
 
+## Mix in text-only documents
+
+Image-text mixes often carry documents without an image, such as FineVision's
+`text_*` subsets. A row whose image column is `None` or an empty list is a
+text-only document; no setting turns this on. Without packing it
+takes a blank image and a `frame_mask` entry of `False`, so its image tokens
+are hidden from attention; the document still occupies the image positions,
+so its text sits after them in the row and in the position encoding, as a
+masked image document rather than plain text. With packing it is just its
+text, and a micro-batch of nothing but text carries no images; the vision
+encoder and adapter then run on one blank image whose output carries no weight,
+so FSDP2's collectives still see every rank, and under `train.compile_model`
+such a micro-batch is a second compiled graph. When the loaded dataset holds
+text-only rows, every unpacked batch carries a `frame_mask`, so the prefix
+route's attention takes an explicit dense mask rather than the unmasked causal
+fast path (or the flex backend's block-sparse mask) for that run, and never
+flips between the two. On `cross_attention` a text-only row skips the
+cross-attention blocks: their attention and MLP updates are zeroed for that
+row, so its text runs through the backbone alone. On `mot` the hidden blank
+image's tokens still pass through the image experts. On `moma` they are dropped
+before routing, so they take no expert capacity; a micro-batch with no image
+gives the image experts zero gradients. On `joint_decoder` and `moma` the
+FlashAttention kernel takes no mask, so an unpacked dataset with text-only rows
+is refused with `model.sdpa_backend = "flash"` under `attention_backend =
+"sdpa"`. Rows that hold several
+images are skipped when the dataset is loaded, and one warning counts them.
+
 ## Start from the pretrained backbone
 
 Stage 1 warm-starts from a checkpoint that holds the pretrained Qwen3-0.6B
@@ -200,7 +248,6 @@ or in core where it belongs:
   DataComp), chat-template rendering with the loss on the assistant turns only,
   and the mixture loader
 - Typed stage contract and pinned source manifest, which fix the stage presets
-- Text-only documents in image-text batches
 - Documents with several images
 - Per-module learning rates and schedules
 - Evaluation parity: chat-template prompts, image attention, the recipe's scorers
