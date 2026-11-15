@@ -69,6 +69,7 @@ from kempnerforge.checkpoint.state import (
     restore_train_state,
     select_rank_state,
 )
+from kempnerforge.checkpoint.traceback_pickling import register_frame_summary_pickling
 from kempnerforge.config.checkpoint import is_weights_only, validate_exclude_keys
 from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES, checked_lr_multipliers
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
@@ -709,6 +710,9 @@ class CheckpointManager:
 
     A ``latest`` symlink always points to the most recent checkpoint.
 
+    Construction calls ``register_frame_summary_pickling``, so a rank's failed DCP save or
+    load reaches the other ranks as its own error on every supported Python version.
+
     Args:
         config: Checkpoint configuration.
         model: The model (FSDP-wrapped or plain).
@@ -758,6 +762,7 @@ class CheckpointManager:
         lr_multipliers: Mapping[str, float] | None = None,
         module_patterns: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
+        register_frame_summary_pickling()
         self._dp_info = dp_coordinates(dp_info) if dp_info is not None else None
         if dp_info is not None and self._dp_info is None:
             raise ValueError(

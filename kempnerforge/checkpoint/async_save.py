@@ -19,6 +19,7 @@ from typing import Any
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.planner import SavePlanner
 
+from kempnerforge.checkpoint.traceback_pickling import register_frame_summary_pickling
 from kempnerforge.config.schema import AsyncCheckpointMode
 
 logger = logging.getLogger(__name__)
@@ -29,12 +30,15 @@ class AsyncCheckpointer:
 
     Wraps ``dcp.async_save()`` and manages the background save future.
     Each new save waits for the previous async save to complete first.
+    Construction calls ``register_frame_summary_pickling``, so a rank's failed write reaches
+    the other ranks as its own error on every supported Python version.
 
     Args:
         mode: Checkpoint mode (disabled/async/async_with_pinned_mem).
     """
 
     def __init__(self, mode: AsyncCheckpointMode = AsyncCheckpointMode.disabled) -> None:
+        register_frame_summary_pickling()
         self.mode = mode
         self._pending_future: Any = None
 
