@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copyreg
 import io
+import linecache
 import pickle
 import traceback
 
@@ -81,25 +82,20 @@ class TestReduceFrameSummary:
             assert all(f._code is not None for f in stack)
             assert all(f._code is None for f in restored_stack)
 
-    def test_a_frame_whose_source_lives_only_on_its_code_object_keeps_its_line(self):
-        """The line is resolved before the code object is dropped."""
-        namespace: dict[str, object] = {}
-        exec(compile("def boom():\n    raise ValueError('from exec')\n", "<kf>", "exec"), namespace)
-        boom = namespace["boom"]
-        assert callable(boom)
-        with pytest.raises(ValueError) as raised:
-            boom()
-        stack = traceback.extract_tb(raised.value.__traceback__)
-        frame = traceback.FrameSummary(
-            stack[-1].filename, stack[-1].lineno, stack[-1].name, lookup_line=False
-        )
-        if HOLDS_CODE:
-            object.__setattr__(frame, "_code", stack[-1]._code)
-        restored = _round_trip_with_reducer(frame)
+    def test_a_frame_keeps_its_source_line_after_the_source_is_gone(self, tmp_path):
+        """The line is read on the pickling side, so the receiver needs no source file."""
+        source = tmp_path / "raising.py"
+        source.write_text("x = 1\nraise OSError(28, 'No space left on device')\n")
+        frame = traceback.FrameSummary(str(source), 2, "<module>", lookup_line=False)
+        payload = io.BytesIO()
+        pickler = pickle.Pickler(payload)
+        pickler.dispatch_table = {traceback.FrameSummary: reduce_frame_summary}
+        pickler.dump(frame)
+        source.unlink()
+        linecache.clearcache()
+        restored = pickle.loads(payload.getvalue())
         assert isinstance(restored, traceback.FrameSummary)
-        assert restored.line == stack[-1].line
-        if HOLDS_CODE:
-            assert restored.line == "raise ValueError('from exec')"
+        assert restored.line == "raise OSError(28, 'No space left on device')"
 
     def test_a_frame_with_locals_keeps_them(self):
         """Captured locals, already strings, round-trip unchanged."""
