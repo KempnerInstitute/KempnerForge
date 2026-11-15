@@ -249,6 +249,20 @@ def test_a_resume_past_a_damaged_shard_matches(tmp_path: Path, read: int) -> Non
     assert resumed.skipped <= skipped
 
 
+def test_a_shard_unreadable_at_a_resume_counts_as_a_skip(tmp_path: Path) -> None:
+    _shards(tmp_path, 2, 4)
+    stream = DataCompStream(tmp_path, PROMPT, seed=0, open_shards=1)
+    first = stream.worker_shards(0, 0)[0]
+    _captions(iter(stream), 2, stream)
+    state = stream.state_dict()
+    (tmp_path / first).write_bytes(b"")
+    resumed = DataCompStream(tmp_path, PROMPT, seed=0, open_shards=1)
+    resumed.load_state_dict(state)
+    second = stream.worker_shards(0, 0)[1].split(".")[0]
+    assert _captions(iter(resumed), 1) == [f"cap {second[-2:]}-0"]
+    assert resumed.skipped == 1
+
+
 def test_a_resume_passes_over_unusable_samples_it_had_reached(tmp_path: Path) -> None:
     members = _sample("0") + _sample("1", jpg=b"x") + _sample("2") + _sample("3")
     _write_shard(tmp_path / "00000.tar", members)
@@ -307,6 +321,33 @@ def test_a_loader_resume_continues_where_training_stopped(
     resumed = loader()
     resumed.load_state_dict(state)
     assert [_batch_captions(batch) for batch in itertools.islice(resumed, 6)] == expected
+
+
+def test_a_loader_of_rendered_samples_resumes_in_process(tmp_path: Path, tokenizer: Any) -> None:
+    _shards(tmp_path, 2, 3)
+    renderer = ChatRenderer(tokenizer, max_text_len=64, image_size=8, answer_only=True)
+
+    def loader() -> StreamLoader:
+        rendered = RenderedStream(DataCompStream(tmp_path, PROMPT, seed=5), renderer, seed=5)
+        return StreamLoader(rendered, 2)
+
+    def answers(batch: dict[str, torch.Tensor]) -> list[str]:
+        return [tokenizer.decode(row[row != -100]) for row in batch["labels"]]
+
+    first = loader()
+    reader = iter(first)
+    next(reader)
+    state = first.state_dict()
+    assert state == first.stream.documents.state_dict()
+    expected = [answers(next(reader)) for _ in range(3)]
+    resumed = loader()
+    resumed.load_state_dict(state)
+    assert [answers(batch) for batch in itertools.islice(resumed, 3)] == expected
+
+
+def test_a_loader_needs_an_iterable_dataset() -> None:
+    with pytest.raises(TypeError, match="needs an IterableDataset, got list"):
+        StreamLoader([1, 2], 2)
 
 
 def test_a_loader_refuses_persistent_workers(tmp_path: Path) -> None:

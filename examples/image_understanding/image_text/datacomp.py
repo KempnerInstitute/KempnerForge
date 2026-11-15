@@ -32,34 +32,28 @@ def tar_samples(path: str | Path, skip: int = 0) -> Iterator[tuple[str, dict[str
     A sample is a run of consecutive members whose paths agree up to the first dot
     of the file name. The first ``skip`` samples are passed over without reading
     their members. A damaged header raises ``tarfile.ReadError`` where tarfile alone
-    would end the archive there; an error among the skipped samples ends the
-    samples quietly instead, as a reader resuming past it has already met it.
+    would end the archive there.
     """
     key: str | None = None
     index = -1
     members: dict[str, bytes] = {}
-    try:
-        with open(path, "rb") as file:
-            with tarfile.open(fileobj=file, mode="r|") as tar:
-                for info in tar:
-                    if not info.isfile():
-                        continue
-                    folder, _, name = info.name.rpartition("/")
-                    stem, _, extension = name.partition(".")
-                    sample = f"{folder}/{stem}" if folder else stem
-                    if sample != key:
-                        if key is not None and index >= skip:
-                            yield key, members
-                        key, members, index = sample, {}, index + 1
-                    if index >= skip:
-                        data = tar.extractfile(info)
-                        members[extension.lower()] = data.read() if data is not None else b""
-                end = tar.offset
-            _check_end(file, end)
-    except (tarfile.TarError, EOFError, OSError):
-        if index < skip:
-            return
-        raise
+    with open(path, "rb") as file:
+        with tarfile.open(fileobj=file, mode="r|") as tar:
+            for info in tar:
+                if not info.isfile():
+                    continue
+                folder, _, name = info.name.rpartition("/")
+                stem, _, extension = name.partition(".")
+                sample = f"{folder}/{stem}" if folder else stem
+                if sample != key:
+                    if key is not None and index >= skip:
+                        yield key, members
+                    key, members, index = sample, {}, index + 1
+                if index >= skip:
+                    data = tar.extractfile(info)
+                    members[extension.lower()] = data.read() if data is not None else b""
+            end = tar.offset
+        _check_end(file, end)
     if key is not None and index >= skip:
         yield key, members
 
@@ -76,6 +70,10 @@ def _check_end(file: BinaryIO, offset: int) -> None:
         raise tarfile.ReadError(f"the archive stops at byte {offset} without its end marker")
 
 
+class ShardEndError(UnusableRowError):
+    """A shard that holds no samples or cannot be read further."""
+
+
 class DataCompStream(IterableDataset):
     """DataComp image-caption pairs from its webdataset shards, each asked with ``prompt``.
 
@@ -83,7 +81,7 @@ class DataCompStream(IterableDataset):
     ``seed``, dealt out to data-parallel ranks and then to this rank's
     ``num_workers`` loader workers. Each worker keeps ``open_shards`` of its shards
     open, reads each front to back, and takes every sample from one of them drawn
-    at random, opening its next shard when one runs out. The stream does not end;
+    at random, opening its next shard when one runs out or fails. The stream does not end;
     after its last shard a worker goes on to the next epoch.
     A sample without a decodable image or a caption is passed over, as is the rest
     of a shard that stops being a readable tar; ``skipped`` counts them, and
@@ -183,10 +181,10 @@ class DataCompStream(IterableDataset):
                 except UnusableRowError as exc:
                     yield UnusableRowError(f"{name} sample {key} {exc}")
         except (tarfile.TarError, EOFError, OSError) as exc:
-            yield UnusableRowError(f"{name} stops being a readable tar: {exc}")
+            yield ShardEndError(f"{name} stops being a readable tar: {exc}")
             return
         if not found and skip == 0:
-            yield UnusableRowError(f"{name} holds no samples")
+            yield ShardEndError(f"{name} holds no samples")
 
     def __iter__(self) -> Iterator[tuple[list[int], Document]]:
         worker = self._worker()
@@ -211,6 +209,8 @@ class DataCompStream(IterableDataset):
                     continue
                 draws += 1
                 active[pick][1] += 1
+                if isinstance(item, ShardEndError):
+                    del active[pick], readers[pick]
                 if isinstance(item, UnusableRowError):
                     self._skips(draws - 1, item)
                     in_a_row += 1
