@@ -61,9 +61,14 @@ def _frame_fields(frame: traceback.FrameSummary) -> tuple[object, ...]:
 
 
 @pytest.fixture
-def unregistered(monkeypatch):
-    """No ``FrameSummary`` reducer in the process-wide table for the test's duration."""
-    monkeypatch.delitem(copyreg.dispatch_table, traceback.FrameSummary, raising=False)
+def unregistered():
+    """No ``FrameSummary`` reducer in the process-wide table for the test's duration; the
+    table's entry from before the test is restored after it."""
+    before = copyreg.dispatch_table.pop(traceback.FrameSummary, None)
+    yield
+    copyreg.dispatch_table.pop(traceback.FrameSummary, None)
+    if before is not None:
+        copyreg.dispatch_table[traceback.FrameSummary] = before
 
 
 class TestReduceFrameSummary:
