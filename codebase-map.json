@@ -805,7 +805,7 @@
     "kempnerforge/training/freeze.py": {
       "purpose": "Freeze utilities: resolve module aliases / fnmatch patterns to parameter names, flip requires_grad, build canonical metadata for checkpoint validation, compute effective freeze at a given step from base specs + a freeze_schedule with start_step boundaries",
       "functions": [
-        "freeze_params(model, specs, module_patterns) -> dict",
+        "freeze_params(model, patterns, *, frozen=True) -> int (elements flipped)",
         "apply_freeze_specs(model, specs, module_patterns) -> dict",
         "canonical_freeze_meta(specs) -> list[dict]",
         "effective_freeze(step, base_specs, schedule, valid_modules) -> list[FreezeSpec]",

@@ -2619,8 +2619,9 @@ class TestRestoreCheckpoint:
         for (name, p), q in pairs:
             assert torch.equal(p, q), name
             if p.requires_grad:
-                moment = resumed_optimizer.state[q]["exp_avg"]
-                assert torch.equal(optimizer.state[p]["exp_avg"], moment), name
+                for moment in ("exp_avg", "exp_avg_sq"):
+                    resumed_moment = resumed_optimizer.state[q][moment]
+                    assert torch.equal(optimizer.state[p][moment], resumed_moment), name
 
     def test_freeze_schedule_is_reapplied_at_the_resumed_step(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry

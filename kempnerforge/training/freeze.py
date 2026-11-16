@@ -120,7 +120,19 @@ def effective_freeze(
       as the build accepts; otherwise ``ValueError``. This catches typos
       at load time rather than at the next step boundary.
 
-    Returns the list of active specs (one per module key).
+    Args:
+        step: The step the freeze is wanted at.
+        base: The build-time freeze list.
+        schedule: The freeze stages, in any order.
+        valid_modules: The module aliases a ``spec.module`` may name besides a parameter
+            pattern, or ``None`` to skip the check.
+
+    Returns:
+        The active specs, one per module key, in the order of their last write.
+
+    Raises:
+        ValueError: A spec names neither a module of ``valid_modules`` nor a parameter
+            pattern.
     """
     by_module: dict[str, FreezeSpec] = {}
 
