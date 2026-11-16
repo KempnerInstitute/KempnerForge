@@ -1460,7 +1460,7 @@ requires-dist = [
     { name = "tensorboard" },
     { name = "tokenizers" },
     { name = "torch", specifier = ">=2.12", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchao", specifier = ">=0.17.0" },
+    { name = "torchao", specifier = ">=0.18.0" },
     { name = "transformers" },
     { name = "wandb" },
 ]
