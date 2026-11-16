@@ -63,7 +63,7 @@ A name in `vlm.freeze` or in a `FreezeStage` is a module alias of `vlm.module_pa
 (`transformer`, `vision_encoder` and `adapter` by default) or a parameter pattern, which
 holds a dot or one of `*?[`, such as `transformer.layers.1.*`. A bare word that is neither
 fails when the config loads; the TOML is checked before CLI overrides apply, so fix it in
-the TOML.
+the TOML. A pattern that matches no parameter fails when the model is built.
 
 Paths in these configs are placeholders (`data_root = "path-to-webvid-10m"`) —
 point them at your own data and output directories, or override on the CLI.

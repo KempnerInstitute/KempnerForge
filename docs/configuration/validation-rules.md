@@ -204,8 +204,9 @@ File:
   `module_patterns`, or a parameter pattern, which holds a dot or one of `*?[`; a key
   resolves as its alias first, dot or not. A bare word that is neither, such as a typo of
   an alias, fails when the config loads. The check runs once the TOML is applied and again
-  once the CLI overrides land, so a name the TOML gets wrong must be fixed in the TOML. A
-  pattern that matches no parameter passes and freezes nothing.
+  once the CLI overrides land, so a name the TOML gets wrong must be fixed in the TOML.
+- The VLM build refuses a pattern in `freeze` or in a `FreezeStage` that matches no
+  parameter of the built model, and names it.
 
 ### `AdapterConfig`
 
