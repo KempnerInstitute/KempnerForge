@@ -11,6 +11,10 @@ There is no `pip install kempnerforge` — you work from a clone.
   for you. No manual Python install needed.
 - **NVIDIA driver 580 or newer**: PyTorch wheels are pulled from the CUDA 13.0
   index and bundle the CUDA runtime, so no separate CUDA toolkit is needed.
+- **A C++20 compiler (GCC 10 or newer)** for `torch.compile` on CPU, including
+  the unit tests that compile a model on CPU: Inductor builds CPU kernels with
+  `g++ -std=c++20`. Where the system compiler is older, put a newer `g++`
+  first on `PATH`.
 - **NVIDIA GPU** for any training or distributed test (H100, H200, or A100).
   Unit tests run on CPU.
 - **uv** — install once per machine:
