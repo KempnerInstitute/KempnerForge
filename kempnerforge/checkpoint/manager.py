@@ -617,7 +617,9 @@ def _restore_left_out(
 
     Args:
         optim_state: The loaded optimizer state; its ``param_groups`` list the saved names.
-        template_groups: The parameter names of each group of the optimizer being loaded.
+        template_groups: The parameter names of each group of the optimizer being loaded,
+            with every EP rank's experts under expert parallelism (see
+            ``ExpertLayout.group_names``), as the save lists its groups.
         left_out: The names with neither saved state nor a never-stepped record. One in no
             group of ``template_groups`` only gets empty state.
         where: The checkpoint directory, named in the errors.
