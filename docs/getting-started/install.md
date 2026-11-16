@@ -9,7 +9,8 @@ There is no `pip install kempnerforge` — you work from a clone.
   `pyproject.toml`'s `requires-python`. uv reads `.python-version` and will
   use any Python ≥ 3.12 already on your machine, or fetch a managed CPython
   for you. No manual Python install needed.
-- **CUDA 12.8 toolkit** — PyTorch wheels are pulled from the CUDA 12.8 index.
+- **NVIDIA driver 580 or newer**: PyTorch wheels are pulled from the CUDA 13.0
+  index and bundle the CUDA runtime, so no separate CUDA toolkit is needed.
 - **NVIDIA GPU** for any training or distributed test (H100, H200, or A100).
   Unit tests run on CPU.
 - **uv** — install once per machine:
@@ -25,7 +26,7 @@ git clone git@github.com:KempnerInstitute/KempnerForge.git
 cd KempnerForge
 
 # Creates .venv, installs runtime + dev dependencies, resolves torch from the
-# CUDA 12.8 index pinned in pyproject.toml.
+# CUDA 13.0 index pinned in pyproject.toml.
 uv sync
 ```
 

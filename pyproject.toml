@@ -8,7 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.6",
+    "torch>=2.12",
     "wandb",
     "tensorboard",
     "transformers",
@@ -66,12 +66,12 @@ build-backend = "hatchling.build"
 default-groups = ["dev"]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu130" }
 
 [tool.ruff]
 line-length = 100
