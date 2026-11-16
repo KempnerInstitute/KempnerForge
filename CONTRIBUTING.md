@@ -486,7 +486,7 @@ uv add <package>
 uv add --group dev <package>
 ```
 
-Always use `uv` — never pip, conda, or venv. PyTorch is pinned to the CUDA 13.0 index in `pyproject.toml`.
+Always use `uv`, never pip, conda, or venv. PyTorch is pinned to the CUDA 13.0 index in `pyproject.toml`.
 
 ## Quick Reference
 
