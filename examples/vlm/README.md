@@ -369,7 +369,7 @@ PyTorch. Two gotchas seen on the Kempner cluster:
 
   ```bash
   uv pip install --reinstall-package torchvision \
-      --index https://download.pytorch.org/whl/cu130 "torchvision==0.27.1"
+      --index https://download.pytorch.org/whl/cu130 "torchvision==0.29.1"
   ```
 
 - **`GLIBCXX_… not found` when importing the evaluator.** lmms-eval's
