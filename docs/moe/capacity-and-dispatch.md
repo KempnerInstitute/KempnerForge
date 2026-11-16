@@ -32,6 +32,10 @@ At `capacity_factor = 1.0`, each expert gets exactly the average load.
 At `1.25`, each expert gets 25% headroom above the average — the
 canonical Switch Transformer setting. At `0.0` (default), there is
 no cap: every token goes to its top-`k` choices regardless of load.
+Today `_apply_capacity` applies `capacity` to each top-`k` slot on its
+own, so with `top_k > 1` an expert can keep up to `top_k` times that
+many routes
+([#587](https://github.com/KempnerInstitute/KempnerForge/issues/587)).
 
 ### Drop policy
 

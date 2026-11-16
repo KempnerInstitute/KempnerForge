@@ -195,7 +195,10 @@ compute or communication, with or without EP:
   count it gets, so a rank that many routes pick receives more rows.
 
 Leave it at `0.0` unless you want the drops themselves, e.g. to match
-a baseline trained with capacity:
+a baseline trained with capacity. The cap applies to each top-`k` slot on
+its own today, so with `top_k = 2` an expert can keep up to twice the
+capacity
+([#587](https://github.com/KempnerInstitute/KempnerForge/issues/587)):
 
 ```toml
 [model]
