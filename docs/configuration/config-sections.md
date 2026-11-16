@@ -79,7 +79,7 @@ Architecture hyperparameters and MoE knobs.
 | `moe_router` | `str` | `"softmax_topk"` | `router` registry key |
 | `moe_shared_experts` | `int` | `0` | shared experts that always process every token |
 | `moe_aux_loss_weight` | `float` | `0.01` | coefficient in training loss |
-| `moe_capacity_factor` | `float` | `0.0` | `0` → no drop; `>0` → cap tokens/expert (typical `1.25`) |
+| `moe_capacity_factor` | `float` | `0.0` | `0` → no drop; `>0` → cap the routes per expert, per top-`k` slot today ([#587](https://github.com/KempnerInstitute/KempnerForge/issues/587)) (typical `1.25`) |
 | `moe_sequence_aux_loss_weight` | `float` | `0.0` | sequence-level balance loss (0 = off) |
 | `moe_gradient_scale` | `bool` | `False` | per-expert gradient normalization |
 | `moe_bias_schedule` | `str` | `"constant"` | `"constant"`, `"cosine_decay"`, `"linear_warmup"` |

@@ -127,8 +127,9 @@ Recovery options, in order of what to try first:
 
 1. **Raise `moe_aux_loss_weight`** from 0.01 → 0.02 (softmax) or turn
    on `moe_sequence_aux_loss_weight = 0.001` (sigmoid).
-2. **Set `moe_capacity_factor = 1.25`** — caps hot experts at 25%
-   above average, spilling overflow to residual.
+2. **Set `moe_capacity_factor = 1.25`**: routes past an expert's
+   capacity, 25% above the average per expert, go to the residual; the
+   cap applies per top-`k` slot today ([#587](https://github.com/KempnerInstitute/KempnerForge/issues/587)).
 3. **Enable `moe_gradient_scale = true`** — normalizes per-expert
    gradient magnitudes so cold experts aren't starved of learning
    signal.

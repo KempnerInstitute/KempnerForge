@@ -28,10 +28,10 @@ tokens per forward:
 capacity = max(1, ceil(num_tokens * top_k / num_experts * capacity_factor))
 ```
 
-At `capacity_factor = 1.0`, each expert gets exactly the average load.
-At `1.25`, each expert gets 25% headroom above the average — the
-canonical Switch Transformer setting. At `0.0` (default), there is
-no cap: every token goes to its top-`k` choices regardless of load.
+At `capacity_factor = 1.0`, `capacity` is the average number of routes
+per expert, and at `1.25` it is 25% above that average; an expert can
+get fewer. At `0.0` (default), there is no cap: every token goes to its
+top-`k` choices regardless of load.
 Today `_apply_capacity` applies `capacity` to each top-`k` slot on its
 own, so with `top_k > 1` an expert can keep up to `top_k` times that
 many routes
