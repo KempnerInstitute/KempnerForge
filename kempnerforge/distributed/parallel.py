@@ -556,7 +556,9 @@ def _build_vlm(
          parameters stay in its HF dtype (D16) to avoid ViT LayerNorm
          numerical drift; with ``vision_config.mixed_precision`` set,
          ``_set_encoder_precision`` makes it compute in that dtype.
-      7. Freeze specs are applied via ``apply_freeze_specs`` and a fully
+      7. Every parameter pattern in ``vlm.freeze`` and ``vlm.freeze_schedule``
+         must match a parameter (``ValueError`` names those that match none);
+         the freeze specs are applied via ``apply_freeze_specs`` and a fully
          frozen encoder is switched to ``eval()``.
     """
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
@@ -568,7 +570,7 @@ def _build_vlm(
         _is_encoder_frozen,
         build_modality_strategy,
     )
-    from kempnerforge.training.freeze import apply_freeze_specs
+    from kempnerforge.training.freeze import apply_freeze_specs, unmatched_patterns
 
     assert vlm_config is not None, "_build_vlm requires vlm_config to be set"
     assert vision_config is not None, "_build_vlm requires vision_config to be set"
@@ -643,6 +645,18 @@ def _build_vlm(
     transformer.to(dtype=param_dtype)
     adapter.to(dtype=param_dtype)
 
+    every_spec = [
+        *vlm_config.freeze,
+        *(spec for stage in vlm_config.freeze_schedule for spec in stage.specs),
+    ]
+    unmatched = unmatched_patterns(wrapper, every_spec, vlm_config.module_patterns)
+    if unmatched:
+        example = next(name for name, _ in wrapper.named_parameters())
+        raise ValueError(
+            f"vlm.freeze and vlm.freeze_schedule name parameter patterns that match no "
+            f"parameter: {unmatched}. A pattern matches the names the built model gives its "
+            f"parameters, such as {example!r}."
+        )
     apply_freeze_specs(wrapper, vlm_config.freeze, vlm_config.module_patterns)
     if encoder_frozen:
         encoder.eval()

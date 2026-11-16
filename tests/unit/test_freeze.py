@@ -5,11 +5,13 @@ from __future__ import annotations
 import pytest
 import torch.nn as nn
 
-from kempnerforge.config.vlm import DEFAULT_MODULE_PATTERNS, FreezeSpec
+from kempnerforge.config.vlm import DEFAULT_MODULE_PATTERNS, FreezeSpec, FreezeStage
 from kempnerforge.training.freeze import (
     apply_freeze_specs,
     canonical_freeze_meta,
+    effective_freeze,
     freeze_params,
+    unmatched_patterns,
 )
 
 
@@ -332,3 +334,123 @@ class TestFreezeNames:
         path.write_text('[vlm]\narch = "joint_decoder"\nfreeze = [{module = "adaptor"}]\n')
         with pytest.raises(ValueError, match="adaptor"):
             load_config(str(path), cli_args=[])
+
+
+def _masks(model: nn.Module) -> dict[str, bool]:
+    return {name: p.requires_grad for name, p in model.named_parameters()}
+
+
+class TestResumedFreezeOrder:
+    """A resume applies the freeze the uninterrupted run had at its step (#512)."""
+
+    @pytest.mark.parametrize(
+        ("base", "stages", "patterns"),
+        [
+            pytest.param(
+                [FreezeSpec("transformer"), FreezeSpec("transformer.1.*", False)],
+                [FreezeStage(4, (FreezeSpec("transformer"),))],
+                DEFAULT_MODULE_PATTERNS,
+                id="pattern_under_a_refrozen_alias",
+            ),
+            pytest.param(
+                [FreezeSpec("vision_encoder")],
+                [
+                    FreezeStage(2, (FreezeSpec("transformer"),)),
+                    FreezeStage(4, (FreezeSpec("top", False),)),
+                    FreezeStage(6, (FreezeSpec("transformer"),)),
+                ],
+                {**DEFAULT_MODULE_PATTERNS, "top": ["transformer.1.*"]},
+                id="custom_alias_of_issue_512",
+            ),
+        ],
+    )
+    def test_a_resume_at_each_step_matches_the_run(self, base, stages, patterns):
+        live = _MiniVLM()
+        apply_freeze_specs(live, base, patterns)
+        for step in range(8):
+            for stage in stages:
+                if stage.start_step == step:
+                    apply_freeze_specs(live, stage.specs, patterns)
+            resumed = _MiniVLM()
+            apply_freeze_specs(resumed, base, patterns)
+            apply_freeze_specs(resumed, effective_freeze(step, base, stages), patterns)
+            assert _masks(resumed) == _masks(live), step
+        assert not any(v for k, v in _masks(live).items() if k.startswith("transformer.1."))
+
+    def test_a_key_written_again_moves_to_the_end(self):
+        base = [FreezeSpec("transformer"), FreezeSpec("transformer.1.*", False)]
+        stages = [FreezeStage(4, (FreezeSpec("transformer"),))]
+        assert [(s.module, s.frozen) for s in effective_freeze(4, base, stages)] == [
+            ("transformer.1.*", False),
+            ("transformer", True),
+        ]
+
+
+class TestUnmatchedPatterns:
+    def test_lists_only_patterns_that_match_nothing(self, model):
+        specs = [
+            FreezeSpec("vision_encoder"),
+            FreezeSpec("transformer.1.*"),
+            FreezeSpec("transfomer.*"),
+            FreezeSpec("adapter.bias", False),
+            FreezeSpec("transfomer.*", False),
+        ]
+        assert unmatched_patterns(model, specs, DEFAULT_MODULE_PATTERNS) == ["transfomer.*"]
+
+    def test_an_alias_without_parameters_is_not_checked(self):
+        empty = nn.Module()
+        empty.vision_encoder = nn.Module()
+        specs = [FreezeSpec("vision_encoder")]
+        assert unmatched_patterns(empty, specs, DEFAULT_MODULE_PATTERNS) == []
+
+
+def _build_vlm(vlm):
+    import torch
+
+    from kempnerforge.config.adapter import AdapterConfig
+    from kempnerforge.config.model import ModelConfig
+    from kempnerforge.config.vision import VisionEncoderConfig
+    from kempnerforge.distributed.parallel import build_parallel_model
+
+    return build_parallel_model(
+        ModelConfig(dim=32, n_layers=2, n_heads=2, n_kv_heads=2, vocab_size=64, max_seq_len=16),
+        torch.device("cpu"),
+        None,
+        vision_config=VisionEncoderConfig(type="random", feature_dim=16, num_tokens=4),
+        adapter_config=AdapterConfig(),
+        vlm_config=vlm,
+    )
+
+
+class TestBuildRefusesUnmatchedPatterns:
+    def test_a_misspelled_pattern_fails_the_build(self):
+        from kempnerforge.config.vlm import VLMConfig
+
+        vlm = VLMConfig(max_text_len=8, freeze=[FreezeSpec("transformer.layer.1.*", False)])
+        with pytest.raises(ValueError, match=r"\['transformer.layer.1.\*'\]"):
+            _build_vlm(vlm)
+
+    def test_a_misspelled_pattern_in_a_stage_fails_the_build(self):
+        from kempnerforge.config.vlm import VLMConfig
+
+        stage = FreezeStage(5, (FreezeSpec("transfomer.*", True),))
+        vlm = VLMConfig(max_text_len=8, freeze_schedule=[stage])
+        with pytest.raises(ValueError, match="transfomer"):
+            _build_vlm(vlm)
+
+    def test_matching_patterns_and_an_encoder_without_parameters_build(self):
+        from kempnerforge.config.vlm import VLMConfig
+
+        vlm = VLMConfig(
+            max_text_len=8,
+            freeze=[
+                FreezeSpec("vision_encoder"),
+                FreezeSpec("transformer"),
+                FreezeSpec("transformer.layers.1.*", False),
+            ],
+            freeze_schedule=[FreezeStage(5, (FreezeSpec("adapter.*", True),))],
+        )
+        model = _build_vlm(vlm)
+        masks = _masks(model)
+        assert all(v for k, v in masks.items() if k.startswith("transformer.layers.1."))
+        assert not any(v for k, v in masks.items() if k.startswith("transformer.layers.0."))

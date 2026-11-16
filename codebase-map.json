@@ -809,7 +809,8 @@
         "apply_freeze_specs(model, specs, module_patterns) -> dict",
         "canonical_freeze_meta(specs) -> list[dict]",
         "effective_freeze(step, base_specs, schedule, valid_modules) -> list[FreezeSpec]",
-        "freeze_meta_at_step(step, config) -> list[dict]"
+        "freeze_meta_at_step(step, config) -> list[dict]",
+        "unmatched_patterns(model, specs, pattern_map) -> list[str]"
       ],
       "tested_by": [
         "tests/unit/test_freeze.py::TestFreezeParams",
@@ -817,6 +818,9 @@
         "tests/unit/test_freeze.py::TestCanonicalFreezeMeta",
         "tests/unit/test_freeze.py::TestEffectiveFreeze",
         "tests/unit/test_freeze.py::TestFreezeNames",
+        "tests/unit/test_freeze.py::TestResumedFreezeOrder",
+        "tests/unit/test_freeze.py::TestUnmatchedPatterns",
+        "tests/unit/test_freeze.py::TestBuildRefusesUnmatchedPatterns",
         "tests/integration/test_vlm_cross_attn.py::TestFreezeStageHook",
         "tests/integration/test_vlm_mot.py::TestFreezeStageHook",
         "tests/distributed/test_vlm_cross_attn_fsdp.py::TestFreezeStageUnderFsdp",
@@ -1919,9 +1923,12 @@
           "TestApplyFreezeSpecs(3)",
           "TestCanonicalFreezeMeta(4)",
           "TestEffectiveFreeze(7)",
-          "TestFreezeNames(12)"
+          "TestFreezeNames(12)",
+          "TestResumedFreezeOrder(3)",
+          "TestUnmatchedPatterns(2)",
+          "TestBuildRefusesUnmatchedPatterns(3)"
         ],
-        "count": 32
+        "count": 40
       },
       "tests/unit/test_check_env.py": {
         "classes": [
