@@ -49,6 +49,7 @@ FP32 = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float3
 UNPACKED_EXPERT = re.compile(r"(?P<layer>.*\.mlp)\.experts\.(?P<index>\d+)\.(?P<rest>.*)")
 PACKED_EXPERT = (".mlp.up_w", ".mlp.down_w", ".mlp.gate_w")
 MOMENTS = ("exp_avg", "exp_avg_sq")
+EXPERT_LR = 1e-3
 LR_PATTERNS = {"layer0": ["layers.0.*"], "layer1": ["layers.1.*"]}
 LR_MULTIPLIERS = {"layer0": 2.0, "layer1": 0.5}
 PACKED = {"moe_packed_experts": True}
@@ -331,19 +332,37 @@ def _resume_experts_the_save_left_out(rank, world, port, names, sizes, overrides
         dist.destroy_process_group()
 
 
-def _resume_some_experts_fresh(rank, world, port, names, sizes, overrides, root) -> None:
+def _with_expert_group(model: torch.nn.Module) -> torch.optim.Optimizer:
+    """AdamW over the trainable parameters, the routed experts in a group of their own.
+
+    The experts' group runs at ``EXPERT_LR``, the other parameters' at ``1e-2``.
+    """
+    trainable = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
+    experts = [p for name, p in trainable if _is_expert(name)]
+    others = [p for name, p in trainable if not _is_expert(name)]
+    return torch.optim.AdamW([{"params": others}, {"params": experts, "lr": EXPERT_LR}], lr=1e-2)
+
+
+def _resume_some_experts_fresh(
+    rank, world, port, names, sizes, overrides, root, expert_group
+) -> None:
     """Resume at this layout the checkpoint in ``root``, whose optimizer held some experts.
 
     ``root`` holds ``ckpt`` and ``reference.pt``, the saving model's weights and AdamW
-    moments under the unsharded names. Each rank loads with every expert allowed to resume
-    fresh, then writes ``mismatches{rank}.pt``: the names, with each expert's global index,
-    whose weight differs from the reference or whose moments are not the reference's, held
-    or not. Each rank checks its own experts, whose moments the ranks hold unevenly.
+    moments under the unsharded names. With ``expert_group`` the optimizer keeps the
+    experts in a group of their own (see ``_with_expert_group``), as the save's did. Each
+    rank loads with every expert allowed to resume fresh, then writes
+    ``mismatches{rank}.pt``: the names, with each expert's global index, whose weight
+    differs from the reference or whose moments are not the reference's, held or not, and
+    under ``expert_group`` each expert whose group runs at another rate than the experts'.
+    Each rank checks its own experts, whose moments the ranks hold unevenly.
     """
     _init(rank, world, port)
     try:
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         model, optimizer = _build(mesh, _config(overrides), seed=1)
+        if expert_group:
+            optimizer = _with_expert_group(model)
         experts = [name for name, _ in model.named_parameters() if _is_expert(name)]
         ckpt = CheckpointConfig(dir=str(Path(root) / "ckpt"))
         manager = CheckpointManager(ckpt, model, optimizer)
@@ -371,6 +390,11 @@ def _resume_some_experts_fresh(rank, world, port, names, sizes, overrides, root)
                 full = t.full_tensor() if isinstance(t, DTensor) else t
                 if not torch.equal(full, reference[key]):
                     wrong.append(key)
+            if expert_group and match is not None:
+                groups = optimizer.param_groups
+                (lr,) = [g["lr"] for g in groups if any(q is p for q in g["params"])]
+                if lr != EXPERT_LR:
+                    wrong.append(f"{saved_name} lr {lr}")
         torch.save(wrong, Path(root) / f"mismatches{rank}.pt")
     finally:
         dist.destroy_process_group()
@@ -456,10 +480,10 @@ def _save_misplaced(rank, world, port, names, sizes, overrides, root) -> None:
 
 
 def _fail_on_rank_one(rank, world, port, names, sizes, overrides, root) -> None:
-    """Fail only rank 1's part of a save, then of a load, before DCP runs.
+    """Fail only rank 1's part of a save, then of a load before DCP runs and after it.
 
     Rank 1 raises its own error. Every other rank raises too, naming the operation and
-    rank 1, rather than wait in DCP's collectives for a rank that has left.
+    rank 1, rather than wait in the next collective for a rank that has left.
     """
     _init(rank, world, port)
     try:
@@ -476,6 +500,7 @@ def _fail_on_rank_one(rank, world, port, names, sizes, overrides, root) -> None:
         for what, target, attribute in (
             ("save", expert_layout_module.ExpertLayout, "to_global"),
             ("load", manager_module, "check_saved_experts"),
+            ("load", manager_module, "_restore_left_out"),
         ):
             original = getattr(target, attribute)
             if rank == 1:
@@ -635,7 +660,8 @@ class TestPlacementCheck:
 
 class TestFailureOnOneRank:
     def test_every_rank_raises_and_names_the_operation(self, tmp_path):
-        """One rank's failure before DCP raises on every rank, in a save and in a load."""
+        """One rank's failure raises on every rank: in a save, and in a load before DCP
+        runs and once it has loaded."""
         names, sizes, overrides = LAYOUTS["ep2_packed"]
         _spawn(_fail_on_rank_one, names, sizes, overrides, str(tmp_path))
 
@@ -661,31 +687,42 @@ class TestExpertsTheSaveLeftOut:
         assert torch.load(tmp_path / "with_state.pt") == []
 
     @pytest.mark.parametrize(
-        ("frozen", "target"),
+        ("frozen", "target", "expert_group"),
         [
-            pytest.param((0, 1), LAYOUTS["ep2"][:2], id="first_half_at_ep2"),
-            pytest.param((2, 3), LAYOUTS["ep2"][:2], id="second_half_at_ep2"),
-            pytest.param((1, 2), EP4, id="middle_two_at_ep4"),
+            pytest.param((0, 1), LAYOUTS["ep2"][:2], False, id="first_half_at_ep2"),
+            pytest.param((2, 3), LAYOUTS["ep2"][:2], False, id="second_half_at_ep2"),
+            pytest.param((1, 2), EP4, False, id="middle_two_at_ep4"),
+            pytest.param((0, 1), LAYOUTS["ep2"][:2], True, id="first_half_own_group_at_ep2"),
+            pytest.param((2, 3), LAYOUTS["ep2"][:2], True, id="second_half_own_group_at_ep2"),
+            pytest.param((1, 2), EP4, True, id="middle_two_own_group_at_ep4"),
         ],
     )
-    def test_a_save_that_held_some_experts_resumes_at_another_ep(self, frozen, target, tmp_path):
+    def test_a_save_that_held_some_experts_resumes_at_another_ep(
+        self, frozen, target, expert_group, tmp_path
+    ):
         """Each EP rank leaves out the experts the save did not hold, by their global index.
 
-        One process saves from an optimizer without the experts in ``frozen``. At another
-        ``ep`` a rank's local name for an expert names another expert in the checkpoint, so
-        the resume must load the held experts' moments and leave out the others by the
-        names the checkpoint keeps them under.
+        One process saves from an optimizer without the experts in ``frozen``, with the
+        experts in a param group of their own under ``expert_group``. At another ``ep`` a
+        rank's local name for an expert names another expert in the checkpoint, and a rank
+        can hold only experts the save left out, so the resume must load the held experts'
+        moments, leave out the others by the names the checkpoint keeps them under, and put
+        them in their group through the other ranks' experts.
         """
         model, _ = _build(None, _config({}), seed=0)
         indices = "|".join(map(str, frozen))
         held_out = re.compile(rf"layers\.\d+\.mlp\.experts\.({indices})\.")
         for name, p in model.named_parameters():
             p.requires_grad_(held_out.match(name) is None)
-        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-2)
+        if expert_group:
+            optimizer = _with_expert_group(model)
+        else:
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(trainable, lr=1e-2)
         _train(model, optimizer, None)
         torch.save(_gathered(model, optimizer, None), tmp_path / "reference.pt")
         CheckpointManager(CheckpointConfig(dir=str(tmp_path / "ckpt")), model, optimizer).save(STEP)
-        _spawn(_resume_some_experts_fresh, *target, {}, str(tmp_path))
+        _spawn(_resume_some_experts_fresh, *target, {}, str(tmp_path), expert_group)
         world = 1
         for size in target[1]:
             world *= size

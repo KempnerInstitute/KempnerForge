@@ -1320,7 +1320,8 @@
           "methods": [
             "to_global(state) -> dict",
             "to_local(state) -> dict",
-            "global_names(names) -> list[str]"
+            "global_names(names) -> list[str]",
+            "group_names(names) -> list[str]"
           ]
         }
       },
@@ -1778,14 +1779,14 @@
           "TestPlacementCheck(1)",
           "TestFailureOnOneRank(1)",
           "TestResumeAtTheSameLayout(11)",
-          "TestExpertsTheSaveLeftOut(5)",
+          "TestExpertsTheSaveLeftOut(8)",
           "TestPerModuleLearningRates(2)",
           "TestLoadAtAnotherEP(18)",
           "TestUnfixedCheckpoint(8)",
           "TestExportFromAnEPCheckpoint(3)",
           "TestWithoutEP(2)"
         ],
-        "count": 66
+        "count": 69
       },
       "tests/unit/test_expert_layout.py": {
         "classes": [

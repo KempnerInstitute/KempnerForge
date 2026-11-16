@@ -1818,7 +1818,7 @@ class CheckpointManager:
             saved_left_out, saved_template_groups = left_out, template_groups
             if layout is not None:
                 saved_left_out = set(layout.global_names(left_out))
-                saved_template_groups = [layout.global_names(names) for names in template_groups]
+                saved_template_groups = [layout.group_names(names) for names in template_groups]
             planner = _NeverSteppedStatePlanner(saved_left_out)
             dcp.load(
                 dcp_state,
@@ -1829,8 +1829,12 @@ class CheckpointManager:
 
             if load_optim:
                 optim_state = cast("dict[str, Any]", dcp_state["optimizer"])
-                _restore_never_stepped(optim_state, planner.never_stepped, dcp_dir)
-                _restore_left_out(optim_state, saved_template_groups, saved_left_out, dcp_dir)
+
+                def restore_unsaved() -> None:
+                    _restore_never_stepped(optim_state, planner.never_stepped, dcp_dir)
+                    _restore_left_out(optim_state, saved_template_groups, saved_left_out, dcp_dir)
+
+                self.agree(_attempt(restore_unsaved), "Checkpoint load")
             if layout is not None:
                 dcp_state = layout.to_local(dcp_state)
             if load_optim:

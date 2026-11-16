@@ -189,6 +189,14 @@ class ExpertLayout:
         """
         return [self._global_name(name) for name in names]
 
+    def group_names(self, names: Iterable[str]) -> list[str]:
+        """A param group's ``names`` as a checkpoint lists them, with every EP rank's experts.
+
+        Each split expert's name stands for that expert on every EP rank, under each global
+        index in order, as ``to_global`` writes the param groups of an optimizer.
+        """
+        return self._every_rank(list(names))
+
     def to_local(self, state: Mapping[str, Any]) -> dict[str, Any]:
         """Undo ``to_global`` on the state dict that a load filled.
 
