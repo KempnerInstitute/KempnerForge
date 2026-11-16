@@ -1654,7 +1654,10 @@ class CheckpointManager:
         A load that restores optimizer state refuses it on every rank together, before any
         state is loaded: each rank checks its own part of the checkpoint, and one all-reduce
         on the manager's gloo group, which every rank enters, has the other ranks raise a
-        ``RuntimeError`` naming the ranks that refused.
+        ``RuntimeError`` naming the ranks that refused. A second such all-reduce follows DCP's
+        load, once each rank has restored the state of the parameters its checkpoint left
+        out or never stepped, and before any state is set; every rank enters it too, also a
+        pipeline stage whose checkpoint holds no optimizer state.
         """
         if exclude_keys is not None:
             validate_exclude_keys(exclude_keys, "exclude_keys")
@@ -1815,6 +1818,8 @@ class CheckpointManager:
         if optimizer_requested:
             self.agree(check_error, "Checkpoint load")
 
+        layout: ExpertLayout | None = None
+        restore_error: BaseException | None = None
         if dcp_state:
             dcp_state, layout = self._present_experts(dcp_state, dcp_dir, saved_keys)
             saved_left_out, saved_template_groups = left_out, template_groups
@@ -1836,22 +1841,26 @@ class CheckpointManager:
                     _restore_never_stepped(optim_state, planner.never_stepped, dcp_dir)
                     _restore_left_out(optim_state, saved_template_groups, saved_left_out, dcp_dir)
 
-                self.agree(_attempt(restore_unsaved), "Checkpoint load")
+                restore_error = _attempt(restore_unsaved)
+            if planner.never_stepped:
+                logger.info(
+                    f"{len(planner.never_stepped)} parameters the saved optimizer held were never "
+                    f"stepped and resume without state: {sorted(planner.never_stepped)[:8]}"
+                )
+        if optimizer_requested:
+            self.agree(restore_error, "Checkpoint load")
+        if dcp_state:
             if layout is not None:
                 dcp_state = layout.to_local(dcp_state)
             if load_optim:
+                loaded_groups = cast("dict[str, Any]", dcp_state["optimizer"])["param_groups"]
                 for index, group in unsaved_groups:
-                    dcp_state["optimizer"]["param_groups"].insert(index, group)
+                    loaded_groups.insert(index, group)
             if load_model:
                 set_model_state_dict(self.model, dcp_state["model"])
             if load_optim:
                 set_optimizer_state_dict(
                     self.model, optimizers, optim_state_dict=dcp_state["optimizer"]
-                )
-            if planner.never_stepped:
-                logger.info(
-                    f"{len(planner.never_stepped)} parameters the saved optimizer held were never "
-                    f"stepped and resume without state: {sorted(planner.never_stepped)[:8]}"
                 )
             if left_out:
                 logger.info(

@@ -4062,6 +4062,68 @@ class TestOptimizerChecksAcrossStages:
         args = (2, _free_port(), str(tmp_path), refusing, scope)
         mp.spawn(_refuse_on_one_stage, args=args, nprocs=2)
 
+    def test_a_stage_without_saved_optimizer_state_resumes_with_the_others(self, tmp_path):
+        """A stage whose checkpoint holds no optimizer state still meets the other stages."""
+        import torch.multiprocessing as mp
+
+        args = (2, _free_port(), str(tmp_path))
+        mp.spawn(_resume_with_one_stage_unstepped, args=args, nprocs=2)
+
+
+def _resume_with_one_stage_unstepped(rank: int, world: int, port: int, ckpt_dir: str) -> None:
+    """Save stage 0 after a step and stage 1 before any, then resume both stages.
+
+    Stage 1's checkpoint holds no optimizer state, so only stage 0 restores any; both stages
+    must still meet in the load's agreements and return the saved step and state.
+    """
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from kempnerforge.checkpoint.manager import CheckpointManager
+
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"tcp://127.0.0.1:{port}",
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        stages = [dist.new_group([r]) for r in range(world)]
+
+        def manager(seed: int, step: bool):
+            torch.manual_seed(seed)
+            model = torch.nn.Linear(4, 4)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            if step:
+                model(torch.ones(2, 4)).sum().backward()
+                optimizer.step()
+                optimizer.zero_grad()
+            config = CheckpointConfig(dir=ckpt_dir)
+            return (
+                model,
+                optimizer,
+                CheckpointManager(
+                    config, model, optimizer, process_group=stages[rank], pp_rank=rank
+                ),
+            )
+
+        model, optimizer, saver = manager(seed=rank, step=rank == 0)
+        saver.save(step=3)
+        resumed, resumed_optimizer, loader = manager(seed=rank + 2, step=False)
+        step, _, _ = loader.load()
+        assert step == 3
+        assert torch.equal(resumed.weight, model.weight)
+        if rank == 0:
+            _assert_same_state_dict(
+                optimizer.state_dict()["state"], resumed_optimizer.state_dict()["state"]
+            )
+        else:
+            assert not resumed_optimizer.state
+    finally:
+        dist.destroy_process_group()
+
 
 def _assert_same_state_dict(expected, actual, where="state_dict"):
     """Assert two optimizer ``state_dict()``s hold the same values, tensors bit for bit."""

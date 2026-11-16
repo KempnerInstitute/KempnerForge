@@ -500,6 +500,7 @@ def _fail_on_rank_one(rank, world, port, names, sizes, overrides, root) -> None:
         for what, target, attribute in (
             ("save", expert_layout_module.ExpertLayout, "to_global"),
             ("load", manager_module, "check_saved_experts"),
+            ("load", manager_module, "_restore_never_stepped"),
             ("load", manager_module, "_restore_left_out"),
         ):
             original = getattr(target, attribute)
@@ -660,8 +661,7 @@ class TestPlacementCheck:
 
 class TestFailureOnOneRank:
     def test_every_rank_raises_and_names_the_operation(self, tmp_path):
-        """One rank's failure raises on every rank: in a save, and in a load before DCP
-        runs and once it has loaded."""
+        """One rank's failure raises on every rank, in a save and before or after a load."""
         names, sizes, overrides = LAYOUTS["ep2_packed"]
         _spawn(_fail_on_rank_one, names, sizes, overrides, str(tmp_path))
 
