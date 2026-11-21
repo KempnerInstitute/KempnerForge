@@ -65,6 +65,10 @@ samples `VLMCollator` batches.
 - `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
   `points.py` writes the point answers.
 - `finevision.py`: FineVision subsets from their memory-mappable Arrow copy.
+- `datacomp.py`: DataComp-1B captions, streamed from its webdataset tar shards with
+  no index or conversion step (`DataCompStream`); `RenderedStream` renders a
+  stream the way `RenderedDataset` renders a reader, and `stream.py`'s
+  `StreamLoader` loads it so that a resume continues where training stopped.
 
 Every sample the renderer builds carries one image, resized square to `image_size`,
 with no tiling or packing. PixMo-Count stores its points in pixels; they are
@@ -91,6 +95,34 @@ uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.p
     --src path-to-FineVision --dst path-to-FineVision-arrow --procs 8
 uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py index \
     --src path-to-FineVision --dst path-to-FineVision-arrow
+```
+
+DataComp has no index, so its reader streams: the shards are listed once,
+reordered every epoch from the seed, and dealt out to data-parallel ranks and
+then to loader workers, without end. Each worker keeps `open_shards` of its
+shards open (4 by default) and takes every sample from one of them drawn at
+random, so a batch mixes several shards; each shard is still read front to back,
+with no buffer of samples to hold. A sample without a decodable image or a
+caption is passed over, as is the rest of a shard that stops being a readable
+tar, and a shard with no samples counts as one skip. `StreamLoader` records the
+position of every batch it hands out, so the stream's `state_dict` holds where
+training stopped, and a resume continues from the next sample with batches in
+the order they would have come, whichever way the loader workers are started. A
+resume must use the same seed, ranks, workers, `open_shards` and shard list.
+Pass the stream's `num_workers` to the loader too:
+
+```python
+stream = DataCompStream(
+    "/path/to/datacomp-1b/raw/webdataset",
+    prompt="Describe the image briefly.",
+    rank=dp_rank,
+    world_size=dp_size,
+    num_workers=4,
+    seed=seed,
+    open_shards=4,
+)
+rendered = RenderedStream(stream, renderer, seed=seed, rank=dp_rank)
+loader = StreamLoader(rendered, batch_size=16, num_workers=4)
 ```
 
 ## Tile images
