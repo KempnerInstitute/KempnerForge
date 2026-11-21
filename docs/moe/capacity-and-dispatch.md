@@ -32,10 +32,6 @@ At `capacity_factor = 1.0`, `capacity` is the average number of routes
 per expert, and at `1.25` it is 25% above that average, rounded up and
 at least 1 in both cases; an expert can get fewer. At `0.0` (default), there is no cap: every token goes to its
 top-`k` choices regardless of load.
-Today `_apply_capacity` applies `capacity` to each top-`k` slot on its
-own, so with `top_k > 1` an expert can keep up to `top_k` times that
-many routes
-([#587](https://github.com/KempnerInstitute/KempnerForge/issues/587)).
 
 ### Drop policy
 

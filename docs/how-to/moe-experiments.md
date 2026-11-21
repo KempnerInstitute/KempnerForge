@@ -129,7 +129,7 @@ Recovery options, in order of what to try first:
    on `moe_sequence_aux_loss_weight = 0.001` (sigmoid).
 2. **Set `moe_capacity_factor = 1.25`**: routes past an expert's
    capacity, 25% above the average per expert rounded up, go to the
-   residual; the cap applies per top-`k` slot today ([#587](https://github.com/KempnerInstitute/KempnerForge/issues/587)).
+   residual.
 3. **Enable `moe_gradient_scale = true`** — normalizes per-expert
    gradient magnitudes so cold experts aren't starved of learning
    signal.
@@ -196,10 +196,7 @@ compute or communication, with or without EP:
   count it gets, so a rank that many routes pick receives more rows.
 
 Leave it at `0.0` unless you want the drops themselves, e.g. to match
-a baseline trained with capacity. The cap applies to each top-`k` slot on
-its own today, so with `top_k = 2` an expert can keep up to twice the
-capacity
-([#587](https://github.com/KempnerInstitute/KempnerForge/issues/587)):
+a baseline trained with capacity:
 
 ```toml
 [model]
