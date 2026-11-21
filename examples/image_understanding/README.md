@@ -81,8 +81,12 @@ a cap of 3 keeps it.
 `FineVisionArrow` keeps only the rows with one image (`max_images`, which `None`
 lifts), using the per-row image counts `index.npz` stores; an index written
 without them takes the counts from `num_images`, and `text_only` keeps the rows
-without images. A conversation keeps its turns up to the first one missing its
-user message or reply, so a row whose first turn is incomplete is not kept.
+without images. Only an entry with image bytes counts as an image, so a blank
+entry, `{"bytes": None, "path": None}`, or a null one is neither counted nor read;
+for a subset converted before that, `index --recount-images` counts each file's
+images again from its Arrow file. A conversation keeps its turns up to the first
+one missing its user message or reply, so a row whose first turn is incomplete is
+not kept.
 
 Convert FineVision once; any number of `convert` processes can share the work,
 a file that fails to convert is listed at the end without stopping the others,
