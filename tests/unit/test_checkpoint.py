@@ -441,6 +441,38 @@ class TestAsyncCheckpointer:
         ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_2"))
         mock_future1.result.assert_called_once()
 
+    def test_async_pinned_mode_stages_with_pinned_memory_writer(self, monkeypatch, tmp_path):
+        """`async_with_pinned_mem` must stage through a pinned-memory writer.
+
+        With a plain ``dcp.async_save()`` the snapshot stages through unpinned
+        CPU memory, so the mode documented as "pinned-memory staging for a
+        faster GPU→CPU copy" behaved exactly like ``async``.
+        """
+        from unittest.mock import MagicMock
+
+        from torch.distributed.checkpoint.filesystem import FileSystemWriter
+
+        mock_async = MagicMock(return_value=MagicMock())
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", mock_async)
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_pinned)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        mock_async.assert_called_once()
+        writer = mock_async.call_args.kwargs["storage_writer"]
+        assert isinstance(writer, FileSystemWriter)
+        assert writer.cache_staged_state_dict is True
+        assert str(writer.path).endswith("step_1")
+
+    def test_async_mode_keeps_default_staging(self, monkeypatch, tmp_path):
+        """Plain ``async`` stages through DCP's default (unpinned) writer."""
+        from unittest.mock import MagicMock
+
+        mock_async = MagicMock(return_value=MagicMock())
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", mock_async)
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        mock_async.assert_called_once()
+        assert "storage_writer" not in mock_async.call_args.kwargs
+
 
 def _mock_dcp_load(monkeypatch):
     """Mock out ``dcp.load`` and the metadata read before it, for a checkpoint with an optimizer."""

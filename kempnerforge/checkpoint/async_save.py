@@ -6,8 +6,9 @@ in the background, returning control to the training loop immediately.
 Modes:
   - disabled: Synchronous save (the default; simple, for debugging).
   - async: Standard async via dcp.async_save().
-  - async_with_pinned_mem: The same dcp.async_save() call as async; no
-    pinned-memory staging is implemented.
+  - async_with_pinned_mem: async, with the snapshot staged into pinned host
+    memory (``FileSystemWriter(cache_staged_state_dict=True)``) for a faster
+    GPU→CPU copy.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from functools import partial
 from typing import Any
 
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.filesystem import FileSystemWriter
 from torch.distributed.checkpoint.planner import SavePlanner
 
 from kempnerforge.config.schema import AsyncCheckpointMode
@@ -66,6 +68,15 @@ class AsyncCheckpointer:
             logger.info(f"Sync checkpoint saved: {checkpoint_id}")
 
         elif self.mode in (AsyncCheckpointMode.async_, AsyncCheckpointMode.async_pinned):
+            if self.mode == AsyncCheckpointMode.async_pinned:
+                # Stage the snapshot into pinned host memory before the disk
+                # write: with ``cache_staged_state_dict=True`` the stager
+                # copies device tensors into pinned CPU memory, overlapping
+                # the device-to-host copy with the training step.
+                async_save = partial(
+                    async_save,
+                    storage_writer=FileSystemWriter(checkpoint_id, cache_staged_state_dict=True),
+                )
             self._pending_future = async_save(
                 state_dict,
                 checkpoint_id=checkpoint_id,
