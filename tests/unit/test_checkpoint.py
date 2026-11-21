@@ -573,6 +573,36 @@ class TestAsyncCheckpointer:
         ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_2"))
         assert len(made) == 2
 
+    @pytest.mark.parametrize(
+        ("version", "reuses"),
+        [("2.12.1", False), ("2.13.0a0", False), ("2.13.0", True), ("2.14.1+cu130", True)],
+    )
+    def test_the_stager_is_reused_from_torch_2_13(self, monkeypatch, version, reuses):
+        """Torch 2.13 is the first release whose stager serves more than one save; a 2.13
+        pre-release still gets a stager per save."""
+        from torch.torch_version import TorchVersion
+
+        from kempnerforge.checkpoint import async_save
+
+        monkeypatch.setattr(async_save.torch, "__version__", TorchVersion(version))
+        assert async_save._reuses_stager() is reuses
+
+    @pytest.mark.parametrize("mode", [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_])
+    def test_close_without_a_stager_only_waits(self, monkeypatch, tmp_path, mode):
+        """A checkpointer that never staged into pinned memory has nothing to release."""
+        from unittest.mock import MagicMock
+
+        future = MagicMock()
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.dcp.async_save", MagicMock(return_value=future)
+        )
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.save", MagicMock())
+        ckpt = AsyncCheckpointer(mode=mode)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        ckpt.close()
+        assert future.result.call_count == (mode == AsyncCheckpointMode.async_)
+        assert not ckpt.is_pending
+
     def test_a_collected_checkpointer_closes_its_reused_stager(self, monkeypatch, tmp_path):
         """Dropping the checkpointer releases the pinned copies without an explicit close."""
         import gc
