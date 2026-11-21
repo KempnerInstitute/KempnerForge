@@ -25,8 +25,21 @@ File:
 - `n_kv_heads` defaults to `n_heads` if left `None` (MHA).
 - `dim`, `n_layers`, `n_heads`, `vocab_size`, `n_kv_heads` must all be
   positive.
-- `dim % n_heads == 0` (head dim is integral).
+- `head_dim_override` must be non-negative and even; `0` infers the head
+  dim as `dim // n_heads`.
+- With `head_dim_override = 0`, `dim % n_heads == 0` (head dim is
+  integral) and `dim // n_heads` must be even, since rotary embeddings
+  rotate pairs of dimensions. An odd quotient fails when the config is
+  built rather than at model build; set an even `head_dim_override` to
+  keep that `dim` and `n_heads`.
 - `n_heads % n_kv_heads == 0` (GQA replication factor is integral).
+- `activation` is not one of core's `mlp` keys (`swiglu`,
+  `standard_gelu`, `standard_relu`); the error names the activation
+  that selects it (`silu`, `gelu`, `relu`).
+- With `num_experts > 0`, `activation` is `silu`, `gelu` or `relu`: a
+  plugin's registered MLP is rejected, since the MoE expert kernels
+  (grouped GEMM, packed experts) compute core's SwiGLU or standard MLP
+  from the expert weights.
 - `sdpa_backend ∈ {"auto", "flash", "efficient", "cudnn", "math"}`.
 - `attention_backend ∈ {"sdpa", "flex"}`.
 - `attention_backend = "flex"` requires `dim // n_heads ≥ 16` (below that the

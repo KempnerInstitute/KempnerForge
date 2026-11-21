@@ -205,6 +205,7 @@
           "methods": [
             "__post_init__()",
             "residual_stream_image_tokens() -> int",
+            "declared_arch() -> str",
             "for_arch(arch, **kwargs) -> VLMConfig"
           ]
         },
@@ -229,8 +230,7 @@
         }
       },
       "globals": [
-        "DEFAULT_MODULE_PATTERNS",
-        "_RESERVED_ARCHS"
+        "DEFAULT_MODULE_PATTERNS"
       ],
       "registry": [
         "@registry.register_vlm_config('joint_decoder')",
