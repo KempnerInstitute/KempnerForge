@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import importlib.util
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -9,6 +13,8 @@ from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.attention import KVCache
 from kempnerforge.model.generate import generate, sample
 from kempnerforge.model.transformer import Transformer
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def _tiny_config() -> ModelConfig:
@@ -264,3 +270,48 @@ class TestGenerate:
             assert (f"include_{name}=True" in message) == (name in omitted)
         assert allocated == []
         assert model.training
+
+
+def _generate_script():
+    """``scripts/generate.py`` as a module, so ``main`` can run with the model load replaced."""
+    spec = importlib.util.spec_from_file_location(
+        "kempnerforge_generate_script", ROOT / "scripts" / "generate.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _Loaded(Exception):
+    """Stops ``main`` at the model load."""
+
+
+class TestGenerateScriptOverrides:
+    def test_an_override_reaches_the_config(self, monkeypatch):
+        """argparse leaves --section.key=value for load_config."""
+        script = _generate_script()
+        seen = []
+
+        def _load_model(config, device, dtype):
+            seen.append(config.checkpoint.load_path)
+            raise _Loaded
+
+        monkeypatch.setattr(script, "_load_model", _load_model)
+        config = str(ROOT / "configs" / "train" / "debug.toml")
+        argv = ["generate.py", config, "--checkpoint.load_path=/ckpt", "--prompt", "Hi"]
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(_Loaded):
+            script.main()
+        assert seen == ["/ckpt"]
+
+    def test_a_space_separated_override_is_refused_before_the_model_loads(self, monkeypatch):
+        """argparse also leaves the value after an unknown key, and load_config refuses the
+        pair instead of loading the key as true."""
+        script = _generate_script()
+        monkeypatch.setattr(script, "_load_model", lambda *args: pytest.fail("model loaded"))
+        config = str(ROOT / "configs" / "train" / "debug.toml")
+        argv = ["generate.py", config, "--checkpoint.load_path", "/ckpt", "--prompt", "Hi"]
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(ValueError, match="write --checkpoint.load_path=/ckpt$"):
+            script.main()
