@@ -112,9 +112,9 @@ checkpoint loads into an EP run. Packed experts under FSDP need torch
   and the result has no optimizer state or `train_state.pt`, so the
   run starts at step 0. A change that also resizes an existing tensor,
   such as more experts (the router grows) or a larger vocabulary, fails
-  in `hf-to-dcp` with a size mismatch. An MoE model that Mixtral cannot
-  hold needs `--no-mixtral-check` on `dcp-to-hf` (see
-  [HF conversion § MoE](hf-conversion.md#moe)).
+  in `hf-to-dcp` with a size mismatch. A model that Llama or Mixtral
+  cannot hold needs `--no-architecture-check` on `dcp-to-hf` (see
+  [HF conversion](hf-conversion.md#what-transformers-can-load)).
 - **Extra parameter**: the saver wrote a tensor the loader doesn't
   want (you removed a module). DCP ignores the extra shard —
   silently, so watch the checkpoint size rather than relying on

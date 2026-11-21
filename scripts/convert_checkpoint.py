@@ -175,14 +175,15 @@ def dcp_to_hf(
     hf_dir: str,
     model_config: ModelConfig,
     dtype: torch.dtype = torch.bfloat16,
-    check_mixtral: bool = True,
+    check_architecture: bool = True,
 ) -> None:
     """Convert a DCP checkpoint to HuggingFace safetensors format.
 
     Handles both standard and pipeline-parallel checkpoints (pp0/, pp1/, ...).
-    An MoE model is written as a Mixtral checkpoint, with packed experts split into
-    one tensor per expert; one that Mixtral cannot hold is refused before anything is
-    read or written, unless ``check_mixtral`` is False (see ``_build_hf_config``).
+    A dense model is written as a Llama checkpoint and an MoE model as a Mixtral
+    checkpoint, with packed experts split into one tensor per expert; a model that
+    its architecture cannot hold is refused before anything is read or written,
+    unless ``check_architecture`` is False (see ``_build_hf_config``).
     A tensor that still shares storage with one already written after the cast,
     such as a tied output head at float32, is written as a copy, since
     safetensors refuses tensors that share memory. A checkpoint saved with
@@ -196,11 +197,11 @@ def dcp_to_hf(
         model_config: Model configuration for building the model skeleton.
         dtype: Export dtype (default: bfloat16), recorded as ``torch_dtype`` in
             the written ``config.json``.
-        check_mixtral: Refuse an MoE model that Mixtral cannot hold. False exports it
-            for ``hf_to_dcp`` to read back, with a warning, since transformers would
-            load it with those parts dropped or left random.
+        check_architecture: Refuse a model that Llama (dense) or Mixtral (MoE) cannot
+            hold. False exports it for ``hf_to_dcp`` to read back, with a warning, since
+            transformers would load it with those parts dropped or left random.
     """
-    hf_config = _build_hf_config(model_config, dtype, check_mixtral=check_mixtral)
+    hf_config = _build_hf_config(model_config, dtype, check_architecture=check_architecture)
     dcp_path = Path(dcp_dir)
     logger.info(f"Loading DCP checkpoint from {dcp_dir}")
 
@@ -333,47 +334,52 @@ def _load_hf_hub(model_id: str) -> dict[str, torch.Tensor]:
     return hf_model.state_dict()
 
 
-def _mixtral_problems(config: ModelConfig) -> list[str]:
-    """Each setting of an MoE model that a Mixtral checkpoint cannot hold.
+def _architecture_problems(config: ModelConfig) -> list[str]:
+    """Each setting of a model that the architecture it exports as cannot hold.
 
-    transformers builds every MoE export as Mixtral: softmax top-k routing to SwiGLU
-    experts in every layer, with no shared experts, RMSNorm, and no query or key norm.
-    Weights of any other part would be dropped or left at their random init.
+    transformers builds a dense export as Llama and an MoE export as Mixtral: both have
+    SwiGLU MLPs or experts, RMSNorm and no query or key norm, and Mixtral routes with
+    softmax top-k in every layer, with no shared experts. Weights of any other part
+    would be dropped or left at their random init.
     """
+    arch = "Mixtral" if config.is_moe else "Llama"
     problems = []
-    if config.moe_shared_experts > 0:
+    if config.is_moe and config.moe_shared_experts > 0:
         problems.append(f"moe_shared_experts={config.moe_shared_experts}: Mixtral has none")
-    if config.moe_frequency > 1:
+    if config.is_moe and config.moe_frequency > 1:
         problems.append(
             f"moe_frequency={config.moe_frequency}: every Mixtral layer is an MoE layer"
         )
-    if config.moe_router != "softmax_topk":
+    if config.is_moe and config.moe_router != "softmax_topk":
         problems.append(f"moe_router={config.moe_router!r}: Mixtral routes with softmax top-k")
     if config.activation != Activation.silu:
-        problems.append(f"activation={str(config.activation)!r}: Mixtral experts are SwiGLU")
+        mlps = "experts" if config.is_moe else "MLPs"
+        problems.append(f"activation={str(config.activation)!r}: {arch} {mlps} are SwiGLU")
     if config.norm_type != NormType.rmsnorm:
-        problems.append(f"norm_type={str(config.norm_type)!r}: Mixtral norms are RMSNorm")
+        problems.append(f"norm_type={str(config.norm_type)!r}: {arch} norms are RMSNorm")
     if config.qk_norm:
-        problems.append("qk_norm=True: Mixtral has no query or key norm")
+        problems.append(f"qk_norm=True: {arch} has no query or key norm")
     return problems
 
 
 def _build_hf_config(
-    config: ModelConfig, dtype: torch.dtype = torch.bfloat16, check_mixtral: bool = True
+    config: ModelConfig, dtype: torch.dtype = torch.bfloat16, check_architecture: bool = True
 ) -> dict:
     """Build a HuggingFace-compatible config.json from ModelConfig.
 
     ``torch_dtype`` names ``dtype``, the dtype the weights are written in, so
-    ``from_pretrained(..., dtype="auto")`` loads them at that precision. An MoE model
-    becomes a Mixtral config, whose ``intermediate_size`` is the expert width. With
-    ``check_mixtral`` False, an MoE model that Mixtral cannot hold gets one too, and a
-    warning that names what transformers would drop.
+    ``from_pretrained(..., dtype="auto")`` loads them at that precision. A dense model
+    becomes a Llama config and an MoE model a Mixtral config, whose
+    ``intermediate_size`` is the expert width. With ``check_architecture`` False, a
+    model that its architecture cannot hold gets one too, and a warning that names
+    what transformers would drop.
 
     Raises:
-        ValueError: ``dim`` is not divisible by ``n_heads``, or, with ``check_mixtral``,
-            an MoE model has what a Mixtral model lacks: shared experts, dense layers
-            between its MoE layers, a router other than softmax top-k, experts that are
-            not SwiGLU, LayerNorm, or a query and key norm.
+        ValueError: ``dim`` is not divisible by ``n_heads``, or, with
+            ``check_architecture``, the model has what its architecture lacks: MLPs or
+            experts that are not SwiGLU, LayerNorm, or a query and key norm, and for an
+            MoE model shared experts, dense layers between its MoE layers, or a router
+            other than softmax top-k.
     """
     if config.dim % config.n_heads != 0:
         raise ValueError(
@@ -395,19 +401,19 @@ def _build_hf_config(
         "torch_dtype": str(dtype).removeprefix("torch."),
     }
 
+    arch = "Mixtral" if config.is_moe else "Llama"
+    problems = "; ".join(_architecture_problems(config))
+    if problems and check_architecture:
+        raise ValueError(
+            f"Cannot export this model as {arch}: {problems}. To export it for hf-to-dcp "
+            "alone, pass --no-architecture-check (check_architecture=False)."
+        )
+    if problems:
+        logger.warning(
+            f"Exporting a model that {arch} cannot hold ({problems}): transformers would "
+            "load it with those parts dropped or left random, so read it only with hf-to-dcp"
+        )
     if config.is_moe:
-        problems = "; ".join(_mixtral_problems(config))
-        if problems and check_mixtral:
-            raise ValueError(
-                f"Cannot export this MoE model as Mixtral: {problems}. To export it for "
-                "hf-to-dcp alone, pass --no-mixtral-check (check_mixtral=False)."
-            )
-        if problems:
-            logger.warning(
-                f"Exporting an MoE model that Mixtral cannot hold ({problems}): "
-                "transformers would load it with those parts dropped or left random, "
-                "so read it only with hf-to-dcp"
-            )
         if config.moe_capacity_factor > 0:
             logger.warning(
                 f"moe_capacity_factor={config.moe_capacity_factor}: transformers has no expert "
@@ -445,11 +451,11 @@ def main() -> None:
         "(default: that field, which is bfloat16 unless the TOML sets it)",
     )
     p_export.add_argument(
-        "--no-mixtral-check",
-        dest="check_mixtral",
+        "--no-architecture-check",
+        dest="check_architecture",
         action="store_false",
-        help="Export an MoE model that Mixtral cannot hold, for hf-to-dcp to read back; "
-        "transformers would load it with those parts dropped or left random",
+        help="Export a model that Llama (dense) or Mixtral (MoE) cannot hold, for hf-to-dcp "
+        "to read back; transformers would load it with those parts dropped or left random",
     )
 
     p_import = subparsers.add_parser("hf-to-dcp", help="Import HuggingFace weights to DCP")
@@ -477,7 +483,7 @@ def main() -> None:
             hf_dir=args.hf_dir,
             model_config=config.model,
             dtype=dtype_map[export_dtype],
-            check_mixtral=args.check_mixtral,
+            check_architecture=args.check_architecture,
         )
     elif args.command == "hf-to-dcp":
         hf_to_dcp(

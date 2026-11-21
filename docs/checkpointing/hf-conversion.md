@@ -48,6 +48,18 @@ and `lm_head.weight`, the head as a copy of the embedding, since safetensors
 refuses tensors that share memory. `config.json` sets `tie_word_embeddings`,
 so transformers ties the two again when it loads the export.
 
+### What transformers can load
+
+transformers builds a dense export as `LlamaForCausalLM` and an MoE export
+as `MixtralForCausalLM`. Both have SwiGLU MLPs or experts and RMSNorm, and
+neither has a query or key norm, so `dcp-to-hf` refuses, before it reads the
+checkpoint, a model with an `activation` other than `"silu"`,
+`norm_type = "layernorm"` or `qk_norm = true`, and an MoE model with what
+Mixtral lacks (see [MoE](#moe)). It names each setting; transformers would
+load such an export with those parts dropped or left random.
+`--no-architecture-check` exports such a model anyway, with a warning, for
+`hf-to-dcp` to read back (see [Resharding](resharding.md)).
+
 ### MoE
 
 An MoE model exports as `MixtralForCausalLM`, under the names a Mixtral
@@ -55,15 +67,10 @@ checkpoint uses (see [Key mapping](#key-mapping)); transformers 5 packs each
 layer's experts when it loads them. Packed experts (`moe_packed_experts`) are
 written as one tensor per expert, like unpacked ones.
 
-A Mixtral model routes with softmax top-k to SwiGLU experts in every layer,
-normalizes with RMSNorm, and has no shared experts and no query or key norm.
-`dcp-to-hf` refuses, before it reads the checkpoint, a model with
-`moe_shared_experts > 0`, `moe_frequency > 1`, a `moe_router` other than
-`"softmax_topk"`, an `activation` other than `"silu"`,
-`norm_type = "layernorm"` or `qk_norm = true`, and names each one;
-transformers would load such an export with those parts dropped or left
-random. `--no-mixtral-check` exports such a model anyway, with a warning,
-for `hf-to-dcp` to read back (see [Resharding](resharding.md)).
+A Mixtral model routes with softmax top-k in every layer and has no shared
+experts, so besides the settings above `dcp-to-hf` refuses an MoE model with
+`moe_shared_experts > 0`, `moe_frequency > 1` or a `moe_router` other than
+`"softmax_topk"` (see [What transformers can load](#what-transformers-can-load)).
 
 transformers has no expert capacity: the export of a model with
 `moe_capacity_factor > 0` drops no tokens, where KempnerForge drops those
@@ -96,9 +103,9 @@ KempnerForge's at the same precision, enough to change some predicted
 tokens: it rounds the normalized activations before scaling them by the
 norm weight, where KempnerForge scales first, and Mixtral's router takes
 its softmax in float32, so a token whose top experts nearly tie can route
-to another one. A float32 export of an MoE model that passes the Mixtral
-check gives the same logits while no token passes an expert's capacity (see
-[MoE](#moe)).
+to another one. A float32 export of an MoE model that passes the
+architecture check gives the same logits while no token passes an expert's
+capacity (see [MoE](#moe)).
 
 No optimizer / scheduler / RNG — only weights. If you need those,
 keep the DCP checkpoint; HF format doesn't carry them.
@@ -199,7 +206,7 @@ experts. From a hub ID it reads a loaded model, whose experts transformers
 splits them. For a model with packed experts it stacks each layer's experts
 into `gate_w`, `up_w` and `down_w`. Mixtral has no expert bias or shared
 experts: `dcp-to-hf` refuses models with them unless given
-`--no-mixtral-check` (see [MoE](#moe)), and then writes them as
+`--no-architecture-check` (see [MoE](#moe)), and then writes them as
 `model.layers.{i}.mlp.expert_bias` and `model.layers.{i}.mlp.shared_experts.*`,
 which `hf-to-dcp` reads back.
 

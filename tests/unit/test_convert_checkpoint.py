@@ -713,7 +713,7 @@ class TestMixtralExport:
                 str(tmp_path / "hf"),
                 config,
                 dtype=torch.float32,
-                check_mixtral=False,
+                check_architecture=False,
             )
         assert "moe_shared_experts=1: Mixtral has none" in caplog.text
         assert "read it only with hf-to-dcp" in caplog.text
@@ -728,8 +728,54 @@ class TestMixtralExport:
         argv = ["convert_checkpoint.py", "dcp-to-hf", "--config", str(toml)]
         argv += ["--dcp-dir", str(tmp_path / "dcp"), "--hf-dir", str(tmp_path / "hf")]
         monkeypatch.setattr(sys, "argv", argv)
-        with pytest.raises(ValueError, match="pass --no-mixtral-check"):
+        with pytest.raises(ValueError, match="pass --no-architecture-check"):
             main()
-        monkeypatch.setattr(sys, "argv", [*argv, "--no-mixtral-check"])
+        monkeypatch.setattr(sys, "argv", [*argv, "--no-architecture-check"])
         main()
         assert (tmp_path / "hf" / "model.safetensors").exists()
+
+
+class TestLlamaExport:
+    """A dense model exports as Llama, and one that Llama cannot hold is refused."""
+
+    @pytest.mark.parametrize(
+        "overrides,named",
+        [
+            ({"qk_norm": True}, "qk_norm=True: Llama has no query or key norm"),
+            ({"norm_type": "layernorm"}, "norm_type='layernorm': Llama norms are RMSNorm"),
+            ({"activation": "gelu"}, "activation='gelu': Llama MLPs are SwiGLU"),
+            ({"activation": "relu"}, "activation='relu': Llama MLPs are SwiGLU"),
+        ],
+    )
+    def test_refuses_what_llama_cannot_hold_before_reading(
+        self, tmp_path, tiny_model_config, overrides, named
+    ):
+        """The refusal names the setting before the checkpoint is read, here one that does
+        not exist, or anything is written."""
+        config = replace(tiny_model_config, **overrides)
+        with pytest.raises(
+            ValueError, match="Cannot export this model as Llama: " + re.escape(named)
+        ):
+            dcp_to_hf(str(tmp_path / "missing"), str(tmp_path / "hf"), config)
+        assert not (tmp_path / "hf").exists()
+
+    def test_without_the_check_a_dense_model_exports_for_hf_to_dcp(
+        self, tmp_path, tiny_model_config, caplog
+    ):
+        """A model with a query and key norm and LayerNorm exports with a warning, and
+        hf-to-dcp reads every weight back."""
+        config = replace(tiny_model_config, qk_norm=True, norm_type="layernorm")
+        source = _random_dcp(tmp_path / "dcp", config)
+        with caplog.at_level(logging.WARNING, logger="convert_checkpoint"):
+            dcp_to_hf(
+                str(tmp_path / "dcp"),
+                str(tmp_path / "hf"),
+                config,
+                dtype=torch.float32,
+                check_architecture=False,
+            )
+        assert "Exporting a model that Llama cannot hold" in caplog.text
+        assert "qk_norm=True: Llama has no query or key norm" in caplog.text
+        back = _read_back(tmp_path / "hf", tmp_path / "back", config)
+        for name, tensor in source.state_dict().items():
+            assert torch.equal(back[name], tensor), name

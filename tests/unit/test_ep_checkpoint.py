@@ -688,11 +688,13 @@ class TestExportFromAnEPCheckpoint:
     def test_dcp_to_hf_exports_every_expert(self, saved_layout, layout, tmp_path):
         """Every expert of every layer reaches the export with its rank's weights, under the
         names and layout the export writes. The gelu layout is not a model Mixtral holds,
-        so the Mixtral check is off."""
+        so the architecture check is off."""
         root = saved_layout(layout)
         config = _config(LAYOUTS[layout][2])
         hf_dir = str(tmp_path / "hf")
-        dcp_to_hf(str(_step_dir(root)), hf_dir, config, dtype=torch.float32, check_mixtral=False)
+        dcp_to_hf(
+            str(_step_dir(root)), hf_dir, config, dtype=torch.float32, check_architecture=False
+        )
         exported = load_file(tmp_path / "hf" / "model.safetensors")
         reference = torch.load(root / "reference.pt")
         experts = {k: v for k, v in reference.items() if _is_expert(k) and not k.endswith(MOMENTS)}
