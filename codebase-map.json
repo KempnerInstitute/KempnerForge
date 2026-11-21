@@ -195,7 +195,7 @@
       "purpose": "VLM (vision-language model) configuration. Discriminated union over `arch`: joint_decoder | cross_attention | mot. Each subclass registered via @registry.register_vlm_config",
       "classes": {
         "FreezeSpec": {
-          "purpose": "Single freeze directive (module alias or fnmatch pattern, frozen flag). Consumed by training/freeze.py"
+          "purpose": "Single freeze directive (module alias or fnmatch pattern, frozen flag; a pattern holds a dot or one of *?[, see is_parameter_pattern, and VLMConfig refuses a bare word that is no alias). Consumed by training/freeze.py"
         },
         "FreezeStage": {
           "purpose": "Step-boundary freeze transition (start_step + tuple of FreezeSpecs). Strictly monotonic in start_step"
@@ -228,6 +228,9 @@
           ]
         }
       },
+      "functions": [
+        "is_parameter_pattern(module) -> bool"
+      ],
       "globals": [
         "DEFAULT_MODULE_PATTERNS",
         "_RESERVED_ARCHS"
@@ -243,7 +246,8 @@
         "tests/unit/test_vlm_config.py::TestCrossAttentionResolvedHeads",
         "tests/unit/test_vlm_config.py::TestMoTConfig",
         "tests/unit/test_vlm_config.py::TestModalityStrategyRegistry",
-        "tests/unit/test_vlm_config.py::TestModelConfigWithVLM"
+        "tests/unit/test_vlm_config.py::TestModelConfigWithVLM",
+        "tests/unit/test_freeze.py::TestFreezeNames"
       ]
     },
     "kempnerforge/config/loader.py": {
@@ -801,17 +805,22 @@
     "kempnerforge/training/freeze.py": {
       "purpose": "Freeze utilities: resolve module aliases / fnmatch patterns to parameter names, flip requires_grad, build canonical metadata for checkpoint validation, compute effective freeze at a given step from base specs + a freeze_schedule with start_step boundaries",
       "functions": [
-        "freeze_params(model, specs, module_patterns) -> dict",
+        "freeze_params(model, patterns, *, frozen=True) -> int (elements flipped)",
         "apply_freeze_specs(model, specs, module_patterns) -> dict",
         "canonical_freeze_meta(specs) -> list[dict]",
         "effective_freeze(step, base_specs, schedule, valid_modules) -> list[FreezeSpec]",
-        "freeze_meta_at_step(step, config) -> list[dict]"
+        "freeze_meta_at_step(step, config) -> list[dict]",
+        "unmatched_patterns(model, specs, pattern_map) -> list[str]"
       ],
       "tested_by": [
         "tests/unit/test_freeze.py::TestFreezeParams",
         "tests/unit/test_freeze.py::TestApplyFreezeSpecs",
         "tests/unit/test_freeze.py::TestCanonicalFreezeMeta",
         "tests/unit/test_freeze.py::TestEffectiveFreeze",
+        "tests/unit/test_freeze.py::TestFreezeNames",
+        "tests/unit/test_freeze.py::TestResumedFreezeOrder",
+        "tests/unit/test_freeze.py::TestUnmatchedPatterns",
+        "tests/unit/test_freeze.py::TestBuildRefusesUnmatchedPatterns",
         "tests/integration/test_vlm_cross_attn.py::TestFreezeStageHook",
         "tests/integration/test_vlm_mot.py::TestFreezeStageHook",
         "tests/distributed/test_vlm_cross_attn_fsdp.py::TestFreezeStageUnderFsdp",
@@ -1913,9 +1922,13 @@
           "TestFreezeParams(6)",
           "TestApplyFreezeSpecs(3)",
           "TestCanonicalFreezeMeta(4)",
-          "TestEffectiveFreeze(7)"
+          "TestEffectiveFreeze(7)",
+          "TestFreezeNames(12)",
+          "TestResumedFreezeOrder(3)",
+          "TestUnmatchedPatterns(2)",
+          "TestBuildRefusesUnmatchedPatterns(3)"
         ],
-        "count": 20
+        "count": 40
       },
       "tests/unit/test_check_env.py": {
         "classes": [

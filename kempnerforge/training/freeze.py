@@ -32,7 +32,7 @@ from collections.abc import Iterable, Mapping
 
 import torch.nn as nn
 
-from kempnerforge.config.vlm import FreezeSpec, FreezeStage, VLMConfig
+from kempnerforge.config.vlm import FreezeSpec, FreezeStage, VLMConfig, is_parameter_pattern
 
 
 def freeze_params(
@@ -106,27 +106,50 @@ def effective_freeze(
       ascending ``start_step`` order, override ``base`` entries on
       conflicting ``module`` keys (last-write-wins). Stages with
       ``start_step > step`` are ignored.
+    - A key moves to the end of the list each time it is written, so
+      the specs come in the order of their last write. Applied in that
+      order, they leave each parameter as applying ``base`` and every
+      stage up to ``step`` one after another does, also when keys
+      select overlapping parameters.
 
     Module-key validation:
 
     - When ``valid_modules`` is provided, every ``spec.module``
       referenced in ``base`` or in any applied stage must appear in
-      the set; otherwise ``ValueError``. This catches typos at load
-      time rather than at the next step boundary.
+      the set or be a parameter pattern (see ``is_parameter_pattern``),
+      as the build accepts; otherwise ``ValueError``. This catches typos
+      at load time rather than at the next step boundary.
 
-    Returns the list of active specs (one per module key).
+    Args:
+        step: The step the freeze is wanted at.
+        base: The build-time freeze list.
+        schedule: The freeze stages, in any order.
+        valid_modules: The module aliases a ``spec.module`` may name besides a parameter
+            pattern, or ``None`` to skip the check.
+
+    Returns:
+        The active specs, one per module key, in the order of their last write.
+
+    Raises:
+        ValueError: A spec names neither a module of ``valid_modules`` nor a parameter
+            pattern.
     """
     by_module: dict[str, FreezeSpec] = {}
 
     def _check(spec: FreezeSpec, where: str) -> None:
-        if valid_modules is not None and spec.module not in valid_modules:
-            raise ValueError(
-                f"FreezeSpec.module={spec.module!r} (from {where}) "
-                f"not in known module aliases {sorted(valid_modules)}"
-            )
+        if valid_modules is None or spec.module in valid_modules:
+            return
+        if is_parameter_pattern(spec.module):
+            return
+        raise ValueError(
+            f"FreezeSpec.module={spec.module!r} (from {where}) is neither a known module "
+            f"alias {sorted(valid_modules)} nor a parameter pattern, which holds a dot or "
+            "one of *?["
+        )
 
     for spec in base:
         _check(spec, "base")
+        by_module.pop(spec.module, None)
         by_module[spec.module] = spec
 
     for stage in sorted(schedule, key=lambda s: s.start_step):
@@ -134,9 +157,40 @@ def effective_freeze(
             break
         for spec in stage.specs:
             _check(spec, f"FreezeStage(start_step={stage.start_step})")
+            by_module.pop(spec.module, None)
             by_module[spec.module] = spec
 
     return list(by_module.values())
+
+
+def unmatched_patterns(
+    model: nn.Module,
+    specs: Iterable[FreezeSpec],
+    pattern_map: Mapping[str, list[str]],
+) -> list[str]:
+    """Return the parameter patterns among ``specs`` that match no parameter of ``model``.
+
+    A spec whose ``module`` is a key of ``pattern_map`` is an alias and is not checked,
+    since an alias such as ``vision_encoder`` can name a module without parameters.
+    Names are matched as ``freeze_params`` matches them.
+
+    Args:
+        model: The model the specs apply to.
+        specs: The freeze specs to check.
+        pattern_map: The module aliases and their patterns.
+
+    Returns:
+        The patterns, sorted and without repeats, that freeze or unfreeze nothing.
+    """
+    names = [name for name, _ in getattr(model, "_orig_mod", model).named_parameters()]
+    return sorted(
+        {
+            spec.module
+            for spec in specs
+            if spec.module not in pattern_map
+            and not any(fnmatch.fnmatch(name, spec.module) for name in names)
+        }
+    )
 
 
 def freeze_meta_at_step(step: int, config: VLMConfig) -> list[dict[str, object]]:
