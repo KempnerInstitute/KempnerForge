@@ -721,11 +721,10 @@
           ]
         },
         "ScheduleFreeAdamW": {
-          "purpose": "Schedule-Free AdamW (Defazio & Mishchenko 2024), eliminates LR schedule via iterate averaging",
+          "purpose": "Schedule-Free AdamW (Defazio & Mishchenko 2024), eliminates LR schedule via iterate averaging; each parameter's step count lives in its optimizer state",
           "methods": [
             "step(closure)",
-            "state_dict()",
-            "load_state_dict(state_dict)",
+            "load_state_dict(state_dict) (maps a legacy optimizer-wide _k onto each parameter's step)",
             "eval_params()",
             "train_params()"
           ]
@@ -741,6 +740,7 @@
       },
       "functions": [
         "build_optimizer(model, config, module_patterns=None) -> Optimizer",
+        "evaluation_point(optimizer, model=None) -> context manager (eval_params() inside, train_params() after; reshards the model's FSDP2 units around the swap)",
         "module_learning_rates(optimizer) -> dict[str, float] (keyed lr/<module>, lr_adamw/<module>)",
         "_split_by_module(model, param_groups, config, module_patterns) -> list[dict]",
         "_module_owners(model, modules, module_patterns) -> (owners, enclosing) (over every parameter name; a parameter several listed modules match goes to the one whose matches the others strictly contain; identical or partly overlapping matches are refused)",
@@ -918,6 +918,7 @@
         "checkpoint_extra(config, step, phases) -> dict"
       ],
       "tested_by": [
+        "tests/unit/test_train_entry.py::TestLoopPeriodicWork",
         "tests/unit/test_train_entry.py::TestRunTrainingLoop",
         "tests/unit/test_train_entry.py::TestBatchStream",
         "tests/unit/test_train_entry.py::TestMoEMetrics",
@@ -1275,6 +1276,8 @@
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
         "tests/unit/test_ep_checkpoint.py",
         "tests/unit/test_checkpoint.py::TestCheckpointManagerLoad",
+        "tests/unit/test_checkpoint.py::TestScheduleFreeCheckpoint",
+        "tests/unit/test_schedule_free_fsdp.py::TestScheduleFreeUnderFsdp2",
         "tests/distributed/test_checkpoint.py"
       ]
     },
@@ -1817,11 +1820,11 @@
       "tests/unit/test_additional_optimizers.py": {
         "classes": [
           "TestLion(10)",
-          "TestScheduleFreeAdamW(9)",
+          "TestScheduleFreeAdamW(21)",
           "TestNoneScheduler(3)",
           "TestOptimizerConfig(3)"
         ],
-        "count": 25
+        "count": 37
       },
       "tests/unit/test_scheduler_extensions.py": {
         "classes": [
