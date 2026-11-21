@@ -189,16 +189,28 @@ wraps DCP's `save` / `async_save` behind a mode flag:
 |--------|----------|-----|
 | `async_mode = "disabled"` (the default) | `dcp.save()`, blocking | Simple, debugging, small models |
 | `async_mode = "async"` | `dcp.async_save()`: snapshots to CPU, writes in the background | Runs where the save stall matters |
-| `async_mode = "async_with_pinned_mem"` | The same `dcp.async_save()` call as `"async"`; no pinned-memory staging is implemented | Nothing beyond `"async"` today |
+| `async_mode = "async_with_pinned_mem"` | Like `"async"`, with the snapshot copied into pinned CPU memory by a reused `DefaultStager`; saves as `"async"` without a CUDA device | Large states, where the copy to CPU dominates the save stall |
 
 Every `save()` call first does `self.wait()` — the previous async
 save must fully complete before starting a new one. This avoids
 holding two CPU snapshots at once and avoids racing on the same
 directory.
 
-The returned future is an `AsyncCheckpointerFuture`; `wait()` calls
-`.result()` which blocks until the background writer has flushed to
-disk. Training calls `ckpt_mgr.wait()` once before shutdown
+With `"async_with_pinned_mem"`, the first save allocates and pins a CPU
+copy of the rank's state. Later saves refill the copy of every tensor whose
+storage is unchanged, as for parameters and optimizer state updated in
+place, and pin a new copy only for new storage, so about the size of each
+rank's model and optimizer state stays pinned until the checkpointer is
+closed or collected. On torch 2.12 the stager cannot be reused, so each
+save pins a new copy. The copy itself is synchronous: `save()` returns once
+the snapshot is in CPU memory, and planning, serialization and the write
+run in the background. Timed around `CheckpointManager.save()` with torch
+2.14.1, FSDP2 over 4 H200s and 4 GB of model and optimizer state per rank,
+the slowest rank stalled for 0.67 s on the first pinned save and 0.13 to
+0.18 s on later ones, against about 0.6 s for `"async"`.
+
+`dcp.async_save()` returns a future, and `wait()` calls its `.result()`,
+which blocks until the background writer has flushed to disk. Training calls `ckpt_mgr.wait()` once before shutdown
 (`training/loop.py::run_training_loop`) to flush any pending save.
 
 ## Process groups

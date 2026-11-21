@@ -85,7 +85,8 @@ those records. When a logging backend has a live run at save time it also holds 
   maintenance, retention cleanup.
 - [`kempnerforge/checkpoint/async_save.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/async_save.py)
   — `AsyncCheckpointer`: the sync and async save modes
-  (`async_with_pinned_mem` runs the same call as `async`).
+  (`async_with_pinned_mem` stages the snapshot in pinned CPU memory where a CUDA
+  device is available).
 - [`kempnerforge/checkpoint/state.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/state.py)
   — `build_train_state` / `restore_train_state`, RNG capture.
 - [`kempnerforge/resilience/elastic.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)
