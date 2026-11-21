@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -11,11 +12,19 @@ from pathlib import Path
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from convert_checkpoint import _build_hf_config, _hf_to_kf_key, _kf_to_hf_key, dcp_to_hf, main
+import convert_checkpoint
+from convert_checkpoint import (
+    _build_hf_config,
+    _hf_to_kf_key,
+    _kf_to_hf_key,
+    dcp_to_hf,
+    hf_to_dcp,
+    main,
+)
 
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import ModelConfig
@@ -126,23 +135,27 @@ class TestRoundTrip:
 
 class TestMoEKFtoHFKeyMapping:
     def test_router_gate(self):
-        assert _kf_to_hf_key("layers.0.mlp.router.gate.weight") == "model.layers.0.mlp.gate.weight"
+        assert (
+            _kf_to_hf_key("layers.0.mlp.router.gate.weight")
+            == "model.layers.0.block_sparse_moe.gate.weight"
+        )
 
     def test_router_expert_bias(self):
         assert _kf_to_hf_key("layers.0.mlp.router.expert_bias") == "model.layers.0.mlp.expert_bias"
 
     def test_expert_projections(self):
+        """Mixtral's w1, w2 and w3 are the gate, down and up projections."""
         assert (
             _kf_to_hf_key("layers.0.mlp.experts.0.gate_proj.weight")
-            == "model.layers.0.mlp.experts.0.gate_proj.weight"
+            == "model.layers.0.block_sparse_moe.experts.0.w1.weight"
         )
         assert (
             _kf_to_hf_key("layers.0.mlp.experts.3.up_proj.weight")
-            == "model.layers.0.mlp.experts.3.up_proj.weight"
+            == "model.layers.0.block_sparse_moe.experts.3.w3.weight"
         )
         assert (
             _kf_to_hf_key("layers.0.mlp.experts.7.down_proj.weight")
-            == "model.layers.0.mlp.experts.7.down_proj.weight"
+            == "model.layers.0.block_sparse_moe.experts.7.w2.weight"
         )
 
     def test_shared_expert(self):
@@ -157,11 +170,27 @@ class TestMoEKFtoHFKeyMapping:
 
     def test_router_gate_different_layers(self):
         assert (
-            _kf_to_hf_key("layers.15.mlp.router.gate.weight") == "model.layers.15.mlp.gate.weight"
+            _kf_to_hf_key("layers.15.mlp.router.gate.weight")
+            == "model.layers.15.block_sparse_moe.gate.weight"
         )
 
 
 class TestMoEHFtoKFKeyMapping:
+    def test_mixtral_router_gate(self):
+        assert (
+            _hf_to_kf_key("model.layers.3.block_sparse_moe.gate.weight")
+            == "layers.3.mlp.router.gate.weight"
+        )
+
+    @pytest.mark.parametrize(
+        "mixtral,kf", [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]
+    )
+    def test_mixtral_expert_projections(self, mixtral, kf):
+        assert (
+            _hf_to_kf_key(f"model.layers.0.block_sparse_moe.experts.5.{mixtral}.weight")
+            == f"layers.0.mlp.experts.5.{kf}.weight"
+        )
+
     def test_router_gate(self):
         assert _hf_to_kf_key("model.layers.0.mlp.gate.weight") == "layers.0.mlp.router.gate.weight"
 
@@ -256,6 +285,22 @@ class TestBuildHFConfig:
         assert hf_cfg["num_local_experts"] == 8
         assert hf_cfg["num_experts_per_tok"] == 2
         assert hf_cfg["router_aux_loss_coef"] == 0.01
+
+    def test_moe_intermediate_size_is_the_expert_width(self):
+        """Mixtral reads intermediate_size as each expert's width; a dense model keeps the
+        dense width."""
+        mc = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=2,
+            vocab_size=256,
+            num_experts=4,
+            moe_expert_ffn_multiplier=0.5,
+        )
+        assert mc.computed_expert_ffn_hidden_dim != mc.computed_ffn_hidden_dim
+        assert _build_hf_config(mc)["intermediate_size"] == mc.computed_expert_ffn_hidden_dim
+        dense = replace(mc, num_experts=0)
+        assert _build_hf_config(dense)["intermediate_size"] == mc.computed_ffn_hidden_dim
 
     def test_head_dim_is_exported(self):
         """A decoupled width is not recoverable from dim // n_heads, so the
@@ -439,13 +484,13 @@ class TestExportDtypePrecedence:
         assert f"Export dtype: float32 (from {source})" in caplog.text
 
 
-def _random_dcp(path: Path, model_config: ModelConfig) -> Transformer:
+def _random_dcp(path: Path, model_config: ModelConfig, std: float = 1.0) -> Transformer:
     """Save a model whose every weight, norms included, is drawn at random; return it."""
     model = Transformer(model_config)
     generator = torch.Generator().manual_seed(0)
     with torch.no_grad():
         for param in model.parameters():
-            param.normal_(generator=generator)
+            param.normal_(std=std, generator=generator)
     dcp.save({"model": model.state_dict()}, checkpoint_id=str(path))
     return model
 
@@ -513,3 +558,178 @@ class TestExportValues:
         assert weights.keys() == expected.keys()
         for name, tensor in expected.items():
             assert torch.equal(weights[name], tensor.detach().to(dtype)), name
+
+
+def _moe_config(**overrides) -> ModelConfig:
+    """A small MoE model that differs from Mixtral's defaults where an export could slip:
+    grouped-query attention, an expert width other than the dense width, and rope_theta."""
+    fields = {
+        "dim": 64,
+        "n_layers": 2,
+        "n_heads": 4,
+        "n_kv_heads": 2,
+        "vocab_size": 256,
+        "max_seq_len": 64,
+        "num_experts": 4,
+        "moe_top_k": 2,
+        "moe_expert_ffn_multiplier": 1.5,
+        "rope_theta": 10000.0,
+    }
+    fields.update(overrides)
+    return ModelConfig(**fields)
+
+
+def _read_back(hf_dir: Path, dcp_dir: Path, config: ModelConfig) -> dict[str, torch.Tensor]:
+    """Import an export with ``hf_to_dcp`` and return the model state it saved."""
+    hf_to_dcp(str(hf_dir), str(dcp_dir), config)
+    state = {"model": Transformer(config).state_dict()}
+    dcp.load(state, checkpoint_id=str(dcp_dir))
+    return state["model"]
+
+
+class TestMixtralExport:
+    """An MoE model exports as a Mixtral checkpoint, which transformers loads as trained."""
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_transformers_loads_every_weight_and_matches_the_logits(self, tmp_path, packed):
+        transformers = pytest.importorskip("transformers")
+        config = _moe_config(moe_packed_experts=packed)
+        source = _random_dcp(tmp_path / "dcp", config, std=0.05).eval()
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=torch.float32)
+        model, info = transformers.AutoModelForCausalLM.from_pretrained(
+            tmp_path / "hf", dtype=torch.float32, output_loading_info=True
+        )
+        assert type(model).__name__ == "MixtralForCausalLM"
+        assert not info["missing_keys"]
+        assert not info["unexpected_keys"]
+        assert not info["mismatched_keys"]
+        tokens = torch.randint(0, 256, (2, 16), generator=torch.Generator().manual_seed(0))
+        with torch.no_grad():
+            torch.testing.assert_close(model.eval()(tokens).logits, source(tokens))
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_packed_experts_are_written_one_tensor_per_expert(self, tmp_path, dtype):
+        """A packed model writes the names an unpacked one does, each expert's slice of the
+        packed weight transposed to the (out, in) layout of a linear layer."""
+        config = _moe_config(moe_packed_experts=True)
+        source = _random_dcp(tmp_path / "dcp", config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=dtype)
+        weights = load_file(tmp_path / "hf" / "model.safetensors")
+        unpacked = Transformer(replace(config, moe_packed_experts=False)).state_dict()
+        assert weights.keys() == {_kf_to_hf_key(name) for name in unpacked}
+        for i, block in source.layers.items():
+            for proj, mixtral in (("gate", "w1"), ("down", "w2"), ("up", "w3")):
+                packed = block.mlp.get_parameter(f"{proj}_w")
+                for j in range(config.num_experts):
+                    name = f"model.layers.{i}.block_sparse_moe.experts.{j}.{mixtral}.weight"
+                    assert torch.equal(weights[name], packed[j].t().to(dtype)), name
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_hf_to_dcp_reads_an_export_back(self, tmp_path, packed):
+        config = _moe_config(moe_packed_experts=packed)
+        source = _random_dcp(tmp_path / "dcp", config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=torch.float32)
+        back = _read_back(tmp_path / "hf", tmp_path / "back", config)
+        for name, tensor in source.state_dict().items():
+            assert torch.equal(back[name], tensor), name
+
+    def test_hf_to_dcp_reads_the_expert_names_written_before(self, tmp_path):
+        """An export written with mlp.gate and mlp.experts.{j}.*_proj still imports."""
+        config = _moe_config()
+        source = _random_dcp(tmp_path / "dcp", config)
+
+        def written_before(name: str) -> str:
+            if ".mlp.experts." in name:
+                return "model." + name
+            return _kf_to_hf_key(name).replace(".block_sparse_moe.gate.", ".mlp.gate.")
+
+        (tmp_path / "hf").mkdir()
+        old = {written_before(name): tensor for name, tensor in source.state_dict().items()}
+        assert any(".mlp.experts.0.gate_proj." in name for name in old)
+        save_file(old, tmp_path / "hf" / "model.safetensors")
+        back = _read_back(tmp_path / "hf", tmp_path / "back", config)
+        for name, tensor in source.state_dict().items():
+            assert torch.equal(back[name], tensor), name
+
+    @pytest.mark.parametrize(
+        "overrides,named",
+        [
+            ({"moe_shared_experts": 1}, "moe_shared_experts=1: Mixtral has none"),
+            ({"moe_frequency": 2}, "moe_frequency=2: every Mixtral layer is an MoE layer"),
+            (
+                {"moe_router": "sigmoid_topk"},
+                "moe_router='sigmoid_topk': Mixtral routes with softmax top-k",
+            ),
+            ({"activation": "gelu"}, "activation='gelu': Mixtral experts are SwiGLU"),
+            ({"norm_type": "layernorm"}, "norm_type='layernorm': Mixtral norms are RMSNorm"),
+            ({"qk_norm": True}, "qk_norm=True: Mixtral has no query or key norm"),
+        ],
+    )
+    def test_refuses_what_mixtral_cannot_hold_before_reading(self, tmp_path, overrides, named):
+        """The refusal names the setting before the checkpoint is read, here one that does
+        not exist, or anything is written."""
+        config = _moe_config(**overrides)
+        with pytest.raises(ValueError, match=re.escape(named)):
+            dcp_to_hf(str(tmp_path / "missing"), str(tmp_path / "hf"), config)
+        assert not (tmp_path / "hf").exists()
+
+    def test_hf_to_dcp_reads_the_experts_a_loaded_mixtral_packs(self, tmp_path, monkeypatch):
+        """A hub ID goes through a loaded model's state dict, where transformers 5 packs each
+        layer's experts; the import splits them back into every expert's weights."""
+        transformers = pytest.importorskip("transformers")
+        config = _moe_config()
+        source = _random_dcp(tmp_path / "dcp", config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=torch.float32)
+        loaded = transformers.AutoModelForCausalLM.from_pretrained(
+            tmp_path / "hf", dtype=torch.float32
+        ).state_dict()
+        assert "model.layers.0.mlp.experts.gate_up_proj" in loaded
+        monkeypatch.setattr(convert_checkpoint, "_load_hf_hub", lambda model_id: loaded)
+        back = _read_back(tmp_path / "some-org-mixtral", tmp_path / "back", config)
+        for name, tensor in source.state_dict().items():
+            assert torch.equal(back[name], tensor), name
+
+    def test_capacity_warns_that_transformers_drops_no_tokens(self, tmp_path, caplog):
+        config = _moe_config(moe_capacity_factor=1.25)
+        _random_dcp(tmp_path / "dcp", config)
+        with caplog.at_level(logging.WARNING, logger="convert_checkpoint"):
+            dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=torch.float32)
+        assert "moe_capacity_factor=1.25: transformers has no expert capacity" in caplog.text
+        assert (tmp_path / "hf" / "model.safetensors").exists()
+
+    def test_every_refused_setting_is_named(self):
+        config = _moe_config(moe_shared_experts=2, moe_router="sigmoid_topk")
+        with pytest.raises(ValueError, match="moe_shared_experts=2.*; moe_router='sigmoid_topk'"):
+            _build_hf_config(config)
+
+    def test_without_the_check_a_model_exports_for_hf_to_dcp(self, tmp_path, caplog):
+        """A DeepSeek-style model exports with a warning that names what Mixtral lacks, and
+        hf-to-dcp reads every weight back, as the resharding round trip needs."""
+        config = _moe_config(moe_router="sigmoid_topk", moe_shared_experts=1, moe_frequency=2)
+        source = _random_dcp(tmp_path / "dcp", config)
+        with caplog.at_level(logging.WARNING, logger="convert_checkpoint"):
+            dcp_to_hf(
+                str(tmp_path / "dcp"),
+                str(tmp_path / "hf"),
+                config,
+                dtype=torch.float32,
+                check_mixtral=False,
+            )
+        assert "moe_shared_experts=1: Mixtral has none" in caplog.text
+        assert "read it only with hf-to-dcp" in caplog.text
+        back = _read_back(tmp_path / "hf", tmp_path / "back", config)
+        for name, tensor in source.state_dict().items():
+            assert torch.equal(back[name], tensor), name
+
+    def test_the_cli_flag_turns_the_check_off(self, tmp_path, monkeypatch):
+        toml = tmp_path / "job.toml"
+        toml.write_text(_TINY_TOML + "num_experts = 2\nmoe_shared_experts = 1\n")
+        _tiny_dcp(tmp_path / "dcp", load_config(toml, cli_args=[]).model)
+        argv = ["convert_checkpoint.py", "dcp-to-hf", "--config", str(toml)]
+        argv += ["--dcp-dir", str(tmp_path / "dcp"), "--hf-dir", str(tmp_path / "hf")]
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(ValueError, match="pass --no-mixtral-check"):
+            main()
+        monkeypatch.setattr(sys, "argv", [*argv, "--no-mixtral-check"])
+        main()
+        assert (tmp_path / "hf" / "model.safetensors").exists()

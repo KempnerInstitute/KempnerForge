@@ -121,6 +121,28 @@ def _is_expert(name: str) -> bool:
     return UNPACKED_EXPERT.fullmatch(name) is not None or name.endswith(PACKED_EXPERT)
 
 
+def _as_exported(experts: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Expert weights under the names and layout a Mixtral export writes them in.
+
+    An unpacked ``layers.{i}.mlp.experts.{j}.{gate,down,up}_proj.weight`` becomes
+    ``model.layers.{i}.block_sparse_moe.experts.{j}.{w1,w2,w3}.weight``; expert ``j`` of a
+    packed ``layers.{i}.mlp.{gate,down,up}_w`` becomes the same name, its slice transposed.
+    """
+    mixtral = {"gate": "w1", "down": "w2", "up": "w3"}
+    exported = {}
+    for name, tensor in experts.items():
+        parts = name.split(".")
+        prefix = f"model.layers.{parts[1]}.block_sparse_moe.experts"
+        if parts[3] == "experts":
+            proj = parts[5].removesuffix("_proj")
+            exported[f"{prefix}.{parts[4]}.{mixtral[proj]}.weight"] = tensor
+        else:
+            proj = parts[3].removesuffix("_w")
+            for j, weight in enumerate(tensor.unbind(0)):
+                exported[f"{prefix}.{j}.{mixtral[proj]}.weight"] = weight.t()
+    return exported
+
+
 def _build(
     mesh: DeviceMesh | None, config: ModelConfig, seed: int
 ) -> tuple[torch.nn.Module, torch.optim.Optimizer]:
@@ -664,10 +686,13 @@ class TestUnfixedCheckpoint:
 class TestExportFromAnEPCheckpoint:
     @pytest.mark.parametrize("layout", ["dp_shard2_ep2", "dp_shard2_ep2_packed", "ep4_packed_gelu"])
     def test_dcp_to_hf_exports_every_expert(self, saved_layout, layout, tmp_path):
-        """Every expert of every layer reaches the export with its rank's weights."""
+        """Every expert of every layer reaches the export with its rank's weights, under the
+        names and layout the export writes. The gelu layout is not a model Mixtral holds,
+        so the Mixtral check is off."""
         root = saved_layout(layout)
         config = _config(LAYOUTS[layout][2])
-        dcp_to_hf(str(_step_dir(root)), str(tmp_path / "hf"), config, dtype=torch.float32)
+        hf_dir = str(tmp_path / "hf")
+        dcp_to_hf(str(_step_dir(root)), hf_dir, config, dtype=torch.float32, check_mixtral=False)
         exported = load_file(tmp_path / "hf" / "model.safetensors")
         reference = torch.load(root / "reference.pt")
         experts = {k: v for k, v in reference.items() if _is_expert(k) and not k.endswith(MOMENTS)}
@@ -676,7 +701,12 @@ class TestExportFromAnEPCheckpoint:
             if config.moe_packed_experts
             else config.num_experts * 3
         )
-        assert _mismatches({k: exported[f"model.{k}"] for k in experts}, experts) == []
+        expected = _as_exported(experts)
+        assert len(expected) == config.n_layers * config.num_experts * (
+            2 if config.activation == "gelu" else 3
+        )
+        assert {k for k in exported if ".block_sparse_moe.experts." in k} == expected.keys()
+        assert _mismatches({k: exported[k] for k in expected}, expected) == []
 
 
 class TestWithoutEP:
