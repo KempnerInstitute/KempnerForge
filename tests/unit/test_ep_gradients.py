@@ -280,6 +280,7 @@ def _check_without_ep(rank, world, port, names, sizes, overrides) -> None:
     try:
         step = _step(names, sizes, overrides)
         norm = clip_grad_norm_(step.model, MAX_NORM)
+        norm = norm.full_tensor() if isinstance(norm, DTensor) else norm
         ref_norm = torch.nn.utils.clip_grad_norm_(step.reference.parameters(), MAX_NORM)
         torch.testing.assert_close(norm, ref_norm, rtol=1e-5, atol=0.0)
         _assert_grads_match(step)
