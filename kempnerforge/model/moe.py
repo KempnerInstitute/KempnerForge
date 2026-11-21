@@ -128,8 +128,8 @@ def _apply_capacity(
     """Zero routing weights for tokens that exceed per-expert capacity.
 
     Capacity = ceil(num_tokens * top_k / num_experts * capacity_factor).
-    For each expert, only the first ``capacity`` tokens (in sequence order)
-    are kept; the rest get weight=0 and are effectively dropped.
+    For each expert, only the first ``capacity`` routes (in token order across
+    all top-k slots) are kept; the rest get weight=0 and are effectively dropped.
 
     Args:
         weights: (num_tokens, top_k) routing weights.
@@ -138,8 +138,8 @@ def _apply_capacity(
         capacity_factor: Multiplier for capacity (1.0 = exact average, 1.25 = 25% headroom).
 
     Returns:
-        (weights, indices) with overflow entries zeroed out. Tensors are cloned
-        to avoid mutating the router's output.
+        (weights, indices) with overflow weights zeroed out. Weights are cloned
+        to avoid mutating the router's output; indices are returned unchanged.
     """
     import math
 
@@ -147,13 +147,10 @@ def _apply_capacity(
     capacity = max(1, math.ceil(num_tokens * top_k / num_experts * capacity_factor))
 
     weights = weights.clone()
-    for k in range(top_k):
-        for e in range(num_experts):
-            assigned = (indices[:, k] == e).nonzero(as_tuple=True)[0]
-            if assigned.numel() <= capacity:
-                continue
-            drop = assigned[capacity:]
-            weights[drop, k] = 0.0
+    for e in range(num_experts):
+        tokens, slots = (indices == e).nonzero(as_tuple=True)
+        if tokens.numel() > capacity:
+            weights[tokens[capacity:], slots[capacity:]] = 0.0
 
     return weights, indices
 

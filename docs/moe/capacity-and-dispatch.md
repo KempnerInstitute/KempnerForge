@@ -44,17 +44,16 @@ expert** — their routing weight is set to 0:
 
 ```python
 # kempnerforge/model/moe.py — _apply_capacity (trimmed)
-for k in range(top_k):
-    for e in range(num_experts):
-        assigned = (indices[:, k] == e).nonzero(as_tuple=True)[0]
-        if assigned.numel() <= capacity:
-            continue
-        drop = assigned[capacity:]
-        weights[drop, k] = 0.0
+for e in range(num_experts):
+    tokens, slots = (indices == e).nonzero(as_tuple=True)
+    if tokens.numel() > capacity:
+        weights[tokens[capacity:], slots[capacity:]] = 0.0
 ```
 
-"First `capacity` tokens wins" — tokens are kept in sequence order,
-later tokens get dropped. If every expert a token chose drops it,
+"First `capacity` routes win": an expert keeps the first `capacity`
+routes to it across all top-`k` slots, in token order, so an earlier
+token's second choice is kept ahead of a later token's first choice.
+Later routes get dropped. If every expert a token chose drops it,
 its routed experts contribute nothing to the MoE output (shared
 experts, when the layer has them, still run), and the residual
 connection carries it through:

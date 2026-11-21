@@ -13,11 +13,15 @@ never imports it, so this directory can be deleted without touching the core.
 examples/image_understanding/
 ├── README.md
 ├── train.py              # training entry point
+├── configs/
+│   └── eval_tasks.toml   # sample evaluation tasks, with placeholder paths
+├── evaluation/           # evaluation tasks and answer scorers (below)
 ├── image_text/           # image-text dataset readers and chat renderer (below)
 ├── scripts/
 │   └── convert_finevision_to_arrow.py  # FineVision parquet -> memory-mappable Arrow
 └── tests/
     ├── test_image_understanding_entry.py   # the entry point loads a config and hands it off
+    ├── evaluation/       # task-file and scorer tests (CPU)
     └── image_text/       # reader and renderer tests (CPU)
 ```
 
@@ -60,6 +64,10 @@ samples `VLMCollator` batches.
 - `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
   `points.py` writes the point answers.
 - `finevision.py`: FineVision subsets from their memory-mappable Arrow copy.
+- `datacomp.py`: DataComp-1B captions, streamed from its webdataset tar shards with
+  no index or conversion step (`DataCompStream`); `RenderedStream` renders a
+  stream the way `RenderedDataset` renders a reader, and `stream.py`'s
+  `StreamLoader` loads it so that a resume continues where training stopped.
 
 Every sample the renderer builds carries one image, resized square to `image_size`,
 with no tiling or packing. PixMo-Count stores its points in pixels; they are
@@ -86,6 +94,34 @@ uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.p
     --src path-to-FineVision --dst path-to-FineVision-arrow --procs 8
 uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py index \
     --src path-to-FineVision --dst path-to-FineVision-arrow
+```
+
+DataComp has no index, so its reader streams: the shards are listed once,
+reordered every epoch from the seed, and dealt out to data-parallel ranks and
+then to loader workers, without end. Each worker keeps `open_shards` of its
+shards open (4 by default) and takes every sample from one of them drawn at
+random, so a batch mixes several shards; each shard is still read front to back,
+with no buffer of samples to hold. A sample without a decodable image or a
+caption is passed over, as is the rest of a shard that stops being a readable
+tar, and a shard with no samples counts as one skip. `StreamLoader` records the
+position of every batch it hands out, so the stream's `state_dict` holds where
+training stopped, and a resume continues from the next sample with batches in
+the order they would have come, whichever way the loader workers are started. A
+resume must use the same seed, ranks, workers, `open_shards` and shard list.
+Pass the stream's `num_workers` to the loader too:
+
+```python
+stream = DataCompStream(
+    "/path/to/datacomp-1b/raw/webdataset",
+    prompt="Describe the image briefly.",
+    rank=dp_rank,
+    world_size=dp_size,
+    num_workers=4,
+    seed=seed,
+    open_shards=4,
+)
+rendered = RenderedStream(stream, renderer, seed=seed, rank=dp_rank)
+loader = StreamLoader(rendered, batch_size=16, num_workers=4)
 ```
 
 ## Tile images
@@ -190,8 +226,27 @@ before routing, so they take no expert capacity; a micro-batch with no image
 gives the image experts zero gradients. On `joint_decoder` and `moma` the
 FlashAttention kernel takes no mask, so an unpacked dataset with text-only rows
 is refused with `model.sdpa_backend = "flash"` under `attention_backend =
-"sdpa"`. Rows that hold several
-images are skipped when the dataset is loaded, and one warning counts them.
+"sdpa"`.
+
+## Documents with several images
+
+An image column that holds a list of images is a multi-image document.
+`data.hf_max_images = n` (`n >= 2`) accepts up to `n` of them per document, in
+list order. A row with more than `n` images, at any cap including the
+default of `1`, is skipped when the dataset is loaded, and one warning counts
+the skipped rows. The images' tokens go before the document's text, each image
+in its own block, which is the layout packing uses; with `vlm.tile_grid` set, each
+image contributes all of its views in order. With `data.pack_sequences = true`
+such documents pack like any other; without it the same packer lays each
+document out in its own row of `train.seq_len`, so the token tensors keep one
+shape across micro-batches and ranks (the image tensor still holds the batch's
+image count). Both need `vlm.arch = "joint_decoder"` and not
+`train.mixed_precision = "fp8"`, nor `model.sdpa_backend = "flash"` under
+`attention_backend = "sdpa"`; and `n` images' tokens (every view of each) plus `vlm.max_text_len` have to fit `train.seq_len` and
+`model.max_seq_len`. The config checks that when `vision_encoder.num_tokens` is
+set; the data pipeline checks it again against the built model's token count
+before training starts, with packing or without, so a probed encoder is
+covered too.
 
 ## Start from the pretrained backbone
 
@@ -214,6 +269,73 @@ and the optimizer starts fresh. Stage 2 starts from a stage-1 checkpoint as
 weights alone with `checkpoint.exclude_from_loading = ["optimizer", "train_state"]`,
 so its step and schedule start again from 0.
 
+## Evaluation tasks and scorers
+
+`evaluation/` holds what an evaluation run is made of: the tasks to run and the
+scorers of their answers. The evaluator that runs them on a checkpoint is on the
+roadmap.
+
+- `tasks.py`: `load_tasks` reads a TOML task file into frozen `EvalTask`s. A task
+  has a unique `name`, a `reader` (one of the `testbed.py` loaders) with that
+  loader's arguments in `reader_args`, a `scorer`, and `max_new_tokens`, the cap
+  on a decoded answer. `reader_args` is a read-only copy. The file is checked as
+  it loads, before a reader opens anything: an unknown key, reader or scorer, an
+  unknown or missing reader argument, a required reader parameter that cannot be
+  given by keyword, and a value of the wrong TOML type for a parameter annotated
+  `str`, `Path`, `bool`, `int` or `float` (alone or with `None`) are refused with
+  the valid ones listed. Nothing else is judged at load: other annotations,
+  nested values and every limit on a value (a count of at least 1, say) are
+  checked by the reader itself when `build_reader` constructs it. A relative
+  path given to a reader parameter annotated `Path`, as the testbed loaders'
+  `annotation_file` and `image_root` are, is taken from the task file's
+  directory, so a task file reads the same data from any working directory.
+- `scorers.py`: a scorer rates one prediction against a sample's reference
+  answers with a value in [0, 1], and a task's score is the mean over its
+  samples. The text scorers take the prediction as a `str` and the references as
+  a non-empty sequence of `str`; anything else raises before any scoring, naming
+  the argument. `get_scorer` returns one by name; its `score` rates a sample and its
+  `aggregate` turns a task's sample scores into the task's metrics.
+  - `vqa_accuracy` (VQAv2, TextVQA): each annotator is left out in turn, the
+    prediction scores `min(1, m / 3)` against the `m` remaining annotators who
+    gave the same answer, and the score is the mean over those rounds, after the
+    official answer normalization (`vqa_normalization.py`) of the prediction and
+    of every reference, whether or not the references agree. With ten references,
+    three matching annotators score 0.9 and four score 1. Four or more references
+    can reach 1, and a single reference scores 0, as in the official evaluation,
+    so data with one answer per question needs another scorer.
+  - `anls` (DocVQA): the similarity `1 - NL` to the closest reference, where `NL`
+    is the Levenshtein distance over the longer length, and 0 once `NL` is above
+    0.5. A similarity of exactly 0.5 scores 0.5, as in the docvqa.org evaluation
+    script and lmms-eval; this departs from the recipe's `DOCVQAScorer`, which
+    scores it 0 (`nl < tau`). Case is ignored, and whitespace is collapsed
+    first: none at either end, and each run inside one space.
+  - `relaxed_accuracy` (ChartQA): 1 for a number within 5 percent of a numeric
+    reference, or for text equal to a reference but for case, surrounding
+    whitespace and trailing `?`, `.` and `!`, applied in that order, so
+    `"yes !"` becomes `"yes "`. A number is what `float` parses, and a trailing
+    `%` makes hundredths, as in Pix2Struct's relaxed correctness: `45%` matches
+    `0.45` and `45.1%` but not `45`. `1,000` is text, while `1_000` is 1000.
+
+`configs/eval_tasks.toml` is a sample with five tasks and their caps (VQAv2 10,
+TextVQA 75, DocVQA 50, ChartQA human and machine 50); its paths are
+placeholders:
+
+```toml
+[[tasks]]
+name = "docvqa"
+reader = "docvqa"
+scorer = "anls"
+max_new_tokens = 50
+
+[tasks.reader_args]
+annotation_file = "path-to-docvqa-annotations"
+image_root = "path-to-docvqa-images"
+```
+
+A reader is an entry of `READERS` and a scorer an entry of `SCORERS`, so a new
+one is added there. A scorer may report several named components per sample and
+aggregate them its own way; the default is the mean of each component.
+
 ## Roadmap
 
 What the recipe still needs. Each lands as its own change in this directory,
@@ -223,9 +345,10 @@ or in core where it belongs:
   DataComp), chat-template rendering with the loss on the assistant turns only,
   and the mixture loader
 - Typed stage contract and pinned source manifest, which fix the stage presets
-- Documents with several images
 - Per-module learning rates and schedules
-- Evaluation parity: chat-template prompts, image attention, the recipe's scorers
+- Evaluation: the evaluator that runs the tasks on a saved checkpoint, periodic
+  evaluation during training, PixMo point and count scorers, documents with
+  several images or none, and image attention when decoding
 - Run-comparison metrics: documents seen, token counts, MFU with the encoder
 
 ## Tests

@@ -60,9 +60,9 @@ def run_eval(
         device: Device to move batches to.
         eval_steps: Number of eval batches to process.
         pp_schedule: Pipeline parallel schedule (None for non-PP). It is the training
-            schedule, run forward-only through its ``eval()``. Its gradient reduction still
-            runs after each call, with its gradient scaling off, so gradients left on the
-            stage keep their values.
+            schedule, run forward-only through its ``eval()``. Gradients left on the
+            stage are set aside for the calls and put back after them, so they keep
+            their values.
         pp_rank: This rank's PP stage index.
         pp_size: Total number of PP stages.
         pp_group: Process group for PP loss broadcast.
@@ -94,6 +94,7 @@ def run_eval(
 
         scale_grads = pp_schedule.scale_grads
         pp_schedule.scale_grads = False
+        set_aside = _set_grads_aside(model)
         try:
             for _ in range(eval_steps // n_microbatches):
                 group = [next(batches) for _ in range(n_microbatches)]
@@ -109,6 +110,8 @@ def run_eval(
                 pp_losses.extend(call_losses)
         finally:
             pp_schedule.scale_grads = scale_grads
+            for param, grad in set_aside:
+                param.grad = grad
 
         if is_last and pp_losses:
             avg_loss = sum(loss.item() for loss in pp_losses) / len(pp_losses)
@@ -158,6 +161,21 @@ def run_eval(
 
     model.train()
     return {"eval/loss": avg_loss, "eval/perplexity": math.exp(min(avg_loss, 20.0))}
+
+
+def _set_grads_aside(
+    model: torch.nn.Module,
+) -> list[tuple[torch.nn.Parameter, torch.Tensor | None]]:
+    """Detach every parameter's gradient from ``model`` and return the pairs to put back.
+
+    The pipeline schedule's ``eval()`` may write, rescale or drop the gradients on its
+    stage, as its metadata pass and gradient reduction do with FSDP2, so ``run_eval``
+    runs it on a stage without gradients.
+    """
+    set_aside = [(param, param.grad) for param in model.parameters()]
+    for param, _ in set_aside:
+        param.grad = None
+    return set_aside
 
 
 def _cycle(dataloader):
