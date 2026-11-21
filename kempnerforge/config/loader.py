@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import shlex
 import sys
 import tomllib
 import types
@@ -233,13 +234,30 @@ def _parse_cli_overrides(args: list[str]) -> dict[str, Any]:
     Supports:
       --model.dim=512
       --train.compile_model=true
+      --train.compile_model (a bare key means true)
       --optimizer.betas=[0.9,0.95]
+
+    Other arguments without ``--`` are skipped, such as the config path when
+    ``load_config`` reads ``sys.argv[1:]``.
+
+    Raises:
+        ValueError: An argument without ``--`` follows a bare key, as the value of a
+            space-separated ``--section.key value`` would, which would otherwise be
+            dropped while the key read as true. The message shows the override joined
+            with ``=`` and quoted for a shell.
     """
     overrides: dict[str, Any] = {}
 
+    bare_key: str | None = None
     for arg in args:
         if not arg.startswith("--"):
+            if bare_key is not None:
+                raise ValueError(
+                    f"Unexpected command-line argument {arg!r} after {bare_key}: "
+                    f"write {shlex.quote(f'{bare_key}={arg}')}"
+                )
             continue
+        bare_key = None if "=" in arg else arg
         if "=" not in arg:
             key = arg[2:]
             value_str = "true"
