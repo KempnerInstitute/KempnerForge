@@ -8,13 +8,13 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.6",
+    "torch>=2.12",
     "wandb",
     "tensorboard",
     "transformers",
     "datasets",
     "tokenizers",
-    "torchao>=0.17.0",
+    "torchao>=0.18.0",
     "pyyaml",
     # Databricks-hosted experiment tracking; lazy-imported in metrics/mlflow/.
     # mlflow-skinny = the tracking client (no pandas; it still pulls fastapi/uvicorn);
@@ -66,12 +66,12 @@ build-backend = "hatchling.build"
 default-groups = ["dev"]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu130" }
 
 [tool.ruff]
 line-length = 100
