@@ -418,7 +418,8 @@
         "VLMWrapper(nn.Module)": {
           "purpose": "VLM wrapper composing vision_encoder + adapter + transformer + strategy. Strategy is a plain Python object, not an nn.Module submodule",
           "methods": [
-            "forward(pixel_values, input_ids, labels, frame_mask, *, doc_ids, position_ids, attention_group_ids, image_rows, image_starts, image_tokens, text_rows, text_positions) -> (logits, labels)"
+            "forward(pixel_values, input_ids, labels, frame_mask, *, doc_ids, position_ids, attention_group_ids, image_rows, image_starts, image_tokens, text_rows, text_positions) -> (logits, labels)",
+            "train(mode=True) (keeps a vision encoder whose parameters are all frozen in eval mode)"
           ],
           "properties": [
             "num_image_tokens"
@@ -1908,6 +1909,13 @@
           "TestBuildVLMWrapperErrors(1)"
         ],
         "count": 42
+      },
+      "tests/unit/test_vlm_encoder_mode.py": {
+        "classes": [
+          "TestWrapperTrain(3)",
+          "TestTrainingLoop(3)"
+        ],
+        "count": 6
       },
       "tests/unit/test_vlm_config.py": {
         "classes": [

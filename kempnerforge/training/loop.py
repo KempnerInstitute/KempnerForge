@@ -594,7 +594,9 @@ def _apply_stage_specs(
 def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     """FreezeStage hook: apply any stage whose start_step matches this boundary.
 
-    Each stage goes through ``_apply_stage_specs``.
+    Each stage goes through ``_apply_stage_specs``, and the model is then put in
+    training mode again, which puts a vision encoder the stages froze in eval mode and
+    one they unfroze back in training mode (see ``VLMWrapper.train``).
 
     Async-save fence: drain any in-flight save FIRST so that its
     metadata.json — which records the pre-transition spec — lands before we
@@ -612,6 +614,7 @@ def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     for stage in pending_stages:
         flipped = _apply_stage_specs(session.model, stage.specs, vlm_cfg.module_patterns)
         logger.info(f"FreezeStage at step={step}: applied {flipped}")
+    session.model.train()
 
 
 def _apply_step_transitions(session: TrainingSession, step: int) -> None:
