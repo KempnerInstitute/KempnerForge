@@ -73,6 +73,7 @@ from kempnerforge.config.checkpoint import is_weights_only, validate_exclude_key
 from kempnerforge.config.optimizer import WEIGHT_DECAY_SCOPES, checked_lr_multipliers
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig
 from kempnerforge.distributed.utils import agree_across_ranks
+from kempnerforge.resilience.elastic import _dcp_durable
 
 logger = logging.getLogger(__name__)
 
@@ -1375,7 +1376,11 @@ class CheckpointManager:
                 topology check. The weights-only ``exclude_keys`` pair reads no
                 train state: no rank restores loader/RNG state or enters the
                 train-state broadcasts or the layout gather, and with
-                ``exact_resume`` it raises.
+                ``exact_resume`` it raises. An exact resume loads the checkpoint rank 0
+                picks for every rank: the one it names, or, when the load reads DCP shards
+                and not every stage directory there holds them all, the newest ``step_N``
+                beside it whose does (see ``_agreed_resume_dir``). Any other load takes its
+                checkpoint as is.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
@@ -1408,19 +1413,19 @@ class CheckpointManager:
                 "start begins a new run at step 0. Load it with exact_resume=False, or drop "
                 "'train_state' from exclude_keys to resume."
             )
-        ckpt_dir = self._resolve_load_path(path)
+        will_load_dcp = (
+            exclude_keys is None or "model" not in exclude_keys or "optimizer" not in exclude_keys
+        )
+        if exact_resume:
+            ckpt_dir = self._agreed_resume_dir(path, fall_back=will_load_dcp)
+        else:
+            ckpt_dir = self._resolve_load_path(path)
         if ckpt_dir is None:
             requested = path if path is not None else self.config.load_path
             if requested:
                 raise FileNotFoundError(f"Checkpoint not found: {requested}")
             logger.info("No checkpoint found — starting from scratch")
             return 0, 0, {}
-
-        will_load_dcp = (
-            exclude_keys is None or "model" not in exclude_keys or "optimizer" not in exclude_keys
-        )
-        if will_load_dcp:
-            ckpt_dir = self._resolve_dcp_load_dir(ckpt_dir, path)
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
         load_train_state = not is_weights_only(exclude_keys)
@@ -1812,28 +1817,6 @@ class CheckpointManager:
         self._pending_dataloader_state = None
         logger.info("Applied stashed dataloader state")
 
-    def _newest_complete_checkpoint(self) -> Path | None:
-        """Newest ``step_N`` dir whose DCP shards are durable, or None.
-
-        Defense in depth: even though the Layer-1 deferral keeps `latest`
-        off half-written checkpoints, a crash mid-flush (or a checkpoint
-        dir left incomplete by older buggy code / external interference)
-        can still leave the newest dir without DCP `.metadata`. Falling
-        back to the newest COMPLETE dir keeps resume working instead of
-        hard-failing in dcp.load with "metadata is None".
-        """
-        if not self.base_dir.exists():
-            return None
-        step_dirs = sorted(
-            (d for d in self.base_dir.iterdir() if d.is_dir() and d.name.startswith("step_")),
-            key=lambda d: int(d.name.split("_")[1]),
-            reverse=True,
-        )
-        for d in step_dirs:
-            if self._dcp_complete(d):
-                return d
-        return None
-
     def _resolve_load_path(self, path: str | None = None) -> Path | None:
         """Resolve the checkpoint path to load from.
 
@@ -1857,29 +1840,68 @@ class CheckpointManager:
 
         return None
 
-    def _resolve_dcp_load_dir(self, resolved: Path, path: str | None) -> Path:
-        """Pick the dir to DCP-load from, falling back if interrupted.
+    def _agreed_resume_dir(self, path: str | None, fall_back: bool) -> Path | None:
+        """Return the checkpoint rank 0 picks for an exact resume, on every rank.
 
-        ``resolved`` is the ``_resolve_load_path`` result. When it was
-        reached via auto-resume (no explicit path/``load_path``) and its
-        DCP shards are not durable — the signature of a crash during an
-        async flush — fall back to the newest complete checkpoint so
-        resume degrades to "last good step" instead of hard-failing in
-        ``dcp.load`` with "metadata is None". An explicitly requested
-        path is honored as-is (caller intent; fail loudly if broken).
+        Rank 0 resolves ``path`` (see ``_resolve_load_path``) and, with ``fall_back`` (the
+        load reads DCP shards), takes the newest ``step_N`` beside it whose every stage
+        directory holds them when that one's do not (see ``_newest_saved_beside``). It
+        broadcasts its choice, or why it could not make one, so every rank loads the same
+        checkpoint, or returns or raises together, whatever its own view of the filesystem.
+        Every rank must call this.
+
+        Raises:
+            Exception: On rank 0, what resolving the checkpoint raised.
+            RuntimeError: On every other rank, naming rank 0's error.
         """
-        explicit = bool(self.config.load_path)
-        if explicit or self._dcp_complete(resolved):
+        outcome: list[dict[str, str | None]] = [{"dir": None, "error": None}]
+        error: Exception | None = None
+        if self._rank == 0 or not dist.is_initialized():
+            try:
+                resolved = self._resolve_load_path(path)
+                if resolved is not None and fall_back:
+                    resolved = self._newest_saved_beside(resolved)
+                outcome[0] = {"dir": None if resolved is None else str(resolved), "error": None}
+            except Exception as e:
+                error = e
+                outcome[0] = {"dir": None, "error": f"{type(e).__name__}: {_error_text(e)}"}
+        if dist.is_initialized():
+            dist.broadcast_object_list(outcome, src=0)
+        if error is not None:
+            raise error
+        chosen, reason = outcome[0]["dir"], outcome[0]["error"]
+        if reason is not None:
+            raise RuntimeError(f"Rank 0 could not pick the checkpoint to resume: {reason}")
+        return None if chosen is None else Path(chosen)
+
+    @staticmethod
+    def _newest_saved_beside(resolved: Path) -> Path:
+        """``resolved``, or the newest ``step_N`` beside it with all its shards if it lacks some.
+
+        A checkpoint's shards are all there when its ``.metadata`` is, or every ``pp{k}`` stage
+        directory in it holds one (``_dcp_durable`` without a pipeline degree, so a stage that
+        never created its directory is not noticed). A switch is logged, so resume degrades to
+        the last good step instead of failing in ``dcp.load`` with "metadata is None";
+        ``resolved`` comes back when no step beside it qualifies.
+        """
+        if _dcp_durable(resolved):
             return resolved
-        fallback = self._newest_complete_checkpoint()
-        if fallback is not None and fallback != resolved:
-            logger.warning(
-                f"`latest` -> {resolved} has no durable DCP metadata "
-                f"(likely an interrupted async flush); resuming from "
-                f"newest complete checkpoint {fallback} instead."
-            )
-            return fallback
-        return resolved
+        saved = {
+            int(number): d
+            for d in resolved.parent.iterdir()
+            if d.name.startswith("step_")
+            and (number := d.name.removeprefix("step_")).isdigit()
+            and _dcp_durable(d)
+        }
+        if not saved:
+            return resolved
+        fallback = saved[max(saved)]
+        logger.warning(
+            f"Not every stage's DCP shards in {resolved} are durable, so the save that wrote it "
+            f"was likely cut short. Resuming from {fallback} instead, the newest checkpoint "
+            f"beside it whose save every stage completed."
+        )
+        return fallback
 
     def _optimizers_saved_in(
         self, dcp_dir: Path, keys: Iterable[str]

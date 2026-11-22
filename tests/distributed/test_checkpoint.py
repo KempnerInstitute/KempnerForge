@@ -547,7 +547,7 @@ class TestAsyncCheckpointLatestSafety:
 
     def test_resume_falls_back_when_latest_incomplete(self, distributed_env, shared_tmp_dir):
         """Defense in depth: if `latest` points at an interrupted async
-        flush (no DCP `.metadata`), resume falls back to the newest
+        flush (no DCP `.metadata`), an exact resume falls back to the newest
         complete checkpoint instead of hard-failing in dcp.load."""
         mesh = distributed_env
         ckpt_dir = shared_tmp_dir
@@ -576,9 +576,59 @@ class TestAsyncCheckpointLatestSafety:
             tmp.rename(link)
         dist.barrier()
 
-        step, tokens_seen, _ = mgr.load()
+        step, tokens_seen, _ = mgr.load(exact_resume=True)
         assert step == 1, f"rank {rank}: expected fallback to step 1, got {step}"
         assert tokens_seen == 64
+
+
+class TestTornStageResume:
+    """Two pipeline stages of two ranks each: a step one stage cannot load is resumed by none."""
+
+    @pytest.mark.parametrize("torn", [0, 1], ids=["stage_0_torn", "stage_1_torn"])
+    def test_every_stage_resumes_the_same_step(self, distributed_env, shared_tmp_dir, torn):
+        """Each stage saves through its own group; stage ``torn`` loses its step-20 shards."""
+        if dist.get_world_size() != 4:
+            pytest.skip("needs 4 ranks, two stages of two")
+        rank = dist.get_rank()
+        stage = rank // 2
+        groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
+
+        def manager() -> tuple[torch.nn.Module, CheckpointManager]:
+            torch.manual_seed(stage)
+            model = torch.nn.Linear(16, 16).cuda()
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            config = CheckpointConfig(dir=shared_tmp_dir, keep_last_n=3)
+            return model, CheckpointManager(
+                config,
+                model,
+                optimizer,
+                process_group=groups[stage],
+                pp_rank=stage,
+                dp_info=(rank % 2, 2),
+            )
+
+        model, saver = manager()
+        model(torch.ones(2, 16, device="cuda")).sum().backward()
+        saver.optimizer.step()
+        saver.save(step=10, tokens_seen=100)
+        at_10 = model.weight.detach().clone()
+        with torch.no_grad():
+            model.weight.add_(1.0)
+        saver.save(step=20, tokens_seen=200)
+        dist.barrier()
+        if rank == 2 * torn:
+            (Path(shared_tmp_dir) / "step_20" / f"pp{torn}" / ".metadata").unlink()
+        dist.barrier()
+
+        model, loader = manager()
+        with torch.no_grad():
+            model.weight.zero_()
+        step, tokens_seen, _ = loader.load(
+            path=str(Path(shared_tmp_dir) / "step_20"), exact_resume=True
+        )
+        outcomes: list = [None] * 4
+        dist.all_gather_object(outcomes, (step, tokens_seen, torch.equal(model.weight, at_10)))
+        assert outcomes == [(10, 100, True)] * 4, f"(step, tokens, step 10's weights): {outcomes}"
 
 
 class TestAsyncSaveBarrierNoDeadlock:
