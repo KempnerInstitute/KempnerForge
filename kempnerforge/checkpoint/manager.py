@@ -32,6 +32,7 @@ import os
 import pickle
 import re
 import shutil
+import socket
 import stat
 import threading
 import time
@@ -60,6 +61,7 @@ from kempnerforge.checkpoint.expert_layout import (
     expert_layout,
     moe_layers,
 )
+from kempnerforge.checkpoint.ownership import claim_checkpoint_dir, release_checkpoint_dir
 from kempnerforge.checkpoint.state import (
     PER_RANK_KEY,
     build_per_rank_envelope,
@@ -790,6 +792,7 @@ class CheckpointManager:
         self._inflight_dir: Path | None = None
         self._tracking_source: TrackingSource | None = None
         self._registrar: CheckpointRegistrar | None = None
+        self._claim: str | None = None
         self._sidecar_lock = threading.Lock()
         self._sync_group: dist.ProcessGroup | None = (
             cast("dist.ProcessGroup", dist.new_group(backend="gloo"))
@@ -818,19 +821,45 @@ class CheckpointManager:
         deferred (async mode, after the flush future has resolved). Raises only
         while `latest` still names the previous checkpoint: once it names this
         one the checkpoint is committed, so an error while pruning is logged and
-        the next commit prunes again.
+        the next commit prunes again. The new link is made under a temporary name of
+        this host, process and call, so no other writer shares it, and is removed if
+        the rename fails.
         """
         latest = self._latest_link()
-        tmp_link = latest.with_suffix(".tmp")
-        tmp_link.unlink(missing_ok=True)
+        tag = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex}"
+        tmp_link = latest.with_name(f"{latest.name}.{tag}.tmp")
         tmp_link.symlink_to(ckpt_dir.name)
-        tmp_link.rename(latest)
+        try:
+            tmp_link.rename(latest)
+        except BaseException:
+            tmp_link.unlink(missing_ok=True)
+            raise
         logger.info(f"Checkpoint committed: {ckpt_dir} (step={step})")
         self._register_committed(step, ckpt_dir)
         try:
             self._cleanup()
         except Exception as e:
             logger.warning(f"Could not prune old checkpoints after committing {ckpt_dir} ({e})")
+
+    def claim_dir(self) -> None:
+        """Make this run the owner of the checkpoint directory before it resumes or saves.
+
+        Rank 0 records the run in ``<dir>/.owner`` (see ``claim_checkpoint_dir``), and
+        every rank raises when that fails, so two live runs never share the directory.
+        Every rank must call this.
+        """
+        claims: list[str] = []
+        error: BaseException | None = None
+        if self._rank == 0:
+            error = _attempt(lambda: claims.append(claim_checkpoint_dir(self.base_dir)))
+        self.agree(error, "Checkpoint directory claim")
+        self._claim = claims[0] if claims else None
+
+    def release_dir(self) -> None:
+        """Mark released the ``<dir>/.owner`` record that this rank's ``claim_dir`` wrote."""
+        if self._claim is not None:
+            release_checkpoint_dir(self.base_dir, self._claim)
+            self._claim = None
 
     def _drain_pending_finalize(
         self, overwriting: Path | None = None, error: BaseException | None = None

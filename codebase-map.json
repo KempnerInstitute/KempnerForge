@@ -1246,6 +1246,8 @@
             "_check_lr_multipliers(metadata, ckpt_dir) -> saved group modules | None (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
             "_present_experts(dcp_state, load_from, saved_keys) (EP experts placed among all of them before DCP; a load refuses a checkpoint of fewer experts than the model; the ranks agree before DCP)",
             "apply_dataloader_state(dataloader)",
+            "claim_dir() (rank 0 claims <dir>/.owner through claim_checkpoint_dir; every rank agrees on the outcome)",
+            "release_dir() (marks the <dir>/.owner record this rank's claim_dir wrote released, at a clean exit)",
             "_resolve_load_path(path)",
             "_cleanup()"
           ]
@@ -1314,6 +1316,25 @@
         "tests/unit/test_expert_layout.py",
         "tests/unit/test_ep_checkpoint.py",
         "tests/distributed/test_ep.py::TestEPCheckpoint"
+      ]
+    },
+    "kempnerforge/checkpoint/ownership.py": {
+      "classes": {
+        "CheckpointDirInUseError": {
+          "purpose": "Another run that is alive, or not known to have ended, owns the checkpoint directory"
+        }
+      },
+      "functions": [
+        "claim_checkpoint_dir(directory) -> str (records this run in <dir>/.owner, linked into place; replaces this process's earlier record; replaces a record of a run that has ended through _take_over, then reads it back; refuses a live or uncheckable owner; returns the claim id; one claim or release at a time per process)",
+        "_take_over(path, held, tmp, me) -> (bool, Path | None) (only the claimer that links .owner.<held claim>.takeover replaces path, after checking it still holds held, by renaming a link of tmp named for its own claim; tokens whose claimers have ended are taken over level by level; tokens removed afterward)",
+        "release_checkpoint_dir(directory, claim) (marks the record of that claim released through _take_over; never removes .owner; an error is logged)",
+        "this_run() -> dict (claim id, SLURM cluster, job or array element, requeue count, host, pid, since)",
+        "_alive(owner, me) -> bool | None (a released record has ended; so has an earlier attempt of this job; another run in this job, or outside SLURM, by its pid on its own host; any other job by squeue without SQUEUE_* filters)"
+      ],
+      "tested_by": [
+        "tests/unit/test_checkpoint_ownership.py",
+        "tests/distributed/test_checkpoint_ownership.py",
+        "tests/unit/test_train_entry.py::TestRunTraining"
       ]
     },
     "kempnerforge/metrics/tracker.py": {
@@ -1943,6 +1964,18 @@
         ],
         "count": 5
       },
+      "tests/unit/test_checkpoint_ownership.py": {
+        "classes": [
+          "TestThisRun(3)",
+          "TestClaim(33)",
+          "TestOneProcess(1)",
+          "TestClaimersInProcesses(1)",
+          "TestRelease(6)",
+          "TestManager(5)",
+          "TestLatestLink(2)"
+        ],
+        "count": 51
+      },
       "tests/unit/test_collective_timeouts.py": {
         "classes": [
           "TestNcclAsyncErrorHandlingEnvGuard(3)",
@@ -2043,6 +2076,11 @@
       },
       "tests/distributed/test_checkpoint.py": {
         "note": "Distributed checkpoint save/load"
+      },
+      "tests/distributed/test_checkpoint_ownership.py": {
+        "classes": [
+          "TestClaimOnEveryRank(2)"
+        ]
       },
       "tests/distributed/test_e2e_training.py": {
         "note": "Multi-GPU training smoke"

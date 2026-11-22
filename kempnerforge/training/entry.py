@@ -429,6 +429,7 @@ def run_training(
     """
     runtime = setup_distributed(config)
     tracker: MetricsTracker | None = None
+    ckpt_mgr: CheckpointManager | None = None
     shutdown_handler = ShutdownHandler(timeout_sec=config.train.shutdown_timeout_sec)
     finished = False
     try:
@@ -453,6 +454,7 @@ def run_training(
         scheduler = build_scheduler(optimizer, config.scheduler, max_steps=config.train.max_steps)
 
         ckpt_mgr = build_checkpoint_manager(config, runtime, model, optimizer, pipeline)
+        ckpt_mgr.claim_dir()
         step, tokens_seen = restore_checkpoint(config, model, scheduler, ckpt_mgr)
 
         tracker = MetricsTracker(config, num_gpus=runtime.world_size)
@@ -499,5 +501,9 @@ def run_training(
         if tracker is not None:
             tracker.close()
         if finished:
-            destroy_distributed()
-            shutdown_handler.finish()
+            try:
+                if ckpt_mgr is not None:
+                    ckpt_mgr.release_dir()
+            finally:
+                destroy_distributed()
+                shutdown_handler.finish()
