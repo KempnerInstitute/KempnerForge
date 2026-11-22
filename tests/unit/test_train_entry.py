@@ -2167,6 +2167,18 @@ class TestVlmDataMetrics:
         batch["frame_mask"] = torch.tensor([[True], [False], [True]])
         assert _batch_counts(batch, 0, tokens_per_image=4)[1] == 2 * 4
 
+    def test_a_cross_attention_step_counts_the_adapters_tokens(self):
+        """With no image positions in the residual stream, the adapter's output still counts."""
+        import types
+
+        batch = self._padded()
+        batch["frame_mask"] = torch.tensor([[True], [False], [True]])
+        session = self._session(batch)
+        session.model.num_image_tokens = 0
+        session.model.vision_encoder = types.SimpleNamespace(num_tokens=16)
+        session.model.adapter = types.SimpleNamespace(output_num_tokens=lambda n: n // 4)
+        assert vlm_step(session, 0).image_tokens == 2 * 4
+
     def test_a_packed_batch_without_images_runs_one_blank_image(self):
         from kempnerforge.data.vlm_dataset import pack_vlm_samples
         from kempnerforge.training.loop import _batch_counts

@@ -320,10 +320,28 @@ class TestVisionFlops:
         model = self._vlm(False, False, types.SimpleNamespace(config=config))
         assert vision_flops_per_image(model) == 2 * 110 * 4 + 4 * 2 * 4**2 * 8 + 2 * 220 * 4
 
-    def test_a_pooling_adapter_counts_its_output_tokens(self):
+    def test_the_adapter_counts_its_own_forward_flops(self):
+        from kempnerforge.model.adapter import AvgPoolAdapter
+
         model = self._vlm(False)
-        model.adapter.output_num_tokens = lambda n: n // 4
-        assert vision_flops_per_image(model) == 2 * 110 * 4 + 3 * 2 * 220 * 1
+        model.adapter = AvgPoolAdapter(in_dim=10, out_dim=20, pool_window=2)
+        adapter_forward = model.adapter.forward_flops(4)
+        assert vision_flops_per_image(model) == 2 * 110 * 4 + 3 * adapter_forward
+
+    def test_an_average_pool_projects_its_pooled_tokens(self):
+        from kempnerforge.model.adapter import AvgPoolAdapter
+
+        adapter = AvgPoolAdapter(in_dim=16, out_dim=8, pool_window=2)
+        params = sum(p.numel() for p in adapter.parameters())
+        assert adapter.forward_flops(16) == 2 * params * 4
+
+    def test_an_attentional_pool_projects_keys_and_values_over_every_window_input(self):
+        from kempnerforge.model.adapter import AttentionalPoolAdapter
+
+        adapter = AttentionalPoolAdapter(in_dim=16, out_dim=8, pool_window=2, pool_heads=4)
+        square = 16 * 16 + 16
+        assert adapter.forward_flops(16) == 2 * (2 * square * 16 + (2 * square + 16 * 8 + 8) * 4)
+        assert adapter.forward_flops(9) == 2 * (2 * square * 16 + (2 * square + 16 * 8 + 8) * 4)
 
     def test_a_compiled_model_reads_its_original_module(self):
         compiled = torch.nn.Module()

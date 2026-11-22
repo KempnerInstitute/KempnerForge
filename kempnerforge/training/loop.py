@@ -549,21 +549,29 @@ def _dp_sum(session: TrainingSession, counts: list[int]) -> list[int]:
     return dp_all_reduce_(tensor, session.dp_groups).tolist()
 
 
-def _step_counts(session: TrainingSession, result: StepResult) -> tuple[int, int, int]:
+def _step_counts(
+    session: TrainingSession, result: StepResult
+) -> tuple[int, int | None, int | None]:
     """Positions, documents and encoder images the step ran over the data-parallel ranks.
 
     Every rank adds its counts in one reduction, whatever its step body reports, so ranks that
     ran different batches count what each of them ran and every rank takes part. A rank that
     reports no ``tokens`` adds the configured batch, and one that reports no documents or
-    encoder images adds zero.
+    encoder images adds zero; those come back None, on every rank, when no rank reported them.
     """
     tc = session.config.train
     tokens = result.tokens
     if tokens is None:
         tokens = tc.batch_size * tc.seq_len * tc.grad_accum_steps
-    counts = [tokens, result.documents or 0, result.encoder_images or 0]
-    total_tokens, documents, images = _dp_sum(session, counts)
-    return total_tokens, documents, images
+    counts = [
+        tokens,
+        result.documents or 0,
+        result.encoder_images or 0,
+        int(result.documents is not None),
+        int(result.encoder_images is not None),
+    ]
+    total, documents, images, with_documents, with_images = _dp_sum(session, counts)
+    return total, (documents if with_documents else None), (images if with_images else None)
 
 
 def text_step(session: TrainingSession, step: int) -> StepResult:
@@ -699,29 +707,31 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
         tracker.log_eval(moe_metrics, step)
 
     if config.is_vlm:
-        local = [
-            result.text_tokens or 0,
-            result.image_tokens or 0,
-            result.document_text_tokens or 0,
-            int(result.text_tokens is None),
-        ]
-        trained, image_tokens, text_tokens, missing = _dp_sum(session, local)
-        if missing:
+        if any_rank(result.text_tokens is None, session.control_group):
             raise RuntimeError(
                 "VLM run: a step body reported no text-token count, so "
                 "data/text_tokens_trained would be logged as zero"
             )
+        assert result.text_tokens is not None
+        local = [
+            result.text_tokens,
+            result.image_tokens or 0,
+            result.document_text_tokens or 0,
+            int(result.image_tokens is not None),
+            int(result.document_text_tokens is not None),
+        ]
+        trained, image_tokens, text_tokens, with_images, with_text = _dp_sum(session, local)
         data_metrics = {"data/text_tokens_trained": float(trained)}
-        if result.image_tokens is not None:
+        if with_images:
             data_metrics["data/image_tokens"] = float(image_tokens)
-        if result.document_text_tokens is not None:
+        if with_text:
             data_metrics["data/text_tokens"] = float(text_tokens)
         if session.documents_seen is not None:
             data_metrics["data/documents_seen"] = float(session.documents_seen)
         tracker.log_eval(data_metrics, step)
 
     mixture = session.data.mixture_dataset
-    if mixture is not None and result.dataset_tokens is not None:
+    if mixture is not None:
         _log_dataset_metrics(session, result, mixture.dataset_names, step)
 
 
@@ -732,11 +742,12 @@ def _log_dataset_metrics(
 
     The loss is the cross-entropy of the source's labeled tokens, weighted by token, and
     the tokens are the positions drawn from the source in this step. A source no rank
-    drew from in this step is left out.
+    drew from in this step is left out. Every rank takes part in the reduction, adding
+    nothing when its step body reports no per-source counts.
     """
-    assert result.dataset_tokens is not None
     stats = torch.zeros(3, len(names), dtype=torch.float64, device=session.runtime.device)
-    stats[0] = result.dataset_tokens.to(stats.device)
+    if result.dataset_tokens is not None:
+        stats[0] = result.dataset_tokens.to(stats.device)
     if result.dataset_losses is not None:
         stats[1:] = result.dataset_losses
     totals = dp_all_reduce_(stats, session.dp_groups).tolist()
@@ -941,7 +952,7 @@ def run_training_loop(
             tokens_in_step, documents_in_step, images_in_step = _step_counts(session, result)
             vision_flops = (
                 images_in_step * vision_flops_per_image(model)
-                if result.encoder_images is not None
+                if images_in_step is not None
                 else None
             )
 
@@ -968,7 +979,7 @@ def run_training_loop(
 
             step += 1
             tokens_seen += tokens_in_step
-            if result.documents is not None:
+            if documents_in_step is not None:
                 session.documents_seen = (session.documents_seen or 0) + documents_in_step
 
             _apply_step_transitions(session, step)

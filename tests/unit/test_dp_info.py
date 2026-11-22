@@ -482,7 +482,8 @@ def _check_mixed_reports(rank: int, world: int, port: int) -> None:
 
 
 def _check_missing_text_tokens(rank: int, world: int, port: int) -> None:
-    """A VLM step body that reports no text tokens on one rank fails every rank, none waiting."""
+    """A VLM step body that reports no text tokens on one rank fails every rank, none waiting:
+    the ranks vote over the loop's control group, which spans the whole job."""
     from kempnerforge.config.schema import AdapterConfig, VisionEncoderConfig, VLMConfig
     from kempnerforge.training.loop import StepResult, _log_periodic_metrics
     from tests.unit.test_train_entry import make_config, make_session
@@ -505,9 +506,44 @@ def _check_missing_text_tokens(rank: int, world: int, port: int) -> None:
             adapter=AdapterConfig(),
             vlm=VLMConfig(max_text_len=32),
         )
+        session.control_group = dist.new_group(backend="gloo")
         result = StepResult(loss=1.0, grad_norm=0.1, text_tokens=10 if rank == 0 else None)
         with pytest.raises(RuntimeError, match="reported no text-token count"):
             _log_periodic_metrics(session, result, 1)
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_partial_reports(rank: int, world: int, port: int) -> None:
+    """Counts one rank's step body reports and another's leaves out still reach every rank:
+    documents and per-source tokens alike."""
+    from kempnerforge.training.loop import StepResult, _log_periodic_metrics, _step_counts
+    from tests.unit.test_train_entry import _mixture_pipeline, make_config, make_session
+
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp_shard",))
+        runtime = RuntimeContext(
+            rank=rank,
+            local_rank=rank,
+            world_size=world,
+            device=torch.device("cpu"),
+            device_mesh=mesh,
+        )
+        session = make_session(make_config(), runtime=runtime, data=_mixture_pipeline())
+        reported = rank == 1
+        result = StepResult(
+            loss=1.0,
+            grad_norm=0.1,
+            tokens=8,
+            documents=3 if reported else None,
+            dataset_tokens=torch.tensor([3, 0]) if reported else None,
+        )
+        assert _step_counts(session, result) == (16, 3, None), rank
+        logged: dict = {}
+        session.tracker.log_eval = lambda m, s: logged.update(m)
+        _log_periodic_metrics(session, result, 1)
+        assert logged == {"data/a/tokens": 3.0}, (rank, logged)
     finally:
         dist.destroy_process_group()
 
@@ -562,6 +598,9 @@ class TestLoggedMetricsOverDataParallel:
 
     def test_a_rank_that_reports_no_counts_still_joins_the_reduction(self):
         mp.spawn(_check_mixed_reports, args=(2, _free_port()), nprocs=2)
+
+    def test_counts_one_rank_reports_reach_every_rank(self):
+        mp.spawn(_check_partial_reports, args=(2, _free_port()), nprocs=2)
 
     def test_a_missing_text_token_count_fails_every_rank(self):
         mp.spawn(_check_missing_text_tokens, args=(2, _free_port()), nprocs=2)

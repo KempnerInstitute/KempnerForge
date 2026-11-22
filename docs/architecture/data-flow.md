@@ -214,12 +214,11 @@ LR that `scheduler.step()` just computed.
 ### 8 · Step accounting
 
 ```python
+tokens_in_step, documents_in_step, images_in_step = _step_counts(session, result)
+# each data-parallel rank adds result.tokens (the configured batch when a
+# step body counts none) in one reduction, with its documents and images
 step += 1
-local_tokens = result.tokens   # positions the step ran on this rank
-if local_tokens is None:       # a step body that does not count them
-    local_tokens = tc.batch_size * tc.seq_len * tc.grad_accum_steps
-tokens_in_step = local_tokens * dp_size
-tokens_seen   += tokens_in_step
+tokens_seen += tokens_in_step
 ```
 
 `result.tokens` counts every micro-step's positions, padding included; a

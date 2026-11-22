@@ -53,8 +53,8 @@ ranks, the same value on every rank, and the learning rate the step's
 update used, read before `optimizer.step()` (for `schedule_free_adamw`,
 the rate before the warmup the optimizer applies inside `step()`; see
 [Schedulers](../training/schedulers.md#shared-warmup)). `tokens_in_step`
-counts the positions the model ran (all micro-steps, padding included,
-times the data-parallel size), and `seq_len` is the length of those rows;
+sums the positions each data-parallel rank ran (all micro-steps, padding
+included), and `seq_len` is the length of those rows;
 a VLM row holds the image positions in the residual stream as well as the
 text.
 

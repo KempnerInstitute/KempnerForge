@@ -148,12 +148,12 @@ def _moe_flops_per_token(config: ModelConfig, seq_len: int) -> int:
 def vision_flops_per_image(model: torch.nn.Module) -> float:
     """FLOPs one image costs a VLM's vision encoder and adapter in a training step.
 
-    Each runs ``2 * N`` FLOPs per token forward for its ``N`` parameters: the encoder over
-    the ``num_tokens`` it processes, plus ``4 * layers * tokens**2 * hidden`` for attention
-    when its tower's config gives the layers and width, and the adapter over the tokens it
-    puts out (``output_num_tokens``), since a pooling adapter projects after it pools. A
-    module with a trainable parameter also runs the backward, twice the forward. Zero for a
-    model without a vision encoder.
+    The encoder runs ``2 * N`` FLOPs per token forward for its ``N`` parameters over the
+    ``num_tokens`` it processes, plus ``4 * layers * tokens**2 * hidden`` for attention when
+    its tower's config gives the layers and width. The adapter runs its ``forward_flops``,
+    which counts each projection over the tokens it sees, or ``2 * N`` per encoder token
+    without one. A module with a trainable parameter also runs the backward, twice the
+    forward. Zero for a model without a vision encoder.
     """
     inner = getattr(model, "_orig_mod", model)
     encoder = getattr(inner, "vision_encoder", None)
@@ -163,18 +163,18 @@ def vision_flops_per_image(model: torch.nn.Module) -> float:
     config = getattr(getattr(encoder, "vision_tower", None), "config", None)
     attention = 4.0 * getattr(config, "num_hidden_layers", 0) * tokens**2
     attention *= getattr(config, "hidden_size", 0)
+    params = list(encoder.parameters())
+    forward = 2.0 * sum(p.numel() for p in params) * tokens + attention
+    total = forward * (3 if any(p.requires_grad for p in params) else 1)
     adapter = getattr(inner, "adapter", None)
-    output_num_tokens = getattr(adapter, "output_num_tokens", None)
-    adapter_tokens = output_num_tokens(tokens) if output_num_tokens is not None else tokens
-    total = 0.0
-    for module, module_tokens, extra in (
-        (encoder, tokens, attention),
-        (adapter, adapter_tokens, 0.0),
-    ):
-        if module is None:
-            continue
-        params = list(module.parameters())
-        forward = 2.0 * sum(p.numel() for p in params) * module_tokens + extra
+    if adapter is not None:
+        params = list(adapter.parameters())
+        forward_flops = getattr(adapter, "forward_flops", None)
+        forward = (
+            forward_flops(tokens)
+            if forward_flops is not None
+            else 2.0 * sum(p.numel() for p in params) * tokens
+        )
         total += forward * (3 if any(p.requires_grad for p in params) else 1)
     return total
 
