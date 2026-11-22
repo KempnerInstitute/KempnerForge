@@ -369,13 +369,13 @@ Installing lmms-eval pulls in extra packages that can clash with a CUDA-pinned
 PyTorch. Two gotchas seen on the Kempner cluster:
 
 - **torchvision must match the CUDA build of torch.** The default-index
-  `torchvision` is ABI-incompatible with `torch …+cu128` (it fails
+  `torchvision` is ABI-incompatible with `torch …+cu130` (it fails
   `register_fake("torchvision::nms")`, which breaks `import lmms_eval`). Install
   the matching build from the same index:
 
   ```bash
   uv pip install --reinstall-package torchvision \
-      --index https://download.pytorch.org/whl/cu128 "torchvision==0.26.0"
+      --index https://download.pytorch.org/whl/cu130 "torchvision==0.29.1"
   ```
 
 - **`GLIBCXX_… not found` when importing the evaluator.** lmms-eval's

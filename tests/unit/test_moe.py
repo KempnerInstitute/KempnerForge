@@ -805,20 +805,88 @@ class TestGroupedPathBf16:
 class TestCapacityFactor:
     """Capacity factor token dropping."""
 
-    def test_capacity_drops_excess_tokens(self):
-        """Capacity factor zeroes weights for overflow tokens."""
+    @pytest.mark.parametrize(
+        "routes,keep",
+        [
+            ([[0]] * 8, [[True]] * 2 + [[False]] * 6),
+            ([[0, 1]] * 4 + [[1, 0]] * 4, [[True, True]] * 4 + [[False, False]] * 4),
+            (
+                [[1, 0], [0, 2], [1, 0], [0, 3]],
+                [[True, True], [True, True], [True, False], [False, True]],
+            ),
+            ([[0, 1], [2, 3], [1, 0], [3, 2]], [[True, True]] * 4),
+        ],
+        ids=["top1", "cross-slot-overflow", "token-order", "balanced"],
+    )
+    def test_capacity_drops_excess_tokens(self, routes, keep):
+        """Each expert keeps its first capacity routes across every top-k slot."""
         from kempnerforge.model.moe import _apply_capacity
 
-        torch.manual_seed(0)
-        num_tokens, top_k, num_experts = 100, 2, 4
-        indices = torch.zeros(num_tokens, top_k, dtype=torch.long)
-        weights = torch.ones(num_tokens, top_k) / top_k
+        indices = torch.tensor(routes)
+        num_tokens, top_k = indices.shape
+        weights = (
+            torch.arange(1, indices.numel() + 1, dtype=torch.float64)
+            .reshape(top_k, num_tokens)
+            .t()
+            .requires_grad_()
+        )
+        before = weights.detach().clone()
+        mask = torch.tensor(keep)
 
-        new_weights, new_indices = _apply_capacity(weights, indices, num_experts, 1.0)
+        new_weights, new_indices = _apply_capacity(weights, indices, 4, 1.0)
 
-        for k in range(top_k):
-            active = (new_weights[:, k] > 0).sum().item()
-            assert active <= 50
+        torch.testing.assert_close(new_weights, before * mask)
+        torch.testing.assert_close(new_indices, torch.tensor(routes))
+        torch.testing.assert_close(weights, before)
+        new_weights.sum().backward()
+        torch.testing.assert_close(weights.grad, mask.to(weights.dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_capacity_drops_cross_slot_outputs_and_gradients(self, packed, dtype, device):
+        """Real top-k routing drops the later tokens, including their gradients."""
+        torch.manual_seed(41)
+        moe = build_moe(
+            dim=32,
+            hidden_dim=64,
+            num_experts=4,
+            top_k=2,
+            capacity_factor=1.0,
+            packed_experts=packed,
+        ).to(device=device, dtype=dtype)
+        with torch.no_grad():
+            moe.router.gate.weight.zero_()
+            moe.router.gate.weight[0, :2] = torch.tensor([2.0, 1.0])
+            moe.router.gate.weight[1, :2] = torch.tensor([1.0, 2.0])
+            moe.router.gate.weight[2:, :2] = -2
+        x = torch.zeros(1, 8, 32, device=device, dtype=dtype)
+        x[0, :4, 0] = 1
+        x[0, 4:, 1] = 1
+        x.requires_grad_()
+
+        out = moe(x)
+        torch.testing.assert_close(out[:, 4:], torch.zeros_like(out[:, 4:]))
+        assert out[:, :4].abs().sum() > 0
+        out.sum().backward()
+        assert x.grad is not None
+        torch.testing.assert_close(x.grad[:, 4:], torch.zeros_like(x.grad[:, 4:]))
+        assert x.grad[:, :4].abs().sum() > 0
+
+        moe.capacity_factor = 0
+        unlimited = moe(x.detach())
+        torch.testing.assert_close(out[:, :4], unlimited[:, :4])
+        assert unlimited[:, 4:].abs().sum() > 0
+
+    @pytest.mark.parametrize("factor,kept", [(0.01, 1), (0.625, 3), (2.0, 8)])
+    def test_capacity_rounding_and_headroom(self, factor, kept):
+        from kempnerforge.model.moe import _apply_capacity
+
+        indices = torch.tensor([[0, 1]] * 4 + [[1, 0]] * 4)
+        weights = torch.ones(8, 2)
+        expected = torch.zeros_like(weights)
+        expected[:kept] = 1
+        actual, _ = _apply_capacity(weights, indices, 4, factor)
+        torch.testing.assert_close(actual, expected)
 
     def test_capacity_zero_disables(self):
         """capacity_factor=0 passes through unchanged."""

@@ -1,0 +1,54 @@
+# Evaluation tasks of the image-understanding recipe: the split each task reads,
+# the scorer of its answers and the cap on a decoded answer. Paths are
+# placeholders: point each annotation_file at the split to evaluate, in the
+# layout its reader takes.
+
+[[tasks]]
+name = "vqav2"
+reader = "vqav2"
+scorer = "vqa_accuracy"
+max_new_tokens = 10
+
+[tasks.reader_args]
+annotation_file = "path-to-vqav2-annotations"
+image_root = "path-to-coco-images"
+
+[[tasks]]
+name = "textvqa"
+reader = "textvqa"
+scorer = "vqa_accuracy"
+max_new_tokens = 75
+
+[tasks.reader_args]
+annotation_file = "path-to-textvqa-annotations"
+image_root = "path-to-textvqa-images"
+
+[[tasks]]
+name = "docvqa"
+reader = "docvqa"
+scorer = "anls"
+max_new_tokens = 50
+
+[tasks.reader_args]
+annotation_file = "path-to-docvqa-annotations"
+image_root = "path-to-docvqa-images"
+
+[[tasks]]
+name = "chartqa-human"
+reader = "chartqa"
+scorer = "relaxed_accuracy"
+max_new_tokens = 50
+
+[tasks.reader_args]
+annotation_file = "path-to-chartqa-human-annotations"
+image_root = "path-to-chartqa-images"
+
+[[tasks]]
+name = "chartqa-machine"
+reader = "chartqa"
+scorer = "relaxed_accuracy"
+max_new_tokens = 50
+
+[tasks.reader_args]
+annotation_file = "path-to-chartqa-machine-annotations"
+image_root = "path-to-chartqa-images"
