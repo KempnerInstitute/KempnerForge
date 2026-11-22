@@ -48,11 +48,16 @@ Span = tuple[int, int]
 
 
 class ChatRenderer:
-    """Renders a single-image document with a chat template into one VLM training sample.
+    """Renders a document with a chat template into one VLM training sample.
 
-    The sample holds ``pixel_values``, ``input_ids`` padded to ``max_text_len``, and
+    The sample holds ``pixel_values``, ``input_ids`` padded to ``max_text_len``,
     next-token ``labels`` (``labels[i]`` is token ``i + 1``) that are ``-100`` on
-    padding and, when ``answer_only``, outside the replies and their turn ends. The
+    padding and, when ``answer_only``, outside the replies and their turn ends, and
+    ``text_len``, the count of real tokens. ``pixel_values`` follows the core
+    dataset's shapes: ``(3, H, W)`` for the one image when ``max_images`` is 1,
+    ``(K, 3, H, W)`` for a document's ``K`` images when it is larger, and
+    ``(0, 3, H, W)`` for a text-only document. A document with more than
+    ``max_images`` images is refused with ``UnrenderableDocumentError``. The
     replies are located by character span in the templated text, each where the
     template of the turns before it ends, so what the template writes before a reply
     (an empty think block, for instance) is never trained and a user message that
@@ -72,6 +77,7 @@ class ChatRenderer:
         max_text_len: int,
         image_size: int,
         answer_only: bool,
+        max_images: int = 1,
         image_placeholder: str = "",
         turn_start: str = "<|im_start|>",
         turn_end: str = "<|im_end|>",
@@ -80,12 +86,15 @@ class ChatRenderer:
     ) -> None:
         if max_text_len < 2:
             raise ValueError(f"max_text_len must be at least 2, got {max_text_len}")
+        if max_images < 1:
+            raise ValueError(f"max_images must be positive, got {max_images}")
         if not getattr(tokenizer, "is_fast", False):
             raise ValueError("ChatRenderer needs a fast tokenizer to map replies to tokens")
         self.tokenizer = tokenizer
         self.max_text_len = max_text_len
         self.image_size = image_size
         self.answer_only = answer_only
+        self.max_images = max_images
         self.image_placeholder = image_placeholder
         self.turn_end = turn_end
         self.image_mean = image_mean
@@ -182,9 +191,10 @@ class ChatRenderer:
 
     def render(self, document: Document, answers: Sequence[str]) -> dict[str, torch.Tensor]:
         """The training sample for ``document`` with the given replies."""
-        if len(document.images) != 1:
-            raise ValueError(
-                f"only single-image documents render to a sample, got {len(document.images)} images"
+        if len(document.images) > self.max_images:
+            raise UnrenderableDocumentError(
+                f"the document holds {len(document.images)} images, over "
+                f"max_images={self.max_images}"
             )
         text, spans = self.text_and_reply_spans(document, answers)
         encoded = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
@@ -213,10 +223,21 @@ class ChatRenderer:
         ids_t = torch.tensor(ids, dtype=torch.long)
         input_ids[:n] = ids_t
         labels[: n - 1] = torch.where(torch.tensor(trained[1:]), ids_t[1:], -100)
-        pixel_values = pil_to_tensor(
-            document.images[0], self.image_size, self.image_mean, self.image_std
-        )
-        return {"pixel_values": pixel_values, "input_ids": input_ids, "labels": labels}
+        return {
+            "pixel_values": self._pixels(document),
+            "input_ids": input_ids,
+            "labels": labels,
+            "text_len": torch.tensor(n, dtype=torch.long),
+        }
+
+    def _pixels(self, document: Document) -> torch.Tensor:
+        if not document.images:
+            return torch.zeros(0, 3, self.image_size, self.image_size)
+        pixels = [
+            pil_to_tensor(image, self.image_size, self.image_mean, self.image_std)
+            for image in document.images
+        ]
+        return pixels[0] if self.max_images == 1 else torch.stack(pixels)
 
     def __call__(self, document: Document, rng: random.Random) -> dict[str, torch.Tensor]:
         """Render with each turn's reply drawn from its answers by ``rng``."""

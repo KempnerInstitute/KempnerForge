@@ -55,7 +55,8 @@ samples `VLMCollator` batches.
   ChartQA (human and augmented); a row whose image does not decode is passed over.
 - `render.py`: `ChatRenderer` applies the tokenizer's chat template (prompt then
   answer for single-turn rows, the full template for conversations) and trains only
-  the assistant replies when `answer_only`. `RenderedDataset` draws one reference
+  the assistant replies when `answer_only`; `max_images` sets how many images a
+  document may bring. `RenderedDataset` draws one reference
   answer per turn from a seed and the row index, so a resume draws the same answers,
   and passes over a document the renderer refuses (an empty reply, or one the text
   budget cuts away), up to `max_attempts` in a row; `skipped` counts them with
@@ -69,8 +70,11 @@ samples `VLMCollator` batches.
   stream the way `RenderedDataset` renders a reader, and `stream.py`'s
   `StreamLoader` loads it so that a resume continues where training stopped.
 
-Every sample the renderer builds carries one image, resized square to `image_size`,
-with no tiling or packing. PixMo-Count stores its points in pixels; they are
+The renderer resizes each image square to `image_size`, with no tiling. A
+sample has the core dataset's shapes, so `VLMCollator` and `PackedVLMCollator`
+batch it: one image by default, up to `max_images` stacked images, or none for a
+text-only document, and `text_len` counts its real tokens. A document with more
+images than `max_images` is passed over. PixMo-Count stores its points in pixels; they are
 converted to percent of the image, the unit the other PixMo sources use. A
 counting answer lists its points before the count, so a row with many points
 outruns `max_text_len` and trains only the leading points. `max_points` retains
@@ -78,10 +82,13 @@ the count only when the cap is small enough for the label and the text budget:
 with a 40-point `dot` row at 256 tokens, a cap of 30 still cuts the count, while
 a cap of 3 keeps it.
 
-`FineVisionArrow` keeps only the rows with one image (`max_images`, which `None`
-lifts), using the per-row image counts `index.npz` stores; an index written
-without them takes the counts from `num_images`, and `text_only` keeps the rows
-without images. A conversation keeps its turns up to the first one missing its
+`FineVisionArrow` keeps the rows with from `min_images` (0) to `max_images` (1)
+images, using the per-row image counts `index.npz` stores; an index written
+without them takes the counts from `num_images`. The defaults read the rows
+without images as text-only documents beside the single-image rows, so a `text_*`
+subset reads as is; `max_images=None` lifts the cap for multi-image rows, to pair
+with the renderer's `max_images`, `min_images=1` leaves out the text-only rows,
+and `text_only` keeps only them without reading the image column. A conversation keeps its turns up to the first one missing its
 user message or reply, so a row whose first turn is incomplete is not kept.
 
 Convert FineVision once; any number of `convert` processes can share the work,

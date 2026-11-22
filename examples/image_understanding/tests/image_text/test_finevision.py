@@ -389,10 +389,13 @@ class TestFineVisionArrow:
         _write_parquet(src / "text_demo" / "train-00000-of-00001.parquet", [rows], schema)
         _run("convert", "--src", str(src), "--dst", str(dst))
         _run("index", "--src", str(src), "--dst", str(dst))
-        reader = FineVisionArrow(dst / "text_demo", text_only=True)
-        assert len(reader) == 2 and reader[1].images == () and reader[1].turns[0].user == "Q1"
-        with pytest.raises(ValueError, match="needs text_only"):
-            FineVisionArrow(dst / "text_demo")
+        for reader in (
+            FineVisionArrow(dst / "text_demo", text_only=True),
+            FineVisionArrow(dst / "text_demo"),
+        ):
+            assert len(reader) == 2 and reader[1].images == () and reader[1].turns[0].user == "Q1"
+        with pytest.raises(ValueError, match="no row"):
+            FineVisionArrow(dst / "text_demo", min_images=1)
 
     def test_text_only_keeps_only_the_rows_without_images(self, subset: Path) -> None:
         with pytest.raises(ValueError, match="no row"):
@@ -423,6 +426,54 @@ class TestFineVisionArrow:
         with pytest.raises(ValueError, match="positive"):
             FineVisionArrow(subset, **{option: 0})
 
+    @pytest.mark.parametrize(
+        ("options", "message"),
+        [
+            ({"min_images": -1}, "must not be negative"),
+            ({"min_images": 2, "max_images": 1}, "exceeds max_images"),
+            ({"min_images": 1, "text_only": True}, "min_images must be 0"),
+        ],
+    )
+    def test_min_images_is_checked(
+        self, subset: Path, options: dict[str, Any], message: str
+    ) -> None:
+        with pytest.raises(ValueError, match=message):
+            FineVisionArrow(subset, **options)
+
+    def test_text_only_and_multi_image_rows_are_kept_together(self, tmp_path: Path) -> None:
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        rows = [_row(n, [(f"Q{n}", f"A{n}")], 5) for n in (0, 1, 2, 3)]
+        _write_parquet(src / "demo" / "train-00000-of-00001.parquet", [rows])
+        _run("convert", "--src", str(src), "--dst", str(dst))
+        _run("index", "--src", str(src), "--dst", str(dst))
+        expected = {
+            (): [0, 1],
+            (("max_images", 2),): [0, 1, 2],
+            (("max_images", None),): [0, 1, 2, 3],
+            (("min_images", 1), ("max_images", None)): [1, 2, 3],
+            (("min_images", 2), ("max_images", 2)): [2],
+        }
+        for options, kept in expected.items():
+            reader = FineVisionArrow(dst / "demo", **dict(options))
+            assert reader.rows.tolist() == kept
+            assert [len(reader[i].images) for i in range(len(reader))] == kept
+
+    def test_a_mixed_subset_renders_text_only_and_multi_image_samples(
+        self, tmp_path: Path, tokenizer: Any
+    ) -> None:
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        rows = [_row(n, [(f"Q{n}", f"A{n}")], 5) for n in (0, 2, 1, 3)]
+        _write_parquet(src / "demo" / "train-00000-of-00001.parquet", [rows])
+        _run("convert", "--src", str(src), "--dst", str(dst))
+        _run("index", "--src", str(src), "--dst", str(dst))
+        renderer = ChatRenderer(
+            tokenizer, max_text_len=64, image_size=8, answer_only=True, max_images=2
+        )
+        dataset = RenderedDataset(FineVisionArrow(dst / "demo", max_images=2), renderer)
+        shapes = [tuple(dataset[i]["pixel_values"].shape) for i in range(len(dataset))]
+        assert shapes == [(0, 3, 8, 8), (2, 3, 8, 8), (1, 3, 8, 8)]
+        assert dataset.skipped == 0
+
     def test_a_row_without_a_complete_turn_is_passed_over(self, subset: Path) -> None:
         """An index that kept such a row (an older keep rule) still reads past it."""
         arrays = dict(np.load(subset / "index.npz"))
@@ -447,8 +498,9 @@ class TestFineVisionArrow:
         _run("convert", "--src", str(src), "--dst", str(dst))
         _run("index", "--src", str(src), "--dst", str(dst))
         reader = FineVisionArrow(dst / "demo", max_images=None)
-        assert reader.rows.tolist() == [1, 2]
-        assert reader[0].turns[0].user == "Q2" and reader.skipped == 1
+        assert reader.rows.tolist() == [0, 1, 2]
+        assert reader[0].turns[0].user == "Q0" and reader[0].images == ()
+        assert reader[1].turns[0].user == "Q2" and reader.skipped == 1
         text = FineVisionArrow(dst / "demo", text_only=True)
         assert text.rows.tolist() == [0] and text[0].images == ()
 

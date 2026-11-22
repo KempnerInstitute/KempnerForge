@@ -47,11 +47,12 @@ class FineVisionArrow(Dataset):
 
     Rows pass when their keep flag is set, every ``min_ratings`` column meets its
     threshold (a missing rating, stored as ``-1``, fails), and the row has between
-    1 and ``max_images`` images; ``None`` lifts the upper limit, for a renderer that
-    accepts documents with several images. A ``text_only`` reader keeps the rows
-    without images instead, and its documents carry none, for a renderer that
-    accepts those. ``num_images`` overrides the per-row image counts stored in
-    ``index.npz``. A conversation keeps its turns up to the first one missing its
+    ``min_images`` and ``max_images`` images. The default keeps the rows without
+    images as text-only documents beside the rows with one image; ``min_images=1``
+    leaves them out, and ``max_images=None`` lifts the upper limit for documents
+    with several images. A ``text_only`` reader keeps only the rows without images
+    and never reads the image column. ``num_images`` overrides the per-row image
+    counts stored in ``index.npz``. A conversation keeps its turns up to the first one missing its
     user message or its reply, since later turns may refer to it; a row whose
     first turn is incomplete, or whose image does not decode or holds no bytes, is
     passed over for the next row, up to ``max_attempts`` in a row, and ``skipped``
@@ -63,6 +64,7 @@ class FineVisionArrow(Dataset):
         subset_dir: str | Path,
         *,
         max_images: int | None = 1,
+        min_images: int = 0,
         num_images: np.ndarray | None = None,
         min_ratings: dict[str, int] | None = None,
         text_only: bool = False,
@@ -73,6 +75,12 @@ class FineVisionArrow(Dataset):
             raise ValueError(f"max_open_files must be positive, got {max_open_files}")
         if max_images is not None and max_images < 1:
             raise ValueError(f"max_images must be positive or None, got {max_images}")
+        if min_images < 0:
+            raise ValueError(f"min_images must not be negative, got {min_images}")
+        if max_images is not None and min_images > max_images:
+            raise ValueError(f"min_images={min_images} exceeds max_images={max_images}")
+        if text_only and min_images:
+            raise ValueError("text_only keeps the rows without images; min_images must be 0")
         self.subset_dir = Path(subset_dir)
         self.text_only = text_only
         self.max_attempts = check_max_attempts(max_attempts)
@@ -106,15 +114,12 @@ class FineVisionArrow(Dataset):
         if text_only:
             keep &= counts == 0
         else:
-            keep &= counts >= 1
+            keep &= counts >= min_images
             if max_images is not None:
                 keep &= counts <= max_images
         self.rows = np.flatnonzero(keep).astype(np.int64)
         if not len(self.rows):
-            raise ValueError(
-                f"no row of {self.subset_dir} passes the filters"
-                + ("" if text_only else "; a subset without images needs text_only")
-            )
+            raise ValueError(f"no row of {self.subset_dir} passes the filters")
         self._readers: OrderedDict[int, Any] = OrderedDict()
 
     @property
