@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -496,6 +497,33 @@ class TestCheckpointLoadDivergentExistence:
         assert tokens_seen == 100, (
             f"rank {rank}: expected tokens_seen=100 after load, got {tokens_seen}"
         )
+
+
+class TestCheckpointLoadUnreadableTrainState:
+    """Every rank raises at once when rank 0 cannot read ``train_state.pt`` (#546)."""
+
+    def test_a_torn_train_state_fails_every_rank_at_once(self, distributed_env, shared_tmp_dir):
+        mesh = distributed_env
+        rank = dist.get_rank()
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, mesh)
+        from kempnerforge.config.schema import OptimizerConfig
+
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        mgr = CheckpointManager(CheckpointConfig(dir=shared_tmp_dir), model, opt)
+        mgr.save(step=1, tokens_seen=100)
+        dist.barrier()
+        path = Path(shared_tmp_dir) / "step_1" / "train_state.pt"
+        if rank == 0:
+            path.write_bytes(path.read_bytes()[:100])
+        dist.barrier()
+        reason = "PytorchStreamReader"
+        if rank != 0:
+            reason = f"Rank 0 could not read {path}: RuntimeError: {reason}"
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match=re.escape(reason)):
+            mgr.load()
+        assert time.monotonic() - start < 60
 
 
 class TestAsyncCheckpointLatestSafety:

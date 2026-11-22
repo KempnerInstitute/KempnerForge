@@ -3608,6 +3608,88 @@ class TestResumeWithoutTrainStateAcrossRanks:
         mp.spawn(_load_with_a_stale_view, args=(2, _free_port(), str(tmp_path), stale), nprocs=2)
 
 
+class _Unprintable(Exception):
+    """An error whose message cannot be formatted."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("no message")
+
+
+def _load_an_unreadable_train_state(
+    rank: int, world: int, port: int, ckpt_dir: str, how: str
+) -> None:
+    """Save on every rank, then load while rank 0 cannot read ``train_state.pt``."""
+    import time
+    from contextlib import nullcontext
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from kempnerforge.checkpoint import manager as mgr_mod
+    from kempnerforge.checkpoint.manager import CheckpointManager
+
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"tcp://127.0.0.1:{port}",
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        torch.manual_seed(0)
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        model(torch.ones(2, 4)).sum().backward()
+        optimizer.step()
+        manager = CheckpointManager(CheckpointConfig(dir=ckpt_dir), model, optimizer)
+        manager.save(step=3, tokens_seen=30)
+        dist.barrier()
+        path = Path(ckpt_dir) / "step_3" / "train_state.pt"
+        if rank == 0 and how == "torn":
+            path.write_bytes(path.read_bytes()[:100])
+        dist.barrier()
+        error, reason = {
+            "torn": (RuntimeError, "PytorchStreamReader"),
+            "foreign": (PermissionError, "Refusing to load"),
+            "unprintable": (_Unprintable, ""),
+        }[how]
+        if rank != 0:
+            if how == "unprintable":
+                reason = "<unprintable _Unprintable>"
+            reason = f"Rank 0 could not read {path}: {error.__name__}: {reason}"
+            error = RuntimeError
+        uid = os.getuid() + (1 if rank == 0 and how == "foreign" else 0)
+        raising = (
+            patch.object(mgr_mod, "_load_train_state", side_effect=_Unprintable())
+            if rank == 0 and how == "unprintable"
+            else nullcontext()
+        )
+        start = time.monotonic()
+        with (
+            patch("os.getuid", return_value=uid),
+            raising,
+            pytest.raises(error, match=re.escape(reason) if reason else None),
+        ):
+            manager.load()
+        assert time.monotonic() - start < 20
+    finally:
+        dist.destroy_process_group()
+
+
+class TestUnreadableTrainStateAcrossRanks:
+    """A ``train_state.pt`` rank 0 cannot read fails every rank at once (#546)."""
+
+    @pytest.mark.parametrize("how", ["torn", "foreign", "unprintable"])
+    def test_every_rank_raises_rank_zeros_error(self, tmp_path, how):
+        """Rank 0 raises its own error; rank 1 names it, instead of waiting for the timeout."""
+        import torch.multiprocessing as mp
+
+        mp.spawn(
+            _load_an_unreadable_train_state, args=(2, _free_port(), str(tmp_path), how), nprocs=2
+        )
+
+
 def _refuse_on_one_stage(
     rank: int, world: int, port: int, ckpt_dir: str, refusing: int, scope: str | None
 ) -> None:

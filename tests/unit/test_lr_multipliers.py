@@ -1202,14 +1202,14 @@ class TestResume:
         step_dir = self._save(tmp_path, {"head": 2.0})
         train_state = torch.load(step_dir / "train_state.pt", weights_only=False)
         _, scheduler, manager = self._resume(tmp_path, {})
-        sent = [True, train_state, (self.RECORD, None)]
+        sent = [True, (train_state, None), (self.RECORD, None)]
         calls = self._as_rank(monkeypatch, manager, 1, sent=sent)
         with pytest.raises(ValueError, match="but this run uses"):
             manager.load(scheduler=scheduler, exclude_keys=["model", "optimizer"])
         assert len(calls) == 3
         assert scheduler.last_epoch == 0
         without_scheduler = {k: v for k, v in train_state.items() if k != "scheduler"}
-        calls = self._as_rank(monkeypatch, manager, 1, sent=[True, without_scheduler])
+        calls = self._as_rank(monkeypatch, manager, 1, sent=[True, (without_scheduler, None)])
         assert manager.load(scheduler=scheduler, exclude_keys=["model", "optimizer"])[0] == 3
         assert len(calls) == 2
 
