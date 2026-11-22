@@ -90,7 +90,7 @@ The script then:
 Async DCP checkpointing uses a CPU-side Gloo process group for
 coordination. Without `GLOO_SOCKET_IFNAME` pointed at the IB
 interface, Gloo falls back to the management Ethernet (`em4` on
-Kempner nodes), which is on a different subnet — peer connections
+Kempner nodes), which is on a different subnet, so peer connections
 time out and the checkpoint never completes.
 
 ### NCCL environment the script sets
@@ -104,7 +104,7 @@ GLOO_SOCKET_IFNAME=ib0
 ```
 
 `NCCL_IB_GID_INDEX=3` is specific to the RoCE/IB fabric on Kempner
-H100/H200 nodes. On other clusters this may need to be 0 or 1 — check
+H100/H200 nodes. On other clusters this may need to be 0 or 1; check
 with your admins or `ibv_devinfo`.
 
 No environment variable bounds a hung collective: neither NCCL nor
@@ -189,12 +189,12 @@ periodic checkpoints are what it resumes from.
 
 First time you run on a new cluster, verify:
 
-1. **All ranks start** — the script's banner line should print once
+1. **All ranks start**: the script's banner line should print once
    per rank, and rank 0 log should show `world_size = N × M`.
-2. **NCCL talks over IB** — set `NCCL_DEBUG=INFO` in the script once
+2. **NCCL talks over IB**: set `NCCL_DEBUG=INFO` in the script once
    to see the negotiated transport. Each rank should log `NET/IB`
    (not `NET/Socket`).
-3. **First all-reduce succeeds** — rank 0 reports model build and
+3. **First all-reduce succeeds**: rank 0 reports model build and
    step 1 loss within a minute or two. A multi-minute hang at step 1
    usually means Gloo is on the wrong interface (DCP init fails) or
    IB GID is wrong.
@@ -208,25 +208,25 @@ export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
 ## What the SLURM scripts don't do
 
-- **Tokenizer caching** — you still need to pre-cache HuggingFace
+- **Tokenizer caching**: you still need to pre-cache HuggingFace
   tokenizers on a login node (compute nodes are usually air-gapped).
   See
   [Prepare tokenized data § Cache the tokenizer first](prepare-tokenized-data.md#cache-the-tokenizer-first).
-- **Data staging** — `configs/train/*.toml` expects your dataset at
+- **Data staging**: `configs/train/*.toml` expects your dataset at
   `data.dataset_path`. Pre-copy or symlink before `sbatch`.
-- **Env mounts** — the scripts assume `uv run python` resolves the
+- **Env mounts**: the scripts assume `uv run python` resolves the
   repo's `.venv`. If your cluster uses different mount points, edit
   the `uv run` lines.
 
 ## See also
 
-- [Resilience § SLURM preemption](../resilience/slurm-preemption.md)
-  — the full `ShutdownHandler` timeline and SLURM requeue dance.
-- [Distributed § DeviceMesh](../distributed/device-mesh.md) — how
+- [Resilience § SLURM preemption](../resilience/slurm-preemption.md):
+  the full `ShutdownHandler` timeline and SLURM requeue dance.
+- [Distributed § DeviceMesh](../distributed/device-mesh.md): how
   `init_distributed` turns rank info into a mesh.
-- [End-to-end training run](end-to-end-training-run.md) — runs
+- [End-to-end training run](end-to-end-training-run.md): runs
   through the single-node path before this page scales it.
-- [Scaling guide](scaling-guide.md) — which parallelism combo to pick
+- [Scaling guide](scaling-guide.md): which parallelism combo to pick
   at each GPU count; this page tells you how to launch it.
-- [`scripts/slurm/multinode.sh`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/slurm/multinode.sh)
-  — the reference script this page documents.
+- [`scripts/slurm/multinode.sh`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/slurm/multinode.sh):
+  the reference script this page documents.
