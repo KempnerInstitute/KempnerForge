@@ -1310,6 +1310,45 @@ class TestRunTraining:
         run_training(config)
         assert not torch.equal(before, next(model.transformer.parameters()))
 
+    def test_injected_data_fn_replaces_the_data_pipeline(self, monkeypatch):
+        """A data_fn builds the pipeline in place of build_data_pipeline, with tokens_per_image."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.data.vlm_dataset import pack_vlm_samples
+        from kempnerforge.model.vlm import build_vlm_wrapper, packed_tokens_per_image
+        from kempnerforge.training.entry import run_training
+
+        config = _vlm_config()
+        config.data.pack_sequences = True
+        config.train.max_steps = 2
+        assert config.vision_encoder is not None and config.adapter is not None
+        assert config.vlm is not None
+        model = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
+        before = next(model.transformer.parameters()).detach().clone()
+        tokens = packed_tokens_per_image(model)
+        gen = torch.Generator().manual_seed(0)
+        ids = torch.randint(0, 256, (12,), generator=gen)
+        doc = {
+            "pixel_values": torch.randn(3, 16, 16, generator=gen),
+            "input_ids": ids,
+            "labels": torch.cat([ids[1:], torch.tensor([-100])]),
+            "text_len": torch.tensor(12),
+        }
+        batch = pack_vlm_samples([doc, doc], seq_len=64, tokens_per_image=tokens, pad_id=0)
+        ckpt = _stub_entry(monkeypatch, model)
+        ckpt.apply_dataloader_state = lambda _loader: None
+        monkeypatch.setattr(
+            entry, "build_data_pipeline", lambda *_a, **_k: pytest.fail("default pipeline built")
+        )
+        calls: list[tuple] = []
+
+        def data_fn(cfg, runtime, *, tokens_per_image=None):
+            calls.append((cfg, runtime.rank, tokens_per_image))
+            return DataPipeline(dataloader=[batch, batch])
+
+        run_training(config, data_fn=data_fn)
+        assert calls == [(config, 0, tokens)]
+        assert not torch.equal(before, next(model.transformer.parameters()))
+
     def test_defaults_to_the_registry_selected_step_body(self, monkeypatch):
         from kempnerforge.training.entry import run_training
 
