@@ -465,9 +465,7 @@ def _check_saved_state_matches(
             fqn = fqn.rpartition(".")[0]
         if fqn:
             saved.setdefault(fqn, set()).add(name.removeprefix(f"{fqn}.").split(".", 1)[0])
-    moved = sorted(
-        fqn for fqn, entries in saved.items() if entries - kept[fqn] and kept[fqn] - entries
-    )
+    moved = sorted(fqn for fqn, entries in saved.items() if entries - kept[fqn] and kept[fqn])
     if moved:
         first = moved[0]
         raise RuntimeError(
@@ -562,9 +560,17 @@ def _check_saved_optimizer(
     where: Path,
     groups_vary: bool,
     saved_modules: Sequence[str | None] | None = None,
+    layout: ExpertLayout | None = None,
 ) -> None:
-    """Run the checks the checkpoint's optimizer state must pass before anything loads."""
-    _check_saved_state_matches(optim_state, saved_keys, where)
+    """Run the checks the checkpoint's optimizer state must pass before anything loads.
+
+    Under expert parallelism, ``layout`` gives each of this rank's experts the global name
+    the checkpoint holds its state under, so each expert's state is compared with its own.
+    """
+    states = optim_state
+    if layout is not None:
+        states = layout.to_global({"optimizer": optim_state})["optimizer"]
+    _check_saved_state_matches(states, saved_keys, where)
     _check_saved_param_groups(optim_state, saved_keys, where, groups_vary, saved_modules)
 
 
@@ -1533,6 +1539,7 @@ class CheckpointManager:
                 dcp_dir,
                 bool(self._lr_multipliers),
                 saved_modules,
+                expert_layout(self.model),
             )
         if optimizer_requested:
             self.agree(check_error, "Checkpoint load")

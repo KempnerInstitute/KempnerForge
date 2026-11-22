@@ -332,6 +332,21 @@ test of all three features together.
 For any optimizer, the decay-vs-no-decay grouping is handled
 automatically — no need to thread `no_decay_params` through your config.
 
+A resume refuses a checkpoint whose saved optimizer state holds entries the
+current optimizer does not keep, as one saved by another optimizer does,
+before loading anything, naming those parameters (each expert under the
+name the checkpoint holds it by): an AdamW checkpoint would otherwise load
+into a Lion run with its `exp_avg` as Lion's momentum and its other entries
+dropped. Only parameters the current optimizer keeps state for are
+compared, so one frozen since the save is not. A saved state short of
+entries, as a Lion checkpoint is for AdamW, stops `dcp.load` at the first
+missing key, and a checkpoint saved before the first step holds no
+optimizer state, so it loads under any optimizer. To
+change `optimizer.name`, continue from the checkpoint's weights with a
+fresh optimizer: `checkpoint.load_path` set to it and
+`checkpoint.exclude_from_loading = ["optimizer"]`, with a `checkpoint.dir`
+that holds no checkpoint (see [DCP model](../checkpointing/dcp-model.md)).
+
 ## See also
 
 - [Schedulers](schedulers.md) — the `scheduler.*` side, including

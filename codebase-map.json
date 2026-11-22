@@ -1628,9 +1628,10 @@
           "TestPeekSavedStep(5)",
           "TestFlushPendingSave(1)",
           "TestSaveVLMFreezeMetadata(3)",
-          "TestLoadVLMFreezeCompare(9)"
+          "TestLoadVLMFreezeCompare(9)",
+          "TestOptimizerTypeChangeOnResume(5)"
         ],
-        "count": 51
+        "count": 56
       },
       "tests/unit/test_observability.py": {
         "classes": [
