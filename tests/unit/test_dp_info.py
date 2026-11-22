@@ -588,7 +588,7 @@ def _check_vlm_partial_loop(rank: int, world: int, port: int) -> None:
                 )
             return StepResult(loss=1.0, grad_norm=0.5, text_tokens=4)
 
-        session = make_session(config, runtime=runtime, step_fn=step_fn)
+        session = make_session(config, runtime=runtime, step_fn=step_fn, nan_detector=_AllFinite())
         logged: dict = {}
         session.tracker.log_eval = lambda m, s: logged.update(m)
         flops: list = []
