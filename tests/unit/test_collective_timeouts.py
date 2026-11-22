@@ -238,3 +238,176 @@ class TestNcclAsyncErrorHandlingEnvGuard:
         assert any("TORCH_NCCL_ASYNC_ERROR_HANDLING=0" in r.getMessage() for r in records), (
             "expected warning when TORCH_NCCL_ASYNC_ERROR_HANDLING=0"
         )
+
+
+_MIXED = "cpu:gloo,cuda:nccl"
+
+
+class _FakeMesh:
+    """The parts of a DeviceMesh ``init_distributed`` reads after building it."""
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        self.mesh_dim_names = names
+
+    def __getitem__(self, name: str) -> _FakeMesh:
+        return self
+
+    def get_local_rank(self) -> int:
+        return 0
+
+
+class TestGroupTimeouts:
+    def test_the_timeout_options_carry_the_timeout(self) -> None:
+        """NCCL takes only its own options, set as torch sets them by default; Gloo ignores them."""
+        import torch.distributed as dist
+
+        from kempnerforge.distributed.setup import _timeout_options
+
+        options = _timeout_options(timedelta(seconds=123))
+        assert type(options) is dist.ProcessGroupNCCL.Options
+        assert options._timeout == timedelta(seconds=123)
+        assert options.is_high_priority_stream is False
+
+    @pytest.mark.parametrize(
+        ("dims", "sizes", "backend", "cuda", "given"),
+        [
+            ({"dp_shard": 2, "tp": 2}, {"dp_shard": 2, "tp": 2}, _MIXED, True, ("dp_shard", "tp")),
+            ({"pp": 2, "dp_shard": 2}, {"pp": 2, "dp_shard": 2}, _MIXED, True, ("pp", "dp_shard")),
+            ({"dp_shard": 2, "ep": 2}, {"dp_shard": 2, "ep": 2}, _MIXED, True, ("dp_shard", "ep")),
+            (
+                {"dp_replicate": 2, "dp_shard": 2},
+                {"dp_replicate": 2, "dp_shard": 2},
+                _MIXED,
+                True,
+                ("dp_replicate", "dp_shard"),
+            ),
+            ({"tp": 4}, {"dp_shard": 1, "tp": 4}, _MIXED, True, ("dp_shard",)),
+            ({}, {"dp_shard": 4}, _MIXED, True, ()),
+            ({}, {"dp_shard": 4}, "nccl", True, ()),
+            ({"dp_shard": 2, "tp": 2}, {"dp_shard": 2, "tp": 2}, "nccl", True, ("dp_shard", "tp")),
+            ({}, {"dp_shard": 4}, "gloo", True, ("dp_shard",)),
+            ({"tp": 4}, {"dp_shard": 1, "tp": 4}, "gloo", True, ("dp_shard", "tp")),
+            ({}, {"dp_shard": 4}, "gloo", False, ()),
+        ],
+    )
+    def test_every_group_init_device_mesh_creates_gets_nccl_timeout_sec(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        dims: dict[str, int],
+        sizes: dict[str, int],
+        backend: str,
+        cuda: bool,
+        given: tuple[str, ...],
+    ) -> None:
+        """init_device_mesh creates a group for each dimension smaller than the world, and for
+        one as wide as the world only with CUDA and Gloo alone; it reuses the default group
+        otherwise, so that dimension gets no options."""
+        from kempnerforge.config.schema import DistributedConfig
+        from kempnerforge.distributed import setup
+
+        built: list[tuple[tuple[int, ...], tuple[str, ...], dict | None]] = []
+
+        def fake_init_device_mesh(device_type, mesh_shape, mesh_dim_names, backend_override):
+            built.append((mesh_shape, mesh_dim_names, backend_override))
+            return _FakeMesh(mesh_dim_names)
+
+        monkeypatch.setattr(setup, "get_world_info", lambda: (0, 0, 4))
+        monkeypatch.setattr(setup, "_set_nccl_env", lambda: None)
+        monkeypatch.setattr(setup.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(setup.dist, "get_backend", lambda group=None: backend)
+        monkeypatch.setattr(setup.torch.cuda, "is_available", lambda: cuda)
+        monkeypatch.setattr(setup.torch.cuda, "set_device", lambda device: None)
+        monkeypatch.setattr(setup, "init_device_mesh", fake_init_device_mesh)
+        monkeypatch.setattr(setup, "_barrier_with_timeout", lambda seconds, reason: None)
+        monkeypatch.setattr(setup, "_set_seed", lambda seed, rank, pp_rank=0: None)
+        monkeypatch.setenv("MASTER_ADDR", "localhost")
+        monkeypatch.setenv("MASTER_PORT", "29500")
+
+        setup.init_distributed(DistributedConfig(nccl_timeout_sec=123, backend=backend, **dims))
+        [(shape, names, overrides)] = built
+        assert dict(zip(names, shape, strict=True)) == sizes
+        if not given:
+            assert overrides is None
+            return
+        assert overrides is not None and tuple(overrides) == given
+        for named, options in overrides.values():
+            assert named == backend
+            assert options._timeout == timedelta(seconds=123)
+
+    def test_the_checkpoint_sync_group_gets_the_timeout(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        import torch.distributed as dist
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.schema import CheckpointConfig
+
+        created: list[dict] = []
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
+        monkeypatch.setattr(dist, "get_world_size", lambda group=None: 1)
+        monkeypatch.setattr(dist, "new_group", lambda **kwargs: created.append(kwargs) or object())
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        config = CheckpointConfig(dir=str(tmp_path))
+        CheckpointManager(config, model, optimizer, group_timeout_sec=123)
+        CheckpointManager(config, model, optimizer)
+        assert created == [
+            {"backend": "gloo", "timeout": timedelta(seconds=123)},
+            {"backend": "gloo"},
+        ]
+
+    def test_the_pipeline_stage_groups_get_the_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        import torch.distributed as dist
+
+        from kempnerforge.distributed.pipeline_parallel import build_stage_group
+
+        calls: list[tuple[list[list[int]], timedelta | None]] = []
+
+        def subgroups(ranks: list[list[int]], timeout: timedelta | None = None):
+            calls.append((ranks, timeout))
+            return "stage group", []
+
+        monkeypatch.setattr(dist, "new_subgroups_by_enumeration", subgroups)
+        mesh = SimpleNamespace(mesh_dim_names=("pp", "dp_shard"), mesh=torch.arange(4).view(2, 2))
+        assert build_stage_group(mesh, 123) == "stage group"
+        assert build_stage_group(mesh) == "stage group"
+        assert calls == [
+            ([[0, 1], [2, 3]], timedelta(seconds=123)),
+            ([[0, 1], [2, 3]], None),
+        ]
+
+    def test_training_passes_nccl_timeout_sec_to_the_checkpoint_groups(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        from kempnerforge.config.schema import DistributedConfig, JobConfig
+        from kempnerforge.distributed import pipeline_parallel
+        from kempnerforge.training import entry
+
+        seen: dict[str, object] = {}
+        monkeypatch.setattr(
+            entry, "CheckpointManager", lambda *args, **kwargs: seen.update(kwargs) or "manager"
+        )
+        monkeypatch.setattr(entry, "get_dp_info", lambda mesh: None)
+        monkeypatch.setattr(
+            pipeline_parallel,
+            "build_stage_group",
+            lambda mesh, timeout_sec=None: seen.update(stage_timeout_sec=timeout_sec) or "pg",
+        )
+        config = JobConfig(distributed=DistributedConfig(nccl_timeout_sec=123))
+        runtime = SimpleNamespace(device_mesh=object())
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        pipeline = SimpleNamespace(rank=1)
+        assert (
+            entry.build_checkpoint_manager(config, runtime, model, optimizer, pipeline) == "manager"
+        )
+        assert seen["group_timeout_sec"] == 123
+        assert seen["stage_timeout_sec"] == 123
+        assert seen["process_group"] == "pg"

@@ -99,18 +99,24 @@ so the process group cannot be used afterward; `check_nccl_health`
 returns `False` and the loop stops.
 
 `distributed.nccl_timeout_sec` (default 1800 s; many shipped configs set
-600 or 1200) is the timeout of the default process group, which
-`init_distributed()` passes to `dist.init_process_group`. It also covers
-a one-dimensional mesh, such as plain FSDP, which reuses the default
-group. The groups `init_device_mesh` creates for the other dimensions
-(TP, PP, EP, HSDP, and FSDP on a multi-dimensional mesh) get PyTorch's
-default instead, 30 minutes for the default `cpu:gloo,cuda:nccl`
-backend. `init_distributed()` also sets `TORCH_NCCL_ASYNC_ERROR_HANDLING=1`
+600 or 1200) is the collective timeout of the process groups a run
+creates. `init_distributed()` passes it to `dist.init_process_group` and
+to `init_device_mesh` for the groups of each mesh dimension (TP, PP, EP,
+HSDP, and FSDP on a multi-dimensional mesh), which would otherwise get
+PyTorch's 30-minute default for the default `cpu:gloo,cuda:nccl`
+backend. With that backend, a dimension as wide as the world uses the
+default group itself.
+The groups get it when they are created, so under
+`TORCH_DISTRIBUTED_DEBUG=DETAIL` the check the debug wrapper runs before
+each collective is bounded by it too.
+The checkpoint manager's gloo group, the pipeline stage groups and the
+loop's control group get it too. Groups torch creates on its own, such
+as FSDP2's post-forward groups when `reshard_after_forward` is an int,
+keep PyTorch's default. `init_distributed()` also sets `TORCH_NCCL_ASYNC_ERROR_HANDLING=1`
 when it is unset (and warns if you set it to `0`), so an NCCL collective
 that runs past its group's timeout aborts the communicator and stops the
-process instead of hanging. Lowering `distributed.nccl_timeout_sec`
-detects a hang faster only on the default group. An `NCCL_TIMEOUT`
-environment variable changes nothing: neither NCCL nor PyTorch reads it.
+process instead of hanging. An `NCCL_TIMEOUT` environment variable
+changes nothing: neither NCCL nor PyTorch reads it.
 
 `ShutdownHandler`'s forced-exit timer also stops a graceful shutdown that
 stalls; see [SLURM preemption](slurm-preemption.md).

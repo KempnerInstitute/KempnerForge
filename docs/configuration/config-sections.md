@@ -248,7 +248,7 @@ Parallelism dimensions and NCCL settings.
 | `pp_schedule` | `"1f1b" \| "gpipe" \| "interleaved_1f1b"` | `"1f1b"` | pipeline schedule |
 | `cp` | `int` | `1` | context parallel; reserved, not implemented, must be `1` (`cp > 1` is rejected at load) |
 | `ep` | `int` | `1` | expert parallel (MoE only) |
-| `nccl_timeout_sec` | `int` | `1800` | NCCL collective timeout |
+| `nccl_timeout_sec` | `int` | `1800` | Collective timeout, in seconds, of the default process group and every mesh group |
 | `backend` | `str` | `"cpu:gloo,cuda:nccl"` | `torch.distributed` backend mapping |
 
 The product `dp_replicate × dp_shard × tp × pp × cp × ep` must equal

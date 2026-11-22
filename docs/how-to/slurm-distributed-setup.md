@@ -109,10 +109,9 @@ with your admins or `ibv_devinfo`.
 
 No environment variable bounds a hung collective: neither NCCL nor
 PyTorch reads `NCCL_TIMEOUT`. `distributed.nccl_timeout_sec` (default
-1800 seconds) is the timeout of the default process group, which plain
-FSDP uses; the groups `init_device_mesh` creates for TP, PP, EP, HSDP and
-other extra mesh dimensions keep PyTorch's 30-minute default. Set it in
-the config or with `--distributed.nccl_timeout_sec=<seconds>`.
+1800 seconds) is the timeout of the default process group and of the
+group of every mesh dimension (TP, PP, EP, HSDP). Set it in the config or
+with `--distributed.nccl_timeout_sec=<seconds>`.
 
 ## Interactive / existing allocation: `interactive.sh`
 

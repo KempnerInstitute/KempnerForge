@@ -55,8 +55,8 @@ All four use `setdefault`, so anything you export before launch wins.
 The launch scripts also set `NCCL_IB_GID_INDEX=3`, which NCCL reads and
 the Python code does not. There is no `NCCL_TIMEOUT` setting: neither NCCL
 nor PyTorch reads that variable. `distributed.nccl_timeout_sec` sets the
-default process group's timeout; the groups `init_device_mesh` creates
-for other mesh dimensions keep PyTorch's 30-minute default.
+timeout of the default process group and of the group of every mesh
+dimension.
 
 ## SLURM metadata (resilience)
 
