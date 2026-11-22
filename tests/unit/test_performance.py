@@ -17,6 +17,7 @@ from kempnerforge.metrics.mfu import (
     compute_mfu,
     estimate_model_flops_per_token,
     get_gpu_peak_tflops,
+    vision_flops_per_image,
 )
 from kempnerforge.model.moe import MoEMLP
 from kempnerforge.model.transformer import Transformer
@@ -287,6 +288,45 @@ class TestMFUDecoupledHeadDim:
             return estimate_model_flops_per_token(cfg, seq_len=s)
 
         assert flops(64) - flops(32) == 12 * 2 * (4 * 32) * (64 - 32)
+
+
+class TestVisionFlops:
+    """The FLOPs one image costs a VLM's vision encoder and adapter (#444)."""
+
+    @staticmethod
+    def _vlm(encoder_trains: bool, adapter_trains: bool = True, tower=None) -> torch.nn.Module:
+        encoder = torch.nn.Linear(10, 10)
+        encoder.num_tokens = 4
+        if tower is not None:
+            encoder.vision_tower = tower
+        adapter = torch.nn.Linear(10, 20)
+        encoder.requires_grad_(encoder_trains)
+        adapter.requires_grad_(adapter_trains)
+        model = torch.nn.Module()
+        model.vision_encoder = encoder
+        model.adapter = adapter
+        return model
+
+    def test_a_frozen_encoder_runs_forward_and_a_trainable_adapter_backward_too(self):
+        assert vision_flops_per_image(self._vlm(False)) == 2 * 110 * 4 + 3 * 2 * 220 * 4
+
+    def test_a_trainable_encoder_runs_its_backward(self):
+        assert vision_flops_per_image(self._vlm(True, False)) == 3 * 2 * 110 * 4 + 2 * 220 * 4
+
+    def test_attention_counts_when_the_tower_config_gives_its_shape(self):
+        import types
+
+        config = types.SimpleNamespace(num_hidden_layers=2, hidden_size=8)
+        model = self._vlm(False, False, types.SimpleNamespace(config=config))
+        assert vision_flops_per_image(model) == 2 * 110 * 4 + 4 * 2 * 4**2 * 8 + 2 * 220 * 4
+
+    def test_a_compiled_model_reads_its_original_module(self):
+        compiled = torch.nn.Module()
+        compiled._orig_mod = self._vlm(False)
+        assert vision_flops_per_image(compiled) == vision_flops_per_image(compiled._orig_mod)
+
+    def test_a_model_without_a_vision_encoder_costs_nothing(self):
+        assert vision_flops_per_image(torch.nn.Linear(2, 2)) == 0.0
 
 
 class TestMemory:

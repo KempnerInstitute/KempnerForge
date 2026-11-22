@@ -239,8 +239,8 @@ if config.metrics.mlflow_run_id:
 ...
 return extra
 
-# training/loop.py::run_training_loop
-ckpt_extra = checkpoint_extra(config, step, phases)
+# training/loop.py::run_training_loop (documents_seen: a VLM run's documents)
+ckpt_extra = checkpoint_extra(config, step, phases, session.documents_seen)
 ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=scheduler,
               dataloader=data.dataloader, extra=ckpt_extra)
 ```

@@ -4172,3 +4172,31 @@ class TestWeightDecayScopeOnResume:
         self._as_rank(monkeypatch, manager, 1, sent=(None, "rank 0 could not read it"))
         with pytest.raises(ValueError, match="rank 0 could not read it"):
             manager.load()
+
+
+class TestRestoredExtra:
+    """The manager records the extra keys its last load restored, for the caller to read."""
+
+    def test_a_load_records_the_extra_keys_it_restored(self, tmp_path):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        saver = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        assert saver.restored_extra == {}
+        saver.save(step=2, tokens_seen=8, extra={"documents_seen": 5})
+        loader = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        assert loader.load()[2]["documents_seen"] == 5
+        assert loader.restored_extra["documents_seen"] == 5
+        loader.restored_extra["documents_seen"] = 0
+        assert loader.restored_extra["documents_seen"] == 5
+
+    def test_a_load_that_finds_nothing_restores_no_extra(self, tmp_path):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path / "none")), model, optimizer)
+        manager._restored_extra = {"documents_seen": 3}
+        assert manager.load() == (0, 0, {})
+        assert manager.restored_extra == {}

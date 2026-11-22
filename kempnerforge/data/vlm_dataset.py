@@ -640,6 +640,8 @@ class VLMCollator:
         depends on which samples have images.
       - ``input_ids``: ``(B, max_text_len)`` int64.
       - ``labels``: ``(B, max_text_len)`` int64 with ``-100`` on pad.
+      - ``text_len``: ``(B,)`` int64, each row's real text tokens: the sample's
+        ``text_len`` when it has one, else its length, at most ``max_text_len``.
       - ``image_positions``: ``(B,)`` long tensor, all zeros; the wrapper
         does not read it, and documents with several images go through
         ``PackedVLMCollator``.
@@ -684,17 +686,20 @@ class VLMCollator:
         views = shape[0] if len(shape) == 4 else 1
         input_ids = torch.full((B, self.max_text_len), self.pad_id, dtype=torch.long)
         labels = torch.full((B, self.max_text_len), -100, dtype=torch.long)
+        text_len = torch.zeros(B, dtype=torch.long)
         for i, s in enumerate(samples):
             ids = s["input_ids"]
             lbl = s["labels"]
             n = min(ids.shape[0], self.max_text_len)
             input_ids[i, :n] = ids[:n]
             labels[i, :n] = lbl[:n]
+            text_len[i] = min(int(s["text_len"]), n) if "text_len" in s else n
         image_positions = torch.zeros(B, dtype=torch.long)
         batch = {
             "pixel_values": pixels,
             "input_ids": input_ids,
             "labels": labels,
+            "text_len": text_len,
             "image_positions": image_positions,
         }
         if self.frame_mask or not all(has_image):

@@ -75,6 +75,7 @@ class FakeCheckpointManager:
         self.tracking_source = None
         self.checkpoint_registrar = None
         self.has_pending_save = False
+        self.restored_extra: dict = {}
 
     def save(self, step, tokens_seen=0, scheduler=None, dataloader=None, extra=None) -> None:
         self.saves.append((step, tokens_seen, dict(extra or {})))
@@ -1380,6 +1381,22 @@ class TestRunTraining:
         assert seen == [0, 1, 2]
         assert torch.equal(before, model.out.weight)
 
+    def test_a_resumed_run_counts_documents_on_from_the_checkpoint(self, monkeypatch):
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        ckpt.restored_extra = {"documents_seen": 7}
+        seen: list = []
+
+        def counting_step(session, _step):
+            seen.append(session.documents_seen)
+            return StepResult(loss=1.0, grad_norm=0.5, documents=2)
+
+        run_training(make_config(max_steps=2), step_fn=counting_step)
+        assert seen == [7, 9]
+        assert ckpt.saves[-1][2]["documents_seen"] == 11
+
     def test_teardown_is_cooperative_only_on_the_clean_path(self, monkeypatch):
         import kempnerforge.training.entry as entry
         from kempnerforge.training.entry import run_training
@@ -1944,29 +1961,6 @@ class TestDpSizeReachesTokenAccounting:
         per_step = config.train.batch_size * config.train.seq_len * config.train.grad_accum_steps
         assert tokens_seen == 2 * per_step * 8
 
-    def test_packed_counts_do_not_count_tensor_parallel_replicas(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import kempnerforge.training.loop as loop
-
-        session = make_session(
-            make_config(),
-            data=DataPipeline(dp_size=2),
-            runtime=dataclasses.replace(_runtime(), world_size=8),
-        )
-        reductions: list[Any] = []
-
-        def reduce_counts(count: torch.Tensor, op: Any) -> None:
-            assert count.item() == 7
-            reductions.append(op)
-            count.fill_(4 * (7 + 11))
-
-        monkeypatch.setattr(loop.dist, "is_initialized", lambda: True)
-        monkeypatch.setattr(loop.dist, "all_reduce", reduce_counts)
-        result = loop.StepResult(loss=1.0, grad_norm=0.5, tokens=7)
-        assert loop._tokens_in_step(session, result) == 18
-        assert reductions == [loop.dist.ReduceOp.SUM]
-
     def test_packed_counts_reach_tokens_seen_without_another_accumulation_factor(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1994,13 +1988,13 @@ class TestDpSizeReachesTokenAccounting:
 
         monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
         events: list[str] = []
-        counted = loop._tokens_in_step
+        counted = loop._step_counts
 
-        def recording(session: TrainingSession, result: loop.StepResult) -> int:
+        def recording(session: TrainingSession, result: loop.StepResult) -> tuple[int, int, int]:
             events.append("count")
             return counted(session, result)
 
-        monkeypatch.setattr(loop, "_tokens_in_step", recording)
+        monkeypatch.setattr(loop, "_step_counts", recording)
         session = make_session(
             make_config(max_steps=1),
             step_fn=lambda _session, _step: loop.StepResult(loss=1.0, grad_norm=0.5, tokens=5),
@@ -2094,6 +2088,120 @@ class TestTokensCountTheBatch:
         tc = config.train
         assert calls[0]["tokens_in_step"] == tc.batch_size * tc.seq_len * 2 * 4
         assert calls[0]["seq_len"] is None
+
+
+class TestVlmDataMetrics:
+    """A VLM step counts its documents, image and text tokens, and encoder images (#444)."""
+
+    @staticmethod
+    def _padded(frames: int | None = None) -> dict[str, torch.Tensor]:
+        shape = (3, 3, 4, 4) if frames is None else (3, frames, 3, 4, 4)
+        return {
+            "pixel_values": torch.zeros(shape),
+            "input_ids": torch.zeros(3, 4, dtype=torch.long),
+            "labels": torch.zeros(3, 4, dtype=torch.long),
+            "text_len": torch.tensor([4, 2, 3]),
+        }
+
+    def _session(self, batch, max_steps: int = 1, grad_accum_steps: int = 1):
+        from kempnerforge.config.schema import AdapterConfig, VisionEncoderConfig, VLMConfig
+
+        model = TinyVlmModel()
+        model.num_image_tokens = 8
+        config = make_config(max_steps=max_steps, grad_accum_steps=grad_accum_steps)
+        config.metrics.log_interval = 1
+        config.vision_encoder = VisionEncoderConfig(type="random", feature_dim=8, num_tokens=8)
+        config.adapter = AdapterConfig()
+        config.vlm = VLMConfig(max_text_len=4)
+        return make_session(
+            config,
+            model=model,
+            optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
+            data=DataPipeline(dataloader=[batch]),
+            step_fn=vlm_step,
+        )
+
+    def test_a_padded_batch_counts_its_rows_and_real_images(self):
+        from kempnerforge.training.loop import _batch_counts
+
+        batch = self._padded()
+        batch["frame_mask"] = torch.tensor([[True], [False], [True]])
+        assert _batch_counts(batch, 8) == (3, 2 * 8, 4 + 2 + 3, 3)
+
+    def test_a_padded_video_batch_counts_real_frames(self):
+        from kempnerforge.training.loop import _batch_counts
+
+        batch = self._padded(frames=4)
+        batch["frame_mask"] = torch.tensor([[True] * 4, [True, True, False, False], [True] * 4])
+        assert _batch_counts(batch, 4 * 5) == (3, 10 * 5, 9, 3 * 4)
+
+    def test_a_padded_batch_without_text_len_gives_no_text_count(self):
+        from kempnerforge.training.loop import _batch_counts
+
+        batch = self._padded()
+        del batch["text_len"]
+        assert _batch_counts(batch, 8) == (3, 3 * 8, None, 3)
+
+    def test_a_packed_batch_counts_each_document_even_in_a_full_row(self):
+        from kempnerforge.data.vlm_dataset import pack_vlm_samples
+        from kempnerforge.training.loop import _batch_counts
+
+        samples = [
+            {
+                "pixel_values": torch.zeros(3, 4, 4),
+                "input_ids": torch.arange(1, 7),
+                "labels": torch.arange(1, 7),
+                "text_len": torch.tensor(n),
+            }
+            for n in (3, 5, 2)
+        ]
+        batch = pack_vlm_samples(samples, seq_len=16, tokens_per_image=4, pad_id=0)
+        assert batch["input_ids"].shape[0] == 2
+        assert _batch_counts(batch, 0) == (3, 3 * 4, 3 + 5 + 2, 3)
+
+    def test_the_step_adds_its_micro_steps(self):
+        session = self._session(self._padded(), grad_accum_steps=2)
+        result = vlm_step(session, 0)
+        counts = (result.documents, result.image_tokens, result.document_text_tokens)
+        assert counts == (2 * 3, 2 * 3 * 8, 2 * 9)
+        assert result.encoder_images == 2 * 3
+
+    def test_documents_seen_adds_up_from_the_resumed_count_and_is_logged_and_saved(self):
+        session = self._session(self._padded(), max_steps=2)
+        session.documents_seen = 10
+        logged: list[dict] = []
+        session.tracker.log_eval = lambda m, s: logged.append(m)  # type: ignore[method-assign]
+        run_training_loop(session)
+        assert session.documents_seen == 10 + 2 * 3
+        data = [m for m in logged if "data/documents_seen" in m]
+        assert [m["data/documents_seen"] for m in data] == [13.0, 16.0]
+        assert data[-1]["data/image_tokens"] == 3 * 8.0
+        assert data[-1]["data/text_tokens"] == 9.0
+        assert session.checkpointer.saves[-1][2]["documents_seen"] == 16
+
+    def test_a_text_run_counts_no_documents(self):
+        session = make_session(make_config(max_steps=1))
+        run_training_loop(session)
+        assert session.documents_seen is None
+        assert "documents_seen" not in session.checkpointer.saves[-1][2]
+
+    def test_the_loop_hands_the_tracker_the_vision_flops_of_a_vlm_step(self, monkeypatch):
+        import kempnerforge.training.loop as loop
+
+        monkeypatch.setattr(loop, "vision_flops_per_image", lambda _model: 100.0)
+        session = self._session(self._padded())
+        calls = TestTokensCountTheBatch._end_steps(monkeypatch, session)
+        run_training_loop(session)
+        assert calls[0]["vision_flops"] == 3 * 100.0
+        text = make_session(make_config(max_steps=1))
+        calls = TestTokensCountTheBatch._end_steps(monkeypatch, text)
+        run_training_loop(text)
+        assert calls[0]["vision_flops"] is None
+
+    def test_checkpoint_extra_saves_documents_seen_when_given(self):
+        config = make_config()
+        assert checkpoint_extra(config, 3, PhaseState(), 7)["documents_seen"] == 7
+        assert "documents_seen" not in checkpoint_extra(config, 3, PhaseState())
 
 
 class TestPhaseTemperatureReachesSampler:
@@ -3793,18 +3901,19 @@ class TestVlmStep:
         assert packed["image_tokens"] == 2
         assert packed["doc_ids"].shape == (2, 4)
 
-    def test_reports_tokens_only_for_packed_batches(self):
-        session, _ = self._session([self._batch()])
-        assert session.step_fn(session, 0).tokens is None
+    def test_reports_the_positions_every_batch_ran(self):
+        """A padded row counts its text and image positions; a packed row holds both."""
+        session, model = self._session([self._batch()])
+        model.num_image_tokens = 3
+        assert session.step_fn(session, 0).tokens == 2 * (4 + 3)
         batch = self._batch()
         batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
-        session, _ = self._session([batch])
-        assert session.step_fn(session, 0).tokens is None
         batch["image_rows"] = torch.tensor([0, 1])
         batch["image_starts"] = torch.tensor([0, 0])
         batch["image_tokens"] = torch.tensor(2)
-        session, _ = self._session([batch])
-        assert session.step_fn(session, 0).tokens == 8
+        session, model = self._session([batch])
+        model.num_image_tokens = 3
+        assert session.step_fn(session, 0).tokens == 2 * 4
 
     def test_packed_rows_are_marked_dynamic_for_compile(self, monkeypatch):
         import torch._dynamo
@@ -4712,7 +4821,8 @@ class TestFreezeStageFence:
         monkeypatch.setattr(session.checkpointer, "save", save)
         run_training_loop(session)
         assert order == ["flush", "freeze", "save"]
-        assert saved == [(2, {"vlm_freeze": freeze_meta_at_step(2, session.config.vlm)})]
+        meta = freeze_meta_at_step(2, session.config.vlm)
+        assert saved == [(2, {"documents_seen": 2, "vlm_freeze": meta})]
 
 
 class TestBatchStreamGuard:

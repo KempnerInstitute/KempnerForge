@@ -205,7 +205,7 @@ class WebVidVideoDataset(VideoDataset):
         )
 
         prompt = self._prompt or None
-        input_ids, labels, _ = _tokenize_and_mask(
+        input_ids, labels, text_len = _tokenize_and_mask(
             self._tokenizer, caption, self._max_text_len, prompt
         )
         if not frames:
@@ -215,6 +215,7 @@ class WebVidVideoDataset(VideoDataset):
             "frame_mask": frame_mask,
             "input_ids": input_ids,
             "labels": labels,
+            "text_len": torch.tensor(text_len, dtype=torch.long),
         }
 
 
@@ -226,6 +227,8 @@ class VideoCollator:
       - ``frame_mask``: ``(B, F)`` bool (``True`` = real frame).
       - ``input_ids``: ``(B, max_text_len)`` int64.
       - ``labels``: ``(B, max_text_len)`` int64 with ``-100`` on pad/prompt.
+      - ``text_len``: ``(B,)`` int64, each row's real text tokens: the sample's
+        ``text_len`` when it has one, else its length, at most ``max_text_len``.
 
     Text is always padded to ``max_text_len`` (never batch-max) so DP ranks
     see identical shapes under FSDP2, matching ``VLMCollator``.
@@ -245,17 +248,20 @@ class VideoCollator:
         frame_mask = torch.stack([s["frame_mask"] for s in samples], dim=0)
         input_ids = torch.full((b, self.max_text_len), self.pad_id, dtype=torch.long)
         labels = torch.full((b, self.max_text_len), -100, dtype=torch.long)
+        text_len = torch.zeros(b, dtype=torch.long)
         for i, s in enumerate(samples):
             ids = s["input_ids"]
             lbl = s["labels"]
             n = min(ids.shape[0], self.max_text_len)
             input_ids[i, :n] = ids[:n]
             labels[i, :n] = lbl[:n]
+            text_len[i] = min(int(s["text_len"]), n) if "text_len" in s else n
         return {
             "pixel_values": pixel_values,
             "frame_mask": frame_mask,
             "input_ids": input_ids,
             "labels": labels,
+            "text_len": text_len,
         }
 
 

@@ -79,9 +79,12 @@ class StepMetrics:
     reserved_gb: float
     total_gb: float
     mem_utilization: float
+    mfu_vlm: float | None # VLM runs: mfu plus the vision encoder and adapter
 ```
 
-Returned from `end_step()` only on logging steps. The raw values are
+Returned from `end_step()` only on logging steps. `mfu_vlm` is logged as
+`train/mfu_vlm` when the loop passes `end_step` the step's `vision_flops`,
+which a VLM step body does (see [MFU](mfu.md#vlm-runs-trainmfu_vlm)). The raw values are
 written to backends; the EMA-smoothed copies go under a `smoothed/` prefix
 (see below).
 
@@ -205,6 +208,7 @@ learning rates, MoE and per-dataset breakdowns, and checkpoint times:
 tracker.log_eval(lr_metrics, step)      # lr/<module> (lr_adamw/<module> under muon), with optimizer.lr_multipliers
 tracker.log_eval(moe_metrics, step)     # moe/aux_loss, moe/expert_balance
 tracker.log_eval(ds_metrics, step)      # loss/<name>, data/<name>/tokens
+tracker.log_eval(data_metrics, step)    # VLM: data/text_tokens_trained, data/image_tokens, data/text_tokens, data/documents_seen
 tracker.log_eval(eval_metrics, step)    # eval loss
 tracker.log_eval(save_metrics, step)    # checkpoint/save_sec, checkpoint/wait_sec
 ```
@@ -217,6 +221,18 @@ the dispatch); `checkpoint/wait_sec` is the time spent draining an async
 save: at the end of the run when a save is still pending, when a shutdown
 finds this step already saved, and when a freeze stage flushes. Neither is
 in `step_time`, except a freeze stage's flush, which runs inside its step.
+
+A VLM run's data metrics are each summed over the data-parallel ranks:
+`data/text_tokens_trained` counts the supervised text tokens of the step,
+`data/text_tokens` every text token of its documents (prompt included,
+padding excluded, from each row's `text_len` or a packed batch's text
+positions), and `data/image_tokens` the image positions of its real images
+in the residual stream (a text-only document's hidden image and padding
+frames excluded; Cross-Attention, whose images do not enter the residual
+stream, logs none). `data/documents_seen` counts the documents the run has
+trained on, a packed row counting each one it holds; it is saved with
+every checkpoint and counts on from there on a resume, from zero after a
+checkpoint saved before it was recorded.
 
 Each call logs with the same `step`, so a single training step can
 produce several side-by-side rows in WandB / TensorBoard.

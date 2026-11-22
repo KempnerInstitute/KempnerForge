@@ -76,6 +76,31 @@ class TestMetricsTracker:
         result = tracker.end_step(step=1, loss=2.5, grad_norm=1.0, lr=3e-4, tokens_in_step=1024)
         assert result is not None
 
+    def test_vision_flops_give_a_vlm_mfu_above_the_language_models(self, monkeypatch):
+        import kempnerforge.metrics.tracker as tracker_mod
+
+        tracker = self._make_tracker()
+        tracker.gpu_peak_tflops = 100.0
+        logged: list[dict] = []
+        tracker._backends = [type("B", (), {"log": lambda _s, d, step: logged.append(d)})()]
+        tracker._step_start = 10.0
+        monkeypatch.setattr(tracker_mod.time, "perf_counter", lambda: 12.0)
+        result = tracker.end_step(
+            step=1, loss=1.0, grad_norm=1.0, lr=1e-4, tokens_in_step=1024, vision_flops=5e13
+        )
+        assert result is not None
+        assert result.mfu_vlm == pytest.approx(result.mfu + 5e13 / (100e12 * 2.0))
+        assert logged[-1]["train/mfu_vlm"] == result.mfu_vlm
+
+    def test_without_vision_flops_there_is_no_vlm_mfu(self):
+        tracker = self._make_tracker()
+        logged: list[dict] = []
+        tracker._backends = [type("B", (), {"log": lambda _s, d, step: logged.append(d)})()]
+        tracker.start_step()
+        result = tracker.end_step(step=1, loss=1.0, grad_norm=1.0, lr=1e-4, tokens_in_step=8)
+        assert result is not None and result.mfu_vlm is None
+        assert "train/mfu_vlm" not in logged[-1]
+
     def test_metrics_fields(self):
         tracker = self._make_tracker()
         tracker.start_step()

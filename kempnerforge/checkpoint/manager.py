@@ -786,6 +786,7 @@ class CheckpointManager:
             raise ValueError(f"lr_multipliers needs module_patterns for {missing}")
         self._lr_module_patterns = {module: sorted(set(patterns[module])) for module in listed}
         self._pending_dataloader_state: dict[str, Any] | None = None
+        self._restored_extra: dict[str, Any] = {}
         self._pending_finalize: tuple[int, Path] | None = None
         self._inflight_dir: Path | None = None
         self._tracking_source: TrackingSource | None = None
@@ -1422,6 +1423,7 @@ class CheckpointManager:
             if requested:
                 raise FileNotFoundError(f"Checkpoint not found: {requested}")
             logger.info("No checkpoint found — starting from scratch")
+            self._restored_extra = {}
             return 0, 0, {}
 
         will_load_dcp = (
@@ -1627,6 +1629,7 @@ class CheckpointManager:
             )
         elif fresh_optimizer:
             logger.info(f"{dcp_dir} holds no optimizer state; the optimizer starts fresh")
+        self._restored_extra = dict(extra)
         return step, tokens_seen, extra
 
     def _train_state_exists(self, path: Path) -> bool:
@@ -1800,6 +1803,14 @@ class CheckpointManager:
             f"step, schedule and data position, and a checkpoint.dir that holds no checkpoint, "
             f"since training auto-resumes from a checkpoint there in place of load_path."
         )
+
+    @property
+    def restored_extra(self) -> dict[str, Any]:
+        """The extra keys the last ``load()`` restored from ``train_state.pt``.
+
+        Empty before a load, and after one that restored no train state.
+        """
+        return dict(self._restored_extra)
 
     def apply_dataloader_state(self, dataloader: Any) -> None:
         """Apply any dataloader state stashed during load().

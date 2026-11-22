@@ -31,6 +31,7 @@ from kempnerforge.distributed.utils import (
     new_control_group,
 )
 from kempnerforge.metrics.logger import get_logger
+from kempnerforge.metrics.mfu import vision_flops_per_image
 from kempnerforge.metrics.tracker import MetricsTracker
 from kempnerforge.model.vlm import inner_transformer
 from kempnerforge.profiling.profiler import print_profiler_summary
@@ -160,7 +161,11 @@ class StepResult:
     number of positions the model ran on this rank over every micro-step,
     image positions and padding included, and ``seq_len`` the length of each
     of those rows; with ``tokens`` None the loop counts
-    ``train.batch_size * train.seq_len`` per micro-step.
+    ``train.batch_size * train.seq_len`` per micro-step. A VLM step also
+    reports the ``documents`` it trained on, the ``image_tokens`` of their
+    real images, their ``document_text_tokens`` (prompt included, padding
+    excluded; None when the batch does not say) and the ``encoder_images``
+    the vision encoder ran, padding frames included.
     """
 
     loss: float
@@ -170,6 +175,10 @@ class StepResult:
     dataset_losses: torch.Tensor | None = None
     tokens: int | None = None
     seq_len: int | None = None
+    documents: int | None = None
+    image_tokens: int | None = None
+    document_text_tokens: int | None = None
+    encoder_images: int | None = None
 
 
 StepFn = Callable[["TrainingSession", int], StepResult]
@@ -177,7 +186,11 @@ StepFn = Callable[["TrainingSession", int], StepResult]
 
 @dataclass
 class TrainingSession:
-    """Everything one training run needs after the build phase."""
+    """Everything one training run needs after the build phase.
+
+    ``documents_seen`` counts the documents a VLM run trained on over the data-parallel
+    ranks, from the checkpoint it resumed; it stays None while the step body reports none.
+    """
 
     config: JobConfig
     runtime: RuntimeContext
@@ -198,6 +211,7 @@ class TrainingSession:
     profiler: Any | None = None
     autocast_dtype: torch.dtype | None = None
     control_group: Any | None = field(default=None, repr=False)
+    documents_seen: int | None = None
     _batch_stream: BatchStream | None = field(default=None, init=False, repr=False)
     _dp_groups: tuple | None = field(default=None, init=False, repr=False)
 
@@ -374,6 +388,8 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
     total_tokens = 0
     seq_len = 0
     image_positions = getattr(getattr(model, "_orig_mod", model), "num_image_tokens", 0)
+    documents = image_tokens = encoder_images = 0
+    document_text_tokens: int | None = 0
 
     for micro_step in range(tc.grad_accum_steps):
         if not batches.has_data:
@@ -398,6 +414,12 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         else:
             seq_len = input_ids.shape[1] + image_positions
         total_tokens += input_ids.shape[0] * seq_len
+        counts = _batch_counts(batch, image_positions)
+        documents += counts[0]
+        image_tokens += counts[1]
+        encoder_images += counts[3]
+        if document_text_tokens is not None:
+            document_text_tokens = None if counts[2] is None else document_text_tokens + counts[2]
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
@@ -423,6 +445,10 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         tokens=total_tokens,
         seq_len=seq_len,
         text_tokens=total_text_tokens,
+        documents=documents,
+        image_tokens=image_tokens,
+        document_text_tokens=document_text_tokens,
+        encoder_images=encoder_images,
     )
 
 
@@ -462,17 +488,69 @@ def _mark_rows_dynamic(*tensors: Any) -> None:
             maybe_mark_dynamic(tensor, 0)
 
 
-def _tokens_in_step(session: TrainingSession, result: StepResult) -> int:
-    """Positions the step ran over the data-parallel ranks, from each rank's count or the config.
+def _batch_counts(batch: dict[str, Any], image_positions: int) -> tuple[int, int, int | None, int]:
+    """A VLM batch's documents, real-image tokens, document text tokens and encoder images.
 
-    Every rank adds the count it reports, so ranks that ran different numbers of rows count
-    what each of them ran.
+    A packed batch (one with ``image_rows``) holds several documents per row: they are the
+    distinct row and document pairs at its text positions and image starts, its image tokens
+    are its images times ``image_tokens``, and its text tokens its ``text_positions``. A padded
+    batch holds one document per row, with ``image_positions`` image tokens split evenly over
+    its frames, of which ``frame_mask`` marks the real ones, and the text tokens its
+    ``text_len`` gives. The text count is None when the batch does not give it. The encoder
+    runs every image or frame either way.
+    """
+    pixel_values = batch["pixel_values"]
+    if "image_rows" in batch:
+        empty = torch.zeros(0, dtype=torch.long)
+        text_positions = batch.get("text_positions")
+        rows = torch.cat([batch.get("text_rows", empty), batch["image_rows"]])
+        starts = torch.cat(
+            [empty if text_positions is None else text_positions, batch["image_starts"]]
+        )
+        doc_ids = batch["doc_ids"]
+        pairs = rows * (int(doc_ids.max()) + 1) + doc_ids[rows, starts]
+        n_images = int(pixel_values.shape[0])
+        return (
+            int(torch.unique(pairs).numel()),
+            n_images * int(batch["image_tokens"]),
+            None if text_positions is None else int(text_positions.numel()),
+            n_images,
+        )
+    rows = int(batch["input_ids"].shape[0])
+    frames = int(pixel_values.shape[1]) if pixel_values.dim() == 5 else 1
+    frame_mask = batch.get("frame_mask")
+    real = int(frame_mask.sum()) if frame_mask is not None else rows * frames
+    text_len = batch.get("text_len")
+    text = int(text_len.sum()) if text_len is not None else None
+    return rows, real * (image_positions // frames), text, rows * frames
+
+
+def _dp_sum(session: TrainingSession, counts: list[int]) -> list[int]:
+    """``counts`` summed over the data-parallel ranks, in one reduction.
+
+    Without data-parallel groups, which a run of one data-parallel rank has, each count is
+    taken ``data.dp_size`` times, as if every rank had run the same batch.
+    """
+    if not session.dp_groups:
+        return [count * session.data.dp_size for count in counts]
+    tensor = torch.tensor(counts, device=session.runtime.device, dtype=torch.long)
+    return dp_all_reduce_(tensor, session.dp_groups).tolist()
+
+
+def _step_counts(session: TrainingSession, result: StepResult) -> tuple[int, int, int]:
+    """Positions, documents and encoder images the step ran over the data-parallel ranks.
+
+    Every rank adds the counts it reports in one reduction, so ranks that ran different
+    batches count what each of them ran. A step body that reports no ``tokens`` counts the
+    configured batch, and one that reports no documents or encoder images counts zero.
     """
     tc = session.config.train
-    if result.tokens is None:
-        return tc.batch_size * tc.seq_len * tc.grad_accum_steps * session.data.dp_size
-    count = torch.tensor([result.tokens], device=session.runtime.device, dtype=torch.long)
-    return int(dp_all_reduce_(count, session.dp_groups).item())
+    configured = tc.batch_size * tc.seq_len * tc.grad_accum_steps * session.data.dp_size
+    reported = (result.tokens, result.documents, result.encoder_images)
+    if all(count is None for count in reported):
+        return configured, 0, 0
+    tokens, documents, images = _dp_sum(session, [count or 0 for count in reported])
+    return (configured if result.tokens is None else tokens), documents, images
 
 
 def text_step(session: TrainingSession, step: int) -> StepResult:
@@ -555,13 +633,18 @@ def select_step_fn(config: JobConfig) -> StepFn:
     return text_step
 
 
-def checkpoint_extra(config: JobConfig, step: int, phases: PhaseState) -> dict:
+def checkpoint_extra(
+    config: JobConfig, step: int, phases: PhaseState, documents_seen: int | None = None
+) -> dict:
     """Metadata saved alongside every checkpoint so a resume is exact.
 
     ``vlm_freeze`` reflects the post-transition state when a FreezeStage
-    has fired (see ``freeze_meta_at_step``).
+    has fired (see ``freeze_meta_at_step``). ``documents_seen``, when given,
+    is saved for the resumed run to count on from.
     """
     extra: dict = {"phase_idx": phases.next_idx} if phases.phases else {}
+    if documents_seen is not None:
+        extra["documents_seen"] = documents_seen
     if config.metrics.wandb_run_id:
         extra["wandb_run_id"] = config.metrics.wandb_run_id
     if config.metrics.mlflow_run_id:
@@ -608,9 +691,16 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
                 "VLM run: the step body reported no text-token count, so "
                 "data/text_tokens_trained would be logged as zero"
             )
-        t = torch.tensor([result.text_tokens], device=session.runtime.device, dtype=torch.long)
-        global_text_tokens = int(dp_all_reduce_(t, session.dp_groups).item())
-        tracker.log_eval({"data/text_tokens_trained": float(global_text_tokens)}, step)
+        local = [result.text_tokens, result.image_tokens or 0, result.document_text_tokens or 0]
+        trained, image_tokens, text_tokens = _dp_sum(session, local)
+        data_metrics = {"data/text_tokens_trained": float(trained)}
+        if result.image_tokens is not None:
+            data_metrics["data/image_tokens"] = float(image_tokens)
+        if result.document_text_tokens is not None:
+            data_metrics["data/text_tokens"] = float(text_tokens)
+        if session.documents_seen is not None:
+            data_metrics["data/documents_seen"] = float(session.documents_seen)
+        tracker.log_eval(data_metrics, step)
 
     mixture = session.data.mixture_dataset
     if mixture is not None and result.dataset_tokens is not None:
@@ -753,7 +843,9 @@ def _shutdown_if_requested(
                 tokens_seen=tokens_seen,
                 scheduler=session.scheduler,
                 dataloader=session.data.dataloader,
-                extra=checkpoint_extra(session.config, step, session.phases),
+                extra=checkpoint_extra(
+                    session.config, step, session.phases, session.documents_seen
+                ),
             )
     return True
 
@@ -811,7 +903,7 @@ def run_training_loop(
                 tokens_seen=0,
                 scheduler=scheduler,
                 dataloader=data.dataloader,
-                extra=checkpoint_extra(config, 0, phases),
+                extra=checkpoint_extra(config, 0, phases, session.documents_seen),
             )
         hooks.on_checkpoint_save(0, config.checkpoint.dir)
 
@@ -828,7 +920,7 @@ def run_training_loop(
 
             tracker.start_step()
             result = session.step_fn(session, step)
-            tokens_in_step = _tokens_in_step(session, result)
+            tokens_in_step, documents_in_step, images_in_step = _step_counts(session, result)
 
             if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
                 optimizer.zero_grad()
@@ -853,6 +945,8 @@ def run_training_loop(
 
             step += 1
             tokens_seen += tokens_in_step
+            if result.documents is not None:
+                session.documents_seen = (session.documents_seen or 0) + documents_in_step
 
             _apply_step_transitions(session, step)
 
@@ -864,6 +958,11 @@ def run_training_loop(
                 lr=applied_lr,
                 tokens_in_step=tokens_in_step,
                 seq_len=result.seq_len,
+                vision_flops=(
+                    images_in_step * vision_flops_per_image(model)
+                    if result.encoder_images is not None
+                    else None
+                ),
             )
 
             hooks.on_step_end(
@@ -918,7 +1017,7 @@ def run_training_loop(
             if prof is not None:
                 prof.step()
 
-            ckpt_extra = checkpoint_extra(config, step, phases)
+            ckpt_extra = checkpoint_extra(config, step, phases, session.documents_seen)
             saved_this_step = config.checkpoint.should_save(step)
             if saved_this_step:
                 with _logged_time(tracker, "checkpoint/save_sec", step):

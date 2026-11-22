@@ -145,6 +145,33 @@ def _moe_flops_per_token(config: ModelConfig, seq_len: int) -> int:
     return 6 * active_params + 12 * config.n_layers * attn_dim * seq_len
 
 
+def vision_flops_per_image(model: torch.nn.Module) -> float:
+    """FLOPs one image costs a VLM's vision encoder and adapter in a training step.
+
+    Each runs ``2 * N`` FLOPs per token forward for its ``N`` parameters: the encoder over
+    the ``num_tokens`` it processes, plus ``4 * layers * tokens**2 * hidden`` for attention
+    when its tower's config gives the layers and width, and the adapter over the encoder's
+    output tokens. A module with a trainable parameter also runs the backward, twice the
+    forward. Zero for a model without a vision encoder.
+    """
+    inner = getattr(model, "_orig_mod", model)
+    encoder = getattr(inner, "vision_encoder", None)
+    if encoder is None:
+        return 0.0
+    tokens = int(getattr(encoder, "num_tokens", 0))
+    config = getattr(getattr(encoder, "vision_tower", None), "config", None)
+    attention = 4.0 * getattr(config, "num_hidden_layers", 0) * tokens**2
+    attention *= getattr(config, "hidden_size", 0)
+    total = 0.0
+    for module, extra in ((encoder, attention), (getattr(inner, "adapter", None), 0.0)):
+        if module is None:
+            continue
+        params = list(module.parameters())
+        forward = 2.0 * sum(p.numel() for p in params) * tokens + extra
+        total += forward * (3 if any(p.requires_grad for p in params) else 1)
+    return total
+
+
 def compute_mfu(
     config: ModelConfig,
     tokens_per_sec: float,

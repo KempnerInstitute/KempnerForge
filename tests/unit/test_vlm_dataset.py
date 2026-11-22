@@ -764,6 +764,14 @@ class TestVLMCollator:
             sample["pixel_values"] = torch.randn(5, 3, 32, 32)
         assert collator(samples)["pixel_values"].shape == (4, 5, 3, 32, 32)
 
+    def test_text_len_counts_each_rows_real_tokens(self):
+        """A sample's text_len, at most max_text_len; its length without one."""
+        collator = VLMCollator(pad_id=0, max_text_len=20)
+        short, long_, bare = self._sample(5), self._sample(20), self._sample(7)
+        short["text_len"] = torch.tensor(5)
+        long_["text_len"] = torch.tensor(30)
+        assert collator([short, long_, bare])["text_len"].tolist() == [5, 20, 20]
+
     def test_empty_batch_raises(self):
         collator = VLMCollator(pad_id=0, max_text_len=8)
         with pytest.raises(ValueError, match="empty batch"):
