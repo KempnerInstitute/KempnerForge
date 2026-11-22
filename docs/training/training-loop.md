@@ -75,6 +75,7 @@ After the step body (either branch):
 ```python
 grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
 if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
+    _route_balance(session, step_ran=False)
     optimizer.zero_grad()
     if nan_detector.should_rollback:
         break
@@ -120,11 +121,18 @@ that. See
 
 ```python
 optimizer.step()
+_route_balance(session, step_ran=True)
 scheduler.step()
 if phase_lr_scale != 1.0:
     for pg in optimizer.param_groups: pg["lr"] *= phase_lr_scale
 optimizer.zero_grad()
 ```
+
+With MoE, `_route_balance` applies the sigmoid routers' balancing right
+after the update: one all-reduce sums their expert counts over the
+step's micro-batches and all ranks, so every rank runs it (see
+[Aux loss and balancing](../moe/aux-loss-and-balancing.md#sigmoid-router--bias-based-balancing)).
+A NaN-skipped step drops the counts instead.
 
 Phase LR scaling runs *after* the scheduler — it multiplies the base
 LR that `scheduler.step()` just computed. This lets a curriculum phase

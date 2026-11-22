@@ -46,13 +46,22 @@ def freeze_params(
     Only parameters whose current state differs from the target are flipped,
     so calling this twice with the same arguments is idempotent. Returns the
     number of elements (``param.numel()`` summed) that were actually flipped.
+    A parameter that its module names in ``always_frozen``, such as the sigmoid
+    router's ``expert_bias``, is never unfrozen.
     """
     pats = list(patterns)
     if not pats:
         return 0
     target_requires_grad = not frozen
+    stay_frozen = {
+        id(getattr(module, name))
+        for module in model.modules()
+        for name in getattr(module, "always_frozen", ())
+    }
     n = 0
     for name, param in model.named_parameters():
+        if target_requires_grad and id(param) in stay_frozen:
+            continue
         if (
             any(fnmatch.fnmatch(name, pat) for pat in pats)
             and param.requires_grad != target_requires_grad

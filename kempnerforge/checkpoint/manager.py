@@ -59,6 +59,7 @@ from kempnerforge.checkpoint.expert_layout import (
     check_saved_experts,
     expert_layout,
     moe_layers,
+    state_dict_name,
 )
 from kempnerforge.checkpoint.state import (
     PER_RANK_KEY,
@@ -120,6 +121,66 @@ def _saved_optimizer_param_groups(saved_keys: Iterable[str]) -> int:
             if key.startswith(_OPTIM_PARAM_GROUPS_PREFIX)
         }
     )
+
+
+def derived_buffer_owners(model: torch.nn.Module) -> dict[str, tuple[torch.nn.Module, str]]:
+    """Map the state-dict key of each buffer a module lists in ``derived_buffers`` to its owner.
+
+    A module lists there the buffers it gained after its checkpoints were first written
+    and derives from its other state when a load lacks them, as the sigmoid router does
+    for its FP32 masters. Each key maps to the module and the buffer's name; a buffer
+    another module holds under the same name is not one of them. The keys are named as
+    ``get_model_state_dict`` names them (see ``state_dict_name``).
+    """
+    owners: dict[str, tuple[torch.nn.Module, str]] = {}
+    for name, module in model.named_modules():
+        prefix = state_dict_name(name)
+        for buffer in getattr(module, "derived_buffers", ()):
+            owners[f"{prefix}.{buffer}" if prefix else buffer] = (module, buffer)
+    return owners
+
+
+def drop_derived_model_keys(
+    model_state: dict[str, Any], model: torch.nn.Module, saved_keys: Container[str]
+) -> dict[str, Any]:
+    """Take out of a load template the derived buffers its checkpoint predates.
+
+    Only the buffers ``derived_buffer_owners`` maps are taken out, and only those the
+    checkpoint, whose keys prefix the model's with ``model.``, lacks; any other key a
+    checkpoint lacks still fails the load. Returns the entries taken out. Put back after
+    the read, they let the strict ``set_model_state_dict`` find every key, under
+    ``torch.compile`` too, and ``derive_buffers`` then recomputes them from the loaded
+    state.
+    """
+    owners = derived_buffer_owners(model)
+    return {
+        key: model_state.pop(key)
+        for key in list(model_state)
+        if key in owners and f"model.{key}" not in saved_keys
+    }
+
+
+def derive_buffers(model: torch.nn.Module, keys: Iterable[str]) -> None:
+    """Have the owner of each derived buffer at ``keys`` recompute it from its loaded state.
+
+    Only those buffers are derived; every other entry keeps the value loaded. Deriving
+    may gather a parameter that FSDP2 shards, so every rank calls this with the same keys.
+
+    Raises:
+        TypeError: A module lists ``derived_buffers`` but has no ``derive_buffers``.
+    """
+    owners = derived_buffer_owners(model)
+    wanted: dict[torch.nn.Module, list[str]] = {}
+    for key in keys:
+        module, name = owners[key]
+        wanted.setdefault(module, []).append(name)
+    for module, names in wanted.items():
+        derive = getattr(module, "derive_buffers", None)
+        if derive is None:
+            raise TypeError(
+                f"{type(module).__name__} lists derived_buffers but has no derive_buffers"
+            )
+        derive(names)
 
 
 def _drop_legacy_group_keys(
@@ -548,8 +609,9 @@ def _check_saved_param_groups(
             found = change
     raise RuntimeError(
         f"{where} {found}: the param groups are laid out otherwise than at the save, as when "
-        "other parameters are trainable under optimizer.lr_multipliers, or their settings "
-        "changed. Resume with the parameters trained at the save, or continue from these "
+        "other parameters are trainable under optimizer.lr_multipliers (a sigmoid router's "
+        "expert_bias, which is no longer trained, for one), or their settings changed. "
+        "Resume with the parameters trained at the save, or continue from these "
         "weights with a fresh optimizer: set checkpoint.load_path to this checkpoint and "
         'checkpoint.exclude_from_loading = ["optimizer"], with a checkpoint.dir that holds '
         "no checkpoint yet."
@@ -1505,8 +1567,17 @@ class CheckpointManager:
             if load_optim and train_state_exists
             else []
         )
+        derived: dict[str, Any] = {}
         if load_model:
             dcp_state["model"] = get_model_state_dict(self.model)
+            if derived_buffer_owners(self.model):
+                model_keys = saved_keys if load_optim else _dcp_keys(dcp_dir)
+                derived = drop_derived_model_keys(dcp_state["model"], self.model, model_keys)
+            if derived:
+                logger.info(
+                    f"{dcp_dir} predates {len(derived)} derived buffers, such as "
+                    f"{next(iter(derived))}; they start from the loaded state"
+                )
         check_error: BaseException | None = None
         if load_optim and not train_state_exists:
             check_error = FileNotFoundError(
@@ -1553,7 +1624,9 @@ class CheckpointManager:
             if layout is not None:
                 dcp_state = layout.to_local(dcp_state)
             if load_model:
-                set_model_state_dict(self.model, dcp_state["model"])
+                set_model_state_dict(self.model, {**dcp_state["model"], **derived})
+                if derived:
+                    derive_buffers(self.model, derived)
             if load_optim:
                 set_optimizer_state_dict(
                     self.model, optimizers, optim_state_dict=dcp_state["optimizer"]

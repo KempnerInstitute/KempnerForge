@@ -305,12 +305,11 @@ class JobConfig:
         ):
             raise ValueError(
                 "model.moe_router = 'sigmoid_topk' does not support "
-                "train.activation_checkpointing = 'full': the sigmoid router updates its expert "
-                "bias in place in every training forward, so the backward's replay of a "
-                "checkpointed block routes with a moved bias, can pick other experts than the "
-                "forward did, and then raises CheckpointError. Use activation_checkpointing = "
-                "'selective', which checkpoints attention only and leaves the MoE layers out "
-                "of the replay."
+                "train.activation_checkpointing = 'full': the backward's replay of a "
+                "checkpointed block runs the router's forward again, which counts the block's "
+                "tokens for balancing a second time and can send them to other experts than "
+                "the forward did. Use activation_checkpointing = 'selective', which checkpoints "
+                "attention only and leaves the MoE layers out of the replay."
             )
 
         if self.model.is_moe and self.distributed.pp > 1:

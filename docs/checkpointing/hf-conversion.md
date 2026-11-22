@@ -159,6 +159,13 @@ MoE-specific:
 | `layers.{i}.mlp.shared_expert.*` | `model.layers.{i}.mlp.shared_experts.*` (plural in HF) |
 | `layers.{i}.mlp.experts.{j}.*` | `model.layers.{i}.mlp.experts.{j}.*` (identical) |
 
+The sigmoid router's `fp32_ema_bits` and `fp32_bias_bits`, FP32 masters
+of its balancing state held as int32 bit patterns, are not exported.
+`hf-to-dcp` derives them from the imported `expert_bias` and
+`expert_ema`, and `dcp-to-hf` converts a checkpoint saved before they
+existed (see
+[Aux loss and balancing](../moe/aux-loss-and-balancing.md#sigmoid-router--bias-based-balancing)).
+
 A checkpoint saved with expert parallelism holds every expert under its
 global index, as one saved without it does (see
 [Expert parallelism § Checkpoints](../distributed/expert-parallelism.md#checkpoints)),

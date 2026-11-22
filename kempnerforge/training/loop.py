@@ -23,6 +23,7 @@ from kempnerforge.config.job import JobConfig
 from kempnerforge.distributed.utils import any_rank, clip_grad_norm_, new_control_group
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
+from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import inner_transformer
 from kempnerforge.profiling.profiler import print_profiler_summary
 from kempnerforge.resilience.health import NaNDetector, check_nccl_health, params_are_finite
@@ -397,6 +398,21 @@ def _mark_rows_dynamic(*tensors: Any) -> None:
             maybe_mark_dynamic(tensor, 0)
 
 
+def _route_balance(session: TrainingSession, *, step_ran: bool) -> None:
+    """Balance the sigmoid routers after an optimizer step, or drop the counts of one skipped.
+
+    Every rank calls this at the same point, since balancing all-reduces the routers'
+    expert counts (see ``Transformer.balance_routers``).
+    """
+    transformer = inner_transformer(session.model)
+    if not session.config.model.is_moe or not isinstance(transformer, Transformer):
+        return
+    if step_ran:
+        transformer.balance_routers()
+    else:
+        transformer.discard_router_counts()
+
+
 def _sum_over_data_ranks(session: TrainingSession, value: int) -> int:
     """Sum a per-rank count over the data-parallel ranks; tp and pp peers hold the same batch."""
     if not dist.is_initialized():
@@ -735,6 +751,7 @@ def run_training_loop(
             tokens_in_step = _tokens_in_step(session, result)
 
             if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
+                _route_balance(session, step_ran=False)
                 optimizer.zero_grad()
                 if session.nan_detector.should_rollback:
                     logger.error("Too many consecutive NaNs — stopping")
@@ -749,6 +766,7 @@ def run_training_loop(
                 continue
 
             optimizer.step()
+            _route_balance(session, step_ran=True)
             _advance_lr_schedule(session)
 
             optimizer.zero_grad()

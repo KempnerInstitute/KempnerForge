@@ -15,10 +15,18 @@ from safetensors.torch import load_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from convert_checkpoint import _build_hf_config, _hf_to_kf_key, _kf_to_hf_key, dcp_to_hf, main
+from convert_checkpoint import (
+    _build_hf_config,
+    _hf_to_kf_key,
+    _kf_to_hf_key,
+    dcp_to_hf,
+    hf_to_dcp,
+    main,
+)
 
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.model.router import SigmoidTopKRouter
 from kempnerforge.model.transformer import Transformer
 
 
@@ -513,3 +521,65 @@ class TestExportValues:
         assert weights.keys() == expected.keys()
         for name, tensor in expected.items():
             assert torch.equal(weights[name], tensor.detach().to(dtype)), name
+
+
+class TestSigmoidRouterMasters:
+    """The sigmoid router's FP32 masters stay out of the export and are derived on import."""
+
+    CONFIG = ModelConfig(
+        dim=32,
+        n_layers=2,
+        n_heads=2,
+        vocab_size=64,
+        max_seq_len=16,
+        num_experts=4,
+        moe_top_k=2,
+        moe_router="sigmoid_topk",
+    )
+
+    def _save(self, path: Path, *, with_masters: bool) -> list[SigmoidTopKRouter]:
+        """Save a model whose routers balanced from random counts; return its routers."""
+        model = Transformer(self.CONFIG)
+        routers = [m for m in model.modules() if isinstance(m, SigmoidTopKRouter)]
+        generator = torch.Generator().manual_seed(0)
+        for router in routers:
+            router.balance(torch.randint(1, 50, (self.CONFIG.num_experts,), generator=generator))
+        state = model.state_dict()
+        if not with_masters:
+            state = {k: v for k, v in state.items() if not k.endswith("_bits")}
+        dcp.save({"model": state}, checkpoint_id=str(path))
+        return routers
+
+    def _assert_exported(self, hf_dir: Path, routers: list[SigmoidTopKRouter]) -> None:
+        weights = load_file(hf_dir / "model.safetensors")
+        assert not [k for k in weights if k.endswith("_bits")]
+        for i, router in enumerate(routers):
+            assert torch.equal(weights[f"model.layers.{i}.mlp.expert_bias"], router.expert_bias)
+            assert torch.equal(
+                weights[f"model.layers.{i}.mlp.router.expert_ema"], router.expert_ema
+            )
+
+    def test_the_masters_are_not_exported(self, tmp_path):
+        routers = self._save(tmp_path / "dcp", with_masters=True)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), self.CONFIG, dtype=torch.float32)
+        self._assert_exported(tmp_path / "hf", routers)
+
+    def test_a_checkpoint_saved_before_the_masters_exports(self, tmp_path):
+        routers = self._save(tmp_path / "dcp", with_masters=False)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), self.CONFIG, dtype=torch.float32)
+        self._assert_exported(tmp_path / "hf", routers)
+
+    def test_an_import_derives_the_masters_from_the_bias_and_the_ema(self, tmp_path, caplog):
+        routers = self._save(tmp_path / "dcp", with_masters=True)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), self.CONFIG, dtype=torch.float32)
+        with caplog.at_level(logging.WARNING):
+            hf_to_dcp(str(tmp_path / "hf"), str(tmp_path / "back"), self.CONFIG)
+        assert "Missing" not in caplog.text
+        model = Transformer(self.CONFIG)
+        state = {"model": model.state_dict()}
+        dcp.load(state, checkpoint_id=str(tmp_path / "back"))
+        model.load_state_dict(state["model"])
+        loaded = [m for m in model.modules() if isinstance(m, SigmoidTopKRouter)]
+        for router, source in zip(loaded, routers, strict=True):
+            for got, want in zip(router._masters(), source._masters(), strict=True):
+                assert torch.equal(got, want)

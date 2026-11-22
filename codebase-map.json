@@ -280,7 +280,9 @@
             "get_moe_router_z_loss()",
             "get_expert_counts()",
             "get_mot_expert_counts()",
-            "set_moe_step(step, max_steps)"
+            "set_moe_step(step, max_steps)",
+            "balance_routers() (one all-reduce of every sigmoid router's pending counts, then balance; every rank calls it after optimizer.step)",
+            "discard_router_counts()"
           ]
         }
       },
@@ -632,15 +634,21 @@
           ]
         },
         "SigmoidTopKRouter": {
-          "purpose": "DeepSeek-V3 style sigmoid router with learnable bias, adaptive scheduling, sequence aux loss",
+          "purpose": "DeepSeek-V3 style sigmoid router: expert_bias frozen to the optimizer (always_frozen), balanced once per optimizer step from pending_counts; adaptive scheduling, sequence aux loss",
           "properties": [
             "aux_loss",
-            "expert_counts"
+            "expert_counts",
+            "pending_counts",
+            "fp32_ema_bits, fp32_bias_bits (FP32 masters held as int32 bits; derived_buffers)"
           ],
           "methods": [
             "forward(x)",
+            "balance(counts) (moves the EMA and the bias from a step's summed counts on the FP32 masters; updates the FSDP2 shard in place)",
             "set_step(step, max_steps)",
-            "_effective_bias_rate()"
+            "_effective_bias_rate()",
+            "_masters() (FP32 views of the master bit buffers)",
+            "_load_from_state_dict(...) (derives absent masters from expert_ema and expert_bias)",
+            "derive_buffers(names) (starts the named masters from the loaded expert_ema and expert_bias; gathers an FSDP2 shard)"
           ]
         }
       },
@@ -653,7 +661,9 @@
         "tests/unit/test_router.py::TestSigmoidSequenceAuxLoss",
         "tests/unit/test_router.py::TestSigmoidBiasSchedule",
         "tests/unit/test_moe.py::TestSigmoidTopKRouter",
-        "tests/unit/test_moe.py::TestSigmoidMoEIntegration"
+        "tests/unit/test_moe.py::TestSigmoidMoEIntegration",
+        "tests/unit/test_router_balance.py",
+        "tests/distributed/test_router_balance.py"
       ]
     },
     "kempnerforge/model/generate.py": {
@@ -1260,12 +1270,19 @@
         "_recorded_weight_decay_scope(meta, metadata_path) -> str (none recorded means exclude_norms_and_biases)",
         "_recorded_lr_multipliers(meta, metadata_path) -> dict (none recorded means empty)",
         "_recorded_lr_layout(meta, metadata_path) -> (patterns, group_modules) (lr_module_patterns, and lr_group_modules: the module of each optimizer param group, recorded without PP)",
-        "_check_saved_param_groups(optim_state, saved_keys, where, groups_vary, saved_modules) (refuses another group count, a missing setting, a module key where this run has none, or another module at a position per the recorded lr_group_modules)"
+        "_check_saved_param_groups(optim_state, saved_keys, where, groups_vary, saved_modules) (refuses another group count, a missing setting, a module key where this run has none, or another module at a position per the recorded lr_group_modules)",
+        "derived_buffer_owners(model) -> dict (state-dict key of each buffer a module lists in derived_buffers -> (module, buffer name))",
+        "drop_derived_model_keys(model_state, model, saved_keys) -> dict (takes out of a load template the derived buffers its checkpoint lacks; put back before set_model_state_dict)",
+        "derive_buffers(model, keys) (the owner of each derived buffer at keys recomputes it from its loaded state)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",
         "tests/unit/test_checkpoint.py::TestOptimizerChecksAcrossStages",
         "tests/unit/test_lr_multipliers.py::TestResume",
+        "tests/unit/test_router_balance.py::TestCheckpointsThatTrainedTheBias",
+        "tests/unit/test_router_balance.py::TestManagerResume",
+        "tests/unit/test_router_balance.py::TestDerivedBufferOwners",
+        "tests/unit/test_convert_checkpoint.py::TestSigmoidRouterMasters",
         "tests/unit/test_lr_multipliers.py::TestLayoutChange",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
@@ -1308,6 +1325,7 @@
         }
       },
       "functions": [
+        "state_dict_name(name) -> str (a module name without the AC and torch.compile wrappers, as get_model_state_dict names entries)",
         "moe_layers(model) -> Iterator[(state-dict name, MoEMLP)]",
         "expert_layout(model) -> ExpertLayout | None (None without expert parallelism)",
         "check_saved_experts(model, saved, where) (refuses a checkpoint holding fewer experts than the model, as one saved with ep > 1 before #202 does)"
@@ -1702,6 +1720,18 @@
         ],
         "count": 22
       },
+      "tests/unit/test_router_balance.py": {
+        "classes": [
+          "TestFrozenBias(2)",
+          "TestBalance(5)",
+          "TestBalanceRouters(3)",
+          "TestCheckpointsThatTrainedTheBias(2)",
+          "TestManagerResume(2)",
+          "TestDerivedBufferOwners(1)",
+          "TestFSDP2(1)"
+        ],
+        "count": 16
+      },
       "tests/unit/test_optimizer.py": {
         "classes": [
           "TestNewtonSchulz(5)",
@@ -1734,9 +1764,10 @@
           "TestBuildHFConfig(4)",
           "TestMoEKFtoHFKeyMapping(5)",
           "TestMoEHFtoKFKeyMapping(5)",
-          "TestMoERoundTrip(1)"
+          "TestMoERoundTrip(1)",
+          "TestSigmoidRouterMasters(3)"
         ],
-        "count": 29
+        "count": 32
       },
       "tests/unit/test_ep_checkpoint.py": {
         "classes": [
@@ -2056,6 +2087,9 @@
       },
       "tests/distributed/test_ep.py": {
         "note": "Expert parallelism, and an EP checkpoint round trip on four GPUs"
+      },
+      "tests/distributed/test_router_balance.py": {
+        "note": "Sigmoid router balancing on four GPUs under FSDP2 (even and uneven shards), HSDP, TP and EP: one all-reduce, the reference rule, the same bias on every rank, which the next forward routes with; a resume from a checkpoint without the FP32 masters, eager and compiled; and saved masters resumed exactly on another mesh (FSDP2 to HSDP)"
       },
       "tests/distributed/test_optimizer_distributed.py": {
         "note": "Lion, Schedule-Free AdamW, optimizer-scheduler compat under FSDP2"

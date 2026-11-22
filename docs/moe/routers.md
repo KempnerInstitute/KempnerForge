@@ -6,7 +6,7 @@ of the component registry:
 | Registry key | Class | Style |
 |--------------|-------|-------|
 | `softmax_topk` | [`SoftmaxTopKRouter`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/model/router.py) | Mixtral — softmax probabilities + Switch-Transformer aux loss |
-| `sigmoid_topk` | [`SigmoidTopKRouter`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/model/router.py) | DeepSeek-V3 — per-expert sigmoid scores + learnable bias balancing |
+| `sigmoid_topk` | [`SigmoidTopKRouter`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/model/router.py) | DeepSeek-V3 style: per-expert sigmoid scores and bias balancing, with a bias the optimizer never trains |
 
 Both produce the same output shape — `(weights, indices)` of shape
 `(num_tokens, top_k)` — so `MoEMLP` works with either. They differ in
@@ -60,9 +60,10 @@ Three things differ from the softmax router:
 1. **Sigmoid, not softmax.** Expert scores are independent per expert —
    no competition for normalization. Raising expert *i*'s score doesn't
    lower expert *j*'s.
-2. **`expert_bias` is a learnable `nn.Parameter`** added to the logits
-   before sigmoid. It's *not* updated by the optimizer — the training
-   loop adjusts it manually via an EMA of per-expert utilization (see
+2. **`expert_bias` is an `nn.Parameter` the optimizer never trains**
+   (`requires_grad=False`), added to the logits before sigmoid. Once per
+   optimizer step, the training loop moves it from an EMA of per-expert
+   utilization summed over the step's micro-batches and all ranks (see
    [Aux loss and balancing § Bias adjustment](aux-loss-and-balancing.md#bias-adjustment)).
 3. **No auxiliary loss by default.** `self.aux_loss = 0.0` unless
    `sequence_aux_loss_weight > 0` (opt-in lightweight balance penalty,
@@ -74,13 +75,15 @@ into the main loss — so the routed experts learn a slightly cleaner
 signal. Empirically both approaches train; the sigmoid router is the
 one you pick when chasing DeepSeek-V3's recipe specifically.
 
-**Use when**: DeepSeek-V3 reproduction, or long MoE runs where
+**Use when**: DeepSeek-V3-style routing (the bias rule and gate weights differ from the paper's; see [Aux loss and balancing](aux-loss-and-balancing.md)), or long MoE runs where
 auxiliary-loss coefficient tuning is annoying and you want the
 balancer off the main loss path.
 
 ## Side effects
 
-Both routers store two tensors as forward-time side effects:
+Both routers store two tensors as forward-time side effects (and a
+training forward of the sigmoid router also adds its expert counts to
+`pending_counts`, which balancing consumes):
 
 ```python
 self.aux_loss:       torch.Tensor  # scalar, picked up by Transformer.get_moe_aux_loss()
@@ -176,7 +179,7 @@ pattern (DeepSeek-V2-Lite uses 2); `0` (the default) is Mixtral-style
 |---|---|---|
 | Balance mechanism | Auxiliary loss adds a term to main loss | EMA-driven bias adjustment; no loss term (by default) |
 | Coefficient to tune | `moe_aux_loss_weight` (typical 0.01) | `bias_update_rate` (0.001 default) + optional `sequence_aux_loss_weight` |
-| Best for | Mixtral baseline, pre-tuned aux-loss recipes | DeepSeek-V3 reproduction, minimal main-loss interference |
+| Best for | Mixtral baseline, pre-tuned aux-loss recipes | DeepSeek-V3-style routing, minimal main-loss interference |
 | Aux-loss-free | No — aux loss always non-zero | Yes by default |
 | Shared experts | Works, but less common in published recipes | Standard DeepSeek pattern (`moe_shared_experts = 1`) |
 
