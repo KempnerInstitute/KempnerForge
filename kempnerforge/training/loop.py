@@ -494,9 +494,11 @@ def checkpoint_extra(config: JobConfig, step: int, phases: PhaseState) -> dict:
     """Metadata saved alongside every checkpoint so a resume is exact.
 
     ``vlm_freeze`` reflects the post-transition state when a FreezeStage
-    has fired (see ``freeze_meta_at_step``).
+    has fired (see ``freeze_meta_at_step``). ``plugins`` is the run's plugins
+    list, which a resume compares with its own (see ``restore_checkpoint``).
     """
     extra: dict = {"phase_idx": phases.next_idx} if phases.phases else {}
+    extra["plugins"] = list(config.plugins)
     if config.metrics.wandb_run_id:
         extra["wandb_run_id"] = config.metrics.wandb_run_id
     if config.metrics.mlflow_run_id:

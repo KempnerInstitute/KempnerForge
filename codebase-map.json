@@ -931,6 +931,7 @@
       "purpose": "Training job orchestration — build phases, run the loop, tear down",
       "functions": [
         "run_training(config, step_fn=None, hooks=None)",
+        "_check_saved_plugins(config, saved_extra, resume_path, rank_zero) (refuses a checkpoint saved with another plugins list unless checkpoint.ignore_plugins_mismatch)",
         "build_model(config, runtime, loss_fn) -> tuple[Module, PipelineBundle | None]",
         "build_checkpoint_manager(config, runtime, model, optimizer, pipeline) -> CheckpointManager",
         "restore_checkpoint(config, model, scheduler, ckpt_mgr) -> tuple[int, int]"

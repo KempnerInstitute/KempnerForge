@@ -3762,9 +3762,8 @@ class TestCheckpointEveryOptimizer:
 
 class TestComponentSwapOnResume:
     def test_resume_into_a_different_component_is_rejected(self, tmp_path):
-        """The `plugins` list is not recorded in the checkpoint, so a resume
-        that builds a different component must fail the load rather than train
-        on a silently mismatched model."""
+        """A resume that builds a component with other parameter names fails the load
+        rather than training a mismatched model."""
         import pytest
         from torch.distributed.checkpoint.api import CheckpointException
 
@@ -3781,6 +3780,42 @@ class TestComponentSwapOnResume:
         opt2 = build_optimizer(resumed, OptimizerConfig(lr=1e-3, fused=False))
         with pytest.raises(CheckpointException, match="Missing key in checkpoint"):
             CheckpointManager(CheckpointConfig(dir=ckpt_dir), resumed, opt2).load()
+
+    def test_resume_into_a_subset_component_is_refused_by_the_plugins_list(
+        self, tmp_path, monkeypatch
+    ):
+        """A component whose parameter names are a subset of the saved ones loads silently,
+        so a resume with another plugins list is refused (#180)."""
+        import pytest
+
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.schema import JobConfig
+
+        class Big(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj1 = torch.nn.Linear(8, 8)
+                self.proj2 = torch.nn.Linear(8, 4)
+
+        class Small(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj1 = torch.nn.Linear(8, 8)
+
+        config = JobConfig(checkpoint=CheckpointConfig(dir=str(tmp_path / "ckpt")))
+        big = Big()
+        manager = CheckpointManager(config.checkpoint, big, torch.optim.AdamW(big.parameters()))
+        manager.save(step=7, extra={"plugins": ["pkg.big_components"]})
+        manager.wait()
+
+        small = Small()
+        resumed = CheckpointManager(config.checkpoint, small, torch.optim.AdamW(small.parameters()))
+        assert resumed.load()[0] == 7
+        with pytest.raises(ValueError, match="saved with plugins"):
+            entry.restore_checkpoint(config, small, None, resumed)
+        config.plugins = ["pkg.big_components"]
+        assert entry.restore_checkpoint(config, small, None, resumed) == (7, 0)
 
 
 WEIGHT_DECAY = 0.5

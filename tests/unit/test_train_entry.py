@@ -527,19 +527,26 @@ class TestVlmTextTokenGuard:
 
 
 class TestCheckpointExtra:
-    def test_empty_without_phases_or_run_ids(self):
-        assert checkpoint_extra(make_config(), 5, PhaseState()) == {}
+    def test_only_the_plugins_list_without_phases_or_run_ids(self):
+        assert checkpoint_extra(make_config(), 5, PhaseState()) == {"plugins": []}
+
+    def test_records_a_copy_of_the_plugins_list(self):
+        config = make_config()
+        config.plugins = ["pkg.components"]
+        extra = checkpoint_extra(config, 5, PhaseState())
+        assert extra["plugins"] == ["pkg.components"]
+        assert extra["plugins"] is not config.plugins
 
     def test_includes_phase_index_when_phases_configured(self):
         phases = PhaseState(phases=[TrainingPhase(start_step=1)], next_idx=1)
-        assert checkpoint_extra(make_config(), 5, phases) == {"phase_idx": 1}
+        assert checkpoint_extra(make_config(), 5, phases) == {"phase_idx": 1, "plugins": []}
 
     def test_includes_metrics_run_ids(self):
         config = make_config()
         config.metrics.wandb_run_id = "wid"
         config.metrics.mlflow_run_id = "mid"
         extra = checkpoint_extra(config, 5, PhaseState())
-        assert extra == {"wandb_run_id": "wid", "mlflow_run_id": "mid"}
+        assert extra == {"wandb_run_id": "wid", "mlflow_run_id": "mid", "plugins": []}
 
     def test_includes_vlm_freeze_metadata(self, tiny_vlm_configs):
         mc, vision, adapter, vlm = tiny_vlm_configs
@@ -1071,7 +1078,7 @@ class TestNanSkippedStep:
         monkeypatch.setattr(ckpt, "save", save)
         step, tokens_seen = run_training_loop(session)
         assert step == 2
-        assert ckpt.saves == [(2, tokens_seen, {})]
+        assert ckpt.saves == [(2, tokens_seen, {"plugins": []})]
         assert ckpt.waits == 1
         assert epochs == [2]
         assert handler.finished is False
@@ -1113,7 +1120,7 @@ class TestNanSkippedStep:
         monkeypatch.setattr(ckpt, "save", save)
         step, tokens_seen = run_training_loop(session)
         assert step == 2
-        assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1})]
+        assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1, "plugins": []})]
         assert loaders == [session.data.dataloader]
         assert loaders[0] is not None
 
@@ -2347,6 +2354,88 @@ class TestRestoreCheckpoint:
         assert config.metrics.wandb_run_id == "W1"
         assert config.metrics.mlflow_run_id == "M1"
         assert config.metrics.mlflow_tags == {}
+
+    @pytest.mark.parametrize("load_path", [False, True], ids=["resume", "warm_start"])
+    def test_a_checkpoint_saved_with_other_plugins_is_refused(
+        self, monkeypatch, tmp_path, load_path
+    ):
+        import kempnerforge.training.entry as entry
+
+        resume = None if load_path else tmp_path / "step_7"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: resume)
+        config = make_config()
+        config.checkpoint.load_path = str(tmp_path / "step_7") if load_path else None
+        mgr = FakeResumeManager(extra={"plugins": ["pkg.big"]})
+        with pytest.raises(ValueError, match=r"step_7 was saved with plugins = \['pkg\.big'\]"):
+            entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [([], ["pkg.big"]), (["pkg.a", "pkg.b"], ["pkg.b", "pkg.a"]), (["pkg.a"], ["pkg.a"] * 2)],
+        ids=["added", "reordered", "repeated"],
+    )
+    def test_any_other_list_is_refused(self, monkeypatch, tmp_path, saved, current):
+        """The lists must match exactly, in order: a plugin can override another's names."""
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
+        config = make_config()
+        config.plugins = current
+        mgr = FakeResumeManager(extra={"plugins": saved})
+        with pytest.raises(ValueError, match="was saved with plugins"):
+            entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+
+    def test_every_rank_checks_once_and_only_rank_zero_warns(self, monkeypatch, tmp_path):
+        import kempnerforge.training.entry as entry
+
+        path = tmp_path / "step_7"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: path)
+        monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(entry.dist, "get_rank", lambda: 1)
+        monkeypatch.setattr(
+            entry.dist, "broadcast_object_list", lambda objs, src: objs.__setitem__(0, str(path))
+        )
+        check, calls = entry._check_saved_plugins, []
+        monkeypatch.setattr(
+            entry, "_check_saved_plugins", lambda *a: calls.append(a[3]) or check(*a)
+        )
+        config = make_config()
+        mgr = FakeResumeManager(step=7, tokens=9, extra={"plugins": ["pkg.big"]})
+        with pytest.raises(ValueError, match="was saved with plugins"):
+            entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert calls == [False]
+        config.checkpoint.ignore_plugins_mismatch = True
+        result, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        )
+        assert result == (7, 9) and calls == [False, False]
+        assert not any("ignore_plugins_mismatch" in w for w in warnings)
+
+    @pytest.mark.parametrize(
+        ("saved", "current"), [(None, ["pkg.big"]), ([], []), (["pkg.big"], ["pkg.big"])]
+    )
+    def test_the_same_plugins_or_no_record_resume(self, monkeypatch, tmp_path, saved, current):
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
+        config = make_config()
+        config.plugins = current
+        extra = {} if saved is None else {"plugins": saved}
+        mgr = FakeResumeManager(step=7, tokens=9, extra=extra)
+        assert entry.restore_checkpoint(config, TinyTextModel(), None, mgr) == (7, 9)
+
+    def test_ignore_plugins_mismatch_resumes_with_a_warning(self, monkeypatch, tmp_path):
+        import kempnerforge.training.entry as entry
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
+        config = make_config()
+        config.checkpoint.ignore_plugins_mismatch = True
+        mgr = FakeResumeManager(step=7, tokens=9, extra={"plugins": ["pkg.big"]})
+        result, warnings = _entry_warnings(
+            lambda: entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        )
+        assert result == (7, 9)
+        assert any("checkpoint.ignore_plugins_mismatch is set" in w for w in warnings)
 
     def test_absent_run_ids_do_not_clobber_existing_ones(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
@@ -4338,7 +4427,8 @@ class TestFreezeStageFence:
         monkeypatch.setattr(session.checkpointer, "save", save)
         run_training_loop(session)
         assert order == ["flush", "freeze", "save"]
-        assert saved == [(2, {"vlm_freeze": freeze_meta_at_step(2, session.config.vlm)})]
+        freeze = freeze_meta_at_step(2, session.config.vlm)
+        assert saved == [(2, {"plugins": [], "vlm_freeze": freeze})]
 
 
 class TestBatchStreamGuard:

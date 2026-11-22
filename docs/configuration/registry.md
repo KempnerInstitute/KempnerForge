@@ -195,12 +195,18 @@ Four rules for plugin authors, all from the distributed contract:
   before `init_distributed`, so a rank stalled reading a manifest never
   reaches the rendezvous — the other ranks then fail there, minutes
   later and far from the cause.
-- **Keep `plugins` in the config you resume with.** The list is not
-  recorded in the checkpoint. Resuming with a list that builds a
-  different component fails the load with `Missing key in checkpoint
-  state_dict` rather than training a mismatched model — but a component
+- **Keep `plugins` in the config you resume with.** Every checkpoint
+  records the list, and the training entry point refuses to resume or
+  warm start, with the train state, from one saved with another list: the
+  same modules in the same order, since a plugin can override the names
+  another registers. Another list can build another component, and one
   whose parameters are a strict subset of the saved ones would load
-  silently.
+  silently. If the plugins that differ build no part of the model, set
+  `checkpoint.ignore_plugins_mismatch = true` to go on with a warning. A
+  checkpoint saved before the list was recorded, a weights-only warm
+  start (`checkpoint.exclude_from_loading = ["optimizer", "train_state"]`),
+  and scripts that load a checkpoint without the training entry point,
+  such as `scripts/eval.py`, are not checked.
 
 ## Adding a new category
 

@@ -324,6 +324,39 @@ def _tag_warm_start_run(config: JobConfig, extra: dict) -> None:
     metrics.mlflow_tags = {**tags, **metrics.mlflow_tags}
 
 
+def _check_saved_plugins(
+    config: JobConfig, saved_extra: dict, resume_path: Path | None, rank_zero: bool
+) -> None:
+    """Refuse to go on from a checkpoint saved with another ``plugins`` list.
+
+    A plugin can register a component the model is built from, so another list can build
+    another model from the same TOML, and DCP loads a model whose parameter names are a
+    subset of the saved ones without an error. A checkpoint saved before the list was
+    recorded, and a weights-only warm start, which reads no train state, are not checked.
+
+    Raises:
+        ValueError: The lists differ and ``checkpoint.ignore_plugins_mismatch`` is off.
+    """
+    saved = saved_extra.get("plugins")
+    if saved is None or list(saved) == list(config.plugins):
+        return
+    source = resume_path if resume_path is not None else config.checkpoint.load_path
+    message = (
+        f"{source} was saved with plugins = {list(saved)!r}, but this run sets plugins = "
+        f"{list(config.plugins)!r}: a plugin can register a component the model is built "
+        "from, and a model whose parameters are a subset of the saved ones loads without an "
+        "error."
+    )
+    if config.checkpoint.ignore_plugins_mismatch:
+        if rank_zero:
+            logger.warning(f"{message} Going on, since checkpoint.ignore_plugins_mismatch is set")
+        return
+    raise ValueError(
+        f"{message} Set plugins as the checkpoint has them, or, if the plugins that differ "
+        "build no part of the model, set checkpoint.ignore_plugins_mismatch = true."
+    )
+
+
 def restore_checkpoint(
     config: JobConfig,
     model: torch.nn.Module,
@@ -346,6 +379,9 @@ def restore_checkpoint(
     each enabled tracking backend opens a run of its own unless ``metrics.mlflow_run_id`` or
     ``metrics.wandb_run_id`` names one, and with MLflow on, rank 0 tags the new run with the
     checkpoint and the MLflow run that saved it (``_tag_warm_start_run``).
+
+    A checkpoint saved with another ``plugins`` list is refused (see
+    ``_check_saved_plugins``).
     """
     num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
@@ -395,6 +431,7 @@ def restore_checkpoint(
             config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
     elif rank_zero:
         _tag_warm_start_run(config, ckpt_extra_loaded)
+    _check_saved_plugins(config, ckpt_extra_loaded, resume_path, rank_zero)
 
     if warm_start_exclude is not None and "model" in warm_start_exclude:
         _mot_text_warm_start(vlm_cfg, model, ckpt_mgr.agree)
