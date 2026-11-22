@@ -2159,6 +2159,46 @@ class TestVlmDataMetrics:
         assert batch["input_ids"].shape[0] == 2
         assert _batch_counts(batch, 0) == (3, 3 * 4, 3 + 5 + 2, 3)
 
+    def test_image_tokens_are_the_adapters_output_even_outside_the_residual_stream(self):
+        """Cross-Attention puts no image positions in the residual stream, yet attends to them."""
+        from kempnerforge.training.loop import _batch_counts
+
+        batch = self._padded()
+        batch["frame_mask"] = torch.tensor([[True], [False], [True]])
+        assert _batch_counts(batch, 0, tokens_per_image=4)[1] == 2 * 4
+
+    def test_a_packed_batch_without_images_runs_one_blank_image(self):
+        from kempnerforge.data.vlm_dataset import pack_vlm_samples
+        from kempnerforge.training.loop import _batch_counts
+
+        sample = {
+            "pixel_values": torch.zeros(0, 3, 4, 4),
+            "input_ids": torch.arange(1, 7),
+            "labels": torch.arange(1, 7),
+            "text_len": torch.tensor(4),
+        }
+        batch = pack_vlm_samples([sample], seq_len=16, tokens_per_image=4, pad_id=0)
+        assert _batch_counts(batch, 0) == (1, 0, 4, 1)
+
+    def test_the_vision_flops_are_the_steps_own_before_a_freeze_stage(self, monkeypatch):
+        import kempnerforge.training.loop as loop
+
+        frozen = {"now": False}
+        monkeypatch.setattr(
+            loop, "vision_flops_per_image", lambda _m: 1.0 if frozen["now"] else 3.0
+        )
+        transitions = loop._apply_step_transitions
+
+        def freezing(session, step):
+            frozen["now"] = True
+            transitions(session, step)
+
+        monkeypatch.setattr(loop, "_apply_step_transitions", freezing)
+        session = self._session(self._padded())
+        calls = TestTokensCountTheBatch._end_steps(monkeypatch, session)
+        run_training_loop(session)
+        assert calls[0]["vision_flops"] == 3 * 3.0
+
     def test_the_step_adds_its_micro_steps(self):
         session = self._session(self._padded(), grad_accum_steps=2)
         result = vlm_step(session, 0)

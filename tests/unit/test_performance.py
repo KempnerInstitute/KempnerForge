@@ -320,6 +320,11 @@ class TestVisionFlops:
         model = self._vlm(False, False, types.SimpleNamespace(config=config))
         assert vision_flops_per_image(model) == 2 * 110 * 4 + 4 * 2 * 4**2 * 8 + 2 * 220 * 4
 
+    def test_a_pooling_adapter_counts_its_output_tokens(self):
+        model = self._vlm(False)
+        model.adapter.output_num_tokens = lambda n: n // 4
+        assert vision_flops_per_image(model) == 2 * 110 * 4 + 3 * 2 * 220 * 1
+
     def test_a_compiled_model_reads_its_original_module(self):
         compiled = torch.nn.Module()
         compiled._orig_mod = self._vlm(False)

@@ -453,6 +453,65 @@ def _check_step_counts(rank: int, world: int, port: int, names: tuple, sizes: tu
         dist.destroy_process_group()
 
 
+def _check_mixed_reports(rank: int, world: int, port: int) -> None:
+    """A rank whose step body reports no counts still joins the reduction, adding the configured
+    batch and no documents, so the ranks agree."""
+    from kempnerforge.training.loop import StepResult, _step_counts
+    from tests.unit.test_train_entry import make_config, make_session
+
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp_shard",))
+        runtime = RuntimeContext(
+            rank=rank,
+            local_rank=rank,
+            world_size=world,
+            device=torch.device("cpu"),
+            device_mesh=mesh,
+        )
+        session = make_session(make_config(), runtime=runtime)
+        tc = session.config.train
+        configured = tc.batch_size * tc.seq_len * tc.grad_accum_steps
+        if rank == 0:
+            result = StepResult(loss=1.0, grad_norm=0.1, tokens=8, documents=2, encoder_images=2)
+        else:
+            result = StepResult(loss=1.0, grad_norm=0.1)
+        assert _step_counts(session, result) == (8 + configured, 2, 2), rank
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_missing_text_tokens(rank: int, world: int, port: int) -> None:
+    """A VLM step body that reports no text tokens on one rank fails every rank, none waiting."""
+    from kempnerforge.config.schema import AdapterConfig, VisionEncoderConfig, VLMConfig
+    from kempnerforge.training.loop import StepResult, _log_periodic_metrics
+    from tests.unit.test_train_entry import make_config, make_session
+
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp_shard",))
+        runtime = RuntimeContext(
+            rank=rank,
+            local_rank=rank,
+            world_size=world,
+            device=torch.device("cpu"),
+            device_mesh=mesh,
+        )
+        session = make_session(make_config(), runtime=runtime)
+        session.config = JobConfig(
+            model=ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=64),
+            train=TrainConfig(batch_size=1, seq_len=64, max_steps=1),
+            vision_encoder=VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=32),
+        )
+        result = StepResult(loss=1.0, grad_norm=0.1, text_tokens=10 if rank == 0 else None)
+        with pytest.raises(RuntimeError, match="reported no text-token count"):
+            _log_periodic_metrics(session, result, 1)
+    finally:
+        dist.destroy_process_group()
+
+
 class TestGetDpInfoOnRealMeshes:
     @pytest.mark.parametrize("world", sorted(_by_world(HSDP_LAYOUTS)))
     def test_hsdp_meshes_give_one_dp_rank_per_data_shard(self, world):
@@ -500,6 +559,12 @@ class TestLoggedMetricsOverDataParallel:
         """Tokens, documents and encoder images sum the DP ranks' own counts, TP peers once."""
         names, sizes = MESHES_OF_TWO[mesh]
         mp.spawn(_check_step_counts, args=(2, _free_port(), names, sizes), nprocs=2)
+
+    def test_a_rank_that_reports_no_counts_still_joins_the_reduction(self):
+        mp.spawn(_check_mixed_reports, args=(2, _free_port()), nprocs=2)
+
+    def test_a_missing_text_token_count_fails_every_rank(self):
+        mp.spawn(_check_missing_text_tokens, args=(2, _free_port()), nprocs=2)
 
     @pytest.mark.parametrize("mesh", sorted(MESHES_OF_TWO))
     def test_vlm_text_tokens_count_each_dp_rank_once(self, mesh):

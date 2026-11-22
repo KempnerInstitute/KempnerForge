@@ -150,9 +150,10 @@ def vision_flops_per_image(model: torch.nn.Module) -> float:
 
     Each runs ``2 * N`` FLOPs per token forward for its ``N`` parameters: the encoder over
     the ``num_tokens`` it processes, plus ``4 * layers * tokens**2 * hidden`` for attention
-    when its tower's config gives the layers and width, and the adapter over the encoder's
-    output tokens. A module with a trainable parameter also runs the backward, twice the
-    forward. Zero for a model without a vision encoder.
+    when its tower's config gives the layers and width, and the adapter over the tokens it
+    puts out (``output_num_tokens``), since a pooling adapter projects after it pools. A
+    module with a trainable parameter also runs the backward, twice the forward. Zero for a
+    model without a vision encoder.
     """
     inner = getattr(model, "_orig_mod", model)
     encoder = getattr(inner, "vision_encoder", None)
@@ -162,12 +163,18 @@ def vision_flops_per_image(model: torch.nn.Module) -> float:
     config = getattr(getattr(encoder, "vision_tower", None), "config", None)
     attention = 4.0 * getattr(config, "num_hidden_layers", 0) * tokens**2
     attention *= getattr(config, "hidden_size", 0)
+    adapter = getattr(inner, "adapter", None)
+    output_num_tokens = getattr(adapter, "output_num_tokens", None)
+    adapter_tokens = output_num_tokens(tokens) if output_num_tokens is not None else tokens
     total = 0.0
-    for module, extra in ((encoder, attention), (getattr(inner, "adapter", None), 0.0)):
+    for module, module_tokens, extra in (
+        (encoder, tokens, attention),
+        (adapter, adapter_tokens, 0.0),
+    ):
         if module is None:
             continue
         params = list(module.parameters())
-        forward = 2.0 * sum(p.numel() for p in params) * tokens + extra
+        forward = 2.0 * sum(p.numel() for p in params) * module_tokens + extra
         total += forward * (3 if any(p.requires_grad for p in params) else 1)
     return total
 

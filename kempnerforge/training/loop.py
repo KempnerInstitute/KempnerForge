@@ -387,7 +387,14 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
     total_text_tokens = 0
     total_tokens = 0
     seq_len = 0
-    image_positions = getattr(getattr(model, "_orig_mod", model), "num_image_tokens", 0)
+    inner = getattr(model, "_orig_mod", model)
+    image_positions = getattr(inner, "num_image_tokens", 0)
+    adapter, encoder = getattr(inner, "adapter", None), getattr(inner, "vision_encoder", None)
+    tokens_per_image = (
+        adapter.output_num_tokens(encoder.num_tokens)
+        if adapter is not None and encoder is not None
+        else None
+    )
     documents = image_tokens = encoder_images = 0
     document_text_tokens: int | None = 0
 
@@ -414,7 +421,7 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         else:
             seq_len = input_ids.shape[1] + image_positions
         total_tokens += input_ids.shape[0] * seq_len
-        counts = _batch_counts(batch, image_positions)
+        counts = _batch_counts(batch, image_positions, tokens_per_image)
         documents += counts[0]
         image_tokens += counts[1]
         encoder_images += counts[3]
@@ -488,16 +495,20 @@ def _mark_rows_dynamic(*tensors: Any) -> None:
             maybe_mark_dynamic(tensor, 0)
 
 
-def _batch_counts(batch: dict[str, Any], image_positions: int) -> tuple[int, int, int | None, int]:
+def _batch_counts(
+    batch: dict[str, Any], image_positions: int, tokens_per_image: int | None = None
+) -> tuple[int, int, int | None, int]:
     """A VLM batch's documents, real-image tokens, document text tokens and encoder images.
 
     A packed batch (one with ``image_rows``) holds several documents per row: they are the
     distinct row and document pairs at its text positions and image starts, its image tokens
-    are its images times ``image_tokens``, and its text tokens its ``text_positions``. A padded
-    batch holds one document per row, with ``image_positions`` image tokens split evenly over
-    its frames, of which ``frame_mask`` marks the real ones, and the text tokens its
-    ``text_len`` gives. The text count is None when the batch does not give it. The encoder
-    runs every image or frame either way.
+    are its images times ``image_tokens``, and its text tokens its ``text_positions``; with no
+    image, the encoder runs one blank image. A padded batch holds one document per row, and its
+    image tokens are ``tokens_per_image``, the adapter's output tokens, for each real image or
+    frame ``frame_mask`` marks (``image_positions`` split evenly over the frames when
+    ``tokens_per_image`` is None); its text tokens are what ``text_len`` gives. The text count
+    is None when the batch does not give it. The encoder runs every image or frame, blank or
+    padding ones included.
     """
     pixel_values = batch["pixel_values"]
     if "image_rows" in batch:
@@ -514,15 +525,16 @@ def _batch_counts(batch: dict[str, Any], image_positions: int) -> tuple[int, int
             int(torch.unique(pairs).numel()),
             n_images * int(batch["image_tokens"]),
             None if text_positions is None else int(text_positions.numel()),
-            n_images,
+            max(n_images, 1),
         )
     rows = int(batch["input_ids"].shape[0])
     frames = int(pixel_values.shape[1]) if pixel_values.dim() == 5 else 1
     frame_mask = batch.get("frame_mask")
     real = int(frame_mask.sum()) if frame_mask is not None else rows * frames
+    per_image = image_positions // frames if tokens_per_image is None else tokens_per_image
     text_len = batch.get("text_len")
     text = int(text_len.sum()) if text_len is not None else None
-    return rows, real * (image_positions // frames), text, rows * frames
+    return rows, real * per_image, text, rows * frames
 
 
 def _dp_sum(session: TrainingSession, counts: list[int]) -> list[int]:
@@ -540,17 +552,18 @@ def _dp_sum(session: TrainingSession, counts: list[int]) -> list[int]:
 def _step_counts(session: TrainingSession, result: StepResult) -> tuple[int, int, int]:
     """Positions, documents and encoder images the step ran over the data-parallel ranks.
 
-    Every rank adds the counts it reports in one reduction, so ranks that ran different
-    batches count what each of them ran. A step body that reports no ``tokens`` counts the
-    configured batch, and one that reports no documents or encoder images counts zero.
+    Every rank adds its counts in one reduction, whatever its step body reports, so ranks that
+    ran different batches count what each of them ran and every rank takes part. A rank that
+    reports no ``tokens`` adds the configured batch, and one that reports no documents or
+    encoder images adds zero.
     """
     tc = session.config.train
-    configured = tc.batch_size * tc.seq_len * tc.grad_accum_steps * session.data.dp_size
-    reported = (result.tokens, result.documents, result.encoder_images)
-    if all(count is None for count in reported):
-        return configured, 0, 0
-    tokens, documents, images = _dp_sum(session, [count or 0 for count in reported])
-    return (configured if result.tokens is None else tokens), documents, images
+    tokens = result.tokens
+    if tokens is None:
+        tokens = tc.batch_size * tc.seq_len * tc.grad_accum_steps
+    counts = [tokens, result.documents or 0, result.encoder_images or 0]
+    total_tokens, documents, images = _dp_sum(session, counts)
+    return total_tokens, documents, images
 
 
 def text_step(session: TrainingSession, step: int) -> StepResult:
@@ -686,13 +699,18 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
         tracker.log_eval(moe_metrics, step)
 
     if config.is_vlm:
-        if result.text_tokens is None:
+        local = [
+            result.text_tokens or 0,
+            result.image_tokens or 0,
+            result.document_text_tokens or 0,
+            int(result.text_tokens is None),
+        ]
+        trained, image_tokens, text_tokens, missing = _dp_sum(session, local)
+        if missing:
             raise RuntimeError(
-                "VLM run: the step body reported no text-token count, so "
+                "VLM run: a step body reported no text-token count, so "
                 "data/text_tokens_trained would be logged as zero"
             )
-        local = [result.text_tokens, result.image_tokens or 0, result.document_text_tokens or 0]
-        trained, image_tokens, text_tokens = _dp_sum(session, local)
         data_metrics = {"data/text_tokens_trained": float(trained)}
         if result.image_tokens is not None:
             data_metrics["data/image_tokens"] = float(image_tokens)
@@ -921,6 +939,11 @@ def run_training_loop(
             tracker.start_step()
             result = session.step_fn(session, step)
             tokens_in_step, documents_in_step, images_in_step = _step_counts(session, result)
+            vision_flops = (
+                images_in_step * vision_flops_per_image(model)
+                if result.encoder_images is not None
+                else None
+            )
 
             if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
                 optimizer.zero_grad()
@@ -958,11 +981,7 @@ def run_training_loop(
                 lr=applied_lr,
                 tokens_in_step=tokens_in_step,
                 seq_len=result.seq_len,
-                vision_flops=(
-                    images_in_step * vision_flops_per_image(model)
-                    if result.encoder_images is not None
-                    else None
-                ),
+                vision_flops=vision_flops,
             )
 
             hooks.on_step_end(

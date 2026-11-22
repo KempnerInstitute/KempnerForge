@@ -226,10 +226,10 @@ A VLM run's data metrics are each summed over the data-parallel ranks:
 `data/text_tokens_trained` counts the supervised text tokens of the step,
 `data/text_tokens` every text token of its documents (prompt included,
 padding excluded, from each row's `text_len` or a packed batch's text
-positions), and `data/image_tokens` the image positions of its real images
-in the residual stream (a text-only document's hidden image and padding
-frames excluded; Cross-Attention, whose images do not enter the residual
-stream, logs none). `data/documents_seen` counts the documents the run has
+positions), and `data/image_tokens` the adapter's output tokens for its
+real images (a text-only document's hidden image and padding frames
+excluded): the image positions of a Joint-Decoder, MoT or MoMa row, and the
+tokens Cross-Attention attends to. `data/documents_seen` counts the documents the run has
 trained on, a packed row counting each one it holds; it is saved with
 every checkpoint and counts on from there on a resume, from zero after a
 checkpoint saved before it was recorded.

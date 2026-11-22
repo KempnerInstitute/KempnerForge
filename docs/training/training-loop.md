@@ -177,10 +177,11 @@ loss whose gradient the update applied, on every rank. `lr` is the LR
 the update used (for `schedule_free_adamw`, the rate before the warmup
 the optimizer applies inside `step()`). The per-module `lr/<module>` and
 `lr_adamw/<module>` metrics are read at the same point, so they describe
-the same update. `tokens_in_step` counts the
-positions the model ran on this rank, `result.tokens`, times the
-data-parallel size; a VLM step counts the image positions in the
-residual stream as well as the text.
+the same update. `tokens_in_step` sums the positions each
+data-parallel rank ran, `result.tokens` (the configured batch for a step
+body that reports none), in one reduction with the step's documents and
+encoder images; a VLM step counts the image positions in the residual
+stream as well as the text.
 
 `StepContext` freezes the full step state for hooks that need to read
 gradients or parameter values before the next iteration. See
