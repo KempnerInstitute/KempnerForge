@@ -2047,3 +2047,96 @@ class TestModelConfigHeadDim:
         model = load_config(str(path), cli_args=[]).model
         assert model.head_dim_override == 0
         assert model.head_dim == 64
+
+
+class TestScalarCoercion:
+    """A bool or int value that does not stand for one is refused, naming the field (#580)."""
+
+    @staticmethod
+    def _toml(tmp_path: Path, section: str, line: str) -> JobConfig:
+        path = tmp_path / "c.toml"
+        path.write_text(f"[{section}]\n{line}\n")
+        return load_config(str(path), cli_args=[])
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("true", True),
+            ("True", True),
+            ("YES", True),
+            ("1", True),
+            ("1.0", True),
+            ("false", False),
+            ("No", False),
+            ("0", False),
+            ("0.0", False),
+        ],
+    )
+    def test_bool_spellings_from_the_cli(self, raw, expected):
+        assert (
+            load_config(cli_args=[f"--train.compile_model={raw}"]).train.compile_model is expected
+        )
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("true", True),
+            ("false", False),
+            ("1", True),
+            ("0", False),
+            ("1.0", True),
+            ("0.0", False),
+        ],
+    )
+    def test_bool_values_from_toml(self, tmp_path, raw, expected):
+        train = self._toml(tmp_path, "train", f"compile_model = {raw}").train
+        assert train.compile_model is expected
+
+    @pytest.mark.parametrize("raw", ["ture", "on", "''", "2", "-1", "0.5"])
+    def test_a_value_that_is_no_bool_is_refused(self, raw):
+        with pytest.raises(ValueError, match=r"TrainConfig\.compile_model: expected a bool"):
+            load_config(cli_args=[f"--train.compile_model={raw}"])
+
+    @pytest.mark.parametrize("raw", ['"ture"', "2", "0.5"])
+    def test_a_toml_value_that_is_no_bool_is_refused(self, tmp_path, raw):
+        with pytest.raises(ValueError, match=r"TrainConfig\.tf32: expected a bool"):
+            self._toml(tmp_path, "train", f"tf32 = {raw}")
+
+    @pytest.mark.parametrize(("raw", "expected"), [("4", 4), ("4.0", 4), ("'4'", 4)])
+    def test_whole_numbers_load_as_ints(self, raw, expected):
+        batch_size = load_config(cli_args=[f"--train.batch_size={raw}"]).train.batch_size
+        assert batch_size == expected and type(batch_size) is int
+
+    @pytest.mark.parametrize("raw", ["2.7", "True", "False", "'2.7'", "'4.0'", "'four'"])
+    def test_a_value_that_is_no_int_is_refused(self, raw):
+        with pytest.raises(ValueError, match=r"TrainConfig\.batch_size: expected an int"):
+            load_config(cli_args=[f"--train.batch_size={raw}"])
+
+    @pytest.mark.parametrize("raw", ["2.7", "true"])
+    def test_a_toml_value_that_is_no_int_is_refused(self, tmp_path, raw):
+        with pytest.raises(ValueError, match=r"TrainConfig\.batch_size: expected an int"):
+            self._toml(tmp_path, "train", f"batch_size = {raw}")
+
+    @pytest.mark.parametrize(("raw", "expected"), [("3e-4", 3e-4), ("1", 1.0), ("'0.5'", 0.5)])
+    def test_numbers_load_as_floats(self, raw, expected):
+        lr = load_config(cli_args=[f"--optimizer.lr={raw}"]).optimizer.lr
+        assert lr == expected and type(lr) is float
+
+    @pytest.mark.parametrize("raw", ["True", "'fast'"])
+    def test_a_value_that_is_no_float_is_refused(self, raw):
+        with pytest.raises(ValueError, match=r"OptimizerConfig\.lr: expected a float"):
+            load_config(cli_args=[f"--optimizer.lr={raw}"])
+
+    def test_a_toml_bool_for_a_float_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match=r"OptimizerConfig\.lr: expected a float"):
+            self._toml(tmp_path, "optimizer", "lr = true")
+
+    def test_a_literal_refusal_names_the_field(self):
+        with pytest.raises(ValueError, match=r"TrainConfig\.mixed_precision: Value 'bf61'"):
+            load_config(cli_args=["--train.mixed_precision=bf61"])
+
+    def test_a_nested_value_names_its_own_field(self, tmp_path):
+        path = tmp_path / "c.toml"
+        path.write_text('[[data.datasets]]\npath = "/d"\nweight = "heavy"\n')
+        with pytest.raises(ValueError, match=r"DatasetSource\.weight: expected a float"):
+            load_config(str(path), cli_args=[])
