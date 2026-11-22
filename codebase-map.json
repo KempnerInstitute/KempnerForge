@@ -1564,12 +1564,12 @@
           "TestJobConfig(11)",
           "TestTomlLoading(12)",
           "TestCliOverrides(11)",
-          "TestScalarCoercion(12)",
+          "TestScalarCoercion(13)",
           "TestCliParsing(6)",
           "TestRegistry(12)",
           "TestEvalConfig(7)"
         ],
-        "count": 119
+        "count": 120
       },
       "tests/unit/test_training.py": {
         "classes": [

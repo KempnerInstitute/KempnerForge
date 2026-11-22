@@ -2131,6 +2131,18 @@ class TestScalarCoercion:
         with pytest.raises(ValueError, match=r"OptimizerConfig\.lr: expected a float"):
             self._toml(tmp_path, "optimizer", "lr = true")
 
+    @pytest.mark.parametrize(
+        ("override", "field", "kind"),
+        [
+            ("--train.data_seed={'seed': 4}", "TrainConfig.data_seed", "an int"),
+            ("--train.batch_size=[4]", "TrainConfig.batch_size", "an int"),
+            ("--optimizer.lr=None", "OptimizerConfig.lr", "a float"),
+        ],
+    )
+    def test_a_value_of_another_type_is_refused(self, override, field, kind):
+        with pytest.raises(ValueError, match=rf"{field}: expected {kind}"):
+            load_config(cli_args=[override])
+
     def test_a_literal_refusal_names_the_field(self):
         with pytest.raises(ValueError, match=r"TrainConfig\.mixed_precision: Value 'bf61'"):
             load_config(cli_args=["--train.mixed_precision=bf61"])

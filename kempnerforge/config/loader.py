@@ -111,24 +111,24 @@ def _coerce_bool(value: Any) -> bool:
     raise ValueError(f"expected a bool (true or false), got {value!r}")
 
 
-def _coerce_number(field_type: type[int] | type[float], value: Any) -> Any:
-    """An int or a float from a number or a numeric string; other types pass through.
+def _coerce_number(field_type: type[int] | type[float], value: Any) -> int | float:
+    """An int or a float from a number or a numeric string.
 
     Raises:
-        ValueError: A bool, a string that is not such a number, or, for an int, a
-            number with a fraction.
+        ValueError: A bool, a string that is not such a number, a value of another type,
+            or, for an int, a number with a fraction.
     """
     article = "an" if field_type is int else "a"
     refusal = f"expected {article} {field_type.__name__}, got {value!r}"
     fractional = isinstance(value, float) and not value.is_integer()
-    if isinstance(value, bool) or (field_type is int and fractional):
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         raise ValueError(refusal)
-    if isinstance(value, (str, int, float)):
-        try:
-            return field_type(value)
-        except ValueError:
-            raise ValueError(refusal) from None
-    return value
+    if field_type is int and fractional:
+        raise ValueError(refusal)
+    try:
+        return field_type(value)
+    except ValueError:
+        raise ValueError(refusal) from None
 
 
 def _coerce_field(dc_type: type, name: str, hint: Any, raw: Any) -> Any:
