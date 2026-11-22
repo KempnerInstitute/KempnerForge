@@ -23,6 +23,10 @@ def _filter_fn(module, fqn):
     return "router" not in fqn
 ```
 
+`apply_float8` hands this filter to torchao through `_keep_tied_head`,
+which also keeps out an output head tied to the token embedding (see
+below).
+
 So the converted set is:
 
 | Module | Converted | Reason |
@@ -35,6 +39,7 @@ So the converted set is:
 | `router.gate` | **no** | Small output dim, not compute-bound |
 | `token_embedding` | no | Not a `Linear` — `nn.Embedding` |
 | Norms (RMSNorm) | no | Not a `Linear` |
+| `output_head.proj` tied to the token embedding | **no** | Kept in high precision so that it stays tied (see below) |
 
 ## Exclusion rules
 
@@ -58,6 +63,13 @@ logic, not a compute bottleneck.
 
 **Embeddings & norms**: not `Linear` — `convert_to_float8_training`
 skips them automatically (no filter entry needed).
+
+**An output head tied to the embedding** (`model.tie_embeddings = true`):
+kept in high precision, the master weights' dtype. With
+`enable_fsdp_float8_all_gather`, torchao gives a converted `Linear`'s
+weight a parameter of its own, which would untie the head from the
+embedding and train two weights; `apply_float8` keeps the tied head out
+of conversion instead and logs an info line that says so.
 
 ## `enable_fsdp_float8_all_gather`
 

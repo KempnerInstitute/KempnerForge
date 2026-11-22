@@ -39,6 +39,8 @@ from kempnerforge.model.mot import MoTAttention
 from kempnerforge.model.transformer import Transformer
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
 
 logger = logging.getLogger(__name__)
@@ -200,6 +202,25 @@ def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpoin
     return sum(wrapped.values())
 
 
+def _keep_tied_head(
+    model: torch.nn.Module, filter_fn: Callable[[torch.nn.Module, str], bool]
+) -> Callable[[torch.nn.Module, str], bool]:
+    """``filter_fn``, except that an output head tied to the token embedding stays out.
+
+    torchao gives a converted Linear's weight a parameter of its own when FSDP2
+    all-gathers in float8, which would untie the head from the embedding, so a tied
+    head stays in high precision, and an info line says so.
+    """
+    head = getattr(model, "output_head", None)
+    embedding = getattr(model, "token_embedding", None)
+    if head is None or embedding is None or head.proj.weight is not embedding.embedding.weight:
+        return filter_fn
+    logger.info(
+        "Float8: output_head.proj stays in high precision, since it is tied to the token embedding"
+    )
+    return lambda module, fqn: fqn != "output_head.proj" and filter_fn(module, fqn)
+
+
 def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True) -> None:
     """Apply Float8 training (torchao) to the model.
 
@@ -246,7 +267,9 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
             return False
         return "router" not in fqn
 
-    convert_to_float8_training(model, config=config, module_filter_fn=_filter_fn)
+    convert_to_float8_training(
+        model, config=config, module_filter_fn=_keep_tied_head(model, _filter_fn)
+    )
 
     logger.info(
         f"Applied Float8 training: recipe=TENSORWISE, "
