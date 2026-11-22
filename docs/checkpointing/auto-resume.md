@@ -95,20 +95,27 @@ if resume_path or config.checkpoint.load_path:
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
         scheduler=scheduler,
+        exact_resume=resume_path is not None,
     )
-    if ckpt_extra_loaded.get("wandb_run_id"):
-        config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
-    if ckpt_extra_loaded.get("mlflow_run_id"):
-        config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
+    if resume_path:
+        if ckpt_extra_loaded.get("wandb_run_id"):
+            config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
+        if ckpt_extra_loaded.get("mlflow_run_id"):
+            config.metrics.mlflow_run_id = ckpt_extra_loaded["mlflow_run_id"]
+    elif rank_zero:
+        _tag_warm_start_run(config, ckpt_extra_loaded)
 ```
 
 So two things can trigger a resume:
 
-- **`resume_path` found**: auto-resume; user passed nothing.
+- **`resume_path` found**: auto-resume; user passed nothing. It
+  continues the run, its MLflow and W&B runs included.
 - **`config.checkpoint.load_path` set**: a warm start from that
   path, used only while `checkpoint.dir` holds no checkpoint. Useful
   for loading pretrained weights, fine-tuning from a specific
-  checkpoint, or debugging.
+  checkpoint, or debugging. It is a new run, so it logs to new MLflow
+  and W&B runs, and its MLflow run is tagged with the checkpoint it
+  started from ([MLflow § Run ID and resume](../metrics-and-profiling/mlflow.md#run-id-and-resume)).
 
 If both are set, `resume_path` wins (auto-resume takes precedence
 over the static config). This is deliberate: SLURM requeues should
@@ -122,6 +129,15 @@ nothing, since the resume then does what it asks): see
 `load_path` warm start, so when a resume wins it is dropped with
 `load_path` and a weights-only warm start becomes a full resume, which
 the same warning states. Use an empty `dir` to guarantee the warm start.
+Per-rank dataloader/RNG state follows it too: only the auto-resume is
+an exact resume, where each rank restores its own state and a changed
+world size or data-parallel layout is refused; a `load_path` warm
+start restores rank 0's single copy on every rank on any topology, and
+a weights-only one (below) restores neither
+(see [Train state](train-state.md#per-rank-state-schema-v1)). To
+auto-resume onto a different topology anyway, set
+`checkpoint.ignore_rank_state_mismatch`: see
+[Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size).
 
 A training checkpoint also holds `train_state.pt`, and `load_path` restores
 it: the step, token count, LR schedule, dataloader position and RNG state
@@ -178,7 +194,8 @@ each stage saves through its own process group, so every rank first
 waits at a barrier until every stage's save has completed; only then
 does rank 0 move `latest` and prune.
 
-A save that fails on any rank (a DCP write or async flush, or rank 0's
+A save that fails on any rank (a DCP write or async flush, a rank's
+capture of its own dataloader and RNG state, or rank 0's
 `train_state.pt`, `metadata.json` or move of `latest`) fails on every
 rank, and `latest` never points at it. The barriers that end `save()`,
 `wait()` and `flush_pending_save()` carry each rank's outcome: a rank
@@ -284,7 +301,12 @@ load_path = "checkpoints/step_5000"
 `load_path` is used only while `dir` holds no checkpoint. With
 `exclude_from_loading` empty it restores the full state of step 5000,
 and requeues of the new run resume from its own checkpoints in the new
-`dir`. Setting `load_path` to `step_5000` while `dir` stays
+`dir`. The new run logs to new MLflow and W&B runs, the MLflow one
+tagged with the checkpoint it started from
+([MLflow § Run ID and resume](../metrics-and-profiling/mlflow.md#run-id-and-resume)),
+while rewinding `latest` as above continues the original runs, where
+MLflow drops the rerun's steps up to the last `train/loss` step the run
+already holds. Setting `load_path` to `step_5000` while `dir` stays
 `checkpoints` does not roll back: the run resumes from the newest
 checkpoint there, and rank 0 warns that `load_path` is not used.
 

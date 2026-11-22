@@ -107,10 +107,10 @@ could not take. The sampler splits the eval set evenly across data-parallel
 ranks and drops the remainder, so each rank needs at least one full batch;
 with none, building the eval dataloader raises `ValueError` before training
 starts. When `eval_steps` asks for more batches than the loader holds, eval
-starts the loader over. The schedule's gradient reduction still runs after
-each `eval()` call, which with FSDP2 reshards the stage; `run_eval` turns the
-schedule's gradient scaling off for those calls, so gradients left on the
-stage keep their values.
+starts the loader over. The schedule's metadata pass and gradient reduction
+still run in each `eval()` call and, with FSDP2, can rescale or drop the
+stage's gradients; `run_eval` sets the gradients left on the stage aside for
+those calls and puts them back after, so they keep their values.
 
 ## In-loop evaluation
 

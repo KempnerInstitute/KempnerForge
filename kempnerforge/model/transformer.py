@@ -11,6 +11,7 @@ Design choices:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -114,6 +115,27 @@ class TransformerBlock(nn.Module):
         )
         x = x + self.mlp(self.mlp_norm(x))
         return x
+
+
+def _write_inline_embeds(h: torch.Tensor, modality: ModalityContext) -> torch.Tensor:
+    """Write ``modality.inline_embeds`` over ``h`` at ``(inline_rows, inline_positions)``.
+
+    Out of place, so gradients reach both the token embedding and the inline
+    embeddings. Raises ``ValueError`` when the embedding width differs from the
+    model dim; the caller checks the indices.
+    """
+    embeds, rows, positions = (
+        modality.inline_embeds,
+        modality.inline_rows,
+        modality.inline_positions,
+    )
+    assert embeds is not None and rows is not None and positions is not None
+    dim = h.shape[-1]
+    if embeds.shape[1] != dim:
+        raise ValueError(
+            f"modality.inline_embeds width ({embeds.shape[1]}) does not match the model dim ({dim})"
+        )
+    return h.index_put((rows, positions), embeds.to(h.dtype))
 
 
 class Transformer(nn.Module):
@@ -262,28 +284,54 @@ class Transformer(nn.Module):
             )
         init_weights(self, self.config)
 
+    def _moe_mlps(self) -> Iterator[tuple[int, str | None, MoEMLP]]:
+        """Yield ``(layer_idx, modality, mlp)`` for every ``MoEMLP`` in ``layers``.
+
+        ``modality`` is ``None`` for a block whose MLP is itself a ``MoEMLP``,
+        and the modality key for one held in a per-modality ``nn.ModuleDict``
+        (a MoT block keeps one router per modality there). MoMa's ``MoMaFFN``
+        holds ``ExpertChoiceMoE`` groups, not ``MoEMLP``s, so a MoMa model
+        yields nothing.
+        """
+        for name, layer in self.layers.items():
+            mlp = layer.mlp
+            if isinstance(mlp, MoEMLP):
+                yield int(name), None, mlp
+            elif isinstance(mlp, nn.ModuleDict):
+                for modality, sub in mlp.items():
+                    if isinstance(sub, MoEMLP):
+                        yield int(name), modality, sub
+
     def set_moe_step(self, step: int, max_steps: int) -> None:
-        """Set training step on all MoE routers for adaptive bias scheduling."""
+        """Set training step on all MoE routers for adaptive bias scheduling.
+
+        Reaches every sigmoid router, including each MoT modality's.
+        """
         from kempnerforge.model.router import SigmoidTopKRouter
 
-        for layer in self.layers.values():
-            if isinstance(layer.mlp, MoEMLP) and isinstance(layer.mlp.router, SigmoidTopKRouter):
-                layer.mlp.router.set_step(step, max_steps)
+        for _, _, mlp in self._moe_mlps():
+            if isinstance(mlp.router, SigmoidTopKRouter):
+                mlp.router.set_step(step, max_steps)
 
     def get_moe_aux_loss(self) -> torch.Tensor:
-        """Collect auxiliary losses from all MoE layers. Returns 0 if dense."""
+        """Sum the auxiliary losses of every MoE router. Returns 0 if dense.
+
+        A MoT layer contributes one term per modality, so an image + text MoT
+        model sums twice as many terms as a text model with the same MoE layers.
+        """
         total = torch.tensor(0.0, device=next(self.parameters()).device)
-        for layer in self.layers.values():
-            if isinstance(layer.mlp, MoEMLP):
-                total = total + layer.mlp.aux_loss
+        for _, _, mlp in self._moe_mlps():
+            total = total + mlp.aux_loss
         return total
 
     def get_moe_router_z_loss(self) -> torch.Tensor:
-        """Collect router z-losses (ST-MoE) from all MoE layers. Returns 0 if dense."""
+        """Sum the router z-losses (ST-MoE) of every MoE router. Returns 0 if dense.
+
+        Like ``get_moe_aux_loss``, a MoT layer contributes one term per modality.
+        """
         total = torch.tensor(0.0, device=next(self.parameters()).device)
-        for layer in self.layers.values():
-            if isinstance(layer.mlp, MoEMLP):
-                total = total + layer.mlp.z_loss
+        for _, _, mlp in self._moe_mlps():
+            total = total + mlp.z_loss
         return total
 
     def get_expert_counts(self) -> dict[int, torch.Tensor]:
@@ -291,14 +339,27 @@ class Transformer(nn.Module):
 
         Returns ``{layer_idx: (num_experts,) tensor}`` for layers whose MLP
         is a ``MoEMLP`` (the standard, single-pool MoE). Returns ``{}`` for
-        dense models and for MoMa: MoMa's per-modality groups have a
-        different shape (per modality, per expert) and surface through
+        dense models, for MoT and for MoMa, whose per-modality routers
+        surface through ``get_mot_expert_counts`` and
         ``get_moma_expert_counts`` instead.
         """
-        counts = {}
-        for name, layer in self.layers.items():
-            if isinstance(layer.mlp, MoEMLP):
-                counts[int(name)] = layer.mlp.expert_counts
+        return {
+            idx: mlp.expert_counts for idx, modality, mlp in self._moe_mlps() if modality is None
+        }
+
+    def get_mot_expert_counts(self) -> dict[int, dict[str, torch.Tensor]]:
+        """Collect per-layer, per-modality expert utilization for MoT MoE layers.
+
+        Returns ``{layer_idx: {modality: (num_experts,) tensor}}`` for every
+        MoT layer whose per-modality FFNs are ``MoEMLP``s; returns ``{}``
+        otherwise. Each tensor holds the token count per expert from that
+        modality's router in the most recent forward, so the image and text
+        counts of a layer sum to different totals.
+        """
+        counts: dict[int, dict[str, torch.Tensor]] = {}
+        for idx, modality, mlp in self._moe_mlps():
+            if modality is not None:
+                counts.setdefault(idx, {})[modality] = mlp.expert_counts
         return counts
 
     def get_moma_expert_counts(self) -> dict[int, dict[str, torch.Tensor]]:
@@ -366,9 +427,14 @@ class Transformer(nn.Module):
         Exactly one of ``tokens`` or ``modality.inputs_embeds`` must be
         provided. Modality-injection routes (``prefix_embeds``,
         ``output_slice``, ``image_features``, ``image_mask``,
-        ``modality_ids``) are grouped on the optional
+        ``modality_ids``, ``inline_embeds``) are grouped on the optional
         ``ModalityContext`` arg; see ``kempnerforge/model/modality.py``
-        for the full intra-context invariant table.
+        for the full intra-context invariant table. ``inline_embeds`` are
+        written over the embedded ``tokens`` at ``(inline_rows,
+        inline_positions)`` before the first layer, which is how a packed
+        row carries each document's image tokens before its own text, and
+        ``output_rows`` / ``output_positions`` pick the positions the head
+        runs on, giving ``(1, M, vocab)`` logits.
 
         Args:
             tokens: Integer token ids, shape ``(batch, seq_len)``.
@@ -430,7 +496,9 @@ class Transformer(nn.Module):
         Returns:
             Logits tensor of shape ``(batch, out_seq_len, vocab_size)``
             where ``out_seq_len == seq_len`` normally or the sliced
-            length when ``modality.output_slice`` is set. Built with
+            length when ``modality.output_slice`` is set, or ``(1, M,
+            vocab_size)`` over the ``M`` positions ``modality.output_rows``
+            and ``output_positions`` pick. Built with
             ``include_output_head=False``, returns the final hidden
             states ``(batch, out_seq_len, dim)`` instead.
         """
@@ -441,6 +509,9 @@ class Transformer(nn.Module):
         image_mask = modality.image_mask if modality is not None else None
         modality_ids = modality.modality_ids if modality is not None else None
         key_padding_mask = modality.key_padding_mask if modality is not None else None
+        inline_embeds = modality.inline_embeds if modality is not None else None
+        output_rows = modality.output_rows if modality is not None else None
+        output_positions = modality.output_positions if modality is not None else None
         position_ids = _argument_or_context("position_ids", position_ids, modality)
         rope_cos = modality.rope_cos if modality is not None else None
         rope_sin = modality.rope_sin if modality is not None else None
@@ -473,6 +544,14 @@ class Transformer(nn.Module):
             if modality_ids is not None:
                 raise ValueError(
                     "modality.modality_ids is training-only; cannot be combined with kv_caches"
+                )
+            if inline_embeds is not None:
+                raise ValueError(
+                    "modality.inline_embeds is training-only; cannot be combined with kv_caches"
+                )
+            if output_rows is not None:
+                raise ValueError(
+                    "modality.output_rows is training-only; cannot be combined with kv_caches"
                 )
             if key_padding_mask is not None:
                 raise ValueError(
@@ -568,6 +647,10 @@ class Transformer(nn.Module):
         )
         assert h is not None
 
+        if inline_embeds is not None:
+            assert modality is not None
+            h = _write_inline_embeds(h, modality)
+
         if prefix_embeds is not None:
             if prefix_embeds.dtype != h.dtype:
                 prefix_embeds = prefix_embeds.to(h.dtype)
@@ -642,6 +725,9 @@ class Transformer(nn.Module):
 
         if output_slice is not None:
             h = h[:, output_slice, :]
+        if output_rows is not None:
+            assert output_positions is not None
+            h = h[output_rows, output_positions].unsqueeze(0)
 
         if self.output_head is not None:
             h = self.output_head(h)

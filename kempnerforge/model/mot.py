@@ -409,6 +409,10 @@ def mot_warm_start_from_text_stack(
     accepted. MoE FFN branches are skipped (their state dict layout is
     incompatible with a dense ``mlp.<proj>`` translation).
 
+    A layer that activation checkpointing wrapped in a ``CheckpointWrapper``
+    is unwrapped first, so the copy reaches its ``MoTBlock`` either way: the
+    warm start runs after the model is built, and so after ``apply_ac``.
+
     No-op when ``transformer`` has no ``MoTBlock`` layers.
     Idempotent: repeated calls with the same source produce identical state.
     Shape-checked: raises ``ValueError`` on per-tensor shape mismatch.
@@ -416,7 +420,10 @@ def mot_warm_start_from_text_stack(
     layers = getattr(transformer, "layers", None)
     if layers is None:
         return
-    mot_layers = {idx: layer for idx, layer in layers.items() if isinstance(layer, MoTBlock)}
+    blocks = {
+        idx: getattr(layer, "_checkpoint_wrapped_module", layer) for idx, layer in layers.items()
+    }
+    mot_layers = {idx: block for idx, block in blocks.items() if isinstance(block, MoTBlock)}
     if not mot_layers:
         return
 

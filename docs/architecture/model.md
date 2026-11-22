@@ -230,14 +230,19 @@ raises).
 
 Extra helpers on `Transformer`:
 
-- `init_weights_and_freqs()` — called after `model.to_empty(device=...)`
+- `init_weights_and_freqs()`: called after `model.to_empty(device=...)`
   to fill parameter values after meta-device materialization
-- `set_moe_step(step, max_steps)` — forwards the current step to every
-  `SigmoidTopKRouter` for the adaptive bias schedule
-- `get_moe_aux_loss()` — sums the per-layer MoE aux loss; returns 0 for
-  dense models
-- `get_expert_counts()` — returns `{layer_idx: counts}` for MoE layers;
-  empty for dense
+- `set_moe_step(step, max_steps)`: forwards the current step to every
+  `SigmoidTopKRouter`, each MoT modality's included, for the adaptive
+  bias schedule
+- `get_moe_aux_loss()` and `get_moe_router_z_loss()`: sum the MoE aux
+  loss and the router z-loss over every router, one per modality on a
+  MoT layer; return 0 for dense models
+- `get_expert_counts()`: returns `{layer_idx: counts}` for flat MoE
+  layers; empty for dense, MoT and MoMa models
+- `get_mot_expert_counts()`: returns `{layer_idx: {modality: counts}}`
+  for MoT MoE layers, one router per modality; `get_moma_expert_counts()`
+  is the MoMa counterpart
 
 The whole class is registered under the `"model"` registry key
 `"transformer"`, which is what the training loop asks for.

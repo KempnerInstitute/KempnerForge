@@ -14,7 +14,7 @@ import contextlib
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.distributed as dist
@@ -23,10 +23,12 @@ import torch.nn.functional as F
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
 from kempnerforge.distributed.utils import (
+    any_rank,
     clip_grad_norm_,
     data_parallel_groups,
     dp_all_reduce_,
     dp_mean,
+    new_control_group,
 )
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.tracker import MetricsTracker
@@ -41,6 +43,9 @@ from kempnerforge.training.grad import maybe_no_sync
 from kempnerforge.training.hooks import HookRunner, StepContext
 from kempnerforge.training.optimizer import module_learning_rates
 from kempnerforge.training.runtime import PipelineBundle, RuntimeContext, pp_group
+
+if TYPE_CHECKING:
+    from kempnerforge.model.transformer import Transformer
 
 logger = get_logger(__name__)
 
@@ -153,9 +158,9 @@ class StepResult:
     source, by source index, and ``dataset_losses`` each source's summed
     cross-entropy (row 0) and labeled-token count (row 1). ``tokens`` is the
     number of positions the model ran on this rank over every micro-step,
-    padding included, and ``seq_len`` the length of each of those rows; with
-    ``tokens`` None the loop counts ``train.batch_size * train.seq_len`` per
-    micro-step.
+    image positions and padding included, and ``seq_len`` the length of each
+    of those rows; with ``tokens`` None the loop counts
+    ``train.batch_size * train.seq_len`` per micro-step.
     """
 
     loss: float
@@ -192,6 +197,7 @@ class TrainingSession:
     eval_dataloader: Any | None = None
     profiler: Any | None = None
     autocast_dtype: torch.dtype | None = None
+    control_group: Any | None = field(default=None, repr=False)
     _batch_stream: BatchStream | None = field(default=None, init=False, repr=False)
     _dp_groups: tuple | None = field(default=None, init=False, repr=False)
 
@@ -233,6 +239,40 @@ def add_moe_losses(loss: torch.Tensor, model: torch.nn.Module, mc: Any) -> torch
         z = inner_transformer(model).get_moe_router_z_loss()  # type: ignore[attr-defined]
         loss = loss + mc.moe_router_z_loss_weight * z
     return loss
+
+
+def _expert_balance(routers: list[tuple[str | None, torch.Tensor]]) -> dict[str, float]:
+    """``moe/expert_balance`` over every router, plus one value per MoT modality.
+
+    Each router's expert counts are divided by that router's own total before
+    taking min over max, so routers that see different token counts (a MoT
+    model's image and text routers) compare as loads. Every flat MoE router sees
+    the same tokens, so for a text model this equals min over max of the raw
+    counts. A router whose counts sum to zero is skipped.
+
+    Args:
+        routers: ``(modality, counts)`` per router; ``modality`` is ``None`` for
+            a flat MoE layer.
+
+    Returns:
+        ``moe/expert_balance``, and ``moe/expert_balance/<modality>`` for each
+        MoT modality; empty when no router saw a token.
+    """
+    loads: list[tuple[str | None, torch.Tensor]] = []
+    for modality, counts in routers:
+        total = counts.float().sum()
+        if total.item() > 0:
+            loads.append((modality, counts.float() / total))
+    if not loads:
+        return {}
+    groups = {"moe/expert_balance": [load for _, load in loads]}
+    for modality in sorted({m for m, _ in loads if m is not None}):
+        groups[f"moe/expert_balance/{modality}"] = [load for m, load in loads if m == modality]
+    balance = {}
+    for key, group in groups.items():
+        values = torch.cat(group)
+        balance[key] = (values.min() / values.max()).item()
+    return balance
 
 
 def pipeline_step(session: TrainingSession, step: int) -> StepResult:
@@ -300,11 +340,28 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
     )
 
 
+_PACKED_BATCH_KEYS = (
+    "doc_ids",
+    "position_ids",
+    "attention_group_ids",
+    "image_rows",
+    "image_starts",
+    "text_rows",
+    "text_positions",
+)
+
+
 def vlm_step(session: TrainingSession, step: int) -> StepResult:
     """VLM step (no PP): pixel_values + input_ids forward, with a text-token count.
 
     Each row the decoder runs holds the model's ``num_image_tokens`` image
     positions (zero when they do not enter the residual stream) and the text.
+    A packed batch (one with ``image_rows``) also carries ``doc_ids``,
+    ``position_ids``, the image placement (``image_starts``, ``image_tokens``)
+    and the text positions, all passed through to the wrapper, with
+    ``attention_group_ids`` when a collator emits them. Its rows hold their
+    image positions already, and its row count varies, so the leading dims are
+    marked dynamic for ``torch.compile``.
     """
     config = session.config
     tc, mc = config.train, config.model
@@ -329,14 +386,26 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         frame_mask = batch["frame_mask"].to(device) if "frame_mask" in batch else None
-        seq_len = input_ids.shape[1] + image_positions
+        extras: dict[str, Any] = {
+            key: batch[key].to(device) for key in _PACKED_BATCH_KEYS if key in batch
+        }
+        if "image_tokens" in batch:
+            extras["image_tokens"] = int(batch["image_tokens"])
+        if "image_rows" in extras:
+            seq_len = input_ids.shape[1]
+            if tc.compile_model:
+                _mark_rows_dynamic(pixel_values, input_ids, labels, *extras.values())
+        else:
+            seq_len = input_ids.shape[1] + image_positions
         total_tokens += input_ids.shape[0] * seq_len
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
                 inner_transformer(model).set_moe_step(step, tc.max_steps)  # type: ignore[attr-defined]
             with session.autocast():
-                logits, labels_out = model(pixel_values, input_ids, labels, frame_mask=frame_mask)
+                logits, labels_out = model(
+                    pixel_values, input_ids, labels, frame_mask=frame_mask, **extras
+                )
                 loss = session.loss_fn(logits, labels_out)
 
             total_text_tokens += int((labels_out != -100).sum().item())
@@ -382,6 +451,28 @@ def _source_cross_entropy(
         out[0].index_add_(0, chunk_sources, losses.double())
         out[1].index_add_(0, chunk_sources, (chunk_labels != -100).double())
     return out
+
+
+def _mark_rows_dynamic(*tensors: Any) -> None:
+    """Mark each tensor's leading dim dynamic so a new packed row count does not recompile."""
+    from torch._dynamo import maybe_mark_dynamic
+
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor):
+            maybe_mark_dynamic(tensor, 0)
+
+
+def _tokens_in_step(session: TrainingSession, result: StepResult) -> int:
+    """Positions the step ran over the data-parallel ranks, from each rank's count or the config.
+
+    Every rank adds the count it reports, so ranks that ran different numbers of rows count
+    what each of them ran.
+    """
+    tc = session.config.train
+    if result.tokens is None:
+        return tc.batch_size * tc.seq_len * tc.grad_accum_steps * session.data.dp_size
+    count = torch.tensor([result.tokens], device=session.runtime.device, dtype=torch.long)
+    return int(dp_all_reduce_(count, session.dp_groups).item())
 
 
 def text_step(session: TrainingSession, step: int) -> StepResult:
@@ -505,13 +596,15 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
     model = session.model
 
     if mc.is_moe:
-        inner = inner_transformer(model)
-        moe_metrics = {"moe/aux_loss": inner.get_moe_aux_loss().item()}  # type: ignore[attr-defined]
-        moe_metrics["moe/router_z_loss"] = inner.get_moe_router_z_loss().item()  # type: ignore[attr-defined]
-        expert_counts = inner.get_expert_counts()  # type: ignore[attr-defined]
-        if expert_counts:
-            all_counts = torch.stack(list(expert_counts.values())).float()
-            moe_metrics["moe/expert_balance"] = (all_counts.min() / all_counts.max()).item()
+        inner = cast("Transformer", inner_transformer(model))
+        moe_metrics = {"moe/aux_loss": inner.get_moe_aux_loss().item()}
+        moe_metrics["moe/router_z_loss"] = inner.get_moe_router_z_loss().item()
+        routers: list[tuple[str | None, torch.Tensor]] = [
+            (None, counts) for counts in inner.get_expert_counts().values()
+        ]
+        for per_modality in getattr(inner, "get_mot_expert_counts", dict)().values():
+            routers.extend(per_modality.items())
+        moe_metrics.update(_expert_balance(routers))
         tracker.log_eval(moe_metrics, step)
 
     if config.is_vlm:
@@ -614,7 +707,18 @@ def _shutdown_if_requested(
     saved_this_step: bool,
     nan_skipped: bool = False,
 ) -> bool:
-    """Write the emergency checkpoint and finish when a shutdown is pending.
+    """Write the emergency checkpoint when a shutdown is pending on any rank.
+
+    Every rank must call this at the same step. It first reinstalls the
+    signal handlers, which native code can replace below Python (Triton's
+    LLVM does on its first in-process compile, after which SIGUSR1 does
+    nothing). The ranks then agree over ``session.control_group`` whether any
+    of them was signaled, so they all stop or all go on, whichever ranks the
+    signal reached and whenever. A rank that learns of the shutdown only from
+    the vote calls ``request()``, so every rank that stops has its forced-exit
+    timer armed. The handler is left armed: the timer still bounds the flush
+    that ``run_training_loop`` ends with and the caller's teardown, and the
+    caller calls ``finish()`` after both.
 
     Returns True when the loop must stop. With ``saved_this_step``, the
     scheduled save of ``step`` is the emergency checkpoint, so it is drained
@@ -625,8 +729,13 @@ def _shutdown_if_requested(
     become ``latest`` and count toward ``keep_last_n``, which can prune the
     last good one.
     """
-    if not session.shutdown_handler.should_shutdown():
+    session.shutdown_handler.reinstall()
+    requested_here = session.shutdown_handler.should_shutdown()
+    if not any_rank(requested_here, session.control_group):
         return False
+    if not requested_here:
+        session.shutdown_handler.request()
+        logger.warning(f"Shutdown requested on another rank at step {step}")
     ckpt_mgr = session.checkpointer
     if saved_this_step:
         logger.warning(
@@ -651,7 +760,6 @@ def _shutdown_if_requested(
                 dataloader=session.data.dataloader,
                 extra=checkpoint_extra(session.config, step, session.phases),
             )
-    session.shutdown_handler.finish()
     return True
 
 
@@ -664,6 +772,14 @@ def run_training_loop(
     checkpoint before returning so the caller can tear down the process
     group safely. ``session.data`` is read once and must stay fixed for the
     duration; only its ``dataloader`` may be swapped mid-run.
+
+    Every rank must call it: the shutdown and NCCL-health stops are agreed
+    over ``session.control_group``. When that is ``None`` the loop makes the
+    group, and destroys it when it returns or raises. It never calls
+    ``shutdown_handler.finish()``; the handler's owner does, once teardown is
+    done. After an NCCL-health stop it saves nothing, drains any pending async
+    save and raises ``RuntimeError`` on every rank, so the job fails rather
+    than ending as if it completed.
     """
     config = session.config
     tc = config.train
@@ -706,6 +822,10 @@ def run_training_loop(
 
     completed_normally = False
     ckpt_extra: dict = {}
+    nccl_failed_at: int | None = None
+    owns_control_group = session.control_group is None
+    if owns_control_group:
+        session.control_group = new_control_group(config.distributed.nccl_timeout_sec)
 
     try:
         while step < tc.max_steps:
@@ -713,6 +833,7 @@ def run_training_loop(
 
             tracker.start_step()
             result = session.step_fn(session, step)
+            tokens_in_step = _tokens_in_step(session, result)
 
             if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
                 optimizer.zero_grad()
@@ -736,10 +857,6 @@ def run_training_loop(
             optimizer.zero_grad()
 
             step += 1
-            local_tokens = result.tokens
-            if local_tokens is None:
-                local_tokens = tc.batch_size * tc.seq_len * tc.grad_accum_steps
-            tokens_in_step = local_tokens * data.dp_size
             tokens_seen += tokens_in_step
 
             _apply_step_transitions(session, step)
@@ -774,9 +891,10 @@ def run_training_loop(
             if (
                 tc.nccl_health_check_interval > 0
                 and step % tc.nccl_health_check_interval == 0
-                and not check_nccl_health()
+                and any_rank(not check_nccl_health(), session.control_group)
             ):
                 logger.error(f"NCCL health check failed at step {step} — stopping")
+                nccl_failed_at = step
                 break
 
             if (
@@ -830,6 +948,9 @@ def run_training_loop(
             if runtime.rank == 0:
                 print_profiler_summary(prof, trace_dir=config.profiling.trace_dir)
         session.batches.close()
+        if owns_control_group and session.control_group is not None:
+            dist.destroy_process_group(session.control_group)
+            session.control_group = None
 
     if completed_normally and not config.checkpoint.should_save(step):
         with _logged_time(tracker, "checkpoint/save_sec", step):
@@ -847,6 +968,11 @@ def run_training_loop(
             ckpt_mgr.wait()
     else:
         ckpt_mgr.wait()
+    if nccl_failed_at is not None:
+        raise RuntimeError(
+            f"NCCL health check failed at step {nccl_failed_at} on at least one rank; "
+            "every rank stopped without a final save"
+        )
 
     logger.info(f"Training complete: {step} steps, {tokens_seen:,} tokens")
     hooks.on_train_end(step, tokens_seen)

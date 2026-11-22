@@ -179,17 +179,18 @@ number on this page is with full AC because it was necessary to fit
 the batch size. The cost is roughly 30% more compute per step;
 usually you don't have a choice, because without AC you OOM.
 
-`"selective"` checkpoints a subset of blocks — sometimes usable for
+`"selective"` checkpoints only the attention module inside each block,
+so MLP activations stay in memory. It is sometimes usable for
 smaller models where full AC leaves GPUs underutilized. Measured
 marginal on most configs in the benchmark.
 
 ## MoE scaling
 
 A separate track. Even at 32 GPUs, the measured MoE run (8 experts,
-4B total, 1.8B active, `TP=4 × EP=2 × FSDP=4`) hits only **1.5%
+9.2B total, 2.9B active, `TP=4 × EP=2 × FSDP=4`) hits only **1.5%
 MFU**. This is correct, not broken:
 
-- ~56M active params per GPU on H200 (designed for billions).
+- ~90M active params per GPU on H200 (designed for billions).
 - Communication dominates (EP all-to-all + FSDP + TP).
 - Reaching dense-MFU territory on MoE at this scale would require
   **~50B total parameters / ~10B active** — a different model size
@@ -230,7 +231,7 @@ for the 32-GPU MoE config per the benchmark.
 
 ### Running MoE + PP
 
-`JobConfig.__post_init__` raises this — MoE is data-dependent and
+`JobConfig.validate` raises this: MoE routing is data-dependent and
 doesn't compose with static pipeline stages. No workaround in
 KempnerForge today. See
 [MoE experiments § Composition caveats](moe-experiments.md#composition-caveats).

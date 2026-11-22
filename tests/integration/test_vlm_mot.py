@@ -195,9 +195,10 @@ class TestBuildAndForward:
 
 
 class TestMoTPlusMoESmoke:
-    """Early MoT + MoE smoke (num_experts=4, moe_frequency=2). Single
-    GPU, no expert parallelism. If this fails, gate the combination at
-    JobConfig.validate before Step 8."""
+    """MoT + MoE smoke (num_experts=4, moe_frequency=2) on a single GPU,
+    without expert parallelism. The MoE loss and metric accessors that
+    reach each modality's router are covered on CPU by
+    ``tests/unit/test_mot.py::TestMoTMoEAccessors``."""
 
     def test_mot_plus_moe_build_smoke_1gpu(self):
         from kempnerforge.model.moe import MoEMLP

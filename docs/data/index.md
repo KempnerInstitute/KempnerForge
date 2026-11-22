@@ -72,9 +72,11 @@ sampler
 
 ## See also
 
-- [Checkpointing § Train state](../checkpointing/train-state.md) —
-  dataloader state *infrastructure* exists but the shipped training
-  loop doesn't wire it into the save; resume restarts the epoch.
+- [Checkpointing § Train state](../checkpointing/train-state.md#dataloader-state):
+  every checkpoint records the `StatefulDataLoader` position (the
+  memory-mapped, HF eager, mixture and VLM paths), and resume continues
+  from it rather than restarting the epoch. The streaming path's plain
+  `DataLoader` keeps no position and restarts.
 - [Training § Training loop](../training/training-loop.md) — where
   the dataloader is consumed step by step.
 - [Configuration § `[data]` — DataConfig](../configuration/config-sections.md) —

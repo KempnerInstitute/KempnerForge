@@ -205,7 +205,9 @@ class WebVidVideoDataset(VideoDataset):
         )
 
         prompt = self._prompt or None
-        input_ids, labels = _tokenize_and_mask(self._tokenizer, caption, self._max_text_len, prompt)
+        input_ids, labels, _ = _tokenize_and_mask(
+            self._tokenizer, caption, self._max_text_len, prompt
+        )
         if not frames:
             labels = torch.full_like(labels, -100)
         return {

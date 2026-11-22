@@ -9,7 +9,6 @@ import random
 import re
 import shutil
 import stat
-import sys
 import threading
 from concurrent.futures import Future
 from pathlib import Path
@@ -472,6 +471,39 @@ def _make_mock_mgr(tmp_path, monkeypatch, *, ignore_freeze_mismatch=False):
     return mgr
 
 
+def _fake_world_of_two(mgr, monkeypatch):
+    """Let ``mgr`` save as either rank of a two-rank job.
+
+    ``save()`` gathers every rank's dataloader/RNG payload and then agrees on the
+    save's status, so a manager driven as a non-zero rank needs a world size, a
+    gather and an all-reduce that cover the whole world; the gather hands back one
+    payload per rank, as the real collective would, and the agreement reports no
+    failure on any rank.
+    """
+    from kempnerforge.checkpoint import manager as mgr_mod
+
+    mgr._world_size = 2
+    monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(mgr_mod.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(mgr_mod.dist, "all_reduce", lambda flags, group=None: None)
+
+    def fake_all_gather(obj_list, obj, group=None):
+        _, dp_info, payload = obj
+        for r in range(len(obj_list)):
+            obj_list[r] = (r, dp_info, payload)
+
+    monkeypatch.setattr(mgr_mod.dist, "all_gather_object", fake_all_gather)
+
+
+def _fake_gather_of_one(monkeypatch):
+    """Answer ``save()``'s per-rank gather with this rank's own payload: a world of one."""
+    monkeypatch.setattr(
+        "kempnerforge.checkpoint.manager.dist.all_gather_object",
+        lambda out, obj, group=None: out.__setitem__(0, obj),
+    )
+
+
 class TestDataloaderStatePersistence:
     """Round-trip coverage for dataloader state across save -> load -> apply.
 
@@ -867,6 +899,7 @@ class TestSaveTrackingSidecar:
 
     def test_only_rank_zero_asks_the_source(self, tmp_path, monkeypatch):
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        _fake_world_of_two(mgr, monkeypatch)
         asked: list[int] = []
 
         def source():
@@ -894,11 +927,10 @@ class TestSaveTrackingSidecar:
             def items(self):
                 raise RuntimeError("no items")
 
-        def deeply_nested():
-            nested: list = []
-            for _ in range(sys.getrecursionlimit()):
-                nested = [nested]
-            return [{"backend": "custom", "deep": nested}]
+        def circular():
+            loop: list = []
+            loop.append(loop)
+            return [{"backend": "custom", "deep": loop}]
 
         def raises():
             raise RuntimeError("no run object")
@@ -911,10 +943,12 @@ class TestSaveTrackingSidecar:
             ),
             "truth-value": (lambda: BadBool([{"backend": "custom"}]), "no truth value"),
             "items": (lambda: [BadItems(backend="custom")], "no items"),
-            "nested": (deeply_nested, "recursion"),
+            "circular": (circular, "Circular reference"),
         }
 
-    @pytest.mark.parametrize("failure", ["raises", "unwritable", "truth-value", "items", "nested"])
+    @pytest.mark.parametrize(
+        "failure", ["raises", "unwritable", "truth-value", "items", "circular"]
+    )
     def test_failing_source_costs_the_key_not_the_save(self, tmp_path, monkeypatch, failure):
         from kempnerforge.checkpoint import manager as mgr_mod
 
@@ -1235,6 +1269,7 @@ class TestSaveCheckpointRegistration:
 
     def test_only_rank_zero_asks_for_fields_or_registers(self, tmp_path, monkeypatch):
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        _fake_world_of_two(mgr, monkeypatch)
         registrar = _Registrar()
         mgr.set_tracking_source(lambda: [self.MLFLOW])
         mgr.set_checkpoint_registrar(registrar)
@@ -2165,8 +2200,13 @@ class TestAsyncLatestSymlinkSafety:
 
     @staticmethod
     def _record_agreements(monkeypatch) -> list[object]:
-        """Run the manager's status agreement as a one-rank all-reduce, recording each one."""
+        """Run the manager's status agreement as a one-rank all-reduce, recording each one.
+
+        ``save()`` also gathers every rank's loader/RNG payload, over the same
+        one-rank world.
+        """
         groups: list[object] = []
+        _fake_gather_of_one(monkeypatch)
         monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
         monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.get_rank", lambda group=None: 0)
         monkeypatch.setattr(
@@ -2263,6 +2303,7 @@ class TestAFailedSaveCommitsNothing:
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
         monkeypatch.setattr(mgr._async_ckpt, "save", write)
         reported: list[list[int]] = []
+        _fake_gather_of_one(monkeypatch)
         monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.is_initialized", lambda: True)
         monkeypatch.setattr("kempnerforge.checkpoint.manager.dist.get_rank", lambda group=None: 0)
         monkeypatch.setattr(
@@ -2391,6 +2432,7 @@ class TestSyncBarrierGroup:
         monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(mgr_mod.dist, "new_group", fake_new_group)
         monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(mgr_mod.dist, "get_world_size", lambda: 1)
 
         mgr = self._mgr(tmp_path)
         assert calls["backend"] == "gloo"

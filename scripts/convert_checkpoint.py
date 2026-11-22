@@ -29,6 +29,7 @@ from pathlib import Path
 import torch
 import torch.distributed.checkpoint as dcp
 
+from kempnerforge.checkpoint.expert_layout import check_saved_experts
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.transformer import Transformer
@@ -99,7 +100,10 @@ def dcp_to_hf(
     Handles both standard and pipeline-parallel checkpoints (pp0/, pp1/, ...).
     A tensor that still shares storage with one already written after the cast,
     such as a tied output head at float32, is written as a copy, since
-    safetensors refuses tensors that share memory.
+    safetensors refuses tensors that share memory. A checkpoint saved with
+    expert parallelism holds every expert, as one saved without it does; one
+    that holds fewer experts than ``model_config`` asks for is refused (see
+    ``check_saved_experts``).
 
     Args:
         dcp_dir: Path to DCP checkpoint directory (e.g., checkpoints/step_10000).
@@ -121,6 +125,8 @@ def dcp_to_hf(
             dcp.load(stage_state, checkpoint_id=str(pp_path))
             model.load_state_dict(stage_state["model"], strict=False)
     else:
+        saved = dcp.FileSystemReader(dcp_dir).read_metadata().state_dict_metadata
+        check_saved_experts(model, saved, dcp_dir)
         state_dict = {"model": model.state_dict()}
         dcp.load(state_dict, checkpoint_id=dcp_dir)
         model.load_state_dict(state_dict["model"])

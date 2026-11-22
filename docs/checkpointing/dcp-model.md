@@ -20,10 +20,21 @@ dcp_state = {
     "optimizer":               optim_state,
     "optimizer_never_stepped": _never_stepped_record(optim_state),
 }
-self._async_ckpt.save(
-    dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group
-)
+dcp_state, layout = self._present_experts(dcp_state)
+save = self._async_ckpt.save
+if layout is not None:
+    save = partial(save, planner=DefaultSavePlanner(dedup_save_to_lowest_rank=True))
+save(dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group)
 ```
+
+`_present_experts` returns the state as it is unless a layer splits its
+experts with expert parallelism. Then it places each rank's experts,
+and their optimizer state, among all of the layer's experts, so the
+checkpoint holds every expert; `load` does the same before DCP and
+undoes it after. Such a save also writes each chunk that several ranks
+hold from its lowest rank, so the EP ranks' copies of the other weights
+are not mixed. See
+[Expert parallelism § Checkpoints](../distributed/expert-parallelism.md#checkpoints).
 
 `checkpointed_optimizers` is the optimizer plus any inner optimizers it
 hands parameters to — see [Inner optimizers](#inner-optimizers).
@@ -176,9 +187,9 @@ wraps DCP's `save` / `async_save` behind a mode flag:
 
 | Config | Behavior | Use |
 |--------|----------|-----|
-| `async_mode = "disabled"` | `dcp.save()` — blocking | Simple, debugging, small models |
-| `async_mode = "async"` | `dcp.async_save()` — snapshots to CPU, writes in background | Default for production |
-| `async_mode = "async_with_pinned_mem"` | Async with pinned-memory staging (faster GPU→CPU copy) | Very large models where GPU→CPU throughput bottlenecks the snapshot |
+| `async_mode = "disabled"` (the default) | `dcp.save()`, blocking | Simple, debugging, small models |
+| `async_mode = "async"` | `dcp.async_save()`: snapshots to CPU, writes in the background | Runs where the save stall matters |
+| `async_mode = "async_with_pinned_mem"` | The same `dcp.async_save()` call as `"async"`; no pinned-memory staging is implemented | Nothing beyond `"async"` today |
 
 Every `save()` call first does `self.wait()` — the previous async
 save must fully complete before starting a new one. This avoids
@@ -213,12 +224,22 @@ dcp_state = {
     "model":     get_model_state_dict(self.model),
     "optimizer": get_optimizer_state_dict(self.model, self.checkpointed_optimizers),
 }
+dcp_state, layout = self._present_experts(dcp_state, dcp_dir, saved_keys)
 dcp.load(dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group)
+if layout is not None:
+    dcp_state = layout.to_local(dcp_state)
 set_model_state_dict(self.model, dcp_state["model"])
 set_optimizer_state_dict(
     self.model, self.checkpointed_optimizers, optim_state_dict=dcp_state["optimizer"]
 )
 ```
+
+Under expert parallelism `_present_experts` places each rank's experts
+among all of them before `dcp.load`, as on save, and `layout.to_local`
+gives the setters this rank's names and tensors back. For any model with
+MoE layers it first refuses a checkpoint that holds fewer experts than
+the model. See
+[Expert parallelism § Checkpoints](../distributed/expert-parallelism.md#checkpoints).
 
 A Muon checkpoint saved before the inner AdamW was checkpointed is the
 one exception: the load passes Muon alone — see

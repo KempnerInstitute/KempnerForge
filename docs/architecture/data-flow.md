@@ -31,7 +31,7 @@ optimizer.step() ; scheduler.step() ; optimizer.zero_grad()
 tracker.end_step(step, loss, grad_norm, lr, tokens_in_step)
 hook_runner.on_step_end(StepContext(...))
 [every N steps] eval, NCCL health, profiler.step, ckpt_mgr.save
-if shutdown_handler.should_shutdown(): save (unless saved above) + break
+if should_shutdown() on any rank: save (unless saved above) + break
 ```
 
 ## Startup, once
@@ -148,7 +148,8 @@ if mc.is_moe:
     loss = loss + mc.moe_aux_loss_weight * aux_loss
 ```
 
-`get_moe_aux_loss()` sums the per-layer `MoEMLP.aux_loss` attributes.
+`get_moe_aux_loss()` sums the `MoEMLP.aux_loss` attributes of every
+router: one per MoE layer, or one per modality on a MoT layer.
 For dense runs it returns `0.0` and the line is a no-op.
 
 ### 6 · Backward with gradient accumulation
@@ -257,14 +258,16 @@ inside `step()`).
 runs user-defined `TrainingHook` callbacks each step.
 
 MoE runs additionally log `moe/aux_loss` and `moe/expert_balance`
-(`min/max` of per-expert token counts) at the same cadence.
+(`min/max` of per-expert loads, each router's counts over its own
+total) at the same cadence, plus `moe/expert_balance/<modality>` on MoT.
 
 ### 11 · Periodic work
 
 In order:
 
 - **NCCL health** (every `tc.nccl_health_check_interval` steps) — fires
-  a small all-reduce; on failure, break the loop.
+  a small all-reduce; if it fails on any rank, every rank leaves the loop
+  without saving, and the loop raises once the last async save is drained.
 - **Eval** (every `eval_config.interval` steps) — runs `run_eval` on the
   eval dataloader, logs metrics, fires `on_eval_end` hooks.
 - **Profiler** — `prof.step()` advances the `torch.profiler` schedule.
@@ -273,9 +276,11 @@ In order:
   it) — `ckpt_mgr.save` writes a DCP checkpoint asynchronously and
   updates the `latest` symlink.
 - **Graceful shutdown** — if SIGTERM/SIGUSR1 fired,
-  `ckpt_mgr.save(step)` as the emergency checkpoint, then exit; a step
-  the checkpoint above already saved is not saved again, and the loop
-  waits for that save before it finishes the shutdown. A NaN-skipped
+  whichever rank it reached (the ranks vote over a gloo group of their
+  own, and a rank the vote stops arms its own forced-exit timer), every
+  rank writes `ckpt_mgr.save(step)` as the emergency checkpoint, then
+  exits; a step the checkpoint above already saved is not saved again,
+  and the loop waits for that save. A NaN-skipped
   step (section 7) runs this check too; the checkpoint above never
   saves such a step, so it writes its own emergency checkpoint, but
   only if an all-reduced check finds every rank's parameters finite.
@@ -292,6 +297,8 @@ After the loop exits:
 - `hook_runner.on_train_end(step, tokens_seen)`.
 - `tracker.close()` flushes WandB / TB.
 - `destroy_distributed()` tears down the process group.
+- `shutdown_handler.finish()`, last, restores the signal handlers and
+  cancels the forced-exit timer, so both cover the flush and the teardown.
 
 ## Where to read next
 

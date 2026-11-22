@@ -70,6 +70,25 @@ class JobConfig:
         if not isinstance(self.plugins, list) or not all(isinstance(p, str) for p in self.plugins):
             raise ValueError(f"plugins must be a list of module paths (got {self.plugins!r})")
 
+        if self.data.hf_max_images != 1:
+            if self.vlm is None or self.video is not None:
+                raise ValueError(
+                    "data.hf_max_images applies to VLM image runs, not text runs or [video]"
+                )
+            if self.vlm.arch != "joint_decoder":
+                raise ValueError(
+                    "data.hf_max_images != 1 requires vlm.arch='joint_decoder' (got "
+                    f"{self.vlm.arch!r}); only its inline route places several images per document"
+                )
+            if self.train.is_fp8:
+                raise ValueError(
+                    "data.hf_max_images != 1 is not supported with train.mixed_precision='fp8'"
+                )
+            if self.model.sdpa_backend == "flash" and self.model.attention_backend == "sdpa":
+                raise ValueError(
+                    "data.hf_max_images != 1 is not supported with model.sdpa_backend='flash'"
+                )
+
         if self.video is not None:
             if self.vlm is None:
                 raise ValueError(
@@ -110,8 +129,7 @@ class JobConfig:
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
-                frames = self.views_per_sample
-                visual_tokens = frames * per_frame
+                visual_tokens = self.views_per_sample * self.images_per_document * per_frame
                 residual_image_tokens = self.vlm.residual_stream_image_tokens(visual_tokens)
                 required = residual_image_tokens + self.vlm.max_text_len
                 if self.model.max_seq_len < required:
@@ -120,6 +138,23 @@ class JobConfig:
                         f"residual_image_tokens ({residual_image_tokens}) + "
                         f"vlm.max_text_len ({self.vlm.max_text_len}) = {required}"
                     )
+
+        if self.data.pack_sequences and self.vlm is not None:
+            if self.video is not None:
+                raise ValueError("data.pack_sequences is not supported with [video]")
+            if self.vlm.arch != "joint_decoder":
+                raise ValueError(
+                    "data.pack_sequences on a VLM run requires vlm.arch='joint_decoder' "
+                    f"(got {self.vlm.arch!r}); the other arches place image tokens as a "
+                    "prefix only"
+                )
+            if self.train.is_fp8:
+                raise ValueError(
+                    "data.pack_sequences on a VLM run does not support "
+                    "train.mixed_precision='fp8': the packed head runs over the batch's text "
+                    "tokens, whose count is the inner dimension of the head's FP8 "
+                    "weight-gradient GEMM and must be a multiple of 16"
+                )
 
         if self.optimizer.lr_multipliers:
             if self.vlm is None:
@@ -139,6 +174,13 @@ class JobConfig:
                 f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE}, "
                 f"got {self.train.seq_len}. Use attention_backend='sdpa' for shorter sequences."
             )
+
+    @property
+    def images_per_document(self) -> int:
+        """Images one document may hold: the image cap, or one clip on a video run."""
+        if self.video is not None:
+            return 1
+        return self.data.hf_max_images
 
     @property
     def is_vlm(self) -> bool:
@@ -256,6 +298,21 @@ class JobConfig:
                 "or TP without FP8."
             )
 
+        if (
+            self.model.is_moe
+            and self.model.moe_router == "sigmoid_topk"
+            and self.train.activation_checkpointing == "full"
+        ):
+            raise ValueError(
+                "model.moe_router = 'sigmoid_topk' does not support "
+                "train.activation_checkpointing = 'full': the sigmoid router updates its expert "
+                "bias in place in every training forward, so the backward's replay of a "
+                "checkpointed block routes with a moved bias, can pick other experts than the "
+                "forward did, and then raises CheckpointError. Use activation_checkpointing = "
+                "'selective', which checkpoints attention only and leaves the MoE layers out "
+                "of the replay."
+            )
+
         if self.model.is_moe and self.distributed.pp > 1:
             alternatives = (
                 "Use FSDP instead; MoT runs neither TP nor EP."
@@ -275,9 +332,7 @@ class JobConfig:
                     f"(distributed.ep={self.distributed.ep}): the FSDP2 wrap for expert-parallel "
                     "blocks expects layer.attention and layer.mlp, and MoTBlock names its "
                     "attention attn and keeps its FFNs per modality, so a MoT model with experts "
-                    "fails to build. Set distributed.ep = 1. MoT with MoE then trains, but "
-                    "without its load-balancing loss, router z-loss, bias schedule or balance "
-                    "metric (https://github.com/KempnerInstitute/KempnerForge/issues/308)."
+                    "fails to build. Set distributed.ep = 1."
                 )
             if isinstance(self.vlm, MoMaConfig):
                 raise ValueError(
@@ -301,8 +356,7 @@ class JobConfig:
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
-                frames = self.views_per_sample
-                visual_tokens = frames * per_frame
+                visual_tokens = self.views_per_sample * self.images_per_document * per_frame
                 residual_image_tokens = self.vlm.residual_stream_image_tokens(visual_tokens)
                 required = residual_image_tokens + self.vlm.max_text_len
                 if self.train.seq_len < required:
@@ -331,14 +385,4 @@ class JobConfig:
                         "torch.compile is not yet validated for MoMa dispatch "
                         "(modality_ids-based scatter/gather + expert-choice top-k cause "
                         "graph breaks). Set compile_model=false for MoMa models."
-                    )
-
-                if self.train.activation_checkpointing == "full":
-                    import logging
-
-                    logging.getLogger(__name__).warning(
-                        "AC=full is currently a no-op for MoMa (apply_ac matches "
-                        "TransformerBlock only; MoMaBlock is a sibling nn.Module). "
-                        "Use ac='selective' (wraps the Attention submodule, still works) "
-                        "or reduce moma_experts_per_modality until the apply_ac refactor lands."
                     )

@@ -69,14 +69,31 @@ For `sigmoid_topk`, the coefficient has no effect by default
 `moe_sequence_aux_loss_weight > 0`; see
 [Aux loss § Sequence-level](../moe/aux-loss-and-balancing.md#sequence-level-aux-loss-sigmoid-only).
 
+On a MoT VLM each modality's router gets the same pressure per unit of
+the coefficient as a text model's router, but the logged
+`moe/aux_loss` sums one term per router, so with balanced routers an
+image + text MoT model reads about twice what a text model with the
+same MoE layers reads; see
+[Aux loss § Training-loop integration](../moe/aux-loss-and-balancing.md#training-loop-integration).
+
 ## Diagnose hot/cold experts
 
-The training loop logs two MoE-specific metrics when `num_experts > 0`:
+The training loop logs these MoE-specific metrics when `num_experts > 0`:
 
 ```
-moe/aux_loss        # scalar aux loss this step (dispatches to WandB/TB)
-moe/expert_balance  # min/max across (layer × expert) — 1.0 = perfect uniform
+moe/aux_loss                   # aux loss summed over routers (dispatches to WandB/TB)
+moe/router_z_loss              # router z-loss summed over routers
+moe/expert_balance             # min/max of expert loads across routers, 1.0 = perfect uniform
+moe/expert_balance/<modality>  # the same over one modality's routers, MoT only
 ```
+
+Each router's counts are first divided by that router's own total, so
+the balance compares each expert's share of its router's tokens. In a
+text model every router sees the same tokens, and this is min/max of
+the raw counts across (layer × expert). A MoT model has a router per
+modality, and its image and text routers see different numbers of
+tokens; `moe/expert_balance/image` and `moe/expert_balance/text` show
+which modality a collapse is in.
 
 Interpretation:
 
@@ -89,9 +106,11 @@ Interpretation:
   If it happens for one step, ignore. If it persists across many
   logging intervals, you have a dead expert.
 
-For per-layer detail, call `Transformer.get_expert_counts()` —
-returns `dict[layer_idx → tensor(num_experts,)]`. Useful to spot
-*which* layer is collapsing:
+For per-layer detail, call `Transformer.get_expert_counts()`, which
+returns `dict[layer_idx → tensor(num_experts,)]`; for a MoT model it
+is empty, and `Transformer.get_mot_expert_counts()` returns
+`dict[layer_idx → dict[modality → tensor(num_experts,)]]` instead.
+Useful to spot *which* layer is collapsing:
 
 ```python
 # In a custom script or notebook
@@ -125,9 +144,9 @@ to go faster.
 
 Rule of thumb — turn on EP when:
 
-1. **Expert weights > 50% of total model memory.** For a 4B-total
-   MoE with 8 experts and `moe_frequency=1`, experts are typically
-   70-80% of parameters. EP=2 cuts that in half per rank.
+1. **Expert weights > 50% of total model memory.** In the 9.2B-total
+   MoE presets (8 experts, `moe_frequency=1`), the experts hold 8.46B
+   of the 9.23B parameters, about 92%. EP=2 cuts that in half per rank.
 2. **You're OOMing with FSDP alone.** FSDP shards by tensor, but
    experts live as `(E, dim, hidden)` parameters (packed) or as
    `ModuleList`. FSDP wraps them but can't split across the expert
@@ -142,7 +161,7 @@ Rule of thumb — turn on EP when:
 Constraints:
 
 - `num_experts` must be divisible by `ep` (validated in
-  `JobConfig.__post_init__`).
+  `JobConfig.validate`).
 - `ep > 1` with `num_experts == 0` is rejected — EP requires MoE.
 - Typical combinations: `ep=2` for 8 experts, `ep=4` for 8-16 experts,
   `ep=8` for 32+ experts.
@@ -231,7 +250,7 @@ at bf16 regardless.
 FP8 + EP composes fine — they're orthogonal (EP moves experts across
 ranks, FP8 wouldn't touch them anyway).
 
-FP8 + TP does **not** compose — `JobConfig.__post_init__` rejects it
+FP8 + TP does **not** compose: `JobConfig.validate` rejects it
 because `Float8Linear`'s DTensor strategy is incomplete. See
 [FP8 § TP incompatibility](../distributed/fp8.md#tp-incompatibility).
 
@@ -239,17 +258,18 @@ because `Float8Linear`'s DTensor strategy is incomplete. See
 
 ```
 MoE + Pipeline Parallelism is not supported. MoE layers use
-all-to-all communication which conflicts with the pipeline schedule.
+data-dependent routing that is incompatible with pipeline stage
+splitting. Use FSDP, TP, or EP instead.
 ```
 
-Raised in `JobConfig.__post_init__` when `num_experts > 0` and
+Raised in `JobConfig.validate` when `num_experts > 0` and
 `pp > 1`. For very large MoE runs that need PP, you'd need a
 schedule that interleaves all-to-all with pipeline microbatches —
 not in KempnerForge today.
 
 ## Minimal production recipe
 
-A reasonable starting point for a 4B-total / 1.8B-active MoE on
+A reasonable starting point for a 9.2B-total / 2.9B-active MoE on
 32 H200 GPUs:
 
 ```toml

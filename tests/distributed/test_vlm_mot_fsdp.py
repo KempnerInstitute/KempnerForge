@@ -346,7 +346,9 @@ class TestMoEWithMoT:
         assert final_ce < initial_ce, (
             f"FSDP+MoE+MoT: CE did not decrease ({initial_ce:.3f} -> {final_ce:.3f})"
         )
-        assert all(a >= 0 for _, a in losses), "aux_loss negative under FSDP+MoE+MoT"
+        assert all(a > 0 for _, a in losses), (
+            "aux_loss not positive under FSDP+MoE+MoT: the per-modality routers were not reached"
+        )
 
 
 class TestCheckpointRoundtrip:

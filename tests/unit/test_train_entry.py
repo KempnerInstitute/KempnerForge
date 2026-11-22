@@ -104,11 +104,19 @@ class FakeShutdownHandler:
     def __init__(self, after_steps: int | None = None) -> None:
         self.after_steps = after_steps
         self.checks = 0
+        self.reinstalls = 0
         self.registered = False
+        self.requested = False
         self.finished = False
 
     def register(self) -> None:
         self.registered = True
+
+    def request(self) -> None:
+        self.requested = True
+
+    def reinstall(self) -> None:
+        self.reinstalls += 1
 
     def should_shutdown(self) -> bool:
         self.checks += 1
@@ -725,7 +733,7 @@ class TestRunTrainingLoop:
         for old, new in zip(before, session.model.parameters(), strict=True):
             assert torch.equal(old, new)
 
-    def test_shutdown_writes_an_emergency_checkpoint_and_finishes(self):
+    def test_shutdown_writes_an_emergency_checkpoint_and_leaves_the_handler_armed(self):
         config = make_config(max_steps=10)
         config.checkpoint.interval = 100
         handler = FakeShutdownHandler(after_steps=2)
@@ -734,7 +742,7 @@ class TestRunTrainingLoop:
         ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
         assert step == 2
         assert ckpt.saved_steps == [2]
-        assert handler.finished is True
+        assert handler.finished is False
         assert ckpt.waits == 1
 
     def test_shutdown_on_a_scheduled_step_saves_it_once(self):
@@ -751,11 +759,11 @@ class TestRunTrainingLoop:
         assert step == 2
         assert ckpt.saved_steps == [2]
         assert hook.saves == [2]
-        assert handler.finished is True
+        assert handler.finished is False
         assert ckpt.waits == 2
 
-    def test_shutdown_on_a_scheduled_step_waits_for_it_before_finishing(self, monkeypatch):
-        """The scheduled save is flushed while the shutdown watchdog is still armed."""
+    def test_every_wait_runs_while_the_shutdown_watchdog_is_armed(self, monkeypatch):
+        """Neither the scheduled save's wait nor the final flush runs after ``finish()``."""
         config = make_config(max_steps=10)
         config.checkpoint.interval = 2
         ckpt = FakeCheckpointManager()
@@ -770,7 +778,8 @@ class TestRunTrainingLoop:
         monkeypatch.setattr(ckpt, "wait", wait)
         session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
         run_training_loop(session)
-        assert finished_at_wait == [False, True]
+        assert finished_at_wait == [False, False]
+        assert handler.finished is False
 
     def test_shutdown_after_a_scheduled_save_still_saves_its_own_step(self):
         """Step 2 is saved on the schedule; a shutdown at step 3 must still save step 3."""
@@ -782,7 +791,7 @@ class TestRunTrainingLoop:
         step, _ = run_training_loop(session)
         assert step == 3
         assert ckpt.saved_steps == [2, 3]
-        assert handler.finished is True
+        assert handler.finished is False
 
     @pytest.mark.parametrize(
         "after_steps,expected",
@@ -800,7 +809,7 @@ class TestRunTrainingLoop:
         step, _ = run_training_loop(session)
         assert step == after_steps
         assert ckpt.saved_steps == expected
-        assert handler.finished is True
+        assert handler.finished is False
 
     @pytest.mark.parametrize("mode", ["disabled", "async", "async_with_pinned_mem"])
     def test_shutdown_on_a_scheduled_step_commits_that_one_save(self, monkeypatch, tmp_path, mode):
@@ -828,6 +837,14 @@ class TestRunTrainingLoop:
         assert saved == [2]
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
         assert (tmp_path / "step_2" / ".metadata").is_file()
+
+    def test_the_signal_handlers_are_reinstalled_at_every_step(self):
+        """A compile can replace them below Python (#448); a skipped step reinstalls too."""
+        config = make_config(max_steps=4)
+        handler = FakeShutdownHandler()
+        session = make_session(config, shutdown_handler=handler, step_fn=_nan_on({1}))
+        run_training_loop(session)
+        assert handler.reinstalls == 4
 
     def test_hooks_fire_for_every_step_and_save(self):
         config = make_config(max_steps=4)
@@ -1076,7 +1093,7 @@ class TestNanSkippedStep:
         assert step == 1
         assert handler.checks == 1
         assert ckpt.saved_steps == [1]
-        assert handler.finished is True
+        assert handler.finished is False
         assert ckpt.waits == 1
 
     def test_shutdown_on_a_skipped_scheduled_step_saves_it_once(self, monkeypatch):
@@ -1101,7 +1118,7 @@ class TestNanSkippedStep:
         assert ckpt.saves == [(2, tokens_seen, {})]
         assert ckpt.waits == 1
         assert epochs == [2]
-        assert handler.finished is True
+        assert handler.finished is False
 
     def test_nan_stop_is_not_saved_even_with_a_shutdown_pending(self):
         """The NaN that trips the stop ends the run before the shutdown check: no save."""
@@ -1218,7 +1235,7 @@ class TestNanSkippedStep:
         with caplog.at_level(logging.ERROR, logger="kempnerforge"):
             step, handler = self._keep_last_one(tmp_path, _bad_update_on(2), mode)
         assert step == 4
-        assert handler.finished is True
+        assert handler.finished is False
         assert sorted(d.name for d in tmp_path.glob("step_*")) == ["step_2"]
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
         errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
@@ -1236,7 +1253,7 @@ class TestNanSkippedStep:
         """A NaN loss alone leaves the weights finite, so skipped step 4 is saved as ``latest``."""
         step, handler = self._keep_last_one(tmp_path, _nan_on({3}))
         assert step == 4
-        assert handler.finished is True
+        assert handler.finished is False
         assert (tmp_path / "step_4" / ".metadata").is_file()
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_4").resolve()
 
@@ -1295,6 +1312,48 @@ def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
 
 
 class TestRunTraining:
+    def test_packed_vlm_batches_train_through_run_training(self, monkeypatch):
+        """run_training drives vlm_step over packed rows with a real wrapper."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.data.vlm_dataset import pack_vlm_samples
+        from kempnerforge.model.vlm import build_vlm_wrapper
+        from kempnerforge.training.entry import run_training
+
+        config = _vlm_config()
+        config.data.pack_sequences = True
+        config.train.max_steps = 2
+        assert config.vision_encoder is not None and config.adapter is not None
+        assert config.vlm is not None
+        model = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
+        before = next(model.transformer.parameters()).detach().clone()
+
+        def doc(text_len: int, seed: int) -> dict:
+            gen = torch.Generator().manual_seed(seed)
+            ids = torch.randint(0, 256, (text_len,), generator=gen)
+            labels = torch.full((text_len,), -100, dtype=torch.long)
+            labels[:-1] = ids[1:]
+            return {
+                "pixel_values": torch.randn(3, 16, 16, generator=gen),
+                "input_ids": ids,
+                "labels": labels,
+                "text_len": torch.tensor(text_len),
+            }
+
+        batches = [
+            pack_vlm_samples(
+                [doc(10, 1), doc(20, 2), doc(6, 3)], seq_len=64, tokens_per_image=8, pad_id=0
+            ),
+            pack_vlm_samples([doc(30, 4), doc(24, 5)], seq_len=64, tokens_per_image=8, pad_id=0),
+        ]
+        assert [b["input_ids"].shape[0] for b in batches] == [1, 2]
+        ckpt = _stub_entry(monkeypatch, model)
+        ckpt.apply_dataloader_state = lambda _loader: None
+        monkeypatch.setattr(
+            entry, "build_data_pipeline", lambda *_a, **_k: DataPipeline(dataloader=batches)
+        )
+        run_training(config)
+        assert not torch.equal(before, next(model.transformer.parameters()))
+
     def test_defaults_to_the_registry_selected_step_body(self, monkeypatch):
         from kempnerforge.training.entry import run_training
 
@@ -1375,6 +1434,40 @@ class TestRunTraining:
         )
         assert destroys == [1]
         assert closes == [1, 1]
+
+    def test_finish_runs_after_the_emergency_flush_and_the_teardown(self, monkeypatch):
+        """The handler and its timer outlive the last ``wait()`` and the teardown (#313)."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+
+        events: list[str] = []
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        handler = FakeShutdownHandler(after_steps=2)
+        monkeypatch.setattr(handler, "finish", lambda: events.append("finish"))
+        monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: handler)
+        monkeypatch.setattr(ckpt, "wait", lambda: events.append("wait"))
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: events.append("destroy"))
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 100
+        run_training(config)
+        assert ckpt.saved_steps == [2]
+        assert events == ["wait", "destroy", "finish"]
+
+    def test_a_failed_run_does_not_finish_the_shutdown_handler(self, monkeypatch):
+        """On the exception path nothing calls ``finish()``; a real timer bounds the exit."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+
+        _stub_entry(monkeypatch, TinyTextModel())
+        handler = FakeShutdownHandler()
+        monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: handler)
+
+        def boom(_session, _step):
+            raise RuntimeError("step blew up")
+
+        with pytest.raises(RuntimeError, match="step blew up"):
+            run_training(make_config(max_steps=2), step_fn=boom)
+        assert handler.finished is False
 
     def test_checkpoint_manager_reads_the_trackers_live_runs(self, monkeypatch):
         import kempnerforge.training.entry as entry
@@ -1851,6 +1944,78 @@ class TestDpSizeReachesTokenAccounting:
         per_step = config.train.batch_size * config.train.seq_len * config.train.grad_accum_steps
         assert tokens_seen == 2 * per_step * 8
 
+    def test_packed_counts_do_not_count_tensor_parallel_replicas(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        session = make_session(
+            make_config(),
+            data=DataPipeline(dp_size=2),
+            runtime=dataclasses.replace(_runtime(), world_size=8),
+        )
+        reductions: list[Any] = []
+
+        def reduce_counts(count: torch.Tensor, op: Any) -> None:
+            assert count.item() == 7
+            reductions.append(op)
+            count.fill_(4 * (7 + 11))
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(loop.dist, "all_reduce", reduce_counts)
+        result = loop.StepResult(loss=1.0, grad_norm=0.5, tokens=7)
+        assert loop._tokens_in_step(session, result) == 18
+        assert reductions == [loop.dist.ReduceOp.SUM]
+
+    def test_packed_counts_reach_tokens_seen_without_another_accumulation_factor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+        counts = iter((17, 23))
+
+        def step_fn(_session: TrainingSession, _step: int) -> loop.StepResult:
+            return loop.StepResult(loss=1.0, grad_norm=0.5, tokens=next(counts))
+
+        session = make_session(
+            make_config(max_steps=2, grad_accum_steps=3),
+            data=DataPipeline(dp_size=4),
+            step_fn=step_fn,
+        )
+        step, tokens_seen = run_training_loop(session)
+        assert (step, tokens_seen) == (2, (17 + 23) * 4)
+        assert session.checkpointer.saves[-1][1] == tokens_seen
+
+    def test_packed_count_is_reduced_before_the_optimizer_steps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kempnerforge.training.loop as loop
+
+        monkeypatch.setattr(loop.dist, "is_initialized", lambda: False)
+        events: list[str] = []
+        counted = loop._tokens_in_step
+
+        def recording(session: TrainingSession, result: loop.StepResult) -> int:
+            events.append("count")
+            return counted(session, result)
+
+        monkeypatch.setattr(loop, "_tokens_in_step", recording)
+        session = make_session(
+            make_config(max_steps=1),
+            step_fn=lambda _session, _step: loop.StepResult(loss=1.0, grad_norm=0.5, tokens=5),
+        )
+        stepped = session.optimizer.step
+
+        def stepping(*args, **kwargs):
+            events.append("optimizer")
+            return stepped(*args, **kwargs)
+
+        monkeypatch.setattr(session.optimizer, "step", stepping)
+        step, tokens_seen = run_training_loop(session)
+        assert events == ["count", "optimizer"]
+        assert (step, tokens_seen) == (1, 5)
+
     def test_default_dp_size_is_one_not_zero(self):
         assert DataPipeline().dp_size == 1
 
@@ -1967,23 +2132,38 @@ class TestPhaseTemperatureReachesSampler:
 
 
 class FakeSubMesh:
-    def __init__(self, key) -> None:
+    def __init__(self, key, coords=(0, 1)) -> None:
         self.key = key
+        self.coords = coords
 
     def get_group(self):
         return f"group:{self.key}"
 
+    def get_local_rank(self) -> int:
+        return self.coords[0]
+
+    def size(self) -> int:
+        return self.coords[1]
+
 
 class FakeMesh:
-    """Enough DeviceMesh surface for the build phases to run on CPU."""
+    """Enough DeviceMesh surface for the build phases to run on CPU.
 
-    def __init__(self, dims=("pp", "dp_shard")) -> None:
+    ``coords`` maps a dimension name to its (local rank, size); any other
+    dimension or slice reports (0, 1).
+    """
+
+    def __init__(self, dims=("pp", "dp_shard"), coords=None) -> None:
         self.mesh_dim_names = dims
+        self.coords = coords or {}
         self.sliced: list = []
 
     def __getitem__(self, key):
         self.sliced.append(key)
-        return FakeSubMesh(key)
+        return FakeSubMesh(key, self.coords.get(key, (0, 1)))
+
+    def get_local_rank(self, name) -> int:
+        return self.coords.get(name, (0, 1))[0]
 
 
 class FakeStageModule(nn.Module):
@@ -2060,6 +2240,19 @@ class TestBuildModel:
         config.video = VideoConfig(max_frames=6, min_frames=1, frame_size=16)
         entry.build_model(config, _runtime(), lambda a, b: a)
         assert seen["frames_per_clip"] == 6
+
+    def test_non_pp_keeps_one_frame_per_clip_under_an_image_cap(self, monkeypatch):
+        """The cap sizes rows, not the clip the prefix route checks, so eval takes one image."""
+        import kempnerforge.training.entry as entry
+
+        seen: dict = {}
+        monkeypatch.setattr(
+            entry, "build_parallel_model", lambda *a, **k: seen.update(k) or "MODEL"
+        )
+        config = _vlm_config()
+        config.data = DataConfig(hf_max_images=3, num_workers=0)
+        entry.build_model(config, _runtime(), lambda a, b: a)
+        assert seen["frames_per_clip"] == 1
 
     def test_non_pp_sizes_the_model_for_the_tiled_views(self, monkeypatch):
         """A 2 × 2 grid without the whole image is four views per sample."""
@@ -2140,6 +2333,32 @@ class TestBuildModel:
         config.distributed.pp = 2
         with pytest.raises(RuntimeError, match="requires a device mesh"):
             entry.build_model(config, _runtime(), "LOSS")
+
+
+class TestBuildCheckpointManager:
+    def test_records_the_data_pipelines_partition(self, tmp_path):
+        """The manager records the (dp_rank, dp_size) the data pipeline reads."""
+        from kempnerforge.training.data_pipeline import build_data_pipeline
+        from kempnerforge.training.entry import build_checkpoint_manager
+
+        config = make_config()
+        config.checkpoint.dir = str(tmp_path / "c")
+        model = TinyTextModel()
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        single = build_checkpoint_manager(config, _runtime(), model, opt, None)
+        assert single._dp_info == (0, 1)
+
+        mesh = FakeMesh(
+            ("dp_replicate", "dp_shard", "tp"),
+            coords={"dp_replicate": (1, 2), "dp_shard": (3, 4), "tp": (1, 2)},
+        )
+        runtime = dataclasses.replace(_runtime(), device_mesh=mesh)
+        mgr = build_checkpoint_manager(config, runtime, model, opt, None)
+        assert mgr._dp_info == (7, 8)
+        assert {"dp_replicate", "dp_shard"} <= set(mesh.sliced)
+        data = build_data_pipeline(config, runtime)
+        assert (data.dp_rank, data.dp_size) == mgr._dp_info
 
 
 class FakeResumeManager:
@@ -2243,14 +2462,17 @@ class TestRestoreCheckpoint:
         assert mgr.load_kwargs["path"] is None
 
     def test_metrics_run_ids_are_restored_onto_the_config(self, monkeypatch, tmp_path):
+        """An auto-resume continues the saved runs, so it adds no warm-start tags."""
         import kempnerforge.training.entry as entry
 
         monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
         config = make_config()
+        config.metrics.enable_mlflow = True
         mgr = FakeResumeManager(extra={"wandb_run_id": "W1", "mlflow_run_id": "M1"})
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
         assert config.metrics.wandb_run_id == "W1"
         assert config.metrics.mlflow_run_id == "M1"
+        assert config.metrics.mlflow_tags == {}
 
     def test_absent_run_ids_do_not_clobber_existing_ones(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
@@ -2260,6 +2482,175 @@ class TestRestoreCheckpoint:
         config.metrics.wandb_run_id = "KEEP"
         entry.restore_checkpoint(config, TinyTextModel(), None, FakeResumeManager(extra={}))
         assert config.metrics.wandb_run_id == "KEEP"
+
+    @staticmethod
+    def _warm_start(monkeypatch, tmp_path, extra, *, metadata=None, rank=0, link=None, **metrics):
+        """Warm-start a config with MLflow on, and ``metrics`` set, from ``tmp_path/step_5``
+        (a ``load_path`` with nothing in ``checkpoint.dir``); return the config and the source.
+
+        ``metadata`` is the source's ``metadata.json``: a dict to write as JSON, or raw text.
+        ``link`` names a symlink to the source, made under ``tmp_path`` and used as ``load_path``.
+        """
+        import kempnerforge.training.entry as entry
+
+        source = tmp_path / "step_5"
+        source.mkdir()
+        if metadata is not None:
+            text = metadata if isinstance(metadata, str) else json.dumps(metadata)
+            (source / "metadata.json").write_text(text)
+        load_path = source
+        if link is not None:
+            load_path = tmp_path / link
+            load_path.symlink_to(source.name)
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)
+        if rank:
+            monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
+            monkeypatch.setattr(entry.dist, "get_rank", lambda: rank)
+            monkeypatch.setattr(entry.dist, "broadcast_object_list", lambda lst, src=0: None)
+        config = make_config()
+        config.checkpoint.load_path = str(load_path)
+        config.metrics.enable_mlflow = True
+        for name, value in metrics.items():
+            setattr(config.metrics, name, value)
+        manager = FakeResumeManager(step=5, extra=extra)
+        entry.restore_checkpoint(config, TinyTextModel(), None, manager)
+        return config, source
+
+    def test_a_warm_start_opens_new_tracking_runs(self, monkeypatch, tmp_path):
+        """A load_path warm start is a new run (#511): the ids of the runs that saved its
+        checkpoint stay unused, and its MLflow run is tagged with the checkpoint and that run."""
+        extra = {"wandb_run_id": "W1", "mlflow_run_id": "M1"}
+        config, source = self._warm_start(monkeypatch, tmp_path, extra, enable_wandb=True)
+        assert (config.metrics.wandb_run_id, config.metrics.mlflow_run_id) == ("", "")
+        assert config.metrics.mlflow_tags == {
+            "kempnerforge.warm_start.checkpoint": str(source.resolve()),
+            "kempnerforge.warm_start.source_run_id": "M1",
+        }
+
+    def test_a_warm_start_keeps_the_run_ids_its_config_sets(self, monkeypatch, tmp_path):
+        """Naming a run in the config is how a warm start continues one on purpose."""
+        extra = {"wandb_run_id": "W1", "mlflow_run_id": "M1"}
+        config, _ = self._warm_start(
+            monkeypatch, tmp_path, extra, wandb_run_id="MINE-W", mlflow_run_id="MINE-M"
+        )
+        assert (config.metrics.wandb_run_id, config.metrics.mlflow_run_id) == ("MINE-W", "MINE-M")
+
+    def test_a_warm_start_names_the_run_its_checkpoint_sidecar_records(self, monkeypatch, tmp_path):
+        """The sidecar names the source run even when train_state.pt is not loaded."""
+        metadata = {"step": 5, "tracking": [{"backend": "mlflow", "run_id": "FROM-SIDECAR"}]}
+        config, _ = self._warm_start(monkeypatch, tmp_path, {}, metadata=metadata)
+        tag = config.metrics.mlflow_tags["kempnerforge.warm_start.source_run_id"]
+        assert tag == "FROM-SIDECAR"
+
+    @pytest.mark.parametrize(
+        "tracking",
+        [
+            [{"backend": "mlflow", "run_id": "FROM-SIDECAR"}],
+            [
+                {"backend": "wandb", "run_id": "W-SIDECAR"},
+                {"backend": "mlflow", "run_id": "FROM-SIDECAR"},
+            ],
+        ],
+        ids=["over-the-train-state", "after-a-wandb-record"],
+    )
+    def test_the_sidecars_mlflow_record_names_the_source_run(self, monkeypatch, tmp_path, tracking):
+        """The sidecar's ``mlflow`` record wins over the train state's id and any other record."""
+        extra = {"mlflow_run_id": "M1"}
+        metadata = {"step": 5, "tracking": tracking}
+        config, _ = self._warm_start(monkeypatch, tmp_path, extra, metadata=metadata)
+        tag = config.metrics.mlflow_tags["kempnerforge.warm_start.source_run_id"]
+        assert tag == "FROM-SIDECAR"
+
+    def test_the_checkpoint_tag_is_the_directory_a_symlinked_load_path_names(
+        self, monkeypatch, tmp_path
+    ):
+        """A load_path through ``latest`` is tagged with the step directory it points at."""
+        config, source = self._warm_start(monkeypatch, tmp_path, {}, link="latest")
+        assert config.checkpoint.load_path == str(tmp_path / "latest")
+        tag = config.metrics.mlflow_tags["kempnerforge.warm_start.checkpoint"]
+        assert tag == str(source.resolve())
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            "{not json",
+            "[]",
+            '{"tracking": "mlflow"}',
+            '{"tracking": [5]}',
+            '{"tracking": [{"backend": "mlflow", "run_id": " "}]}',
+        ],
+        ids=["malformed", "not-an-object", "not-a-list", "entry-not-an-object", "blank-run-id"],
+    )
+    def test_an_unusable_sidecar_falls_back_to_the_train_state(
+        self, monkeypatch, tmp_path, metadata
+    ):
+        """Reading the sidecar never raises: only rank 0 reads it, after the load's collectives."""
+        extra = {"mlflow_run_id": "M1"}
+        config, _ = self._warm_start(monkeypatch, tmp_path, extra, metadata=metadata)
+        assert config.metrics.mlflow_tags["kempnerforge.warm_start.source_run_id"] == "M1"
+
+    def test_a_warm_start_without_a_source_run_tags_only_the_checkpoint(
+        self, monkeypatch, tmp_path
+    ):
+        config, source = self._warm_start(monkeypatch, tmp_path, {}, metadata={"step": 5})
+        assert config.metrics.mlflow_tags == {
+            "kempnerforge.warm_start.checkpoint": str(source.resolve())
+        }
+
+    def test_a_configured_tag_wins_over_a_warm_start_tag(self, monkeypatch, tmp_path):
+        tags = {"kempnerforge.warm_start.source_run_id": "mine", "team": "vlm"}
+        config, _ = self._warm_start(
+            monkeypatch, tmp_path, {"mlflow_run_id": "M1"}, mlflow_tags=tags
+        )
+        assert config.metrics.mlflow_tags["kempnerforge.warm_start.source_run_id"] == "mine"
+        assert config.metrics.mlflow_tags["team"] == "vlm"
+
+    def test_a_warm_start_without_mlflow_adds_no_tags(self, monkeypatch, tmp_path):
+        extra = {"wandb_run_id": "W1", "mlflow_run_id": "M1"}
+        config, _ = self._warm_start(monkeypatch, tmp_path, extra, enable_mlflow=False)
+        assert config.metrics.mlflow_tags == {}
+        assert (config.metrics.wandb_run_id, config.metrics.mlflow_run_id) == ("", "")
+
+    def test_only_rank_zero_tags_a_warm_start(self, monkeypatch, tmp_path):
+        config, _ = self._warm_start(monkeypatch, tmp_path, {"mlflow_run_id": "M1"}, rank=1)
+        assert config.metrics.mlflow_tags == {}
+        assert config.metrics.mlflow_run_id == ""
+
+    @pytest.mark.parametrize(
+        ("metrics", "named"),
+        [
+            ({"enable_wandb": True}, ["mlflow_run_id=M1", "wandb_run_id=W1"]),
+            ({"enable_wandb": True, "mlflow_run_id": "MINE"}, ["wandb_run_id=W1"]),
+            ({"enable_mlflow": False}, []),
+        ],
+        ids=["both-backends", "mlflow-run-named-in-config", "no-backend"],
+    )
+    def test_a_warm_start_says_which_saved_runs_it_does_not_continue(
+        self, monkeypatch, tmp_path, metrics, named
+    ):
+        import kempnerforge.training.entry as entry
+
+        seen: list[str] = []
+        monkeypatch.setattr(entry.logger, "info", lambda msg, *a, **k: seen.append(str(msg)))
+        extra = {"wandb_run_id": "W1", "mlflow_run_id": "M1"}
+        self._warm_start(monkeypatch, tmp_path, extra, **metrics)
+        lines = [m for m in seen if m.startswith("Warm start from")]
+        assert len(lines) == (1 if named else 0)
+        for item in ("mlflow_run_id=M1", "wandb_run_id=W1"):
+            assert any(item in line for line in lines) == (item in named)
+
+    def test_a_weights_only_warm_start_names_the_mlflow_run_its_sidecar_records(
+        self, monkeypatch, tmp_path
+    ):
+        """A load that skips train_state.pt has no ``extra``, so the sidecar names the run."""
+        import kempnerforge.training.entry as entry
+
+        seen: list[str] = []
+        monkeypatch.setattr(entry.logger, "info", lambda msg, *a, **k: seen.append(str(msg)))
+        metadata = {"step": 5, "tracking": [{"backend": "mlflow", "run_id": "FROM-SIDECAR"}]}
+        self._warm_start(monkeypatch, tmp_path, {}, metadata=metadata)
+        (line,) = [m for m in seen if m.startswith("Warm start from")]
+        assert "mlflow_run_id=FROM-SIDECAR" in line
 
     def test_vlm_resume_computes_expected_freeze_at_the_saved_step(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
@@ -2324,6 +2715,7 @@ class TestRestoreCheckpoint:
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
         assert mgr.load_kwargs["path"] == (str(resume) if resume_found else None)
         assert mgr.load_kwargs["exclude_keys"] == want_exclude
+        assert mgr.load_kwargs["exact_resume"] is resume_found
 
     def test_resume_with_stale_load_path_restores_full_state(self, monkeypatch, tmp_path):
         """A requeued run keeps its warm-start config; the resume must still
@@ -2814,6 +3206,8 @@ class TestRestoreFromSavedCheckpoints:
 
 
 class FakeDataset:
+    has_text_only_rows = False
+
     def __init__(self, n=8, **kw) -> None:
         self.n = n
         self.kwargs = kw
@@ -2947,6 +3341,9 @@ class TestVlmSourceBuilders:
             vlmd, "HuggingFaceVLMDataset", lambda **k: FakeDataset(**seen.setdefault("dataset", k))
         )
         monkeypatch.setattr(vlmd, "VLMCollator", lambda **k: seen.setdefault("image_collator", k))
+        monkeypatch.setattr(
+            vlmd, "PackedVLMCollator", lambda **k: seen.setdefault("packed_collator", k)
+        )
         monkeypatch.setattr(vid, "build_video_dataset", lambda *a: FakeDataset())
         monkeypatch.setattr(vid, "VideoCollator", lambda **k: seen.setdefault("video_collator", k))
 
@@ -2957,7 +3354,137 @@ class TestVlmSourceBuilders:
         data = dp.build_data_pipeline(self._vlm_data_config(), _runtime())
         assert data.dataloader == "stateful_OBJ"
         assert seen["image_collator"]["pad_id"] == 7
+        assert seen["image_collator"]["frame_mask"] is False
         assert "video_collator" not in seen
+
+    def test_image_path_passes_the_image_cap_to_the_dataset(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.hf_max_images = 2
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=16)
+        assert seen["dataset"]["max_images"] == 2
+        assert seen["packed_collator"]["max_docs_per_row"] == 1 and "image_collator" not in seen
+
+    def test_a_dataset_with_text_only_rows_masks_every_batch(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        monkeypatch.setattr(FakeDataset, "has_text_only_rows", True)
+        dp.build_data_pipeline(self._vlm_data_config(), _runtime())
+        assert seen["image_collator"]["frame_mask"] is True
+
+    def test_an_image_cap_above_one_without_packing_uses_fixed_rows(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.hf_max_images = 3
+        config.train.seq_len = 128
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=16)
+        assert seen["packed_collator"] == {
+            "pad_id": 7,
+            "seq_len": config.train.seq_len,
+            "tokens_per_image": 16,
+            "max_docs_per_row": 1,
+        }
+        assert "image_collator" not in seen
+        with pytest.raises(ValueError, match="data.hf_max_images on a VLM run needs the built"):
+            dp.build_data_pipeline(config, _runtime())
+
+    @pytest.mark.parametrize("pack", [False, True])
+    def test_laid_out_rows_must_fit_the_image_cap_and_the_text(self, monkeypatch, pack):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.hf_max_images = 3
+        config.data.pack_sequences = pack
+        too_many = (config.train.seq_len - config.vlm.max_text_len) // 3 + 1
+        with pytest.raises(ValueError, match="cannot hold one document"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=too_many)
+        assert "dataset" not in seen
+
+    def test_text_only_rows_are_refused_with_flash_attention(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.model.sdpa_backend = "flash"
+        dp.build_data_pipeline(config, _runtime())
+        monkeypatch.setattr(FakeDataset, "has_text_only_rows", True)
+        with pytest.raises(ValueError, match="sdpa_backend='flash'"):
+            dp.build_data_pipeline(config, _runtime())
+        config.model.attention_backend = "flex"
+        dp.build_data_pipeline(config, _runtime())
+
+    def test_packed_image_path_takes_the_model_token_count(self, monkeypatch):
+        import kempnerforge.data.vlm_dataset as vlmd
+
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        monkeypatch.setattr(vlmd, "PackedVLMCollator", lambda **k: seen.setdefault("packed", k))
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        data = dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        assert data.dataloader == "stateful_OBJ"
+        assert seen["packed"] == {
+            "pad_id": 7,
+            "seq_len": config.train.seq_len,
+            "tokens_per_image": 12,
+            "max_docs_per_row": 0,
+        }
+        assert "image_collator" not in seen
+        with pytest.raises(ValueError, match="built model's tokens per image"):
+            dp.build_data_pipeline(config, _runtime())
+        with pytest.raises(ValueError, match="cannot hold one document"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
+
+    def test_packed_fit_check_runs_before_the_dataset_loads(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        with pytest.raises(ValueError, match="cannot hold one document"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
+        with pytest.raises(ValueError, match="built model's tokens per image"):
+            dp.build_data_pipeline(config, _runtime())
+        assert "dataset" not in seen
+
+    def test_packed_tiled_image_budget_counts_every_view(self, monkeypatch):
+        import kempnerforge.data.vlm_dataset as vlmd
+
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        monkeypatch.setattr(vlmd, "PackedVLMCollator", lambda **k: seen.setdefault("packed", k))
+        config = self._vlm_data_config(tile_grid=2, tile_global=False)
+        config.data.pack_sequences = True
+        config.train.seq_len = 4 * 12 + config.vlm.max_text_len - 1
+        with pytest.raises(ValueError, match="48 image tokens"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        config.train.seq_len += 1
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        assert seen["packed"]["tokens_per_image"] == 12
+        assert seen["dataset"]["tile_grid"] == 2
+        assert seen["dataset"]["tile_global"] is False
+
+    def test_tiled_documents_with_several_images_count_every_view_of_every_image(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config(tile_grid=2, tile_global=False)
+        config.data.hf_max_images = 2
+        config.train.seq_len = 2 * 4 * 12 + config.vlm.max_text_len - 1
+        with pytest.raises(ValueError, match="96 image tokens"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        config.train.seq_len += 1
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        assert seen["packed_collator"]["max_docs_per_row"] == 1
+        assert seen["dataset"]["max_images"] == 2 and seen["dataset"]["tile_grid"] == 2
 
     def test_image_path_hands_the_tiling_to_the_dataset(self, monkeypatch):
         seen: dict = {}
@@ -2966,6 +3493,18 @@ class TestVlmSourceBuilders:
         dp.build_data_pipeline(self._vlm_data_config(tile_grid=2, tile_global=False), _runtime())
         assert seen["dataset"]["tile_grid"] == 2
         assert seen["dataset"]["tile_global"] is False
+
+    def test_packing_with_an_image_cap_packs_capped_documents(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        config.data.hf_max_images = 2
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=16)
+        assert seen["dataset"]["max_images"] == 2
+        assert seen["packed_collator"]["max_docs_per_row"] == 0
+        assert seen["packed_collator"]["tokens_per_image"] == 16
 
     def test_video_path_uses_the_video_collator(self, monkeypatch):
         seen: dict = {}
@@ -3191,9 +3730,11 @@ class TinyVlmModel(nn.Module):
         self.proj = nn.Linear(DIM, VOCAB)
         self.embed = nn.Embedding(VOCAB, DIM)
         self.seen_frame_mask: list = []
+        self.seen_packed: list = []
 
-    def forward(self, pixel_values, input_ids, labels, frame_mask=None):
+    def forward(self, pixel_values, input_ids, labels, frame_mask=None, **packed):
         self.seen_frame_mask.append(frame_mask)
+        self.seen_packed.append(packed)
         return self.proj(self.embed(input_ids)), labels
 
 
@@ -3231,6 +3772,61 @@ class TestVlmStep:
         session, model = self._session([self._batch(with_mask=True)])
         session.step_fn(session, 0)
         assert model.seen_frame_mask[0] is not None
+
+    def test_packed_keys_are_threaded_when_present(self):
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        batch["image_rows"] = torch.tensor([0, 1])
+        batch["image_starts"] = torch.tensor([0, 0])
+        batch["position_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        batch["image_tokens"] = torch.tensor(2)
+        session, model = self._session([batch])
+        session.step_fn(session, 0)
+        packed = model.seen_packed[0]
+        assert set(packed) == {
+            "doc_ids",
+            "position_ids",
+            "image_rows",
+            "image_starts",
+            "image_tokens",
+        }
+        assert packed["image_tokens"] == 2
+        assert packed["doc_ids"].shape == (2, 4)
+
+    def test_reports_tokens_only_for_packed_batches(self):
+        session, _ = self._session([self._batch()])
+        assert session.step_fn(session, 0).tokens is None
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        session, _ = self._session([batch])
+        assert session.step_fn(session, 0).tokens is None
+        batch["image_rows"] = torch.tensor([0, 1])
+        batch["image_starts"] = torch.tensor([0, 0])
+        batch["image_tokens"] = torch.tensor(2)
+        session, _ = self._session([batch])
+        assert session.step_fn(session, 0).tokens == 8
+
+    def test_packed_rows_are_marked_dynamic_for_compile(self, monkeypatch):
+        import torch._dynamo
+
+        marked: list = []
+        monkeypatch.setattr(torch._dynamo, "maybe_mark_dynamic", lambda t, d: marked.append(d))
+        batch = self._batch()
+        batch["doc_ids"] = torch.zeros(2, 4, dtype=torch.long)
+        batch["image_rows"] = torch.tensor([0, 1])
+        batch["image_starts"] = torch.tensor([0, 0])
+        batch["image_tokens"] = torch.tensor(2)
+        session, _ = self._session([batch])
+        session.step_fn(session, 0)
+        assert marked == []
+        session.config.train.compile_model = True
+        session.step_fn(session, 0)
+        assert marked == [0] * 6
+
+    def test_unpacked_batches_pass_no_packed_keys(self):
+        session, model = self._session([self._batch()])
+        session.step_fn(session, 0)
+        assert model.seen_packed[0] == {}
 
     def test_frame_mask_is_none_for_image_batches(self):
         session, model = self._session([self._batch()])
@@ -3381,6 +3977,17 @@ class TinyMoEModel(nn.Module):
         return self._counts
 
 
+class TinyMoTMoEModel(TinyMoEModel):
+    """``TinyMoEModel`` with MoT's per-modality routers: no flat counts, counts per modality."""
+
+    def __init__(self, mot_counts) -> None:
+        super().__init__(counts={})
+        self._mot_counts = mot_counts
+
+    def get_mot_expert_counts(self):
+        return self._mot_counts
+
+
 def _moe_config(z_weight=0.0, aux_weight=0.1, **kw):
     config = make_config(**kw)
     config.model.num_experts = 4
@@ -3423,6 +4030,40 @@ class TestMoEMetrics:
         session.tracker.log_eval = lambda m, s: logged.append((m, s))  # type: ignore[method-assign]
         run_training_loop(session)
         return logged
+
+    def _moe_metrics(self, model):
+        logged = self._run_one_step(model, _moe_config(max_steps=1))
+        return [m for m, _ in logged if "moe/aux_loss" in m][0]
+
+    def test_expert_balance_covers_mot_routers(self):
+        """MoT counts arrive per layer and modality; the image loads are 0.25 and 0.75."""
+        mot = {1: {"image": torch.tensor([1.0, 3.0]), "text": torch.tensor([4.0, 4.0])}}
+        moe = self._moe_metrics(TinyMoTMoEModel(mot))
+        assert moe["moe/expert_balance"] == pytest.approx(1 / 3)
+        assert moe["moe/expert_balance/image"] == pytest.approx(1 / 3)
+        assert moe["moe/expert_balance/text"] == pytest.approx(1.0)
+
+    def test_expert_balance_normalizes_each_router(self):
+        """Balanced routers read 1.0 whatever tokens each saw; raw counts would read 0.25."""
+        mot = {
+            1: {"image": torch.tensor([2.0, 2.0]), "text": torch.tensor([8.0, 8.0])},
+            3: {"image": torch.tensor([2.0, 2.0]), "text": torch.tensor([8.0, 8.0])},
+        }
+        moe = self._moe_metrics(TinyMoTMoEModel(mot))
+        assert moe["moe/expert_balance"] == pytest.approx(1.0)
+
+    def test_expert_balance_skips_a_router_that_saw_no_tokens(self):
+        mot = {1: {"image": torch.tensor([0.0, 0.0]), "text": torch.tensor([3.0, 1.0])}}
+        moe = self._moe_metrics(TinyMoTMoEModel(mot))
+        assert moe["moe/expert_balance"] == pytest.approx(1 / 3)
+        assert "moe/expert_balance/image" not in moe
+
+    def test_a_model_without_mot_counts_has_no_mot_routers(self):
+        """A custom MoE model need not implement ``get_mot_expert_counts``."""
+        assert not hasattr(TinyMoEModel(), "get_mot_expert_counts")
+        moe = self._moe_metrics(TinyMoEModel(counts={"0": torch.tensor([2.0, 8.0])}))
+        assert moe["moe/expert_balance"] == pytest.approx(0.25)
+        assert not any(key.startswith("moe/expert_balance/") for key in moe)
 
     def test_expert_balance_is_min_over_max(self):
         model = TinyMoEModel(counts={"0": torch.tensor([2.0, 8.0])})
@@ -3780,17 +4421,20 @@ class TestPerDatasetMetrics:
 
 
 class TestLoopPeriodicWork:
-    def test_nccl_failure_stops_the_run_without_a_final_save(self, monkeypatch):
+    def test_nccl_failure_fails_the_run_without_a_final_save(self, monkeypatch):
+        """The pending save is drained, then the run raises so the job does not end as done."""
         import kempnerforge.training.loop as loop
 
         monkeypatch.setattr(loop, "check_nccl_health", lambda: False)
         config = make_config(max_steps=6)
         config.train.nccl_health_check_interval = 1
         session = make_session(config)
-        step, _ = run_training_loop(session)
-        ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
-        assert step == 1
+        with pytest.raises(RuntimeError, match="NCCL health check failed at step 1"):
+            run_training_loop(session)
+        ckpt = session.checkpointer
+        assert isinstance(ckpt, FakeCheckpointManager)
         assert ckpt.saves == []
+        assert ckpt.waits == 1
 
     def test_healthy_nccl_does_not_stop_the_run(self, monkeypatch):
         import kempnerforge.training.loop as loop

@@ -94,7 +94,19 @@ def _resolve_pad_id(tokenizer_path: str) -> int:
     return int(resolve_pad_id(build_tokenizer(tokenizer_path)))
 
 
-def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPipeline:
+def _row_tokens_per_image(tokens_per_image: int | None, setting: str) -> int:
+    """The built model's tokens per image, which laying out image slots in rows needs."""
+    if not tokens_per_image:
+        raise ValueError(
+            f"{setting} on a VLM run needs the built model's tokens per image; pass the "
+            "wrapper's packed_tokens_per_image(model) as tokens_per_image"
+        )
+    return tokens_per_image
+
+
+def _build_vlm_pipeline(
+    config: JobConfig, dp_rank: int, dp_size: int, tokens_per_image: int | None
+) -> DataPipeline:
     """Image (Joint-Decoder) or video VLM loader, selected by ``config.is_video``."""
     tc = config.train
     vlm_cfg = config.vlm
@@ -116,8 +128,26 @@ def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPi
         if not config.data.hf_dataset_name or not config.data.tokenizer_path:
             raise ValueError("VLM training requires data.hf_dataset_name and data.tokenizer_path")
 
-        from kempnerforge.data.vlm_dataset import HuggingFaceVLMDataset, VLMCollator
+        from kempnerforge.data.vlm_dataset import (
+            HuggingFaceVLMDataset,
+            PackedVLMCollator,
+            VLMCollator,
+        )
 
+        laid_out = config.data.pack_sequences or config.data.hf_max_images != 1
+        row_tokens = 0
+        if laid_out:
+            setting = "data.pack_sequences" if config.data.pack_sequences else "data.hf_max_images"
+            row_tokens = _row_tokens_per_image(tokens_per_image, setting)
+            visual_tokens = config.data.hf_max_images * config.views_per_sample * row_tokens
+            footprint = visual_tokens + vlm_cfg.max_text_len
+            if footprint > tc.seq_len:
+                raise ValueError(
+                    f"train.seq_len ({tc.seq_len}) cannot hold one document: {visual_tokens} "
+                    f"image tokens (data.hf_max_images={config.data.hf_max_images} x "
+                    f"{config.views_per_sample} views x {row_tokens}) + vlm.max_text_len "
+                    f"({vlm_cfg.max_text_len})"
+                )
         dataset = HuggingFaceVLMDataset(
             dataset_name=config.data.hf_dataset_name,
             split=config.data.hf_dataset_split,
@@ -128,14 +158,44 @@ def _build_vlm_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPi
             prompt_field=config.data.hf_dataset_prompt_field or None,
             image_size=config.data.hf_image_size,
             dataset_config=config.data.hf_dataset_config,
+            max_images=config.data.hf_max_images,
             tile_grid=vlm_cfg.tile_grid,
             tile_global=vlm_cfg.tile_global,
         )
-        collator = VLMCollator(
-            pad_id=_resolve_pad_id(config.data.tokenizer_path),
-            max_text_len=vlm_cfg.max_text_len,
-        )
-        logger.info(f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}")
+        pad_id = _resolve_pad_id(config.data.tokenizer_path)
+        if laid_out:
+            collator = PackedVLMCollator(
+                pad_id=pad_id,
+                seq_len=tc.seq_len,
+                tokens_per_image=row_tokens,
+                max_docs_per_row=0 if config.data.pack_sequences else 1,
+            )
+            layout = "packed" if config.data.pack_sequences else "one per row"
+            logger.info(
+                f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
+                f"up to {config.data.hf_max_images} images x {row_tokens} tokens + text "
+                f"per document, {layout} in rows of {tc.seq_len}"
+            )
+        else:
+            flash = (
+                config.model.sdpa_backend == "flash"
+                and config.model.attention_backend == "sdpa"
+                and vlm_cfg.arch in ("joint_decoder", "moma")
+            )
+            if dataset.has_text_only_rows and flash:
+                raise ValueError(
+                    "A dataset with text-only rows is not supported with model.sdpa_backend='flash'"
+                )
+            collator = VLMCollator(
+                pad_id=pad_id,
+                max_text_len=vlm_cfg.max_text_len,
+                frame_mask=dataset.has_text_only_rows,
+            )
+            rows = "with" if dataset.has_text_only_rows else "without"
+            logger.info(
+                f"VLM dataset: {len(dataset):,} samples from {config.data.hf_dataset_name}, "
+                f"{rows} text-only rows"
+            )
 
     sampler = DistributedSampler(
         dataset,
@@ -315,17 +375,21 @@ def _build_hf_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPip
     return DataPipeline(dataloader=dataloader, dp_rank=dp_rank, dp_size=dp_size)
 
 
-def build_data_pipeline(config: JobConfig, runtime: RuntimeContext) -> DataPipeline:
+def build_data_pipeline(
+    config: JobConfig, runtime: RuntimeContext, *, tokens_per_image: int | None = None
+) -> DataPipeline:
     """Build the training data pipeline for whichever ``[data]`` source is set.
 
     Returns an empty pipeline when no source is configured — the text and PP
-    step bodies then run on random tokens.
+    step bodies then run on random tokens. ``tokens_per_image`` is the slots one
+    image takes in a laid-out VLM row, packed or one document per row, read off
+    the built wrapper (``packed_tokens_per_image``).
     """
     eos_token_id = _resolve_eos_token_id(config)
     dp_rank, dp_size = get_dp_info(runtime.device_mesh)
 
     if config.is_vlm:
-        return _build_vlm_pipeline(config, dp_rank, dp_size)
+        return _build_vlm_pipeline(config, dp_rank, dp_size, tokens_per_image)
     if config.data.datasets:
         return _build_mixture_pipeline(config, dp_rank, dp_size, eos_token_id)
     if config.data.dataset_path:
