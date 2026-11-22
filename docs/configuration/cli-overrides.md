@@ -36,7 +36,7 @@ Each flag must begin with `--`. Parsing splits once on `=`:
 | `--optimizer.betas=[0.9,0.95]` | `list → tuple(0.9, 0.95)` (coerced to tuple by field type) |
 | `--checkpoint.load_path=/scratch/ckpt` | `str("/scratch/ckpt")` (literal_eval fails, keep as string) |
 | `--adapter.pre_norm=` | `str("")` (literal_eval fails on an empty value, keep as string) |
-| `--data.anneal_weights={"c4":0.7,"books":0.3}` | `dict` (parsed into `DataConfig.anneal_weights`) |
+| `--data.anneal_weights='{"c4":0.7,"books":0.3}'` | `dict` (parsed into `DataConfig.anneal_weights`) |
 
 Quote any value the shell would otherwise eat:
 
@@ -61,6 +61,17 @@ path = "/scratch/books"
 weight = 0.3
 name = "books"
 ```
+
+## Dict-valued fields
+
+A dotted path below a dict-valued field sets that one key and keeps the
+rest of the table, whether the TOML or the field's default holds it.
+With `[metrics.mlflow_tags]` holding `team = "kf"` and `stage = "one"`,
+`--metrics.mlflow_tags.stage=two` gives `{"team": "kf", "stage": "two"}`,
+and `--vlm.module_patterns.adapter="['adapter.*']"` changes the adapter's
+patterns and keeps the other modules'. A dict literal replaces the
+whole table: `--data.anneal_weights='{"c4":0.7,"books":0.3}'` drops any
+other key the TOML set.
 
 ## Boolean shorthand
 

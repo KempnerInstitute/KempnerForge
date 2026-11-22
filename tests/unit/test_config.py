@@ -1911,6 +1911,101 @@ class TestRegistry:
             assert callable(registry.get("norm", name))
 
 
+class TestDottedDictOverrides:
+    """A dotted CLI override below a dict-valued field sets one key and keeps the rest (#509)."""
+
+    _VLM = '[vision_encoder]\ntype = "random"\n\n[adapter]\ntype = "mlp_2layer"\n'
+
+    @staticmethod
+    def _tables_with(args: list[str]):
+        """An Optional and a nested dict field, which no built-in config has, after ``args``."""
+        from dataclasses import dataclass, field
+
+        @dataclass
+        class Tables:
+            optional: dict[str, str] | None = None
+            nested: dict[str, dict[str, int]] = field(
+                default_factory=lambda: {"a": {"x": 1, "y": 2}, "b": {"z": 3}}
+            )
+
+        return loader._apply_dict_to_dataclass(Tables(), _parse_cli_overrides(args))
+
+    @staticmethod
+    def _toml(tmp_path: Path, body: str) -> str:
+        path = tmp_path / "base.toml"
+        path.write_text(body)
+        return str(path)
+
+    def test_a_dotted_key_keeps_the_rest_of_a_toml_table(self, tmp_path):
+        path = self._toml(tmp_path, '[metrics.mlflow_tags]\nteam = "kf"\nstage = "one"\n')
+        tags = load_config(path, cli_args=["--metrics.mlflow_tags.stage=two"]).metrics.mlflow_tags
+        assert tags == {"team": "kf", "stage": "two"}
+        assert type(tags) is dict
+
+    def test_dotted_keys_set_and_add_keys_of_the_table(self, tmp_path):
+        path = self._toml(tmp_path, "[data.anneal_weights]\na = 0.5\nb = 0.5\n")
+        args = ["--data.anneal_weights.c=0.25", "--data.anneal_weights.a=0.9"]
+        weights = load_config(path, cli_args=args).data.anneal_weights
+        assert weights == {"a": 0.9, "b": 0.5, "c": 0.25}
+
+    def test_a_dict_literal_replaces_the_table(self, tmp_path):
+        path = self._toml(tmp_path, '[metrics.mlflow_tags]\nteam = "kf"\nstage = "one"\n')
+        override = "--metrics.mlflow_tags={'stage': 'two'}"
+        assert load_config(path, cli_args=[override]).metrics.mlflow_tags == {"stage": "two"}
+
+    def test_a_dotted_key_keeps_the_defaults_of_a_toml_vlm_section(self, tmp_path):
+        path = self._toml(tmp_path, self._VLM + '\n[vlm]\narch = "joint_decoder"\n')
+        defaults = load_config(path, cli_args=[]).vlm
+        assert defaults is not None and len(defaults.module_patterns) > 1
+        override = "--vlm.module_patterns.adapter=['adapter.*', 'extra.*']"
+        vlm = load_config(path, cli_args=[override]).vlm
+        assert vlm is not None
+        assert vlm.module_patterns == {
+            **defaults.module_patterns,
+            "adapter": ["adapter.*", "extra.*"],
+        }
+
+    def test_a_dotted_key_keeps_the_defaults_of_a_vlm_section_the_cli_builds(self, tmp_path):
+        path = self._toml(tmp_path, self._VLM)
+        defaults = load_config(path, cli_args=["--vlm.arch=mot"]).vlm
+        assert defaults is not None and "mot" in defaults.module_patterns
+        args = ["--vlm.arch=mot", "--vlm.module_patterns.adapter=['adapter.*']"]
+        vlm = load_config(path, cli_args=args).vlm
+        assert vlm is not None
+        assert vlm.module_patterns == {**defaults.module_patterns, "adapter": ["adapter.*"]}
+
+    def test_dotted_keys_merge_nested_tables_into_plain_dicts(self):
+        args = ["--nested.a.x=5", "--nested.b.w=4"]
+        tables = self._tables_with(args)
+        assert tables.nested == {"a": {"x": 5, "y": 2}, "b": {"z": 3, "w": 4}}
+        assert all(type(t) is dict for t in (tables.nested, *tables.nested.values()))
+
+    def test_an_optional_dict_left_at_none_takes_dotted_keys_as_a_plain_dict(self):
+        tables = self._tables_with(["--optional.k=v"])
+        assert tables.optional == {"k": "v"}
+        assert type(tables.optional) is dict
+
+    def test_a_given_table_does_not_build_the_field_default(self):
+        """A dataclass built from a dict reads a field's default only for dotted keys."""
+        from dataclasses import dataclass, field
+
+        def no_default() -> dict[str, str]:
+            raise AssertionError("the default was built")
+
+        @dataclass
+        class Raising:
+            table: dict[str, str] = field(default_factory=no_default)
+
+        for raw in ({"k": "v"}, _parse_cli_overrides(["--table={'k': 'v'}"])["table"]):
+            assert loader._instantiate_from_dict(Raising, {"table": raw}).table == {"k": "v"}
+
+    def test_dotted_keys_inside_an_earlier_literal_give_plain_dicts(self):
+        args = ["--nested={'a': {}}", "--nested.a.p.q=1", "--nested.c.d=2"]
+        tables = self._tables_with(args)
+        assert tables.nested == {"a": {"p": {"q": 1}}, "c": {"d": 2}}
+        assert type(tables.nested["a"]["p"]) is dict and type(tables.nested["c"]) is dict
+
+
 class TestEvalConfig:
     def test_defaults(self):
         ec = EvalConfig()

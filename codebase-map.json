@@ -250,8 +250,10 @@
       "functions": [
         "load_toml(path) -> dict",
         "load_config(config_path, cli_args) -> JobConfig",
-        "_parse_cli_overrides(args) -> dict",
+        "_parse_cli_overrides(args) -> dict (dotted paths build _DottedKeys)",
         "_apply_dict_to_dataclass(dc, data)",
+        "_with_dotted_keys(table, keys) -> dict (a dotted override's keys set on a dict-valued field's table, the rest kept)",
+        "_dict_field_value(raw, current) -> dict (a dotted override merges into current, a literal replaces it)",
         "_coerce_value(field_type, value)",
         "_get_type_hints(dc_type) -> dict"
       ],
@@ -259,6 +261,7 @@
         "tests/unit/test_config.py::TestTomlLoading",
         "tests/unit/test_config.py::TestCliOverrides",
         "tests/unit/test_config.py::TestCliParsing",
+        "tests/unit/test_config.py::TestDottedDictOverrides",
         "tests/unit/test_mixing.py::TestMixingTomlLoading",
         "tests/unit/test_annealing.py::TestAnnealingTomlLoading"
       ]
@@ -1562,9 +1565,10 @@
           "TestCliOverrides(11)",
           "TestCliParsing(6)",
           "TestRegistry(12)",
-          "TestEvalConfig(7)"
+          "TestEvalConfig(7)",
+          "TestDottedDictOverrides(9)"
         ],
-        "count": 107
+        "count": 116
       },
       "tests/unit/test_training.py": {
         "classes": [

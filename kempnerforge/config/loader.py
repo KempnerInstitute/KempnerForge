@@ -125,6 +125,40 @@ def _dataclass_type_from_hint(hint: Any) -> type | None:
     return None
 
 
+class _DottedKeys(dict):
+    """The keys a dotted CLI override names below a config field, unlike a dict literal.
+
+    ``_parse_cli_overrides`` builds these for dotted paths, so a dotted key below a
+    dict-valued field sets that key and keeps the rest of the field's table.
+    """
+
+
+def _with_dotted_keys(table: dict[str, Any], keys: dict[str, Any]) -> dict[str, Any]:
+    """``table`` with the keys a dotted override sets, the rest of it kept.
+
+    A dotted key below one of ``table``'s own tables sets that key in it in turn; any other
+    value, a dict literal included, replaces the one ``table`` holds. The result holds plain
+    dicts only.
+    """
+    merged = dict(table)
+    for key, value in keys.items():
+        if isinstance(value, dict):
+            below = merged.get(key) if isinstance(value, _DottedKeys) else None
+            value = _with_dotted_keys(below if isinstance(below, dict) else {}, value)
+        merged[key] = value
+    return merged
+
+
+def _dict_field_value(raw: dict[str, Any], current: Any) -> dict[str, Any]:
+    """The table a dict ``raw`` gives a field that holds ``current``.
+
+    A dotted override sets its keys in ``current``'s table and keeps the rest; a dict
+    literal, as from a TOML table, replaces it.
+    """
+    table = current if isinstance(raw, _DottedKeys) and isinstance(current, dict) else {}
+    return _with_dotted_keys(table, raw)
+
+
 def _instantiate_from_dict(dc_type: type, data: dict[str, Any]) -> Any:
     """Construct a dataclass directly from a dict, without first building a
     default instance.
@@ -157,6 +191,11 @@ def _instantiate_from_dict(dc_type: type, data: dict[str, Any]) -> Any:
         inner = _dataclass_type_from_hint(hint)
         if inner is not None and isinstance(raw, dict):
             kwargs[f.name] = _instantiate_from_dict(inner, raw)
+        elif isinstance(raw, dict):
+            default = None
+            if isinstance(raw, _DottedKeys):
+                default = f.default_factory() if callable(f.default_factory) else f.default
+            kwargs[f.name] = _coerce_value(hint, _dict_field_value(raw, default))
         else:
             kwargs[f.name] = _coerce_value(hint, raw)
     return dc_type(**kwargs)
@@ -213,6 +252,10 @@ def _apply_dict_to_dataclass(dc: Any, data: dict[str, Any]) -> Any:
             raw = data[f.name]
             if is_dataclass(current_val) and isinstance(raw, dict):
                 kwargs[f.name] = _apply_dict_to_dataclass(current_val, raw)
+            elif isinstance(raw, dict) and _dataclass_type_from_hint(type_hints[f.name]) is None:
+                kwargs[f.name] = _coerce_value(
+                    type_hints[f.name], _dict_field_value(raw, current_val)
+                )
             elif current_val is None and isinstance(raw, dict):
                 inner = _dataclass_type_from_hint(type_hints[f.name])
                 if inner is not None:
@@ -255,7 +298,7 @@ def _parse_cli_overrides(args: list[str]) -> dict[str, Any]:
         parts = key.split(".")
         d = overrides
         for part in parts[:-1]:
-            d = d.setdefault(part, {})
+            d = d.setdefault(part, _DottedKeys())
         d[parts[-1]] = value
 
     return overrides
