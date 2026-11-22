@@ -224,8 +224,9 @@ tokens_seen += tokens_in_step
 `result.tokens` counts every micro-step's positions, padding included; a
 VLM step also counts the image positions in the residual stream.
 
-`tokens_in_step` times all ranks in the data-parallel dimension, not the
-full `world_size` — TP, PP, and EP don't multiply unique tokens.
+`tokens_in_step` sums over the ranks of the data-parallel dimensions, not
+the full `world_size`: TP, PP and EP peers hold the same batch and count it
+once.
 
 ### 9 · Phase transitions
 

@@ -112,7 +112,7 @@ language model's as `train/mfu_vlm`:
 ```
 vision_flops = images_in_step * flops_per_image
 flops_per_image = f_enc * (2 * enc_params * enc_tokens + 4 * layers * enc_tokens**2 * hidden)
-                + f_adapter * 2 * adapter_params * adapter_tokens
+                + f_adapter * adapter.forward_flops(enc_tokens)
 ```
 
 `f` is 3 for a module with a trainable parameter (forward and backward) and
@@ -120,10 +120,10 @@ flops_per_image = f_enc * (2 * enc_params * enc_tokens + 4 * layers * enc_tokens
 stage that fires after the step changes the next step's count. `enc_tokens`
 is the encoder's `num_tokens`; the attention term needs the layers and width
 of the encoder's `vision_tower` config, which the Hugging Face encoders
-have, and is zero without them. `adapter_tokens` is the adapter's
-`output_num_tokens`, since a pooling adapter projects after it pools; the
-attentional pool's key and value projections over the window inputs count
-at that rate too, so its share is an underestimate. The images are summed
+have, and is zero without them. `VisionAdapter.forward_flops` counts each
+projection over the tokens it sees, `2 * params` per output token by
+default (a pooling adapter projects after it pools), and the attentional
+pool's key and value projections over every padded window input. The images are summed
 over the data-parallel ranks, in the same reduction as the step's tokens
 (`vision_flops_per_image` in `kempnerforge/metrics/mfu.py`).
 

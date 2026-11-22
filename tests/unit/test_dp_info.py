@@ -481,7 +481,9 @@ def _check_mixed_reports(rank: int, world: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def _check_missing_text_tokens(rank: int, world: int, port: int) -> None:
+def _check_missing_text_tokens(
+    rank: int, world: int, port: int, names: tuple, sizes: tuple
+) -> None:
     """A VLM step body that reports no text tokens on one rank fails every rank, none waiting:
     the ranks vote over the loop's control group, which spans the whole job."""
     from kempnerforge.config.schema import AdapterConfig, VisionEncoderConfig, VLMConfig
@@ -490,7 +492,7 @@ def _check_missing_text_tokens(rank: int, world: int, port: int) -> None:
 
     _init(rank, world, port)
     try:
-        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp_shard",))
+        mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         runtime = RuntimeContext(
             rank=rank,
             local_rank=rank,
@@ -544,6 +546,62 @@ def _check_partial_reports(rank: int, world: int, port: int) -> None:
         session.tracker.log_eval = lambda m, s: logged.update(m)
         _log_periodic_metrics(session, result, 1)
         assert logged == {"data/a/tokens": 3.0}, (rank, logged)
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_vlm_partial_loop(rank: int, world: int, port: int) -> None:
+    """A VLM step loop in which one rank's step body reports the optional counts and the
+    other's leaves them out: both ranks publish them, count the documents, save them and
+    hand the tracker the same vision FLOPs."""
+    import kempnerforge.training.loop as loop
+    from kempnerforge.config.schema import AdapterConfig, VisionEncoderConfig, VLMConfig
+    from kempnerforge.training.loop import StepResult, run_training_loop
+    from tests.unit.test_train_entry import make_config, make_session
+
+    _init(rank, world, port)
+    try:
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp_shard",))
+        runtime = RuntimeContext(
+            rank=rank,
+            local_rank=rank,
+            world_size=world,
+            device=torch.device("cpu"),
+            device_mesh=mesh,
+        )
+        config = make_config(max_steps=1)
+        config.metrics.log_interval = 1
+        config.vision_encoder = VisionEncoderConfig(type="random", feature_dim=8, num_tokens=8)
+        config.adapter = AdapterConfig()
+        config.vlm = VLMConfig(max_text_len=4)
+
+        def step_fn(_session, _step):
+            if rank == 1:
+                return StepResult(
+                    loss=1.0,
+                    grad_norm=0.5,
+                    text_tokens=4,
+                    documents=3,
+                    image_tokens=24,
+                    document_text_tokens=9,
+                    encoder_images=3,
+                )
+            return StepResult(loss=1.0, grad_norm=0.5, text_tokens=4)
+
+        session = make_session(config, runtime=runtime, step_fn=step_fn)
+        logged: dict = {}
+        session.tracker.log_eval = lambda m, s: logged.update(m)
+        flops: list = []
+        end_step = session.tracker.end_step
+        session.tracker.end_step = lambda **k: (flops.append(k["vision_flops"]), end_step(**k))[1]
+        loop.vision_flops_per_image = lambda _model: 10.0
+        run_training_loop(session)
+        published = (logged["data/documents_seen"], logged["data/image_tokens"])
+        assert published == (3.0, 24.0), (rank, logged)
+        assert logged["data/text_tokens"] == 9.0, (rank, logged)
+        assert session.documents_seen == 3, rank
+        assert session.checkpointer.saves[-1][2]["documents_seen"] == 3, rank
+        assert flops == [3 * 10.0], (rank, flops)
     finally:
         dist.destroy_process_group()
 
@@ -602,8 +660,14 @@ class TestLoggedMetricsOverDataParallel:
     def test_counts_one_rank_reports_reach_every_rank(self):
         mp.spawn(_check_partial_reports, args=(2, _free_port()), nprocs=2)
 
-    def test_a_missing_text_token_count_fails_every_rank(self):
-        mp.spawn(_check_missing_text_tokens, args=(2, _free_port()), nprocs=2)
+    @pytest.mark.parametrize("mesh", sorted(MESHES_OF_TWO))
+    def test_a_missing_text_token_count_fails_every_rank(self, mesh):
+        """Also between tensor-parallel peers of one DP rank, whom the DP groups leave out."""
+        names, sizes = MESHES_OF_TWO[mesh]
+        mp.spawn(_check_missing_text_tokens, args=(2, _free_port(), names, sizes), nprocs=2)
+
+    def test_a_vlm_loop_publishes_the_counts_one_rank_reports(self):
+        mp.spawn(_check_vlm_partial_loop, args=(2, _free_port()), nprocs=2)
 
     @pytest.mark.parametrize("mesh", sorted(MESHES_OF_TWO))
     def test_vlm_text_tokens_count_each_dp_rank_once(self, mesh):
