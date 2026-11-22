@@ -23,7 +23,7 @@ def _ensure_init(self) -> None:
         from torch.utils.tensorboard import SummaryWriter
         self._writer = SummaryWriter(log_dir=self._config.tensorboard_dir)
     except ImportError:
-        logger.warning("tensorboard not installed — disabling TensorBoard backend")
+        logger.warning("tensorboard not installed; disabling TensorBoard backend")
         self._writer = False
 ```
 

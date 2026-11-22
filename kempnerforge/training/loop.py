@@ -652,7 +652,7 @@ def _shutdown_if_requested(
             "neither become `latest` nor count toward `checkpoint.keep_last_n`"
         )
     else:
-        logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
+        logger.warning(f"Shutdown requested at step {step}; saving emergency checkpoint")
         ckpt_mgr.save(
             step=step,
             tokens_seen=tokens_seen,
@@ -737,7 +737,7 @@ def run_training_loop(
             if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
                 optimizer.zero_grad()
                 if session.nan_detector.should_rollback:
-                    logger.error("Too many consecutive NaNs — stopping")
+                    logger.error("Too many consecutive NaNs; stopping")
                     break
                 _advance_lr_schedule(session)
                 step += 1
@@ -787,7 +787,7 @@ def run_training_loop(
                 and step % tc.nccl_health_check_interval == 0
                 and any_rank(not check_nccl_health(), session.control_group)
             ):
-                logger.error(f"NCCL health check failed at step {step} — stopping")
+                logger.error(f"NCCL health check failed at step {step}; stopping")
                 nccl_failed_at = step
                 break
 

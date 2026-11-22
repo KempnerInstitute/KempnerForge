@@ -36,7 +36,7 @@ The training loop reacts:
 - Zeros gradients and skips the optimizer step (in the loop, right
   after `check_loss` returns False — preserves last-good weights)
 - When `nan_detector.should_rollback` becomes true (consecutive count
-  ≥ `max_consecutive`), rank 0 logs `"Too many consecutive NaNs — stopping"`
+  ≥ `max_consecutive`), rank 0 logs `"Too many consecutive NaNs; stopping"`
   and breaks the loop
 
 You still need to act — the detector doesn't roll back, it just keeps
@@ -151,7 +151,7 @@ nccl_health_check_interval = 100   # all-reduce sanity every 100 steps
 
 Every 100 steps, every rank contributes a tensor of ones to a tiny
 all-reduce. If the sum ≠ `world_size`, the training loop logs
-`"NCCL health check failed at step <N> — stopping"` and breaks.
+`"NCCL health check failed at step <N>; stopping"` and breaks.
 See
 [Resilience § NCCL liveness](../resilience/nccl-liveness.md#periodic-check-in-the-loop).
 

@@ -84,7 +84,7 @@ def _set_nccl_env() -> None:
     existing = os.environ.get("TORCH_NCCL_ASYNC_ERROR_HANDLING")
     if existing == "0":
         logger.warning(
-            "TORCH_NCCL_ASYNC_ERROR_HANDLING=0 detected — NCCL timeouts "
+            "TORCH_NCCL_ASYNC_ERROR_HANDLING=0 detected: NCCL timeouts "
             "are advisory; stuck collectives can hang indefinitely."
         )
     else:

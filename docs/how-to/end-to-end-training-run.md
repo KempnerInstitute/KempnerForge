@@ -114,8 +114,8 @@ kill -TERM <pid>
 Expected rank-0 log:
 
 ```
-Shutdown requested at step 247 — saving emergency checkpoint
-Emergency checkpoint written to checkpoints/hf_wikitext/step_247
+Shutdown requested at step 247; saving emergency checkpoint
+Checkpoint committed: checkpoints/hf_wikitext/step_247 (step=247)
 ```
 
 If you just hit `Ctrl+C`, you'll resume from the last periodic save

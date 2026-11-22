@@ -1442,7 +1442,7 @@ class CheckpointManager:
             requested = path if path is not None else self.config.load_path
             if requested:
                 raise FileNotFoundError(f"Checkpoint not found: {requested}")
-            logger.info("No checkpoint found — starting from scratch")
+            logger.info("No checkpoint found; starting from scratch")
             return 0, 0, {}
 
         will_load_dcp = (
@@ -1495,7 +1495,7 @@ class CheckpointManager:
                         )
                         if getattr(self.config, "ignore_freeze_mismatch", False):
                             logger.warning(
-                                msg + " — proceeding because checkpoint.ignore_freeze_mismatch=True"
+                                msg + "; proceeding because checkpoint.ignore_freeze_mismatch=True"
                             )
                         else:
                             raise ValueError(

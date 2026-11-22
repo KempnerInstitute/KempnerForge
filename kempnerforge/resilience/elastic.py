@@ -190,7 +190,7 @@ def resolve_resume_path(
             )
             continue
         logger.warning(
-            f"Auto-resume: skipping {path} — no DCP .metadata, so the save that "
+            f"Auto-resume: skipping {path}: no DCP .metadata, so the save that "
             f"produced it did not complete"
         )
 
@@ -227,4 +227,4 @@ def log_job_info() -> None:
     )
 
     if info.is_requeued:
-        logger.info(f"Job was requeued (restart #{info.restart_count}) — will auto-resume")
+        logger.info(f"Job was requeued (restart #{info.restart_count}); will auto-resume")
