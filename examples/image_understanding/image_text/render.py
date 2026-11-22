@@ -64,7 +64,9 @@ class ChatRenderer:
     templated text, each where the template of the turns before it ends, so a user
     message that quotes a reply is not mistaken for it. What the template writes
     between the assistant header and a reply (an empty think block, for instance)
-    is trained only with ``train_reply_prefix``.
+    is trained only with ``train_reply_prefix``. The first user message follows the
+    image placeholders after a space, and with ``lead_space`` starts with that space
+    even when there are no placeholders.
     Leading newlines of a reply are dropped, as the template drops them. A document
     whose replies are all blank, a reply that carries template text (``turn_start``,
     ``turn_end`` or a think tag), or replies that ``max_text_len`` cuts away
@@ -85,6 +87,7 @@ class ChatRenderer:
         tile_global: bool = True,
         train_reply_prefix: bool = False,
         image_placeholder: str = "",
+        lead_space: bool = False,
         turn_start: str = "<|im_start|>",
         turn_end: str = "<|im_end|>",
         image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
@@ -107,6 +110,7 @@ class ChatRenderer:
         self.tile_global = tile_global
         self.train_reply_prefix = train_reply_prefix
         self.image_placeholder = image_placeholder
+        self.lead_space = lead_space
         self.turn_end = turn_end
         self.image_mean = image_mean
         self.image_std = image_std
@@ -159,7 +163,7 @@ class ChatRenderer:
         answers = self._replies(document, answers)
         placeholders = self.image_placeholder * len(document.images)
         first_user = document.turns[0].user
-        if placeholders:
+        if placeholders or self.lead_space:
             first_user = f"{placeholders} {first_user}"
         if document.kind == "qa":
             prompt = self._template(

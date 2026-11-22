@@ -1,0 +1,94 @@
+[render]
+answer_only = true
+train_reply_prefix = true
+lead_space = true
+
+[packing]
+view_groups = true
+
+[[source]]
+reader = "coco_captions"
+repeat = 10
+annotation_file = "path-to-testbed/annotations/coco-captions/raw/coco_karpathy_train.json"
+image_root = "path-to-testbed/vision/coco/raw"
+prompt = "Provide a short caption for the image."
+
+[[source]]
+reader = "vqav2"
+repeat = 10
+annotation_file = "path-to-testbed/annotations/vqav2/raw/vqa_train.json"
+image_root = "path-to-testbed/vision/coco/raw"
+
+[[source]]
+name = "chartqa_human"
+reader = "chartqa"
+repeat = 10
+annotation_file = "path-to-testbed/annotations/ChartQA/ChartQA_Dataset/train/train_human.json"
+image_root = "path-to-testbed/annotations/ChartQA/ChartQA_Dataset/train/png"
+
+[[source]]
+name = "chartqa_augmented"
+reader = "chartqa"
+repeat = 10
+annotation_file = "path-to-testbed/annotations/ChartQA/ChartQA_Dataset/train/train_augmented.json"
+image_root = "path-to-testbed/annotations/ChartQA/ChartQA_Dataset/train/png"
+
+[[source]]
+reader = "docvqa"
+repeat = 10
+annotation_file = "path-to-testbed/annotations/DocVQA/train_v1.0_withQT.json"
+image_root = "path-to-testbed/annotations/DocVQA"
+
+[[source]]
+reader = "textvqa"
+repeat = 10
+annotation_file = "path-to-testbed/annotations/TextVQA/TextVQA_0.5.1_train.json"
+image_root = "path-to-testbed/annotations/TextVQA/train_images"
+
+[[source]]
+reader = "pixmo_captions"
+annotation_file = "path-to-testbed/annotations/cap/raw/train.jsonl"
+image_root = "path-to-testbed/vision/pixmo"
+prompt = "Provide a short caption for the image."
+
+[[source]]
+reader = "pixmo_cap_qa"
+repeat = 2
+annotation_file = "path-to-testbed/annotations/cap-qa/raw/train.jsonl"
+image_root = "path-to-testbed/vision/pixmo"
+
+[[source]]
+reader = "pixmo_pointing"
+repeat = 2
+annotation_file = "path-to-testbed/annotations/points-pointing/raw/train.jsonl"
+image_root = "path-to-testbed/vision/pixmo"
+max_points = 30
+
+[[source]]
+name = "pixmo_points_counting"
+reader = "pixmo_counting"
+repeat = 3
+annotation_file = "path-to-testbed/annotations/points-counting/raw/train.jsonl"
+image_root = "path-to-testbed/vision/pixmo"
+multi_label = true
+max_points = 30
+
+[[source]]
+reader = "pixmo_point_explanations"
+repeat = 5
+annotation_file = "path-to-testbed/annotations/point-explanations/raw/train.jsonl"
+image_root = "path-to-testbed/vision/pixmo"
+
+[[source]]
+name = "pixmo_count"
+reader = "pixmo_counting"
+repeat = 20
+annotation_file = "path-to-testbed/annotations/count/raw/train.jsonl"
+image_root = "path-to-testbed/vision/pixmo"
+multi_label = false
+max_points = 30
+
+[[source]]
+reader = "finevision"
+root = "path-to-FineVision-arrow"
+exclude = ["a_okvqa", "aokvqa", "text_mathqa", "text_numinamath_cot", "text_openorca"]

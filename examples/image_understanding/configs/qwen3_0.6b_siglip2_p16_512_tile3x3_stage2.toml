@@ -1,0 +1,89 @@
+[model]
+dim = 1024
+n_layers = 28
+n_heads = 16
+n_kv_heads = 8
+head_dim_override = 128
+vocab_size = 151936
+ffn_hidden_dim = 3072
+norm_type = "rmsnorm"
+norm_eps = 1e-6
+activation = "silu"
+qk_norm = true
+rope_theta = 1000000.0
+tie_embeddings = false
+max_seq_len = 16384
+attention_backend = "flex"
+
+[vision_encoder]
+type = "siglip2"
+path = "google/siglip2-so400m-patch16-512"
+mixed_precision = "bf16"
+
+[adapter]
+type = "avgpool"
+pool_window = 2
+hidden_dim = 1152
+activation = "gelu"
+pre_norm = "rmsnorm"
+
+[vlm]
+arch = "joint_decoder"
+tile_grid = 3
+tile_global = true
+freeze = []
+
+[data]
+tokenizer_path = "Qwen/Qwen3-0.6B"
+hf_image_size = 512
+pack_sequences = true
+num_workers = 12
+prefetch_factor = 16
+pin_memory = true
+
+[train]
+batch_size = 1
+seq_len = 16384
+max_steps = 90000
+grad_accum_steps = 2
+grad_clip_norm = inf
+seed = 1
+compile_model = false
+activation_checkpointing = "none"
+
+[distributed]
+dp_shard = 4
+dp_replicate = 4
+
+[optimizer]
+name = "muon"
+lr = 5e-5
+weight_decay = 0.01
+betas = [0.9, 0.999]
+eps = 1e-8
+weight_decay_scope = "all"
+muon_momentum = 0.95
+muon_ns_steps = 5
+muon_nesterov = true
+muon_adjust_lr = "match_rms_adamw"
+muon_orthogonalize = "exact"
+lr_multipliers = { vision_encoder = 0.2, adapter = 0.2 }
+
+[scheduler]
+name = "cosine"
+warmup_steps = 6000
+warmup_start_factor = 5e-4
+min_lr_ratio = 0.1
+
+[checkpoint]
+dir = "path-to-output-dir"
+load_path = "path-to-converted-stage-1-checkpoint"
+exclude_from_loading = ["optimizer", "train_state"]
+interval = 1000
+keep_last_n = 0
+
+[metrics]
+log_interval = 20
+enable_wandb = false
+enable_tensorboard = true
+tensorboard_dir = "path-to-tensorboard-dir"

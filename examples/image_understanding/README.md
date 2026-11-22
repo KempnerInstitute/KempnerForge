@@ -13,14 +13,20 @@ never imports it, so this directory can be deleted without touching the core.
 examples/image_understanding/
 ├── README.md
 ├── train.py              # training entry point
+├── mixture.py            # packed loader over a mixture of image-text sources
 ├── configs/
-│   └── eval_tasks.toml   # sample evaluation tasks, with placeholder paths
+│   ├── eval_tasks.toml   # sample evaluation tasks, with placeholder paths
+│   └── qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml  # stage 2 on the packed mixture
+├── mixtures/
+│   └── stage2_testbed_finevision_pixmo_text.toml  # its sources, with placeholder paths
 ├── evaluation/           # evaluation tasks and answer scorers (below)
 ├── image_text/           # image-text dataset readers and chat renderer (below)
 ├── scripts/
-│   └── convert_finevision_to_arrow.py  # FineVision parquet -> memory-mappable Arrow
+│   ├── convert_finevision_to_arrow.py  # FineVision parquet -> memory-mappable Arrow
+│   └── convert_pt_checkpoint.py        # a .pt joint-decoder checkpoint -> DCP
 └── tests/
     ├── test_image_understanding_entry.py   # the entry point loads a config and hands it off
+    ├── test_convert_pt_checkpoint.py       # the .pt checkpoint converter
     ├── evaluation/       # task-file and scorer tests (CPU)
     └── image_text/       # reader and renderer tests (CPU)
 ```
@@ -36,11 +42,10 @@ uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py \
     --checkpoint.load_path=/your/init/checkpoint --checkpoint.dir=/your/run/dir
 ```
 
-The recipe's stage presets are not here yet. They need the roadmap below first
-(the typed stage contract fixes their fields, and the readers, packing, tiling
-and per-module learning rates fix their values), so they arrive with those
-changes rather than as placeholders that would be rewritten by each one.
-Until then, write a config the way the [VLM example](../vlm/README.md) does,
+`--mixture=<mixture.toml>` trains on a packed mixture of the image-text readers
+below instead of the `[data]` source; see [Stage 2 on the packed
+mixture](#stage-2-on-the-packed-mixture) for the one preset here. For other
+runs, write a config the way the [VLM example](../vlm/README.md) does,
 with `vlm.arch = "joint_decoder"`, `vision_encoder.type = "siglip2"` and
 `adapter.type = "avgpool"`. The geometry is the recipe's: a 512 px view is
 32 × 32 = 1024 patch tokens, pooled 2 × 2 to 256 visual tokens, plus
@@ -299,6 +304,46 @@ and the optimizer starts fresh. Stage 2 starts from a stage-1 checkpoint as
 weights alone with `checkpoint.exclude_from_loading = ["optimizer", "train_state"]`,
 so its step and schedule start again from 0.
 
+## Stage 2 on the packed mixture
+
+`configs/qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml` trains every module of
+Qwen3-0.6B with SigLIP2 so400m/16 at 512 px. Each image is cut into a 3 × 3 grid
+of 512 px views after the whole image, and each view is pooled 2 × 2 to 256
+tokens, so an image takes 2560 positions. Rows are 16384 positions, two
+micro-batches per step, on 16 GPUs (`dp_replicate = 4` × `dp_shard = 4`), which
+is 524,288 positions a step for 90,000 steps. The optimizer is Muon with Nesterov
+momentum, updates scaled to AdamW's RMS (`match_rms_adamw`) and orthogonalized
+over whole matrices (`exact`), AdamW for the embeddings, the output head and the
+other non-matrix parameters, weight decay 0.01 on every parameter, a learning
+rate of 5e-5 for the backbone and 1e-5 for the encoder and the connector,
+6000 warmup steps from 5e-4 of it, then cosine to a tenth. Gradients are not
+clipped (`grad_clip_norm = inf`).
+
+`mixtures/stage2_testbed_finevision_pixmo_text.toml` lists its sources: COCO
+captions, VQAv2, ChartQA (human and augmented), DocVQA and TextVQA ten times
+each, the PixMo sources with their own repeats, and every FineVision subset of
+the Arrow copy once, the `text_*` ones included, less `a_okvqa` and `aokvqa`
+(they overlap the A-OKVQA evaluation) and three long chain-of-thought text
+subsets. Replace `path-to-testbed` with the root holding `annotations/` and
+`vision/`, and `path-to-FineVision-arrow` with the converted copy. Replies are
+trained with the empty think block before them (`train_reply_prefix`), each
+prompt starts with a space (`lead_space`), and each view's tokens attend to each
+other in both directions (`view_groups`).
+
+The run starts from a stage-1 checkpoint saved as one `.pt` state dict, written
+as a DCP for this config first:
+
+```bash
+uv run python examples/image_understanding/scripts/convert_pt_checkpoint.py \
+    --checkpoint path-to-stage-1.pt \
+    --config examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml \
+    --out /your/init/checkpoint
+uv run torchrun --nnodes=4 --nproc_per_node=4 examples/image_understanding/train.py \
+    examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml \
+    --mixture=examples/image_understanding/mixtures/stage2_testbed_finevision_pixmo_text.toml \
+    --checkpoint.load_path=/your/init/checkpoint --checkpoint.dir=/your/run/dir
+```
+
 ## Evaluation tasks and scorers
 
 `evaluation/` holds what an evaluation run is made of: the tasks to run and the
@@ -372,8 +417,7 @@ What the recipe still needs. Each lands as its own change in this directory,
 or in core where it belongs:
 
 - Training sources (COCO, VQAv2, TextVQA, DocVQA, ChartQA, PixMo, FineVision,
-  DataComp), chat-template rendering with the loss on the assistant turns only,
-  and the mixture loader
+  DataComp), chat-template rendering with the loss on the assistant turns only
 - Typed stage contract and pinned source manifest, which fix the stage presets
 - Per-module learning rates and schedules
 - Evaluation: the evaluator that runs the tasks on a saved checkpoint, periodic
