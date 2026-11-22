@@ -576,12 +576,7 @@ def checkpoint_extra(config: JobConfig, step: int, phases: PhaseState) -> dict:
 def _logged_time(tracker: MetricsTracker, key: str, step: int) -> Iterator[None]:
     """Log the time the block takes as the metric ``key`` of ``step``.
 
-    The loop wraps every checkpoint save in it as ``checkpoint/save_sec`` (for an
-    async save, the wait for the previous upload, the staging and the dispatch; the
-    upload itself runs in the background) and every drain of an async save as
-    ``checkpoint/wait_sec``; the drain at the end of the run is timed only when a save
-    is pending, so it adds no second, empty wait to a step already drained. Nothing
-    is logged when the block raises.
+    Nothing is logged when the block raises.
     """
     start = time.perf_counter()
     yield

@@ -4306,6 +4306,20 @@ class TestPerDatasetMetrics:
         ds = [m for m in logged if any(k.startswith("loss/") for k in m)][0]
         assert set(ds) == {"loss/a", "data/a/tokens"}
 
+    def test_a_step_body_without_losses_logs_the_token_counts(self):
+        """A custom step body may report a source's tokens without its loss."""
+        from kempnerforge.training.loop import StepResult
+
+        session, logged = self._mixture_session()
+
+        def tokens_only(session, step):
+            return StepResult(loss=1.0, grad_norm=0.0, dataset_tokens=torch.tensor([3, 0]))
+
+        session.step_fn = tokens_only
+        run_training_loop(session)
+        ds = [m for m in logged if any(k.startswith("data/a/") for k in m)][0]
+        assert ds == {"data/a/tokens": 3.0}
+
     @staticmethod
     def _random_batch(sources: list[int], seed: int) -> dict[str, torch.Tensor]:
         """Four rows of four tokens from ``sources``; row 0's first label is -100."""
