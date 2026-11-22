@@ -346,6 +346,17 @@ class Transformer(nn.Module):
             if isinstance(mlp.router, SigmoidTopKRouter):
                 mlp.router.pending_counts.zero_()
 
+    def detach_router_losses(self) -> None:
+        """Detach every router's ``aux_loss`` and ``z_loss`` once the loss holds what it uses.
+
+        A term the loss leaves out, such as the z-loss at weight 0, would otherwise keep
+        its graph until the next forward, and with it, under activation checkpointing, the
+        inputs of every checkpointed block. The detached values still serve the metrics.
+        """
+        for _, _, mlp in self._moe_mlps():
+            mlp.router.aux_loss = mlp.aux_loss.detach()
+            mlp.router.z_loss = mlp.z_loss.detach()
+
     def get_moe_aux_loss(self) -> torch.Tensor:
         """Sum the auxiliary losses of every MoE router. Returns 0 if dense.
 

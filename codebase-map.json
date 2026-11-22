@@ -282,6 +282,7 @@
             "get_mot_expert_counts()",
             "set_moe_step(step, max_steps)",
             "balance_routers() (one all-reduce of every sigmoid router's pending counts, then balance; every rank calls it after optimizer.step)",
+            "detach_router_losses() (detaches every router's aux_loss and z_loss once the loss holds them)",
             "discard_router_counts()"
           ]
         }
@@ -633,6 +634,13 @@
             "forward(x)"
           ]
         },
+        "Recomputing": {
+          "purpose": "Context of an activation-checkpoint recompute: routers compute as in the forward but set no attribute and count no token; enters the selective-checkpoint context inside; re-enterable",
+          "methods": [
+            "__enter__()",
+            "__exit__(*exc)"
+          ]
+        },
         "SigmoidTopKRouter": {
           "purpose": "DeepSeek-V3 style sigmoid router: expert_bias frozen to the optimizer (always_frozen), balanced once per optimizer step from pending_counts; adaptive scheduling, sequence aux loss",
           "properties": [
@@ -663,7 +671,9 @@
         "tests/unit/test_moe.py::TestSigmoidTopKRouter",
         "tests/unit/test_moe.py::TestSigmoidMoEIntegration",
         "tests/unit/test_router_balance.py",
-        "tests/distributed/test_router_balance.py"
+        "tests/distributed/test_router_balance.py",
+        "tests/unit/test_activation_checkpointing.py::TestRecomputing",
+        "tests/unit/test_activation_checkpointing.py::TestMoERecompute"
       ]
     },
     "kempnerforge/model/generate.py": {
@@ -1123,6 +1133,8 @@
         "apply_ac(model, mode) -> int",
         "_ac_blocks(model) -> list[tuple[nn.ModuleDict, str]]",
         "_is_checkpointed(module) -> bool",
+        "_routing_contexts() -> (forward, recompute) contexts (the recompute takes the forward's aten.topk outputs and runs as a Recomputing)",
+        "_RoutingCheckpointWrapper (CheckpointWrapper of a block holding an MoEMLP under full AC; runs eagerly under torch.compile)",
         "apply_float8(model, enable_fsdp_float8_all_gather)",
         "apply_fsdp2(model, device_mesh, mp_policy, reshard_after_forward) (text-only path; shares _fsdp_wrap_transformer_blocks with VLM)",
         "_apply_fsdp_vlm(wrapper, device_mesh, mp_policy, reshard_after_forward) (VLM-aware FSDP: inner Transformer per-block + adapter + optional encoder wrap based on freeze)",
@@ -1144,7 +1156,10 @@
         "tests/unit/test_activation_checkpointing.py::TestWhatGetsWrapped",
         "tests/unit/test_activation_checkpointing.py::TestCheckpointingTakesEffect",
         "tests/unit/test_activation_checkpointing.py::TestLogging",
-        "tests/unit/test_activation_checkpointing.py::TestUnderFsdp2"
+        "tests/unit/test_activation_checkpointing.py::TestUnderFsdp2",
+        "tests/unit/test_activation_checkpointing.py::TestMoERecompute",
+        "tests/distributed/test_ac_moe_recompute.py",
+        "tests/integration/test_compile.py::TestCompiledMoECheckpointing"
       ]
     },
     "kempnerforge/distributed/tensor_parallel.py": {
@@ -2017,9 +2032,10 @@
       },
       "tests/integration/test_compile.py": {
         "classes": [
-          "TestCompileCorrectness(3)"
+          "TestCompileCorrectness(3)",
+          "TestCompiledMoECheckpointing(1)"
         ],
-        "count": 3
+        "count": 4
       },
       "tests/integration/test_vlm_train_step.py": {
         "classes": [
@@ -2090,6 +2106,9 @@
       },
       "tests/distributed/test_router_balance.py": {
         "note": "Sigmoid router balancing on four GPUs under FSDP2 (even and uneven shards), HSDP, TP and EP: one all-reduce, the reference rule, the same bias on every rank, which the next forward routes with; a resume from a checkpoint without the FP32 masters, eager and compiled; and saved masters resumed exactly on another mesh (FSDP2 to HSDP)"
+      },
+      "tests/distributed/test_ac_moe_recompute.py": {
+        "note": "Full activation checkpointing of MoE blocks on four GPUs (FSDP2, HSDP, TP, EP; text and MoT; both routers; fp32 and bf16): trains like none, and the recompute replaces no router attribute and counts no token twice"
       },
       "tests/distributed/test_optimizer_distributed.py": {
         "note": "Lion, Schedule-Free AdamW, optimizer-scheduler compat under FSDP2"

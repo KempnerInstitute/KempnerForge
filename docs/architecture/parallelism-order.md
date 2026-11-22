@@ -94,6 +94,18 @@ and that op has no sharding strategy yet.
 `selective`, the balanced trade-off) in `CheckpointWrapper`. Mode
 `none` is a no-op.
 
+Under `full`, a block that holds an `MoEMLP` gets a wrapper whose
+recompute takes the routers' `torch.topk` outputs from the forward
+instead of computing them again, so it routes every token as the forward
+did even where the GPU computes the scores a little differently, and
+leaves the routers' `aux_loss`, `z_loss`, `expert_counts` and
+`pending_counts` as the forward set them. Under `torch.compile` that
+block runs eagerly, since the saved top-k outputs come from the eager
+ops only and the recompute runs eagerly in any case. The recompute uses
+the saved outputs up, so a forward's graph through such a block takes one
+backward: a second one, after `backward(retain_graph=True)`, raises. The
+training loop runs one.
+
 AC must run **before** FSDP2. FSDP2 bucketizes parameters at the
 `fully_shard` boundary; wrapping a layer in `CheckpointWrapper` *after*
 FSDP has taken ownership of its parameters breaks the bucket layout and

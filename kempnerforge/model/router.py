@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Collection
+from contextlib import AbstractContextManager, nullcontext
+from contextvars import ContextVar, Token
 from typing import Any
 
 import torch
@@ -13,6 +15,39 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 
 from kempnerforge.config.registry import registry
 
+_RECOMPUTING: ContextVar[bool] = ContextVar("kempnerforge_router_recomputing", default=False)
+
+
+class Recomputing:
+    """Mark the recompute of an activation-checkpointed block, which routers leave no trace of.
+
+    The backward of a checkpointed block runs its forward again to rebuild the activations
+    it did not keep. In this context a router computes what it computed in the forward, so
+    that the rebuilt activations match, but sets no attribute and counts no token: its
+    ``aux_loss``, ``z_loss`` and ``expert_counts`` stay those of the forward, whose loss
+    the backward differentiates, and the sigmoid router's ``pending_counts`` count each
+    token once. ``inner`` is entered inside it, as the selective-checkpoint context that
+    hands the recompute the forward's top-k routing. It can be entered more than once.
+    """
+
+    def __init__(self, inner: AbstractContextManager[Any] | None = None) -> None:
+        self._inner = inner if inner is not None else nullcontext()
+        self._tokens: list[Token[bool]] = []
+
+    def __enter__(self) -> None:
+        self._tokens.append(_RECOMPUTING.set(True))
+        try:
+            self._inner.__enter__()
+        except BaseException:
+            _RECOMPUTING.reset(self._tokens.pop())
+            raise
+
+    def __exit__(self, *exc: Any) -> None:
+        try:
+            self._inner.__exit__(*exc)
+        finally:
+            _RECOMPUTING.reset(self._tokens.pop())
+
 
 class SoftmaxTopKRouter(nn.Module):
     """Mixtral-style softmax top-k router with auxiliary load-balancing loss.
@@ -21,7 +56,8 @@ class SoftmaxTopKRouter(nn.Module):
     softmax-normalized, then renormalized over the selected top_k.
 
     Stores ``aux_loss`` and ``expert_counts`` as side effects of each forward
-    call for collection by the training loop and metrics.
+    call for collection by the training loop and metrics, except in the recompute
+    of an activation-checkpointed block (see ``Recomputing``).
     """
 
     def __init__(self, dim: int, num_experts: int, top_k: int) -> None:
@@ -59,11 +95,13 @@ class SoftmaxTopKRouter(nn.Module):
         p = probs.mean(dim=0)
 
         if num_tokens == 0:
-            self.aux_loss = self.z_loss = logits.sum() * 0
+            aux_loss = z_loss = logits.sum() * 0
         else:
-            self.aux_loss = self.num_experts * (f * p).sum()
-            self.z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
-        self.expert_counts = tokens_per_expert.detach()
+            aux_loss = self.num_experts * (f * p).sum()
+            z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
+        if not _RECOMPUTING.get():
+            self.aux_loss, self.z_loss = aux_loss, z_loss
+            self.expert_counts = tokens_per_expert.detach()
 
         return weights, indices
 
@@ -80,8 +118,10 @@ class SigmoidTopKRouter(nn.Module):
     The bias adjustment nudges under-utilized experts up and over-utilized
     experts down, achieving balance without interfering with the main loss
     gradient signal. A training forward adds its expert counts to
-    ``pending_counts``, which ``balance`` consumes. ``derived_buffers`` names the
-    buffers a load derives from the other state when a checkpoint lacks them.
+    ``pending_counts``, which ``balance`` consumes; the recompute of an
+    activation-checkpointed block does not (see ``Recomputing``).
+    ``derived_buffers`` names the buffers a load derives from the other state
+    when a checkpoint lacks them.
 
     ``always_frozen`` names the parameters that ``freeze_params`` never unfreezes.
 
@@ -263,24 +303,24 @@ class SigmoidTopKRouter(nn.Module):
         num_tokens = x.shape[0]
         one_hot = F.one_hot(indices, num_classes=self.num_experts).float()
         tokens_per_expert = one_hot.sum(dim=(0, 1))
-        self.expert_counts = tokens_per_expert.detach()
+        record = not _RECOMPUTING.get()
 
         if num_tokens == 0:
-            self.aux_loss = self.z_loss = scores.sum() * 0
-            return weights, indices
-
-        if self.training:
-            self.pending_counts.add_(tokens_per_expert.detach().long())
-
-        if self.sequence_aux_loss_weight > 0:
-            f = tokens_per_expert.detach() / (num_tokens * self.top_k + 1e-8)
-            p = scores.mean(dim=0)
-            balance_loss = self.num_experts * (f * p).sum()
-            self.aux_loss = self.sequence_aux_loss_weight * balance_loss
+            aux_loss = z_loss = scores.sum() * 0
         else:
-            self.aux_loss = torch.tensor(0.0, device=x.device)
-
-        self.z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
+            if self.training and record:
+                self.pending_counts.add_(tokens_per_expert.detach().long())
+            if self.sequence_aux_loss_weight > 0:
+                f = tokens_per_expert.detach() / (num_tokens * self.top_k + 1e-8)
+                p = scores.mean(dim=0)
+                balance_loss = self.num_experts * (f * p).sum()
+                aux_loss = self.sequence_aux_loss_weight * balance_loss
+            else:
+                aux_loss = torch.tensor(0.0, device=x.device)
+            z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
+        if record:
+            self.aux_loss, self.z_loss = aux_loss, z_loss
+            self.expert_counts = tokens_per_expert.detach()
 
         return weights, indices
 

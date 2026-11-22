@@ -208,12 +208,18 @@ def clip_grads(model: torch.nn.Module, max_norm: float, pp_group: Any = None) ->
 
 
 def add_moe_losses(loss: torch.Tensor, model: torch.nn.Module, mc: Any) -> torch.Tensor:
-    """MoE auxiliary + router z-loss terms (only called when ``mc.is_moe``)."""
+    """MoE auxiliary + router z-loss terms (only called when ``mc.is_moe``).
+
+    The routers' losses are then detached (see ``Transformer.detach_router_losses``).
+    """
     aux_loss = inner_transformer(model).get_moe_aux_loss()  # type: ignore[attr-defined]
     loss = loss + mc.moe_aux_loss_weight * aux_loss
     if mc.moe_router_z_loss_weight > 0:
         z = inner_transformer(model).get_moe_router_z_loss()  # type: ignore[attr-defined]
         loss = loss + mc.moe_router_z_loss_weight * z
+    transformer = inner_transformer(model)
+    if isinstance(transformer, Transformer):
+        transformer.detach_router_losses()
     return loss
 
 
