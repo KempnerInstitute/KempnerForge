@@ -55,11 +55,13 @@ samples `VLMCollator` batches.
   ChartQA (human and augmented); a row whose image does not decode is passed over.
 - `render.py`: `ChatRenderer` applies the tokenizer's chat template (prompt then
   answer for single-turn rows, the full template for conversations) and trains only
-  the assistant replies when `answer_only`; `max_images` sets how many images a
-  document may bring. `RenderedDataset` draws one reference
+  the assistant replies when `answer_only` (with `train_reply_prefix`, also what
+  the template writes between the assistant header and a reply, such as an empty
+  think block); `max_images` sets how many images a document may bring.
+  `RenderedDataset` draws one reference
   answer per turn from a seed and the row index, so a resume draws the same answers,
-  and passes over a document the renderer refuses (an empty reply, or one the text
-  budget cuts away), up to `max_attempts` in a row; `skipped` counts them with
+  and passes over a document the renderer refuses (replies that are all empty, or
+  that the text budget cuts away), up to `max_attempts` in a row; `skipped` counts them with
   the reader's skips, per rank, and loader workers forked from the training
   process add to its count.
 - `pixmo.py`: PixMo captions, CapQA, pointing, counting and point-explanations;
@@ -69,12 +71,16 @@ samples `VLMCollator` batches.
   no index or conversion step (`DataCompStream`); `RenderedStream` renders a
   stream the way `RenderedDataset` renders a reader, and `stream.py`'s
   `StreamLoader` loads it so that a resume continues where training stopped.
+- `packing.py`: `PackedLoader` packs a dataset's rendered documents into one row of
+  `seq_len` per batch, for packed training.
 
-The renderer resizes each image square to `image_size`, with no tiling. A
-sample has the core dataset's shapes, so `VLMCollator` and `PackedVLMCollator`
-batch it: one image by default, up to `max_images` stacked images, or none for a
+The renderer resizes each image square to `image_size`, or with `tile_grid` cuts
+it into views as `vlm.tile_grid` does. A sample has the core dataset's shapes, so
+`VLMCollator` and `PackedVLMCollator` batch it: one image by default, up to
+`max_images` images (every image with `None`) concatenated, or none for a
 text-only document, and `text_len` counts its real tokens. A document with more
-images than `max_images` is passed over. PixMo-Count stores its points in pixels; they are
+images than `max_images` is passed over. `max_text_len=None` keeps the whole text
+unpadded, for packing. PixMo-Count stores its points in pixels; they are
 converted to percent of the image, the unit the other PixMo sources use. A
 counting answer lists its points before the count, so a row with many points
 outruns `max_text_len` and trains only the leading points. `max_points` retains
@@ -82,14 +88,14 @@ the count only when the cap is small enough for the label and the text budget:
 with a 40-point `dot` row at 256 tokens, a cap of 30 still cuts the count, while
 a cap of 3 keeps it.
 
-`FineVisionArrow` keeps the rows with from `min_images` (0) to `max_images` (1)
-images, using the per-row image counts `index.npz` stores; an index written
-without them takes the counts from `num_images`. The defaults read the rows
-without images as text-only documents beside the single-image rows, so a `text_*`
-subset reads as is; `max_images=None` lifts the cap for multi-image rows, to pair
-with the renderer's `max_images`, `min_images=1` leaves out the text-only rows,
-and `text_only` keeps only them without reading the image column. A conversation keeps its turns up to the first one missing its
-user message or reply, so a row whose first turn is incomplete is not kept.
+`FineVisionArrow` keeps the rows with from `min_images` (0) to `max_images` (no
+cap) images, using the per-row image counts `index.npz` stores; an index written
+without them takes the counts from `num_images`. The defaults read every image of
+a row, and the rows without images as text-only documents, so a `text_*` subset
+reads as is; `min_images=1` leaves out the text-only rows, and `text_only` keeps
+only them without reading the image column. A row is kept when its conversation
+holds a turn and the last turn has a reply; every turn is read, a missing user
+message or reply as empty text.
 
 Convert FineVision once; any number of `convert` processes can share the work,
 a file that fails to convert is listed at the end without stopping the others,
@@ -102,6 +108,23 @@ uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.p
 uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py index \
     --src path-to-FineVision --dst path-to-FineVision-arrow
 ```
+
+### Packing documents
+
+`PackedLoader` reads a dataset, such as a `ConcatDataset` of `RenderedDataset`s
+over several sources (a source listed twice counts twice), in an order shuffled
+each pass and split evenly across data-parallel ranks. It packs the documents in
+that order into one row of `seq_len` per batch: a row takes documents until the
+next one would overflow it, and that document opens the next row. A document
+whose images' tokens and text together exceed `seq_len` is passed over and
+counted in `oversize`. Text-only documents pack beside image documents. With
+`view_groups=True` each batch carries `attention_group_ids` that let the tokens of
+each image view attend to each other in both directions, while attention stays
+causal across views and text and never crosses documents. Passes
+follow one another without end, and `state_dict` records where the next row
+starts, so a resume packs the same rows. Render for it with `max_text_len=None`
+and `max_images=None`, so documents are neither cut nor capped and `seq_len`
+alone bounds them.
 
 DataComp has no index, so its reader streams: the shards are listed once,
 reordered every epoch from the seed, and dealt out to data-parallel ranks and

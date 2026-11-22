@@ -12,7 +12,7 @@ from image_text.render import ChatRenderer, RenderedDataset, UnrenderableDocumen
 from image_text.skip import UnusableRowError
 from PIL import Image
 
-from kempnerforge.data.vlm_dataset import PackedVLMCollator, VLMCollator
+from kempnerforge.data.vlm_dataset import PackedVLMCollator, VLMCollator, image_to_views
 
 
 def _image(size: tuple[int, int] = (12, 9)) -> Image.Image:
@@ -170,10 +170,28 @@ class TestChatRenderer:
             _renderer(tokenizer, max_text_len=17).render(_qa(), ["a cat"])
 
     @pytest.mark.parametrize("kind", ["qa", "conversation"])
-    def test_an_empty_reply_is_refused(self, tokenizer: Any, kind: str) -> None:
-        doc, answers = (_qa(), ["\n"]) if kind == "qa" else (_conversation(), ["A1.", " \t"])
-        with pytest.raises(UnrenderableDocumentError, match="empty reply"):
+    def test_a_document_whose_replies_are_all_empty_is_refused(
+        self, tokenizer: Any, kind: str
+    ) -> None:
+        doc, answers = (_qa(), ["\n"]) if kind == "qa" else (_conversation(), ["", " \t"])
+        with pytest.raises(UnrenderableDocumentError, match="all empty"):
             _renderer(tokenizer).render(doc, answers)
+
+    def test_an_empty_reply_beside_others_trains_its_turn_end(self, tokenizer: Any) -> None:
+        renderer = _renderer(tokenizer)
+        assert renderer.text(_conversation(), ["", "A2."]).startswith(
+            "<|im_start|>user\nQ1?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n"
+        )
+        sample = renderer.render(_conversation(), ["", "A2."])
+        assert _trained_text(tokenizer, sample) == "<|im_end|>A2.<|im_end|>"
+
+    @pytest.mark.parametrize("kind", ["qa", "conversation"])
+    def test_train_reply_prefix_trains_the_think_block(self, tokenizer: Any, kind: str) -> None:
+        doc, answers = (_qa(), ["a cat"]) if kind == "qa" else (_conversation(), ["A1.", "A2."])
+        sample = _renderer(tokenizer, train_reply_prefix=True).render(doc, answers)
+        last = "<think>\n\n</think>\n\n" + answers[-1] + "<|im_end|>"
+        first = "" if kind == "qa" else "A1.<|im_end|>"
+        assert _trained_text(tokenizer, sample) == first + last
 
     @pytest.mark.parametrize("reply", ["x</think>y", "<think>x", "a<|im_end|>b", "<|im_start|>"])
     @pytest.mark.parametrize("kind", ["qa", "conversation"])
@@ -252,6 +270,50 @@ class TestChatRenderer:
     def test_max_images_must_be_positive(self, tokenizer: Any) -> None:
         with pytest.raises(ValueError, match="max_images must be positive"):
             _renderer(tokenizer, max_images=0)
+
+    @pytest.mark.parametrize("grid", [-1, 1])
+    def test_tile_grid_must_be_zero_or_a_grid(self, tokenizer: Any, grid: int) -> None:
+        with pytest.raises(ValueError, match="tile_grid must be 0 or at least 2"):
+            _renderer(tokenizer, tile_grid=grid)
+
+    def test_without_max_text_len_the_text_is_whole_and_unpadded(self, tokenizer: Any) -> None:
+        renderer = _renderer(tokenizer, max_text_len=None)
+        doc = _qa(user=" ".join(["word"] * 100))
+        sample = renderer.render(doc, ["a cat"])
+        n = len(renderer.token_ids(doc, ["a cat"]))
+        assert sample["input_ids"].shape == sample["labels"].shape == (n,)
+        assert int(sample["text_len"]) == n
+        assert _trained_text(tokenizer, sample) == "a cat<|im_end|>"
+
+    def test_without_max_images_every_image_is_stacked(self, tokenizer: Any) -> None:
+        renderer = _renderer(tokenizer, max_images=None)
+        many = Document(images=(_image(),) * 5, turns=(Turn("Compare.", ("Same.",)),))
+        text_only = Document(images=(), turns=(Turn("Hi?", ("Hello.",)),))
+        assert renderer.render(many, ["Same."])["pixel_values"].shape == (5, 3, 16, 16)
+        assert renderer.render(_qa(), ["a cat"])["pixel_values"].shape == (1, 3, 16, 16)
+        assert renderer.render(text_only, ["Hello."])["pixel_values"].shape == (0, 3, 16, 16)
+
+    @pytest.mark.parametrize(
+        ("max_images", "images", "shape"),
+        [
+            (1, 1, (5, 3, 16, 16)),
+            (1, 0, (0, 5, 3, 16, 16)),
+            (2, 2, (10, 3, 16, 16)),
+            (None, 0, (0, 3, 16, 16)),
+        ],
+    )
+    def test_tiled_images_bring_their_views(
+        self, tokenizer: Any, max_images: int | None, images: int, shape: tuple[int, ...]
+    ) -> None:
+        renderer = _renderer(tokenizer, max_images=max_images, tile_grid=2)
+        doc = Document(images=(_image(),) * images, turns=(Turn("Look.", ("Ok.",)),))
+        pixels = renderer.render(doc, ["Ok."])["pixel_values"]
+        assert pixels.shape == shape
+        if images:
+            expected = image_to_views(
+                _image(), 16, renderer.image_mean, renderer.image_std, tile_grid=2
+            )
+            assert torch.equal(pixels[:5], expected)
 
 
 class TestRenderedDataset:

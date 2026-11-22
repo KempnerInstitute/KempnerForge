@@ -79,14 +79,14 @@ def subset(tmp_path: Path) -> Path:
         src / "demo" / "train-00000-of-00002.parquet",
         [
             [_row(1, [("Q0", "A0")], 5), _row(2, [("Q1", "A1")], 5)],
-            [_row(1, [("Q2", ""), ("Q2b", " ")], 5)],
+            [_row(1, [("Q2", "A2"), ("Q2b", "")], 5)],
         ],
     )
     _write_parquet(
         src / "demo" / "train-00001-of-00002.parquet",
         [
             [
-                _row(1, [("Q3", "A3"), ("Q3b", "A3b"), ("Q3c", "")], None, width=7),
+                _row(1, [("Q3", "A3"), ("Q3b", ""), ("Q3c", "A3c")], None, width=7),
                 _row(1, [("Q4", "A4")], 2),
             ]
         ],
@@ -149,20 +149,24 @@ class TestConversion:
             "train-00000-of-00001.meta.npz",
         ]
 
-    def test_keep_flags_need_one_complete_turn(self) -> None:
+    def test_keep_flags_need_a_reply_in_the_last_turn(self) -> None:
         texts = pa.array(
             [
                 [{"user": "Q", "assistant": "A"}],
-                [{"user": "Q", "assistant": ""}, {"user": " ", "assistant": "A"}],
-                [{"user": "Q", "assistant": None}, {"user": "Q2", "assistant": "A2"}],
+                [{"user": "Q", "assistant": ""}, {"user": "", "assistant": "A"}],
+                [{"user": "Q", "assistant": "A"}, {"user": "Q2", "assistant": ""}],
+                [{"user": "Q", "assistant": "A"}, {"user": "Q2", "assistant": None}],
+                [{"user": "Q", "assistant": "A"}, None],
+                [{"user": "Q", "assistant": " "}],
                 [],
                 None,
             ],
             type=SCHEMA.field("texts").type,
         )
-        assert _converter().keep_flags(texts).tolist() == [True, False, False, False, False]
-        assert _converter().keep_flags(texts.slice(0, 2)).tolist() == [True, False]
-        assert _converter().keep_flags(texts.slice(3, 2)).tolist() == [False, False]
+        flags = _converter().keep_flags
+        assert flags(texts).tolist() == [True, True, False, False, False, True, False, False]
+        assert flags(texts.slice(1, 2)).tolist() == [True, False]
+        assert flags(texts.slice(5, 3)).tolist() == [True, False, False]
 
     def test_keep_flags_skip_the_values_under_a_null_slot(self) -> None:
         values = pa.array(
@@ -345,15 +349,19 @@ class TestFineVisionArrow:
         assert len(reader) == 4
         assert [reader[i].turns[0].user for i in range(4)] == ["Q0", "Q1", "Q3", "Q4"]
 
-    def test_single_image_rows_by_default(self, subset: Path) -> None:
+    def test_every_image_of_every_row_by_default(self, subset: Path) -> None:
         reader = FineVisionArrow(subset)
-        assert [reader[i].turns[0].user for i in range(len(reader))] == ["Q0", "Q3", "Q4"]
-        assert all(len(reader[i].images) == 1 for i in range(len(reader)))
+        assert [reader[i].turns[0].user for i in range(len(reader))] == ["Q0", "Q1", "Q3", "Q4"]
+        assert [len(reader[i].images) for i in range(len(reader))] == [1, 2, 1, 1]
 
-    def test_documents_are_conversations(self, subset: Path) -> None:
-        doc = FineVisionArrow(subset)[1]
+    def test_documents_are_conversations_with_every_turn(self, subset: Path) -> None:
+        doc = FineVisionArrow(subset)[2]
         assert doc.kind == "conversation"
-        assert [(t.user, t.answers) for t in doc.turns] == [("Q3", ("A3",)), ("Q3b", ("A3b",))]
+        assert [(t.user, t.answers) for t in doc.turns] == [
+            ("Q3", ("A3",)),
+            ("Q3b", ("",)),
+            ("Q3c", ("A3c",)),
+        ]
         assert doc.images[0].size == (7, 3)
 
     def test_max_images_keeps_rows_within_the_limit(self, subset: Path) -> None:
@@ -364,13 +372,6 @@ class TestFineVisionArrow:
         counts = np.array([2, 1, 1, 1, 1], dtype=np.int16)
         reader = FineVisionArrow(subset, max_images=1, num_images=counts)
         assert [reader[i].turns[0].user for i in range(len(reader))] == ["Q1", "Q3", "Q4"]
-
-    def test_max_images_needs_image_counts(self, subset: Path) -> None:
-        arrays = dict(np.load(subset / "index.npz"))
-        del arrays["num_images"]
-        np.savez(subset / "index.npz", **arrays)
-        with pytest.raises(ValueError, match="no num_images"):
-            FineVisionArrow(subset, max_images=1)
 
     def test_ratings_filter_drops_missing_and_low_scores(self, subset: Path) -> None:
         reader = FineVisionArrow(subset, max_images=None, min_ratings={"relevance_min": 3})
@@ -447,9 +448,9 @@ class TestFineVisionArrow:
         _run("convert", "--src", str(src), "--dst", str(dst))
         _run("index", "--src", str(src), "--dst", str(dst))
         expected = {
-            (): [0, 1],
+            (): [0, 1, 2, 3],
             (("max_images", 2),): [0, 1, 2],
-            (("max_images", None),): [0, 1, 2, 3],
+            (("max_images", 1),): [0, 1],
             (("min_images", 1), ("max_images", None)): [1, 2, 3],
             (("min_images", 2), ("max_images", 2)): [2],
         }
@@ -474,15 +475,14 @@ class TestFineVisionArrow:
         assert shapes == [(0, 3, 8, 8), (2, 3, 8, 8), (1, 3, 8, 8)]
         assert dataset.skipped == 0
 
-    def test_a_row_without_a_complete_turn_is_passed_over(self, subset: Path) -> None:
-        """An index that kept such a row (an older keep rule) still reads past it."""
+    def test_counts_are_needed_only_to_filter_by_them(self, subset: Path) -> None:
         arrays = dict(np.load(subset / "index.npz"))
-        arrays["keep"][:] = True
+        del arrays["num_images"]
         np.savez(subset / "index.npz", **arrays)
-        reader = FineVisionArrow(subset, max_images=None)
-        assert len(reader) == 5
-        assert reader[2].turns[0].user == "Q3"
-        assert reader.skipped == 1
+        assert [len(d.images) for d in FineVisionArrow(subset)] == [1, 2, 1, 1]
+        for options in ({"max_images": 1}, {"min_images": 1}, {"text_only": True}):
+            with pytest.raises(ValueError, match="no num_images"):
+                FineVisionArrow(subset, **options)
 
     def test_null_images_and_turns_are_tolerated(self, tmp_path: Path) -> None:
         src, dst = tmp_path / "parquet", tmp_path / "arrow"
@@ -491,16 +491,17 @@ class TestFineVisionArrow:
         no_bytes = _row(1, [("Q1", "A1")], 5)
         no_bytes["images"][0]["bytes"] = None
         null_turn = _row(1, [("Q2", "A2")], 5)
-        null_turn["texts"] = [*null_turn["texts"], None]
-        _write_parquet(
-            src / "demo" / "train-00000-of-00001.parquet", [[no_images, no_bytes, null_turn]]
-        )
+        null_turn["texts"] = [None, *null_turn["texts"]]
+        null_last = _row(1, [("Q3", "A3")], 5)
+        null_last["texts"] = [*null_last["texts"], None]
+        rows = [no_images, no_bytes, null_turn, null_last, _row(1, [("Q4", "A4")], 5)]
+        _write_parquet(src / "demo" / "train-00000-of-00001.parquet", [rows])
         _run("convert", "--src", str(src), "--dst", str(dst))
         _run("index", "--src", str(src), "--dst", str(dst))
-        reader = FineVisionArrow(dst / "demo", max_images=None)
-        assert reader.rows.tolist() == [0, 1, 2]
+        reader = FineVisionArrow(dst / "demo")
+        assert reader.rows.tolist() == [0, 1, 2, 4]
         assert reader[0].turns[0].user == "Q0" and reader[0].images == ()
-        assert reader[1].turns[0].user == "Q2" and reader.skipped == 1
+        assert reader[1].turns[0].user == "Q4" and reader.skipped == 2
         text = FineVisionArrow(dst / "demo", text_only=True)
         assert text.rows.tolist() == [0] and text[0].images == ()
 
