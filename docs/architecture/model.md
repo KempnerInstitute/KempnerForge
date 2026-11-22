@@ -141,6 +141,13 @@ silent-incorrectness risk. Keep them module-level.
 math via a context manager. `"auto"` lets PyTorch pick. Cached multi-token
 appends use `causal_lower_right` without a dense mask or kernel fallback,
 so a pinned flash backend stays enabled.
+The CUDA flash kernel takes no dense mask, so under `"flash"` a forward
+that passes one to SDPA on CUDA (packed documents, padded frames,
+attention groups) raises a `ValueError`, and the training setup refuses
+the configs that build one (see
+[Validation rules](../configuration/validation-rules.md#flash-attention-and-masked-runs)).
+Capturing attention weights computes attention without SDPA and is not
+affected.
 
 ## MLP
 

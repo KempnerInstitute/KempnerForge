@@ -201,6 +201,54 @@ class JobConfig:
             return self.vlm.views_per_image
         return 1
 
+    def masks_frames_in_backend_attention(self) -> bool:
+        """Whether a frame mask reaches self-attention that runs under ``model.sdpa_backend``.
+
+        The modality strategy, which the vlm section's ``arch`` picks, masks padded frames in
+        self-attention under Joint-Decoder, MoT and MoMa; Cross-Attention masks them in its
+        cross-attention layers only. The model's attention, which the section's class picks,
+        runs SDPA under the configured backend except under MoT. A section whose ``arch`` an
+        override changed is judged by both.
+        """
+        if self.vlm is None:
+            return False
+        masks = self.vlm.arch in ("joint_decoder", "mot", "moma")
+        return masks and _arch_of(self.vlm) != "mot"
+
+    def check_flash_attention_masks(self) -> None:
+        """Refuse ``sdpa_backend="flash"`` for a training run whose batches carry a mask.
+
+        PyTorch's CUDA FlashAttention kernel takes no attention mask. Packed rows mask
+        their documents from each other under ``attention_backend="sdpa"``, where a run
+        reads them from a dataset (flex turns them into a block mask), and the padded
+        frames of a video run are masked under either backend where
+        ``masks_frames_in_backend_attention`` says so: Joint-Decoder and MoMa. The training
+        setup calls this on CUDA, after the CLI overrides and before the process group
+        starts; evaluation and generation, whose forwards carry no mask, do not.
+
+        Raises:
+            ValueError: The run would train with ``sdpa_backend="flash"`` and a mask.
+        """
+        if self.model.sdpa_backend != "flash":
+            return
+        data = self.data
+        masked = None
+        if (
+            data.pack_sequences
+            and self.model.attention_backend == "sdpa"
+            and (self.is_vlm or data.datasets or data.dataset_path or data.hf_dataset_name)
+        ):
+            masked = "data.pack_sequences, which masks the documents of a row from each other"
+        elif self.video is not None and self.masks_frames_in_backend_attention():
+            assert self.vlm is not None
+            masked = f"[video] on vlm.arch={self.vlm.arch!r}, which masks padded frames"
+        if masked is not None:
+            raise ValueError(
+                f"model.sdpa_backend='flash' is not supported with {masked}: PyTorch's "
+                "FlashAttention kernel takes no attention mask on CUDA. Use another "
+                "sdpa_backend, such as 'auto'."
+            )
+
     def validate(self, world_size: int = 1) -> None:
         """Run cross-config validations that depend on the world size."""
         self.distributed.validate_world_size(world_size)

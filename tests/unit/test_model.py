@@ -179,6 +179,25 @@ class TestAttention:
         attn = Attention(dim=128, n_heads=4, n_kv_heads=4, sdpa_backend="math")
         assert attn.sdpa_backend == "math"
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_flash_refuses_a_dense_mask_on_cuda_before_running_sdpa(self):
+        """PyTorch's CUDA flash kernel takes no mask; the refusal says so instead of its error."""
+        device = torch.device("cuda")
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2, sdpa_backend="flash").to(device)
+        cos, sin = precompute_rope_frequencies(16, 16, device=device)
+        mask = torch.ones(1, 1, 8, 8, dtype=torch.bool, device=device).tril()
+        x = torch.randn(1, 8, 64, device=device)
+        match = "sdpa_backend='flash' cannot run a forward with an attention mask"
+        with pytest.raises(ValueError, match=match):
+            attn(x, cos[:8], sin[:8], attn_mask=mask)
+
+    def test_flash_runs_a_dense_mask_on_cpu(self):
+        """PyTorch's CPU flash kernel takes the mask, so the refusal is for CUDA alone."""
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2, sdpa_backend="flash")
+        cos, sin = precompute_rope_frequencies(16, 16)
+        mask = torch.ones(1, 1, 8, 8, dtype=torch.bool).tril()
+        assert attn(torch.randn(1, 8, 64), cos[:8], sin[:8], attn_mask=mask).shape == (1, 8, 64)
+
     @pytest.mark.parametrize("capture", [False, True])
     @pytest.mark.parametrize("past", [0, 4])
     def test_a_visibility_mask_is_refused_before_writing_the_cache(self, capture, past):
