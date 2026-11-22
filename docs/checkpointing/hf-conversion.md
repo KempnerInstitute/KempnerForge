@@ -112,12 +112,25 @@ uv run python scripts/convert_checkpoint.py hf-to-dcp \
 
 What happens:
 
-1. Load the HF state dict:
-   - Local dir: prefer `*.safetensors`, fall back to
-     `pytorch_model*.bin`.
-   - HF ID: download via
-     `transformers.AutoModelForCausalLM.from_pretrained`.
-2. Convert keys HF → KempnerForge naming.
+1. Load the HF state dict from the standard weight files at the top of
+   the model, in the order transformers loads them by default:
+   `model.safetensors`, else the shards
+   `model.safetensors.index.json` names, and otherwise the same for
+   `pytorch_model.bin`. An adapter or another variant beside them is
+   left out; there is no variant or subfolder choice, and a config's
+   `transformers_weights` is not read.
+   - Local dir: those files; a directory with none of these names gives
+     every `*.safetensors` file, or else every `pytorch_model*.bin`.
+   - HF ID: the same files, each downloaded with
+     `huggingface_hub.hf_hub_download` or taken from its cache, the
+     shards at the commit their index came from. None of the
+     repository's code runs and no Hugging Face model is built, and a
+     shard that cannot be had fails the import.
+2. Convert keys HF → KempnerForge naming. The names converted are the
+   ones stored in the files: the Llama-style names, and the MoE names
+   `dcp-to-hf` writes. Others, such as Mixtral's `block_sparse_moe`
+   weights, are not mapped and keep their initialization, with a
+   warning.
 3. `model.load_state_dict(converted, strict=False)` — missing KF
    keys (e.g. learned RoPE frequencies) stay at their default init
    and are logged as warnings.

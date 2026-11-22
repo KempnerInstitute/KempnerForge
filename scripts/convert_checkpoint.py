@@ -204,38 +204,77 @@ def hf_to_dcp(
     logger.info(f"Saved DCP checkpoint: {dcp_path}")
 
 
-def _load_hf_local(path: Path) -> dict[str, torch.Tensor]:
-    """Load state dict from a local HuggingFace model directory."""
-    safetensor_files = list(path.glob("*.safetensors"))
-    if safetensor_files:
-        from safetensors.torch import load_file
+_WEIGHT_FILES = (
+    ("model.safetensors", "model.safetensors.index.json"),
+    ("pytorch_model.bin", "pytorch_model.bin.index.json"),
+)
 
-        state = {}
-        for f in sorted(safetensor_files):
+
+def _indexed_shards(index: Path) -> list[str]:
+    """The shard files a weights index names in its ``weight_map``."""
+    return sorted(set(json.loads(index.read_text())["weight_map"].values()))
+
+
+def _read_weight_files(files: list[Path]) -> dict[str, torch.Tensor]:
+    """Read safetensors files, or ``.bin`` files with ``weights_only=True``, into one dict."""
+    from safetensors.torch import load_file
+
+    state: dict[str, torch.Tensor] = {}
+    for f in files:
+        if f.suffix == ".safetensors":
             state.update(load_file(f))
-        return state
-
-    bin_files = list(path.glob("pytorch_model*.bin"))
-    if bin_files:
-        state = {}
-        for f in sorted(bin_files):
+        else:
             state.update(torch.load(f, map_location="cpu", weights_only=True))
-        return state
+    return state
 
-    raise FileNotFoundError(f"No model files found in {path}")
+
+def _load_hf_local(path: Path) -> dict[str, torch.Tensor]:
+    """Load the weights of a local HuggingFace model directory.
+
+    The files read are the ones transformers loads by default from those standard names in the
+    directory: ``model.safetensors``, else the shards its index names, and otherwise the same
+    for ``pytorch_model.bin``, so an adapter or another variant beside them is left out. A
+    directory with none of these names gives every ``*.safetensors`` file, or else every
+    ``pytorch_model*.bin``.
+    """
+    for single, index in _WEIGHT_FILES:
+        if (path / single).exists():
+            return _read_weight_files([path / single])
+        if (path / index).exists():
+            return _read_weight_files([path / name for name in _indexed_shards(path / index)])
+    files = sorted(path.glob("*.safetensors")) or sorted(path.glob("pytorch_model*.bin"))
+    if not files:
+        raise FileNotFoundError(f"No model files found in {path}")
+    return _read_weight_files(files)
 
 
 def _load_hf_hub(model_id: str) -> dict[str, torch.Tensor]:
-    """Load state dict from HuggingFace Hub."""
-    from transformers import AutoModelForCausalLM
+    """Download the weight files of a Hub model that ``_load_hf_local`` reads, and read them.
 
-    logger.info(f"Downloading model from HuggingFace Hub: {model_id}")
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    )
-    return hf_model.state_dict()
+    The first of the standard names the repository has is downloaded as ``hf_hub_download``
+    resolves the branch, which keeps the cache's record of that branch for offline loads. The
+    shards an index names are downloaded at the commit of the snapshot it came from, so a branch
+    that moves meanwhile mixes no files, and a shard that cannot be had fails the load. None of
+    the repository's code runs, no Hugging Face model is built, and the weights keep the
+    precision they are stored in.
+    """
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError
+
+    logger.info(f"Downloading the weight files of {model_id} from the HuggingFace Hub")
+    for single, index in _WEIGHT_FILES:
+        for name in (single, index):
+            try:
+                path = Path(hf_hub_download(model_id, name))
+            except EntryNotFoundError:
+                continue
+            if name == single:
+                return _read_weight_files([path])
+            commit = path.parent.name
+            shards = [hf_hub_download(model_id, f, revision=commit) for f in _indexed_shards(path)]
+            return _read_weight_files([Path(shard) for shard in shards])
+    names = ", ".join(name for pair in _WEIGHT_FILES for name in pair)
+    raise FileNotFoundError(f"Found none of {names} for {model_id} on the Hub or in its cache")
 
 
 def _build_hf_config(config: ModelConfig, dtype: torch.dtype = torch.bfloat16) -> dict:
