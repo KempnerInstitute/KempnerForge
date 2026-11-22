@@ -1042,6 +1042,9 @@ class TestJobConfig:
         else:
             config.check_flash_attention_masks()
 
+    def test_a_run_without_a_vlm_masks_no_frames(self):
+        assert not JobConfig().masks_frames_in_backend_attention()
+
     def test_vlm_packing_inherits_the_sequence_parallel_refusal(self):
         """Packed rows are indexed as plain tensors, which sequence parallelism cannot carry."""
         config = JobConfig(

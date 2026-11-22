@@ -191,6 +191,17 @@ class TestAttention:
         with pytest.raises(ValueError, match=match):
             attn(x, cos[:8], sin[:8], attn_mask=mask)
 
+    def test_flash_refuses_a_dense_mask_on_a_query_that_reports_cuda(self, monkeypatch):
+        """The refusal follows the query's is_cuda, so a CPU query that reports CUDA reaches it."""
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2, sdpa_backend="flash")
+        cos, sin = precompute_rope_frequencies(16, 16)
+        mask = torch.ones(1, 1, 8, 8, dtype=torch.bool).tril()
+        x = torch.randn(1, 8, 64)
+        monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+        match = "sdpa_backend='flash' cannot run a forward with an attention mask"
+        with pytest.raises(ValueError, match=match):
+            attn(x, cos[:8], sin[:8], attn_mask=mask)
+
     def test_flash_runs_a_dense_mask_on_cpu(self):
         """PyTorch's CPU flash kernel takes the mask, so the refusal is for CUDA alone."""
         attn = Attention(dim=64, n_heads=4, n_kv_heads=2, sdpa_backend="flash")

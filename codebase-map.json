@@ -1533,7 +1533,7 @@
           "TestRMSNorm(3)",
           "TestBuildNorm(3)",
           "TestRoPE(7)",
-          "TestAttention(12)",
+          "TestAttention(13)",
           "TestMLP(5)",
           "TestEmbedding(3)",
           "TestTransformerBlock(2)",
@@ -1546,7 +1546,7 @@
           "TestMoT(10)",
           "TestInitWeights(5)"
         ],
-        "count": 79
+        "count": 80
       },
       "tests/unit/test_config.py": {
         "classes": [
@@ -1559,14 +1559,14 @@
           "TestDataConfig(2)",
           "TestMetricsConfig(2)",
           "TestProfilingConfig(1)",
-          "TestJobConfig(15)",
+          "TestJobConfig(16)",
           "TestTomlLoading(12)",
           "TestCliOverrides(11)",
           "TestCliParsing(6)",
           "TestRegistry(12)",
           "TestEvalConfig(7)"
         ],
-        "count": 111
+        "count": 112
       },
       "tests/unit/test_training.py": {
         "classes": [
