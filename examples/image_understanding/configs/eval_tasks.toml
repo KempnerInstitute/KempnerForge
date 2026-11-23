@@ -2,7 +2,7 @@
 # the scorer of its answers and the cap on a decoded answer. Paths are
 # placeholders: point each annotation_file at the split to evaluate, in the
 # layout its reader takes. The tasks after VQAv2 are the board's, with its
-# answer caps.
+# answer caps, then MathVista testmini with the recipe's.
 
 [[tasks]]
 name = "vqav2"
@@ -101,3 +101,12 @@ max_new_tokens = 10
 
 [tasks.reader_args]
 annotation_file = "path-to-mmlu-test-parquet"
+
+[[tasks]]
+name = "mathvista-testmini"
+reader = "mathvista"
+scorer = "mathvista_accuracy"
+max_new_tokens = 100
+
+[tasks.reader_args]
+annotation_file = "path-to-mathvista-testmini-parquet"

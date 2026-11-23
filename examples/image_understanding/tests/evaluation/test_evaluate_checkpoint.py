@@ -75,6 +75,7 @@ def test_the_loaded_config_and_tasks_are_handed_off(
         "pixmo-counting",
         "gsm8k",
         "mmlu",
+        "mathvista-testmini",
     ]
     assert {key: seen[key] for key in ("checkpoint", "output", "batch_size", "publish")} == {
         "checkpoint": "runs/a",

@@ -2,8 +2,9 @@
 
 A scorer rates one sample: the decoded prediction against that sample's
 reference, which is its reference answers for every scorer here but
-``points_in_masks``, whose reference is the objects' masks. The text scorers
-take the prediction as a ``str`` and the references as a non-empty sequence of
+``points_in_masks``, whose reference is the objects' masks, and
+``mathvista_accuracy``, whose reference is the problem (``MathVistaReference``).
+The text scorers take the prediction as a ``str`` and the references as a non-empty sequence of
 ``str``; anything else raises before any scoring (``TypeError``, or
 ``ValueError`` for no reference). A sample's score
 is one value in [0, 1], or a mapping of named components for a scorer that
@@ -301,6 +302,139 @@ def choice_letter(prediction: str, answers: Sequence[str]) -> float:
     return float(letter is not None and letter.group(1) == reference)
 
 
+MATHVISTA_QUESTION_TYPES = ("multi_choice", "free_form")
+MATHVISTA_ANSWER_TYPES = ("text", "integer", "float", "list")
+_LETTER_IN_PARENTHESES = re.compile(r"\(([a-zA-Z])\)")
+_NUMBER_TYPES: dict[str, Callable[[str], int | float]] = {"integer": int, "float": float}
+
+
+def _non_blank(name: str, value: Any) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-blank string, got {value!r}")
+
+
+def _check_choice_of(name: str, value: Any, options: Sequence[str]) -> None:
+    if value not in options:
+        raise ValueError(f"{name} must be one of {list(options)}, got {value!r}")
+
+
+@dataclass(frozen=True)
+class MathVistaReference:
+    """What a reply to a MathVista problem is scored against.
+
+    ``answer`` is the reference answer and ``query`` the prompt the model was
+    asked. ``question_type`` is ``multi_choice``, whose options are ``choices``
+    and lettered from ``A``, or ``free_form``. ``answer_type`` is ``text``,
+    ``integer``, ``float``, rounded to ``precision`` decimal places, or ``list``.
+    ``extract(question, reply)`` reads the answer to a question out of a free
+    reply. A problem that could never be scored is refused with ``ValueError``:
+    a blank answer or query, an unknown type, a multiple-choice problem whose
+    answer is not one of its options, a free-form ``text`` answer, or a
+    ``float`` answer without a precision.
+    """
+
+    answer: str
+    query: str
+    question_type: str
+    answer_type: str
+    extract: Callable[[str, str], str]
+    choices: tuple[str, ...] = ()
+    precision: int | None = None
+
+    def __post_init__(self) -> None:
+        _non_blank("answer", self.answer)
+        _non_blank("query", self.query)
+        _check_choice_of("question_type", self.question_type, MATHVISTA_QUESTION_TYPES)
+        _check_choice_of("answer_type", self.answer_type, MATHVISTA_ANSWER_TYPES)
+        if self.question_type == "multi_choice":
+            if not all(isinstance(choice, str) for choice in self.choices):
+                raise ValueError(f"the options must be strings, got {self.choices!r}")
+            if self.answer not in self.choices:
+                raise ValueError(f"the answer {self.answer!r} is not one of {list(self.choices)}")
+        elif self.answer_type == "text":
+            raise ValueError("a free-form problem has an integer, float or list answer, not text")
+        if self.answer_type == "float" and self.precision is None:
+            raise ValueError("a float answer needs a precision")
+
+
+def mathvista_extraction(reply: str, reference: MathVistaReference) -> str:
+    """The answer ``reply`` gives before it is normalized, as the recipe extracts it.
+
+    An empty reply gives ``""``. A multiple-choice reply that is exactly one of
+    the options is taken as it is, and so is the number of an ``integer`` or
+    ``float`` answer's reply that ``int`` or ``float`` parses whole, written back
+    by ``str``. Any other reply goes to ``reference.extract``, asked the
+    problem's query.
+    """
+    if reply == "":
+        return ""
+    if reference.question_type == "multi_choice" and reply in reference.choices:
+        return reply
+    parse = _NUMBER_TYPES.get(reference.answer_type)
+    if parse is not None:
+        try:
+            return str(parse(reply))
+        except ValueError:
+            pass
+    return reference.extract(reference.query, reply)
+
+
+def _closest_option(text: str, choices: Sequence[str]) -> str:
+    """The option of ``choices`` fewest edits from ``text``; the first of equally close ones."""
+    distances = [_levenshtein(text, choice) for choice in choices]
+    return choices[distances.index(min(distances))]
+
+
+def normalize_mathvista_answer(extraction: str, reference: MathVistaReference) -> str | None:
+    """``extraction`` in the form of the reference answer, as MathVista's evaluation normalizes it.
+
+    A multiple-choice extraction loses its surrounding whitespace, and the first
+    letter in parentheses, ``(b)``, becomes that capital. A capital that letters
+    an option (``A`` the first) gives that option; anything else gives the option
+    the fewest Levenshtein edits away. An ``integer`` answer becomes
+    ``int(float(extraction))`` and a ``float`` answer ``round(float(extraction),
+    precision)``, each written by ``str``, or ``None`` when ``float`` cannot read
+    the extraction; a ``list`` answer is the extraction as it is.
+    """
+    if reference.question_type == "multi_choice":
+        text = extraction.strip()
+        letters = _LETTER_IN_PARENTHESES.findall(text)
+        if letters:
+            text = letters[0].upper()
+        labels = [chr(ord("A") + index) for index in range(len(reference.choices))]
+        if text in labels:
+            return reference.choices[labels.index(text)]
+        return _closest_option(text, reference.choices)
+    try:
+        if reference.answer_type == "integer":
+            return str(int(float(extraction)))
+        if reference.answer_type == "float" and reference.precision is not None:
+            return str(round(float(extraction), reference.precision))
+    except (ValueError, OverflowError):
+        return None
+    return extraction
+
+
+def mathvista_accuracy(prediction: str, reference: MathVistaReference) -> float:
+    """1 when the answer ``prediction`` gives is the reference answer, as the recipe scores it.
+
+    The answer is extracted by ``mathvista_extraction`` and normalized by
+    ``normalize_mathvista_answer``, after MathVista's ``extract_answer.py`` and
+    ``calculate_score.py``, and compared with the reference answer as text
+    (``str``), as the recipe compares them.
+
+    Raises:
+        TypeError: ``prediction`` is not a ``str`` or ``reference`` is not a
+            ``MathVistaReference``.
+    """
+    if not isinstance(prediction, str):
+        raise TypeError(f"prediction must be a str, got {prediction!r}")
+    if not isinstance(reference, MathVistaReference):
+        raise TypeError(f"reference must be a MathVistaReference, got {reference!r}")
+    normalized = normalize_mathvista_answer(mathvista_extraction(prediction, reference), reference)
+    return float(str(normalized) == reference.answer)
+
+
 def mean_scores(scores: Iterable[SampleScore]) -> dict[str, float]:
     """The mean of each component over a task's samples.
 
@@ -339,6 +473,7 @@ SCORERS: dict[str, Scorer] = {
     "count_accuracy": Scorer(count_accuracy),
     "exact_vqa_accuracy": Scorer(exact_vqa_accuracy),
     "final_number": Scorer(final_number),
+    "mathvista_accuracy": Scorer(mathvista_accuracy),
     "points_in_masks": Scorer(points_in_masks),
     "relaxed_accuracy": Scorer(relaxed_accuracy),
     "vqa_accuracy": Scorer(vqa_accuracy),

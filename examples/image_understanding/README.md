@@ -16,7 +16,7 @@ examples/image_understanding/
 ├── evaluate_checkpoint.py   # evaluation entry point (below)
 ├── mixture.py            # packed loader over a mixture of image-text sources
 ├── configs/
-│   ├── eval_tasks.toml   # the board's evaluation tasks, with placeholder paths
+│   ├── eval_tasks.toml   # the board's evaluation tasks and MathVista, with placeholder paths
 │   ├── evaluate_checkpoint.sbatch   # sample job script for evaluating one checkpoint
 │   └── qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml  # stage 2 on the packed mixture
 ├── mixtures/
@@ -585,6 +585,17 @@ the scorers of their answers.
   solution's `####`, and MMLU's question lists the options as `A.` to `D.`,
   then "Answer with the letter of the correct option.", answered by the letter.
   `testbed.py`'s `aokvqa` reads A-OKVQA with every direct answer kept.
+  `mathvista` reads a MathVista split's parquet file as Hugging Face publishes
+  it (`AI4Math/MathVista`, whose `testmini` split holds the 1,000 problems with
+  answers; CC BY-SA 4.0, for use as a test set only), images included, so
+  nothing is converted first. A problem asks its `query`, the question with its
+  hint and lettered options, as the recipe asks it, and `reference(row)` is the
+  problem (`MathVistaReference`): its answer, question and answer types,
+  options, precision and query. Every row is checked as the file loads, so a
+  split without answers, as the test split is, or a problem the scorer could not
+  score is refused with its `pid` named; an image that does not decode is passed
+  over. Its `extractor_device` (`cpu` by default) is where the answer extractor
+  of `mathvista_accuracy` runs.
 - `scorers.py`: a scorer rates one prediction against a sample's reference
   answers with a value in [0, 1], and a task's score is the mean over its
   samples. A reader with a `reference(row)` method gives the reference instead.
@@ -626,11 +637,36 @@ the scorers of their answers.
     reference.
   - `choice_letter` (MMLU): 1 when the first standalone capital `A` to `D` is the
     reference letter.
+  - `mathvista_accuracy` (MathVista): 1 when the answer a reply gives, extracted
+    and normalized after MathVista's `extract_answer.py` and
+    `calculate_score.py`, is the reference answer. An empty reply gives no
+    answer; a multiple-choice reply that is exactly an option, or the reply to an
+    integer or float problem that `int` or `float` reads whole, is taken as it
+    is; any other reply goes to an extractive question-answering model,
+    `google/bigbird-base-trivia-itc`, asked the problem's query with the reply as
+    the context. Then for multiple choice an option's letter, or the letter in
+    `(b)`, gives that option and anything else the option the fewest Levenshtein
+    edits away, so an empty reply picks the shortest option; an integer answer is
+    read through `float` and truncated, a float answer rounded to its precision,
+    and a list answer kept as extracted. As in the recipe, which departs from the
+    official code here, the model replaces the official GPT-4 extraction, a
+    failed extraction stops the evaluation instead of giving no answer, and the
+    answers are compared as text. The model (about 530 MB, at a pinned revision)
+    is downloaded to the Hugging Face cache the first time a row needs it; each
+    rank loads its own copy, as each rank scores its own rows. transformers 5 has
+    no question-answering pipeline, so `extraction.py` reads the span as the
+    transformers 4 pipeline the recipe calls does, with the same tokenizer, built
+    from the model's SentencePiece file with `protobuf` (the `sentencepiece`
+    package is not needed). Two things differ from the recipe: the model attends
+    fully at every length, where BigBird's block-sparse attention turns full only
+    from its first short input, which made the recipe's extraction depend on the
+    order rows are scored in; and a reply of only whitespace gives no answer,
+    where the recipe's pipeline finds none and the recipe stops the evaluation.
 
 `configs/eval_tasks.toml` is a sample with VQAv2 (10) and the nine tasks of the
 board, with its caps: A-OKVQA 10, DocVQA 50, TextVQA 75, ChartQA human and
-machine 50, PixMo pointing 75 and counting 20, GSM8K 256 and MMLU 10. Its paths
-are placeholders:
+machine 50, PixMo pointing 75 and counting 20, GSM8K 256 and MMLU 10; then
+MathVista testmini with the recipe's 100. Its paths are placeholders:
 
 ```toml
 [[tasks]]

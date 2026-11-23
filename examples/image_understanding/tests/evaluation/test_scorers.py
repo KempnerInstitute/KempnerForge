@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 import pytest
 from evaluation.scorers import (
     SCORERS,
+    MathVistaReference,
     Scorer,
     anls,
     choice_letter,
@@ -16,7 +19,10 @@ from evaluation.scorers import (
     exact_vqa_accuracy,
     final_number,
     get_scorer,
+    mathvista_accuracy,
+    mathvista_extraction,
     mean_scores,
+    normalize_mathvista_answer,
     parse_points,
     points_in_masks,
     relaxed_accuracy,
@@ -389,6 +395,231 @@ class TestChoiceLetter:
         self, prediction: str, expected: float
     ) -> None:
         assert choice_letter(prediction, ["C"]) == expected
+
+
+class _Extracts:
+    """A stand-in answer extractor: a fixed answer, noting each question and reply it is given."""
+
+    def __init__(self, answer: str = "") -> None:
+        self.answer = answer
+        self.asked: list[tuple[str, str]] = []
+
+    def __call__(self, question: str, reply: str) -> str:
+        self.asked.append((question, reply))
+        return self.answer
+
+
+QUERY = "Hint: answer with the option letter.\nQuestion: What fraction is blue?"
+OPTIONS = ("3/11", "8/11", "6/11", "3/5")
+
+
+def _problem(
+    answer: str = "8/11",
+    question_type: str = "multi_choice",
+    answer_type: str = "text",
+    choices: Sequence[str] = OPTIONS,
+    precision: int | None = None,
+    extract: _Extracts | None = None,
+) -> MathVistaReference:
+    return MathVistaReference(
+        answer=answer,
+        query=QUERY,
+        question_type=question_type,
+        answer_type=answer_type,
+        extract=extract or _Extracts(),
+        choices=tuple(choices),
+        precision=precision,
+    )
+
+
+def _free_form(
+    answer: str, answer_type: str, precision: int | None = None, extract: _Extracts | None = None
+) -> MathVistaReference:
+    return _problem(answer, "free_form", answer_type, (), precision, extract)
+
+
+class TestMathVistaReference:
+    @pytest.mark.parametrize(
+        ("changes", "error"),
+        [
+            ({"answer": " "}, "answer must be a non-blank string"),
+            ({"query": ""}, "query must be a non-blank string"),
+            ({"question_type": "open"}, "question_type must be one of"),
+            ({"answer_type": "fraction"}, "answer_type must be one of"),
+            ({"answer": "1/2"}, "is not one of"),
+            ({"choices": ()}, "is not one of"),
+            ({"choices": ("8/11", None)}, "options must be strings"),
+            ({"question_type": "free_form", "choices": ()}, "integer, float or list answer"),
+            ({"question_type": "free_form", "answer_type": "float"}, "needs a precision"),
+        ],
+    )
+    def test_a_problem_that_could_never_be_scored_is_refused(
+        self, changes: dict[str, Any], error: str
+    ) -> None:
+        fields: dict[str, Any] = {
+            "answer": "8/11",
+            "query": QUERY,
+            "question_type": "multi_choice",
+            "answer_type": "text",
+            "extract": _Extracts(),
+            "choices": OPTIONS,
+            "precision": None,
+        }
+        with pytest.raises(ValueError, match=error):
+            MathVistaReference(**{**fields, **changes})
+
+
+class TestMathVistaExtraction:
+    def test_an_empty_reply_gives_nothing_without_the_extractor(self) -> None:
+        extract = _Extracts("8/11")
+        assert mathvista_extraction("", _problem(extract=extract)) == ""
+        assert extract.asked == []
+
+    def test_a_reply_that_is_exactly_an_option_is_taken_as_it_is(self) -> None:
+        extract = _Extracts("3/5")
+        assert mathvista_extraction("6/11", _problem(extract=extract)) == "6/11"
+        assert extract.asked == []
+
+    @pytest.mark.parametrize(
+        ("answer_type", "reply", "number"),
+        [
+            ("integer", " 42\n", "42"),
+            ("integer", "+7", "7"),
+            ("integer", "1_000", "1000"),
+            ("float", "1.50", "1.5"),
+            ("float", "2", "2.0"),
+            ("float", " 1e2", "100.0"),
+        ],
+    )
+    def test_a_number_the_answer_type_parses_whole_is_taken_as_that_number(
+        self, answer_type: str, reply: str, number: str
+    ) -> None:
+        extract = _Extracts("0")
+        problem = _free_form("1", answer_type, precision=1, extract=extract)
+        assert mathvista_extraction(reply, problem) == number
+        assert extract.asked == []
+
+    @pytest.mark.parametrize(
+        ("problem", "reply"),
+        [
+            (_problem(), "B"),
+            (_problem(), "8/11 "),
+            (_free_form("42", "integer"), "The answer is 42."),
+            (_free_form("42", "integer"), "42.0"),
+            (_free_form("[1, 2]", "list"), "[1, 2]"),
+        ],
+    )
+    def test_any_other_reply_is_read_by_the_extractor_asked_the_query(
+        self, problem: MathVistaReference, reply: str
+    ) -> None:
+        extract = _Extracts(" read")
+        problem = dataclasses.replace(problem, extract=extract)
+        assert mathvista_extraction(reply, problem) == " read"
+        assert extract.asked == [(QUERY, reply)]
+
+
+class TestMathVistaNormalization:
+    @pytest.mark.parametrize(
+        ("text", "option"), [("B", "8/11"), ("(c) 6/11", "6/11"), (" (b)", "8/11")]
+    )
+    def test_a_letter_names_its_option(self, text: str, option: str) -> None:
+        assert normalize_mathvista_answer(text, _problem()) == option
+
+    @pytest.mark.parametrize(("text", "option"), [("8/12", "8/11"), ("b", "3/5"), ("", "3/5")])
+    def test_other_text_takes_the_option_the_fewest_edits_away(
+        self, text: str, option: str
+    ) -> None:
+        assert normalize_mathvista_answer(text, _problem()) == option
+
+    def test_equally_close_options_give_the_first(self) -> None:
+        assert normalize_mathvista_answer("a", _problem("ac", choices=("ab", "ac"))) == "ab"
+
+    @pytest.mark.parametrize(
+        ("text", "number"),
+        [
+            (" 42.", "42"),
+            ("3.9", "3"),
+            ("-2", "-2"),
+            ("7 apples", None),
+            ("inf", None),
+            ("nan", None),
+        ],
+    )
+    def test_an_integer_answer_is_read_as_a_whole_number(
+        self, text: str, number: str | None
+    ) -> None:
+        assert normalize_mathvista_answer(text, _free_form("42", "integer")) == number
+
+    @pytest.mark.parametrize(
+        ("text", "precision", "number"),
+        [("3.14159", 2, "3.14"), ("0.25", 1, "0.2"), (" 2", 1, "2.0"), ("pi", 2, None)],
+    )
+    def test_a_float_answer_is_rounded_to_its_precision(
+        self, text: str, precision: int, number: str | None
+    ) -> None:
+        problem = _free_form("3.14", "float", precision=precision)
+        assert normalize_mathvista_answer(text, problem) == number
+
+    def test_a_list_answer_is_the_extraction_as_it_is(self) -> None:
+        problem = _free_form("[2014, 2016]", "list")
+        assert normalize_mathvista_answer(" [2014, 2016]", problem) == " [2014, 2016]"
+
+
+class TestMathVistaAccuracy:
+    @pytest.mark.parametrize(
+        "problem",
+        [_problem(), _free_form("42", "integer"), _free_form("1.25", "float", precision=2)],
+    )
+    def test_the_reference_answer_as_the_reply_scores_one(
+        self, problem: MathVistaReference
+    ) -> None:
+        assert mathvista_accuracy(problem.answer, problem) == 1.0
+
+    def test_a_wrong_option_scores_zero(self) -> None:
+        assert mathvista_accuracy("3/11", _problem()) == 0.0
+
+    def test_the_extracted_answer_is_normalized_before_it_is_compared(self) -> None:
+        assert (
+            mathvista_accuracy("It is 42.", _free_form("42", "integer", extract=_Extracts(" 42.")))
+            == 1.0
+        )
+        assert mathvista_accuracy("I pick b", _problem(extract=_Extracts("(B)"))) == 1.0
+
+    def test_a_list_answer_must_be_extracted_exactly(self) -> None:
+        problem = _free_form("[2014, 2016]", "list", extract=_Extracts("[2014, 2016]"))
+        assert mathvista_accuracy("Between [2014, 2016].", problem) == 1.0
+        problem = _free_form("[2014, 2016]", "list", extract=_Extracts(" [2014, 2016]"))
+        assert mathvista_accuracy("Between [2014, 2016].", problem) == 0.0
+
+    def test_an_empty_reply_picks_the_shortest_option(self) -> None:
+        assert mathvista_accuracy("", _problem("3/5")) == 1.0
+        assert mathvista_accuracy("", _problem("8/11")) == 0.0
+
+    def test_an_answer_that_is_not_a_number_scores_zero_on_a_numeric_problem(self) -> None:
+        assert (
+            mathvista_accuracy("some", _free_form("42", "integer", extract=_Extracts("some")))
+            == 0.0
+        )
+
+    def test_an_extractor_that_fails_raises(self) -> None:
+        def broken(question: str, reply: str) -> str:
+            raise OSError("the extractor is not on this node")
+
+        problem = dataclasses.replace(_problem(), extract=broken)
+        with pytest.raises(OSError, match="not on this node"):
+            mathvista_accuracy("the second one", problem)
+
+    @pytest.mark.parametrize(
+        ("prediction", "reference", "error"),
+        [(None, _problem(), "prediction must be a str"), ("B", ["8/11"], "MathVistaReference")],
+    )
+    def test_the_arguments_are_checked(self, prediction: Any, reference: Any, error: str) -> None:
+        with pytest.raises(TypeError, match=error):
+            mathvista_accuracy(prediction, reference)
+
+    def test_it_is_registered_with_the_mean_over_samples(self) -> None:
+        scorer = get_scorer("mathvista_accuracy")
+        assert scorer.score is mathvista_accuracy and scorer.aggregate is mean_scores
 
 
 class TestMeanScores:
