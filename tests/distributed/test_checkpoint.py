@@ -1118,3 +1118,54 @@ class TestWeightDecayScopeAcrossStages:
             pytest.raises(expected, match=reason),
         ):
             resumed.load()
+
+
+class TestPinnedSnapshot:
+    def test_a_pinned_save_snapshots_dtensors_when_it_returns(
+        self, distributed_env, shared_tmp_dir, monkeypatch
+    ):
+        """A sharded weight and a 0-dim replicated DTensor changed right after an
+        async_with_pinned_mem save returns load back as they were at save time. The
+        background write is held until they have changed."""
+        import threading
+
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.filesystem import FileSystemWriter
+        from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+
+        from kempnerforge.checkpoint.async_save import AsyncCheckpointer
+
+        mesh = distributed_env["dp_shard"]
+
+        def state(weight: float, scale: float) -> dict:
+            return {
+                "weight": distribute_tensor(
+                    torch.full((64, 32), weight, device="cuda"), mesh, [Shard(0)]
+                ),
+                "scale": distribute_tensor(torch.tensor(scale, device="cuda"), mesh, [Replicate()]),
+            }
+
+        release = threading.Event()
+        real_write = FileSystemWriter.write_data
+
+        def held_write(writer, plan, planner):
+            assert release.wait(timeout=60)
+            return real_write(writer, plan, planner)
+
+        monkeypatch.setattr(FileSystemWriter, "write_data", held_write)
+        live = state(1.0, 1.0)
+        checkpoint_id = os.path.join(shared_tmp_dir, "pinned")
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_pinned)
+        try:
+            ckpt.save(live, checkpoint_id=checkpoint_id)
+            with torch.no_grad():
+                for tensor in live.values():
+                    tensor.mul_(11.0)
+        finally:
+            release.set()
+        ckpt.wait()
+        dist.barrier()
+        loaded = state(0.0, 0.0)
+        dcp.load(loaded, checkpoint_id=checkpoint_id)
+        assert torch.equal(loaded["weight"].full_tensor(), torch.ones(64, 32, device="cuda"))
+        assert loaded["scale"].full_tensor().item() == 1.0
