@@ -1,4 +1,5 @@
-"""Fakes shared by the unit tests of the MLflow checkpoint models (no server, no mlflow needed)."""
+"""Fixtures shared by the unit tests: fakes for the MLflow checkpoint models (no server, no
+mlflow needed), and a registry that drops the entries a test registers."""
 
 from __future__ import annotations
 
@@ -9,6 +10,8 @@ import threading
 import types
 
 import pytest
+
+from kempnerforge.config.registry import registry
 
 EXTERNAL_TAG = "mlflow.model.isExternal"
 PAGE_LIMIT = 50
@@ -177,3 +180,20 @@ def model_store(monkeypatch) -> FakeModelStore:
             setattr(module, key, value)
         monkeypatch.setitem(sys.modules, name, module)
     return FakeModelStore()
+
+
+@pytest.fixture
+def isolated_registry():
+    """The global registry, with the entries the test registers removed afterward.
+
+    An entry a ``kempnerforge`` module registers stays, even when the test is what first
+    imported that module: the module stays imported, so nothing would register it again.
+    """
+    before = {category: set(store) for category, store in registry._stores.items()}
+    yield registry
+    for category, store in registry._stores.items():
+        owners = registry._owners.get(category, {})
+        for name in set(store) - before.get(category, set()):
+            if not owners.get(name, "").startswith("kempnerforge."):
+                del store[name]
+                owners.pop(name, None)
