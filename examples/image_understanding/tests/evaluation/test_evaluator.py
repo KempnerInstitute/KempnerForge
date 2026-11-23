@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 import torch
+from _gloo_ranks import gloo_group, held_store
 from evaluation import evaluator
 from evaluation.checkpoint import load_model
 from evaluation.evaluator import (
@@ -47,7 +48,6 @@ from PIL import Image
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.loader import load_config
 from kempnerforge.metrics.mlflow.publish import PublishRefused
-from tests.gloo_ranks import gloo_group, held_store
 
 LONG_QUESTION_ROW = 4
 LONG_PROMPT_TOKENS = 21
@@ -1193,7 +1193,7 @@ def _spawn_ranks(
     """
     import torch.multiprocessing as mp
 
-    with held_store(world) as port:
+    with held_store() as port:
         args = (
             world,
             port,
