@@ -329,6 +329,40 @@ train.is_fp8 && distributed.tp > 1  →  ValueError
 Rationale in the error message: `torchao.Float8Linear` does not compose
 with DTensor sharding today.
 
+### FP8 geometry
+
+```
+train.is_fp8 && model.dim % 16 != 0                                           →  ValueError
+train.is_fp8 && vlm is None && (train.batch_size * train.seq_len) % 16 != 0   →  ValueError
+```
+
+`torch._scaled_mm` needs both dimensions of an FP8 weight to be
+multiples of 16, and every attention and MLP projection and the output
+head has `model.dim` on one side, so with any other `dim` no layer
+could run in FP8. Other unaligned layers are not errors: `k_proj` and
+`v_proj` with a small `n_kv_heads * head_dim`, an output head with a
+`vocab_size` such as 50257, or an explicit `ffn_hidden_dim` that is not
+a multiple of 16 stay in bf16, and `apply_float8` names them in a
+startup warning (see
+[FP8 § Exclusion rules](../distributed/fp8.md#exclusion-rules)).
+
+The second rule covers the weight gradient. torchao computes it as
+`grad_output.t() @ input`, which multiplies over the micro-batch's
+`batch_size * seq_len` tokens, and `torch._scaled_mm` needs that
+dimension to be a multiple of 16 as well. Without the check, such a run
+passes the forward and fails in its first backward. Under pipeline
+parallelism each micro-batch is also `batch_size` rows. VLM runs are
+not checked, because their token counts depend on the data (image
+tokens plus text) rather than on the config alone; a VLM micro-batch
+whose token count is not a multiple of 16 fails in its first backward,
+with an error such as `Expected trailing dimension of mat1 to be
+divisible by 16 but got mat1 shape: (<out_features>x<tokens>)`. A
+packed VLM run (`data.pack_sequences = true`) is refused with FP8 when
+`JobConfig` is built (`__post_init__`), because its head runs over the
+batch's text tokens, a count that changes from batch to batch. With
+`data.hf_streaming`, the last batch of each pass over the stream can be
+short, so keep `train.seq_len` itself a multiple of 16 there.
+
 ### Sigmoid MoE router + full activation checkpointing
 
 ```
