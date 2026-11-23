@@ -534,7 +534,7 @@ class TestEvaluateBatch:
             asked.append((question, reply))
             return _number_words(question, reply)
 
-        monkeypatch.setattr(readers, "AnswerExtractor", lambda device: extract)
+        monkeypatch.setattr(readers, "bigbird_extractor", lambda device: extract)
         monkeypatch.setattr(
             evaluator, "greedy_decode", _replies(run, [["blue"], ["three"], ["one"], []])
         )
@@ -552,7 +552,7 @@ class TestEvaluateBatch:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            readers, "AnswerExtractor", lambda device: AnswerExtractor(device, load=_load_nowhere)
+            readers, "bigbird_extractor", lambda device: AnswerExtractor(device, _load_nowhere)
         )
         (task,) = load_tasks(_mathvista_task(write_mathvista(MATHVISTA_PROBLEMS)))
         reader, decoder = build_reader(task), _decoder(run)
@@ -1317,7 +1317,7 @@ def _evaluate_on_rank(
         evaluator.greedy_decode = lambda model, rows, **kwargs: [
             Generation((three,), True) for _ in rows
         ]
-        readers.AnswerExtractor = (
+        readers.bigbird_extractor = (
             partial(AnswerExtractor, load=_load_nowhere)
             if rank == broken_rank
             else lambda device: _number_words

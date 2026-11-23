@@ -14,6 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import torch
+from evaluation import extraction
 from evaluation.extraction import AnswerExtractor
 from evaluation.readers import (
     MATHVISTA_COLUMNS,
@@ -252,9 +253,14 @@ class TestMathVista:
             MathVistaRows(path, _extract)
 
     def test_the_factory_gives_each_row_an_extractor_on_the_device(
-        self, write_mathvista: Callable[..., Path]
+        self, write_mathvista: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        fetched: list[Path] = []
+        monkeypatch.setattr(
+            extraction, "fetch_bigbird", lambda: fetched.append(tmp_path) or tmp_path
+        )
         reader = mathvista(write_mathvista(MATHVISTA_PROBLEMS), extractor_device="cpu")
+        assert fetched == [tmp_path]
         extract = reader.reference(0).extract
         assert isinstance(extract, AnswerExtractor) and extract.device == torch.device("cpu")
         assert all(reader.reference(row).extract is extract for row in range(len(reader)))
@@ -266,8 +272,9 @@ class TestMathVista:
             mathvista(write_mathvista(MATHVISTA_PROBLEMS), extractor_device="gpu0")
 
     def test_a_task_file_reads_the_split_from_its_own_directory(
-        self, write_mathvista: Callable[..., Path], tmp_path: Path
+        self, write_mathvista: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        monkeypatch.setattr(extraction, "fetch_bigbird", lambda: tmp_path)
         write_mathvista(MATHVISTA_PROBLEMS, name="testmini.parquet")
         path = tmp_path / "tasks.toml"
         path.write_text(

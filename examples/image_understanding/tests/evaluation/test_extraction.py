@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import threading
-import time
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +10,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from evaluation import extraction
 from evaluation.extraction import (
     CANDIDATE_SPANS,
     EXTRACTOR_FILES,
@@ -22,7 +21,10 @@ from evaluation.extraction import (
     AnswerExtractor,
     SpanModel,
     answer_spans,
+    bigbird_extractor,
     bigbird_tokenizer,
+    extractor_device,
+    fetch_bigbird,
     load_bigbird,
 )
 
@@ -116,7 +118,11 @@ def _extractor(
         {_id(tokenizer, token): value for token, value in ends.items()},
     )
     span_model = SpanModel(tokenizer, model, _id(tokenizer, "[CLS]"))
-    return AnswerExtractor(load=lambda device: span_model), model
+    return AnswerExtractor("cpu", lambda device: span_model), model
+
+
+def _load_nothing(device: torch.device) -> SpanModel:
+    raise AssertionError("nothing is loaded")
 
 
 class TestAnswerSpans:
@@ -263,59 +269,21 @@ class TestAnswerExtractor:
                 raise OSError("the extractor is not on this node")
             return span_model
 
-        extract = AnswerExtractor(load=load)
+        extract = AnswerExtractor("cpu", load)
         with pytest.raises(OSError, match="not on this node"):
             extract("what?", "a cat")
         assert extract("what?", "a cat") == "a"
         assert len(attempts) == 2
 
-    def test_a_load_past_its_deadline_stops_with_the_model_to_fetch(
-        self, spiece_model: Path
-    ) -> None:
-        released = threading.Event()
-
-        def stuck(device: torch.device) -> SpanModel:
-            released.wait(30)
-            raise OSError("released")
-
-        extract = AnswerExtractor(load=stuck, load_timeout=0.2)
-        started = time.monotonic()
-        try:
-            with pytest.raises(TimeoutError, match=f"longer than 0.2 s; fetch {EXTRACTOR_MODEL}"):
-                extract("what?", "a cat")
-        finally:
-            released.set()
-        assert time.monotonic() - started < 10
-
-    def test_a_load_runs_off_the_calling_thread(self, spiece_model: Path) -> None:
-        tokenizer = bigbird_tokenizer(spiece_model, TOKENS)
-        span_model = SpanModel(tokenizer, _Logits({}, {}), _id(tokenizer, "[CLS]"))
-        threads: list[threading.Thread] = []
-
-        def load(device: torch.device) -> SpanModel:
-            threads.append(threading.current_thread())
-            return span_model
-
-        AnswerExtractor(load=load)("what?", "a cat")
-        assert threads and threads[0] is not threading.current_thread()
-        assert threads[0].daemon
-
-    def test_cuda_without_an_index_is_the_current_device(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-        monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
-        assert AnswerExtractor("cuda").device == torch.device("cuda", 3)
-        assert AnswerExtractor("cuda:1").device == torch.device("cuda", 1)
-
     def test_a_device_torch_cannot_read_is_refused(self) -> None:
         with pytest.raises(ValueError, match="extractor_device 'gpu0' is not a torch device"):
-            AnswerExtractor("gpu0")
+            AnswerExtractor("gpu0", _load_nothing)
 
     def test_a_cuda_device_needs_cuda(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         with pytest.raises(ValueError, match="needs CUDA"):
-            AnswerExtractor("cuda")
+            extractor_device("cuda")
+        assert extractor_device("cpu") == torch.device("cpu")
 
 
 @pytest.fixture
@@ -343,12 +311,11 @@ def bigbird_snapshot(tmp_path: Path, spiece_model: Path) -> Path:
     return folder
 
 
-class TestLoadBigBird:
-    def test_the_pinned_snapshot_is_loaded_attending_fully(
+class TestBigBird:
+    def test_the_pinned_files_are_fetched(
         self, bigbird_snapshot: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import huggingface_hub
-        from transformers.utils import logging as transformers_logging
 
         requests: list[tuple[Sequence[Any], dict[str, Any]]] = []
 
@@ -357,18 +324,53 @@ class TestLoadBigBird:
             return str(bigbird_snapshot)
 
         monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
-        verbosity = transformers_logging.get_verbosity()
-        span_model = load_bigbird(torch.device("cpu"))
-        assert transformers_logging.get_verbosity() == verbosity
+        assert fetch_bigbird() == bigbird_snapshot
         assert requests == [
             (
                 (EXTRACTOR_MODEL,),
                 {"revision": EXTRACTOR_REVISION, "allow_patterns": list(EXTRACTOR_FILES)},
             )
         ]
+
+    def test_the_model_loads_from_its_folder_attending_fully(self, bigbird_snapshot: Path) -> None:
+        from transformers.utils import logging as transformers_logging
+
+        verbosity = transformers_logging.get_verbosity()
+        span_model = load_bigbird(torch.device("cpu"), bigbird_snapshot)
+        assert transformers_logging.get_verbosity() == verbosity
         model: Any = span_model.model
         assert model.bert.attention_type == "original_full" and not model.training
         assert span_model.cls_id == span_model.tokenizer.token_to_id("[CLS]")
+
+    def test_the_extractor_fetches_when_made_and_loads_on_its_first_call(
+        self, bigbird_snapshot: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fetched: list[Path] = []
+        loaded: list[torch.device] = []
+
+        def fetch() -> Path:
+            fetched.append(bigbird_snapshot)
+            return bigbird_snapshot
+
+        def load(device: torch.device, folder: Path) -> SpanModel:
+            loaded.append(device)
+            return load_bigbird(device, folder)
+
+        monkeypatch.setattr(extraction, "fetch_bigbird", fetch)
+        monkeypatch.setattr(extraction, "load_bigbird", load)
+        extract = bigbird_extractor("cpu")
+        assert (fetched, loaded) == ([bigbird_snapshot], [])
         context = "the answer is 42. a cat"
-        answer = AnswerExtractor(load=load_bigbird)("how many?", context)
+        answer = extract("how many?", context)
         assert answer and answer in context
+        extract("what?", "a dog")
+        assert (fetched, loaded) == ([bigbird_snapshot], [torch.device("cpu")])
+
+    def test_a_device_is_refused_before_anything_is_fetched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fetched: list[str] = []
+        monkeypatch.setattr(extraction, "fetch_bigbird", lambda: fetched.append("fetched"))
+        with pytest.raises(ValueError, match="extractor_device 'gpu0'"):
+            bigbird_extractor("gpu0")
+        assert fetched == []

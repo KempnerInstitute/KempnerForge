@@ -207,12 +207,13 @@ def write_task(tmp_path: Path) -> Callable[..., Path]:
 
 @pytest.fixture(autouse=True)
 def no_extractor_download(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Makes loading the real answer extractor fail, so no test downloads it."""
+    """Makes fetching or loading the real answer extractor fail, so no test downloads it."""
     from evaluation import extraction
 
-    def refuse(device: Any) -> Any:
-        raise RuntimeError("the tests never load the real answer extractor; pass a stand-in")
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("the tests never fetch the real answer extractor; pass a stand-in")
 
+    monkeypatch.setattr(extraction, "fetch_bigbird", refuse)
     monkeypatch.setattr(extraction, "load_bigbird", refuse)
 
 

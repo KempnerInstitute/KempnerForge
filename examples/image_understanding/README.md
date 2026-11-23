@@ -595,7 +595,8 @@ the scorers of their answers.
   split without answers, as the test split is, or a problem the scorer could not
   score is refused with its `pid` named; an image that does not decode is passed
   over. Its `extractor_device` (`cpu` by default) is where the answer extractor
-  of `mathvista_accuracy` runs.
+  of `mathvista_accuracy` runs; a device the process cannot use is refused
+  before the extractor is fetched.
 - `scorers.py`: a scorer rates one prediction against a sample's reference
   answers with a value in [0, 1], and a task's score is the mean over its
   samples. A reader with a `reference(row)` method gives the reference instead.
@@ -651,15 +652,13 @@ the scorers of their answers.
     and a list answer kept as extracted. As in the recipe, which departs from the
     official code here, the model replaces the official GPT-4 extraction, a
     failed extraction stops the evaluation instead of giving no answer, and the
-    answers are compared as text. The model (about 530 MB, at a pinned revision)
-    is downloaded to the Hugging Face cache the first time a row needs it; each
-    rank loads its own copy, as each rank scores its own rows, and the others
-    wait for it at the end of the task. A load, download included, that takes
-    longer than ten minutes (`EXTRACTOR_LOAD_TIMEOUT_SEC`, well inside the
-    process group's 1,800 s default timeout) stops the evaluation on every rank
-    with the model to fetch, so on a slow network fetch it before the run
-    (`extraction.py`'s `EXTRACTOR_MODEL`, `EXTRACTOR_REVISION` and
-    `EXTRACTOR_FILES`). transformers 5 has
+    answers are compared as text. The model's files (about 530 MB, at a pinned
+    revision) are downloaded to the Hugging Face cache the first time a MathVista
+    task is evaluated: every rank fetches them when it opens the task's split,
+    before anything is decoded, so a failed download stops the evaluation at
+    once. Each rank loads the model from them when one of its rows first needs
+    it, as each rank scores its own rows; a reply needing no extraction loads
+    nothing. transformers 5 has
     no question-answering pipeline, so `extraction.py` reads the span as the
     transformers 4 pipeline the recipe calls does, with the same tokenizer, built
     from the model's SentencePiece file with `protobuf` (the `sentencepiece`

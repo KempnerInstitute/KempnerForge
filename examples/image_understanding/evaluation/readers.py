@@ -30,7 +30,7 @@ from image_text.skip import (
 from image_text.testbed import ImageTextRows
 from torch.utils.data import Dataset
 
-from .extraction import AnswerExtractor
+from .extraction import bigbird_extractor
 from .scorers import MathVistaReference
 
 MMLU_LETTERS = ("A", "B", "C", "D")
@@ -287,7 +287,7 @@ def mathvista(annotation_file: str | Path, extractor_device: str = "cpu") -> Mat
 
     ``annotation_file`` is a split's parquet file as published (``testmini``,
     the split with answers). A reply that needs its answer extracted is read by
-    an ``AnswerExtractor`` on ``extractor_device``, loaded when a row first needs
-    it.
+    ``bigbird_extractor`` on ``extractor_device``, whose files are fetched when
+    the reader is made and whose model is loaded when a row first needs it.
     """
-    return MathVistaRows(annotation_file, AnswerExtractor(extractor_device))
+    return MathVistaRows(annotation_file, bigbird_extractor(extractor_device))
