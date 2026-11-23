@@ -1650,7 +1650,7 @@
           "TestFlushPendingSave(1)",
           "TestSaveVLMFreezeMetadata(3)",
           "TestLoadVLMFreezeCompare(9)",
-          "TestUnreadableTrainStateAcrossRanks(1)"
+          "TestUnreadableTrainStateAcrossRanks(1)",
           "TestTornStageAcrossRanks(1)"
         ],
         "count": 52
