@@ -1271,7 +1271,8 @@ class CheckpointManager:
 
         ``extra["vlm_freeze"]``, when present, is recorded in ``metadata.json`` as given:
         ``canonical_freeze_meta`` has already sorted and deduplicated it, so the comparison
-        on load does not depend on order.
+        on load does not depend on order. ``extra["plugins"]``, when present, is recorded
+        there too, for ``load`` to compare before reading any state.
 
         ``per_rank`` is the envelope ``save()`` gathered from every rank; omitting it writes
         a legacy train state carrying rank 0's loader/RNG state only.
@@ -1286,8 +1287,9 @@ class CheckpointManager:
         )
         torch.save(train_state, ckpt_dir / _TRAIN_STATE_FILE)
         meta: dict[str, Any] = {"step": step, "tokens_seen": tokens_seen}
-        if extra is not None and "vlm_freeze" in extra:
-            meta["vlm_freeze"] = extra["vlm_freeze"]
+        for key in ("vlm_freeze", "plugins"):
+            if extra is not None and key in extra:
+                meta[key] = extra[key]
         text = self._sidecar_text(meta)
         with self._sidecar_lock:
             _replace_file(ckpt_dir / _METADATA_FILE, text)
@@ -1351,6 +1353,7 @@ class CheckpointManager:
         exclude_keys: list[str] | None = None,
         vlm_freeze_expected: list[dict[str, Any]] | None = None,
         exact_resume: bool = False,
+        plugins_expected: list[str] | None = None,
     ) -> tuple[int, int, dict[str, Any]]:
         """Load a checkpoint and restore all state.
 
@@ -1384,6 +1387,10 @@ class CheckpointManager:
                 train state: no rank restores loader/RNG state or enters the
                 train-state broadcasts or the layout gather, and with
                 ``exact_resume`` it raises.
+            plugins_expected: The run's ``plugins`` list, compared with the one the
+                checkpoint's ``metadata.json`` records before any state is read (see
+                ``_check_plugins``). Every rank must pass the same value. A weights-only
+                warm start, which reads no train state, is not compared.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
@@ -1397,8 +1404,9 @@ class CheckpointManager:
                 ``"train_state"`` outside ``["optimizer", "train_state"]``, or is that
                 pair with ``exact_resume``, raised before the path is resolved; the
                 checkpoint was saved under another weight-decay scope, LR multipliers or
-                patterns of their modules (see ``__init__``); or, on an exact resume, its
-                per-rank state does not fit this run's topology and
+                patterns of their modules (see ``__init__``), or with another ``plugins``
+                list (see ``plugins_expected``); or, on an exact resume, its per-rank state
+                does not fit this run's topology and
                 ``checkpoint.ignore_rank_state_mismatch`` is off (see ``exact_resume``).
             RuntimeError: The saved optimizer state does not fit this run's optimizers.
 
@@ -1481,6 +1489,11 @@ class CheckpointManager:
                                 msg + " (set checkpoint.ignore_freeze_mismatch=true to override)"
                             )
 
+        metadata: _MetadataOutcome | None = None
+        if plugins_expected is not None and load_train_state:
+            metadata = self._broadcast_metadata(ckpt_dir)
+            self._check_plugins(metadata, ckpt_dir, plugins_expected)
+
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
 
         load_model = exclude_keys is None or "model" not in exclude_keys
@@ -1490,16 +1503,18 @@ class CheckpointManager:
         saved_keys, restored_on_any_rank = (
             self._read_saved_keys(dcp_dir) if load_optim else ({}, False)
         )
-        metadata: _MetadataOutcome | None = None
         saved_modules: list[str | None] | None = None
+        lr_checked = False
         if restored_on_any_rank and (
             self._weight_decay_scope is not None or self._lr_multipliers is not None
         ):
-            metadata = self._broadcast_metadata(ckpt_dir)
+            if metadata is None:
+                metadata = self._broadcast_metadata(ckpt_dir)
             if self._weight_decay_scope is not None:
                 self._check_weight_decay_scope(metadata, ckpt_dir)
             if self._lr_multipliers is not None:
                 saved_modules = self._check_lr_multipliers(metadata, ckpt_dir)
+                lr_checked = True
         fresh_optimizer = load_optim and not _holds_optimizer(saved_keys)
         if fresh_optimizer:
             load_optim = False
@@ -1596,11 +1611,13 @@ class CheckpointManager:
             assert train_state is not None, "train_state broadcast failed"
             if (
                 self._lr_multipliers is not None
-                and metadata is None
+                and not lr_checked
                 and scheduler is not None
                 and "scheduler" in train_state
             ):
-                self._check_lr_multipliers(self._broadcast_metadata(ckpt_dir), ckpt_dir)
+                if metadata is None:
+                    metadata = self._broadcast_metadata(ckpt_dir)
+                self._check_lr_multipliers(metadata, ckpt_dir)
             if exact_resume:
                 train_state = self._per_rank_view(train_state)
             if dataloader is None and "dataloader" in train_state:
@@ -1710,6 +1727,54 @@ class CheckpointManager:
         if dist.is_initialized():
             dist.broadcast_object_list(outcome, src=0)
         return outcome[0]
+
+    def _check_plugins(
+        self, metadata: _MetadataOutcome, ckpt_dir: Path, expected: list[str]
+    ) -> None:
+        """Refuse a checkpoint saved with a ``plugins`` list other than ``expected``.
+
+        A plugin can register a component the model is built from, so another list can
+        build another model from the same TOML, and DCP loads a model whose parameter names
+        are a subset of the saved ones without an error. The lists compare in order, each
+        module counted once, since importing a module again does nothing. ``metadata`` is
+        what ``_broadcast_metadata`` returned on every rank, so every rank raises or goes
+        on together, and rank 0 alone warns. A checkpoint whose ``metadata.json`` records
+        no list, or cannot be read, is not compared.
+
+        Raises:
+            ValueError: The lists differ and ``checkpoint.ignore_plugins_mismatch`` is off.
+        """
+        meta, error = metadata
+        saved = None if meta is None else meta.get("plugins")
+        if not isinstance(saved, list) or not all(isinstance(p, str) for p in saved):
+            if self._rank == 0:
+                if meta is None:
+                    reason = error
+                elif saved is None:
+                    reason = f"its {_METADATA_FILE} records no plugins list"
+                else:
+                    reason = f"its {_METADATA_FILE} records plugins = {saved!r}"
+                logger.warning(
+                    f"plugins = {list(expected)!r} is not compared with {ckpt_dir}: {reason}"
+                )
+            return
+        if list(dict.fromkeys(saved)) == list(dict.fromkeys(expected)):
+            return
+        message = (
+            f"{ckpt_dir} was saved with plugins = {saved!r}, but this run sets plugins = "
+            f"{list(expected)!r}: a plugin can register a component the model is built from, "
+            "and a model whose parameters are a subset of the saved ones loads without an error."
+        )
+        if self.config.ignore_plugins_mismatch:
+            if self._rank == 0:
+                logger.warning(
+                    f"{message} Going on, since checkpoint.ignore_plugins_mismatch is set"
+                )
+            return
+        raise ValueError(
+            f"{message} Set plugins as the checkpoint has them, or, if the plugins that differ "
+            "build no part of the model, set checkpoint.ignore_plugins_mismatch = true."
+        )
 
     def _check_weight_decay_scope(self, metadata: _MetadataOutcome, ckpt_dir: Path) -> None:
         """Refuse a checkpoint saved under a weight-decay scope other than this manager's.

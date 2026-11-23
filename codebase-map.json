@@ -934,7 +934,6 @@
       "purpose": "Training job orchestration — build phases, run the loop, tear down",
       "functions": [
         "run_training(config, step_fn=None, hooks=None)",
-        "_check_saved_plugins(config, saved_extra, resume_path, rank_zero) (refuses a checkpoint saved with another plugins list unless checkpoint.ignore_plugins_mismatch)",
         "build_model(config, runtime, loss_fn) -> tuple[Module, PipelineBundle | None]",
         "build_checkpoint_manager(config, runtime, model, optimizer, pipeline) -> CheckpointManager",
         "restore_checkpoint(config, model, scheduler, ckpt_mgr) -> tuple[int, int]"
@@ -1248,9 +1247,10 @@
             "wait()",
             "flush_pending_save()",
             "peek_saved_step(path)",
-            "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
+            "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected, exact_resume, plugins_expected)",
             "_read_saved_keys(dcp_dir) -> (keys, restored_on_any_rank) (this rank's DCP keys; with a scope or multipliers an all-reduce on the gloo group tells every rank whether any rank's index holds optimizer state)",
             "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope, multipliers and group-layout checks all decide from it)",
+            "_check_plugins(metadata, ckpt_dir, expected) (every rank refuses another plugins list before any state is read, unless checkpoint.ignore_plugins_mismatch)",
             "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
             "_check_lr_multipliers(metadata, ckpt_dir) -> saved group modules | None (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
             "_present_experts(dcp_state, load_from, saved_keys) (EP experts placed among all of them before DCP; a load refuses a checkpoint of fewer experts than the model; the ranks agree before DCP)",
