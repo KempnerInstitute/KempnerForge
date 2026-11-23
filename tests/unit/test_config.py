@@ -339,9 +339,7 @@ class TestTrainConfig:
             TrainConfig(nan_max_consecutive=count)
 
     def test_nan_detection_from_cli(self) -> None:
-        config = load_config(
-            cli_args=["--train.nan_action=raise", "--train.nan_max_consecutive=3"]
-        )
+        config = load_config(cli_args=["--train.nan_action=raise", "--train.nan_max_consecutive=3"])
         assert config.train.nan_action == "raise"
         assert config.train.nan_max_consecutive == 3
 
