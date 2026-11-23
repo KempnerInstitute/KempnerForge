@@ -302,10 +302,18 @@ class TestPerRankEnvelopeSchema:
             del p["dataloader"]
         assert saved_data_position(build_per_rank_envelope(payloads, world_size=WORLD)) is None
 
-    @pytest.mark.parametrize("defect", ["missing_entry", "no_rng", "dataloader_on_some_ranks"])
-    def test_saved_data_position_refuses_an_unsound_envelope(self, defect):
+    @pytest.mark.parametrize(
+        ("defect", "reason"),
+        [
+            ("missing_entry", r"no payload for ranks \[2\] of world_size=4"),
+            ("no_rng", r"entry for rank 0 lacks a complete 'rng' capture"),
+            ("dataloader_on_some_ranks", r"no 'dataloader' state for ranks \[1\] while"),
+        ],
+        ids=["missing_entry", "no_rng", "dataloader_on_some_ranks"],
+    )
+    def test_saved_data_position_refuses_an_unsound_envelope(self, defect, reason):
         """The envelope is checked on the topology that saved it, so no rank keeps a guess."""
-        with pytest.raises(ValueError) as exc:
+        with pytest.raises(ValueError, match=reason) as exc:
             saved_data_position(_defective_envelope(defect))
         assert not isinstance(exc.value, RankStateMismatchError)
 
@@ -808,14 +816,19 @@ class TestLegacyAndTopology:
             assert _draw() == expected
 
     def test_legacy_checkpoint_under_the_flag_keeps_the_position_and_drops_rng(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, caplog
     ):
         """Without per-rank state a changed topology cannot be seen, so the flag assumes one.
 
-        The manager is built before the reference draw because module init itself
-        consumes torch RNG.
+        The warning says why, what was kept and what was dropped. The manager is built
+        before the reference draw because module init itself consumes torch RNG. The
+        ``kempnerforge`` logger stops propagation once configured, so the test lets
+        records reach ``caplog``.
         """
+        import logging
+
         self._write_legacy_ckpt(tmp_path, step=3)
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
         for r in (0, 1):
             mgr = _mock_mgr(tmp_path, monkeypatch, ignore_rank_state_mismatch=True)
             mgr._rank = r
@@ -823,11 +836,17 @@ class TestLegacyAndTopology:
             _seed_all(555)
             fresh = _draw()
             _seed_all(555)
-            step, tokens, _ = mgr.load(path=str(Path(tmp_path) / "step_3"), exact_resume=True)
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
+                step, tokens, _ = mgr.load(path=str(Path(tmp_path) / "step_3"), exact_resume=True)
             assert (step, tokens) == (3, 99)
             assert mgr._pending_dataloader_state == {"epoch": 2, "batches_yielded": 50}
             assert mgr._pending_dataloader_carried
             assert _draw() == fresh, f"rank {r} restored rank 0's RNG under the flag"
+            assert "The checkpoint holds no per-rank state" in caplog.text
+            assert "resumes it as if they did" in caplog.text
+            assert "Kept: rank 0's data position" in caplog.text
+            assert "Dropped: rank 0's saved RNG state" in caplog.text
 
     @pytest.mark.parametrize("lenient", [True, False], ids=["flag", "no_flag"])
     def test_legacy_position_that_cannot_carry_over(self, tmp_path, monkeypatch, caplog, lenient):
@@ -892,7 +911,7 @@ class TestLegacyAndTopology:
     def test_world_size_mismatch_refused_with_actionable_error(self, tmp_path, monkeypatch):
         payloads, _ = _mk_payloads(seed_base=1000, cursor_base=100)
         _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step=7)
-        with pytest.raises(ValueError, match="world_size=4.*world_size=2") as exc:
+        with pytest.raises(RankStateMismatchError, match="world_size=4.*world_size=2") as exc:
             _load_as_rank(tmp_path, monkeypatch, rank=1, step=7, world_size=2)
         assert "ignore_rank_state_mismatch" in str(exc.value)
 
@@ -986,7 +1005,7 @@ class TestLegacyAndTopology:
 
         mgr = _mock_mgr(tmp_path, monkeypatch)
         mgr.save(step=2, dataloader=Loader())
-        with pytest.raises(ValueError, match="world_size=1"):
+        with pytest.raises(RankStateMismatchError, match="world_size=1"):
             _load_as_rank(tmp_path, monkeypatch, rank=3, step=2, world_size=WORLD)
 
 
@@ -1111,6 +1130,38 @@ class TestDataParallelLayout:
         )
         mgr.apply_dataloader_state(resumed)
         assert resumed.state_dict()["global_position"] == 4 * 2 * 3
+
+    def test_override_on_the_saved_layout_still_raises_a_position_that_does_not_fit(
+        self, tmp_path, monkeypatch
+    ):
+        """On the layout that saved it each rank resumes its own position, flag or not.
+
+        The flag lets only a changed topology through, so a position the loader cannot
+        place, here a stream's in a map-style run, still raises.
+        """
+        from kempnerforge.config.schema import DataConfig
+        from kempnerforge.data.dataloader import DataPositionError, StatefulDataLoader
+        from kempnerforge.data.sampler import DistributedSampler
+
+        payloads, _ = _mk_payloads(seed_base=1000, cursor_base=100)
+        for p in payloads.values():
+            p["dataloader"] = {"stream": {}, "epoch": 0, "batches_yielded": 3}
+        _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step=7, layout=DP4)
+        dataset = list(range(64))
+        for r in range(WORLD):
+            mgr, (step, _, _), _ = _load_in_layout(
+                tmp_path, monkeypatch, rank=r, step=7, layout=DP4, ignore_rank_state_mismatch=True
+            )
+            assert step == 7
+            assert not mgr._pending_dataloader_carried
+            loader = StatefulDataLoader(
+                dataset,
+                batch_size=2,
+                sampler=DistributedSampler(dataset, num_replicas=4, rank=r, seed=1),
+                config=DataConfig(num_workers=0, pin_memory=False),
+            )
+            with pytest.raises(DataPositionError, match="streaming data position"):
+                mgr.apply_dataloader_state(loader)
 
     def test_override_keeps_step_scheduler_and_extras(self, tmp_path, monkeypatch):
         """Resuming past the per-rank state drops only the RNG keys and the own loader state.

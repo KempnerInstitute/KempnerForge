@@ -1703,12 +1703,12 @@
           "TestAFailedCaptureFailsEveryRank(4)",
           "TestFourRankSaveLoad(6)",
           "TestLegacyAndTopology(10)",
-          "TestDataParallelLayout(11)",
+          "TestDataParallelLayout(12)",
           "TestLoadsThatAreNotAResume(2)",
           "TestWeightsOnlyWarmStart(3)",
           "TestMidSaveInterruption(1)"
         ],
-        "count": 61
+        "count": 62
       },
       "tests/unit/test_observability.py": {
         "classes": [

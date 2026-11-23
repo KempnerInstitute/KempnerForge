@@ -339,12 +339,13 @@ def test_warm_start_starts_the_data_fresh_when_the_position_cannot_carry_over(
 ):
     """A ``load_path`` warm start on another data-parallel size warns instead of refusing.
 
-    The ``kempnerforge`` logger stops propagation once configured, so the test lets
-    records reach ``caplog``.
+    The ``kempnerforge`` logger stops propagation once configured, which importing the
+    training entry in ``_restore`` may do first, so the test lets records reach
+    ``caplog`` after the restore.
     """
-    monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
     _save_loader_state(tmp_path / "saved", saved_state())
     manager = _restore(tmp_path, warm_start=True)
+    monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
     loader = resumed_loader()
     with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
         manager.apply_dataloader_state(loader)
