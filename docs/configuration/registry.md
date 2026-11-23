@@ -23,7 +23,8 @@ function or class when that is another one (a shared helper or an
 `get` raises `KeyError` with an "Available: […]" hint when a name is
 missing; `list(category)` returns registered names; `unregister(category, name)`
 removes an entry and returns it, raising the same `KeyError` when the name
-is missing (an adapter's `accepts` declaration goes with it).
+is missing (an adapter's `accepts` and `output_num_tokens` declarations go
+with it).
 
 ## The seven categories
 
@@ -161,6 +162,38 @@ def build_my_head(in_dim, out_dim, hidden_dim=None, activation="gelu", **_):
 `accepts` that adapter accepts every field, and its builder receives them
 all. A declaration that names a field `AdapterConfig` does not have fails
 when the config loads.
+
+### Adapters that pool declare their token count
+
+When `vision_encoder.num_tokens` is set, the config checks, before any module
+exists, that the image tokens plus `vlm.max_text_len` fit `model.max_seq_len`
+(when `JobConfig` is built) and `train.seq_len` (in `JobConfig.validate`). It
+counts an image's tokens with `AdapterConfig.output_num_tokens`, which
+returns the `output_num_tokens` the adapter registered with: a callable that
+takes the `AdapterConfig` and the encoder's tokens per image and returns the
+tokens the adapter emits. An adapter that registers none keeps the count, as
+the projection adapters do, so an adapter that pools declares its count. The
+built-in `avgpool` and `attentional_pool` declare theirs with
+`pooled_token_count`, which a plugin that pools a square patch grid the same
+way can use too:
+
+```python
+from kempnerforge.model.adapter import pooled_token_count
+
+def _my_pool_tokens(config, num_input_tokens):
+    return pooled_token_count(num_input_tokens, config.pool_window)
+
+@registry.register_adapter("my_pool", output_num_tokens=_my_pool_tokens)
+def build_my_pool(in_dim, out_dim, pool_window=2, **_):
+    return MyPool(in_dim, out_dim, pool_window)
+```
+
+The declaration must agree with the built module's `output_num_tokens`, which
+the model build uses to size the residual stream and to check
+`model.max_seq_len` again. Without it, the config checks count `my_pool`'s
+tokens unpooled and can reject a `model.max_seq_len` that the pooled tokens
+fit. A declaration that is not callable fails at registration with
+`TypeError`.
 
 ### Making sure the module runs
 

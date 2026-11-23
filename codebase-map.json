@@ -28,7 +28,9 @@
             "list_vlm_configs()",
             "register_modality_strategy(name)",
             "get_modality_strategy(name)",
-            "list_modality_strategies()"
+            "list_modality_strategies()",
+            "register_adapter(name, accepts=None, output_num_tokens=None) (output_num_tokens(config, n) -> the adapter's token count, which AdapterConfig.output_num_tokens returns for the config-time sequence-length checks)",
+            "get_adapter_output_num_tokens(name)"
           ]
         }
       },
@@ -36,7 +38,8 @@
         "registry: Registry"
       ],
       "tested_by": [
-        "tests/unit/test_config.py::TestRegistry"
+        "tests/unit/test_config.py::TestRegistry",
+        "tests/unit/test_adapter.py::TestAdapterOutputNumTokensDeclaration"
       ]
     },
     "kempnerforge/config/schema.py": {
@@ -1650,10 +1653,10 @@
           "TestFlushPendingSave(1)",
           "TestSaveVLMFreezeMetadata(3)",
           "TestLoadVLMFreezeCompare(9)",
-          "TestUnreadableTrainStateAcrossRanks(1)"
+          "TestUnreadableTrainStateAcrossRanks(1)",
           "TestTornStageAcrossRanks(1)"
         ],
-        "count": 52
+        "count": 53
       },
       "tests/unit/test_observability.py": {
         "classes": [

@@ -1829,20 +1829,27 @@ class TestRegistry:
         with pytest.raises(KeyError, match=r"Unknown model: 'b'\. Available: \['a'\]"):
             reg.unregister("model", "b")
 
-    def test_unregister_adapter_drops_its_accepts(self):
-        """The adapter and its ``accepts`` declaration leave together, so a later
-        adapter under the same name does not inherit the old declaration."""
+    def test_unregister_adapter_drops_its_declarations(self):
+        """The adapter and its ``accepts`` and ``output_num_tokens`` declarations
+        leave together, so a later adapter under the same name does not inherit
+        the old ones."""
         reg = Registry()
 
         def build(in_dim, out_dim, **_):
             return None
 
-        reg.register_adapter("a", accepts=("pool_window",))(build)
+        def quarter(config, num_input_tokens):
+            return num_input_tokens // 4
+
+        reg.register_adapter("a", accepts=("pool_window",), output_num_tokens=quarter)(build)
+        assert reg.get_adapter_output_num_tokens("a") is quarter
         assert reg.unregister("adapter", "a") is build
         assert reg.list_adapters() == []
         assert reg.get_adapter_accepts("a") is None
+        assert reg.get_adapter_output_num_tokens("a") is None
         reg.register_adapter("a")(build)
         assert reg.get_adapter_accepts("a") is None
+        assert reg.get_adapter_output_num_tokens("a") is None
 
     def test_builtin_optimizer_registered(self):
         from kempnerforge.config.registry import registry
