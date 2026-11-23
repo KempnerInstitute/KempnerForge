@@ -591,7 +591,9 @@
           ],
           "methods": [
             "forward(x)",
-            "_local_forward(x_flat, weights, indices)"
+            "_local_forward(x_flat, weights, indices)",
+            "_expert_params() -> list[Parameter]",
+            "_keep_in_graph(output, params) -> Tensor (adds a zero-valued term of params so each gets a gradient under FSDP2)"
           ]
         }
       },
@@ -1702,17 +1704,19 @@
           "TestGradientScaling(6)",
           "TestSetMoeStep(3)",
           "TestMoESigmoidConfigValidation(6)",
-          "TestPackedExperts(17)"
+          "TestPackedExperts(17)",
+          "TestIdleExperts(6)"
         ],
-        "count": 91
+        "count": 119
       },
       "tests/unit/test_router.py": {
         "classes": [
           "TestSoftmaxTopKRouter(8)",
           "TestSigmoidSequenceAuxLoss(5)",
-          "TestSigmoidBiasSchedule(6)"
+          "TestSigmoidBiasSchedule(6)",
+          "TestEmptyInput(3)"
         ],
-        "count": 19
+        "count": 22
       },
       "tests/unit/test_optimizer.py": {
         "classes": [
