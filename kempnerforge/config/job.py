@@ -372,6 +372,15 @@ class JobConfig:
         if self.is_vlm:
             assert self.vlm is not None
             assert self.vision_encoder is not None
+            if (
+                self.vision_encoder.type in _HF_VISION_ENCODER_TYPES
+                and not self.vision_encoder.path
+            ):
+                raise ValueError(
+                    f"vision_encoder.type = {self.vision_encoder.type!r} loads a pretrained "
+                    "Hugging Face model, but vision_encoder.path is empty; set "
+                    "vision_encoder.path to the model's Hub id or local directory"
+                )
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)

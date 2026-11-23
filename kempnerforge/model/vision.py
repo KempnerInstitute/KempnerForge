@@ -132,7 +132,10 @@ class _HFVisionEncoder(VisionEncoder):
                 "Install it or use the 'random' encoder for tests."
             ) from e
         if not path:
-            raise ValueError("vlm.vision_encoder_path must be set for HF-backed vision encoders")
+            raise ValueError(
+                "vision_encoder.path must be set for HF-backed vision encoders: set it to the "
+                "Hugging Face Hub id or the local directory of the pretrained model"
+            )
         model = AutoModel.from_pretrained(path)
         vision_tower = getattr(model, "vision_model", model)
         self.vision_tower = vision_tower

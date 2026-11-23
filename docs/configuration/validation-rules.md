@@ -419,6 +419,21 @@ When `distributed.ep > 1`:
   `"ep > 1 requires an MoE model (num_experts > 0)"`).
 - `model.num_experts % distributed.ep == 0`.
 
+### Vision encoder weights
+
+```
+vlm set && vision_encoder.type in {"siglip2", "clip"} && vision_encoder.path == ""  →  ValueError
+```
+
+The Hugging Face encoders load a pretrained model from `vision_encoder.path`,
+a Hub id or a local directory, and the error asks for it. The check runs here,
+on the config after the CLI overrides, so a TOML can leave the path to
+`--vision_encoder.path`. The model's own config is read only when the model is
+built: with `vision_encoder.feature_dim = 0`, a model whose config has no
+`hidden_size` fails there, with an error that names `vision_encoder.path` and
+asks for `vision_encoder.feature_dim`, the width of the features its vision
+tower returns.
+
 ### MoE + torch.compile — warning, not error
 
 ```

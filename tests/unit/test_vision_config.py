@@ -106,3 +106,40 @@ class TestVisionEncoderMixedPrecision:
         toml.write_text('[vision_encoder]\ntype = "random"\nmixed_precision = "fp16"\n')
         with pytest.raises(ValueError):
             load_config(str(toml), cli_args=[])
+
+
+def _vlm_toml(tmp_path, encoder: str):
+    """A small VLM config whose ``[vision_encoder]`` sets only ``type = encoder``."""
+    toml = tmp_path / "vlm.toml"
+    toml.write_text(
+        "[model]\nmax_seq_len = 512\n\n[train]\nseq_len = 512\n\n"
+        f'[vision_encoder]\ntype = "{encoder}"\n\n[vlm]\nmax_text_len = 64\n'
+    )
+    return toml
+
+
+class TestHFEncoderPath:
+    """An HF-backed encoder loads its weights from ``vision_encoder.path``, so
+    ``JobConfig.validate`` refuses an empty one before the process group starts."""
+
+    @pytest.mark.parametrize("encoder", ["siglip2", "clip"])
+    def test_an_empty_path_fails_validation(self, tmp_path, encoder):
+        config = load_config(_vlm_toml(tmp_path, encoder), cli_args=[])
+        with pytest.raises(
+            ValueError,
+            match=rf"vision_encoder\.type = '{encoder}' loads a pretrained Hugging Face model, "
+            r"but vision_encoder\.path is empty; set vision_encoder\.path",
+        ):
+            config.validate(world_size=1)
+
+    def test_a_path_given_on_the_command_line_completes_the_toml(self, tmp_path):
+        """The check reads the config after the CLI overrides land."""
+        config = load_config(
+            _vlm_toml(tmp_path, "siglip2"), cli_args=["--vision_encoder.path=org/tower"]
+        )
+        config.validate(world_size=1)
+        assert config.vision_encoder is not None
+        assert config.vision_encoder.path == "org/tower"
+
+    def test_the_random_encoder_needs_no_path(self, tmp_path):
+        load_config(_vlm_toml(tmp_path, "random"), cli_args=[]).validate(world_size=1)

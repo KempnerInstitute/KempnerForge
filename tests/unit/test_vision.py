@@ -270,7 +270,7 @@ class TestHFVisionEncoderMocked:
         monkeypatch.setitem(sys.modules, "transformers", fake_mod)
 
         builder = registry.get_vision_encoder("siglip2")
-        with pytest.raises(ValueError, match="vision_encoder_path must be set"):
+        with pytest.raises(ValueError, match=r"vision_encoder\.path must be set"):
             builder("")
 
     def test_falls_back_to_top_level_model_when_no_vision_model(self, monkeypatch):
