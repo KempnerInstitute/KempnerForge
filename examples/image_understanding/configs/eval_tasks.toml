@@ -52,3 +52,12 @@ max_new_tokens = 50
 [tasks.reader_args]
 annotation_file = "path-to-chartqa-machine-annotations"
 image_root = "path-to-chartqa-images"
+
+[[tasks]]
+name = "realworldqa"
+reader = "realworldqa"
+scorer = "trimmed_match"
+max_new_tokens = 10
+
+[tasks.reader_args]
+dataset_dir = "path-to-realworldqa"

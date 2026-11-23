@@ -13,10 +13,16 @@ from evaluation.scorers import (
     get_scorer,
     mean_scores,
     relaxed_accuracy,
+    trimmed_match,
     vqa_accuracy,
 )
 
-TEXT_SCORERS = {"anls": anls, "relaxed_accuracy": relaxed_accuracy, "vqa_accuracy": vqa_accuracy}
+TEXT_SCORERS = {
+    "anls": anls,
+    "relaxed_accuracy": relaxed_accuracy,
+    "vqa_accuracy": vqa_accuracy,
+    "trimmed_match": trimmed_match,
+}
 
 
 def _votes(matching: int, total: int) -> list[str]:
@@ -337,3 +343,62 @@ class TestLookup:
         scores = [count_error("3", 3), count_error("5", 2)]
         assert Scorer(count_error).aggregate(scores) == {"correct": 0.5, "error": 1.5}
         assert Scorer(count_error, aggregate=worst).aggregate(scores) == {"worst_error": 3.0}
+
+
+class TestTrimmedMatch:
+    @pytest.mark.parametrize(
+        ("prediction", "answer"),
+        [
+            ("C", "C"),
+            ("c", "C"),
+            ("Yes", "yes"),
+            (" B \n", "B"),
+            ("B.", "B"),
+            ("yes?", "Yes"),
+            ("No!", "no"),
+            ("B?!.", "b"),
+            ("left", "Left?"),
+            ("2", "2"),
+            ("Green.", "Green"),
+        ],
+    )
+    def test_a_match_but_for_case_edges_and_final_marks_scores_one(
+        self, prediction: str, answer: str
+    ) -> None:
+        assert trimmed_match(prediction, [answer]) == 1.0
+
+    @pytest.mark.parametrize(
+        ("prediction", "answer"),
+        [
+            ("B", "C"),
+            ("B. Left", "B"),
+            ("(B)", "B"),
+            ("B)", "B"),
+            ("Answer: B", "B"),
+            (".B", "B"),
+            ("yes !", "yes"),
+            ("not sure", "No"),
+            ("3.0", "3"),
+            ("two", "2"),
+            ("", "B"),
+        ],
+    )
+    def test_anything_else_scores_zero(self, prediction: str, answer: str) -> None:
+        assert trimmed_match(prediction, [answer]) == 0.0
+
+    @pytest.mark.parametrize(
+        ("prediction", "answer"),
+        [("Yes", "yes"), (" YES. ", "yes"), ("yes!", "Yes?"), ("no", "yes"), ("yes !", "yes")],
+    )
+    def test_text_is_trimmed_as_relaxed_accuracy_trims_it(
+        self, prediction: str, answer: str
+    ) -> None:
+        assert trimmed_match(prediction, [answer]) == relaxed_accuracy(prediction, [answer])
+
+    def test_a_number_is_compared_as_text(self) -> None:
+        assert trimmed_match("3.0", ["3"]) == 0.0
+        assert relaxed_accuracy("3.0", ["3"]) == 1.0
+
+    def test_any_matching_reference_counts(self) -> None:
+        assert trimmed_match("b", ["A", "B"]) == 1.0
+        assert trimmed_match("c", ("A", "B")) == 0.0

@@ -145,7 +145,7 @@ class TestLoadTasks:
 
 
 class TestSampleFile:
-    def test_it_holds_the_five_tasks_and_their_caps(self) -> None:
+    def test_it_holds_its_tasks_and_their_caps(self) -> None:
         assert [
             (task.name, task.reader, task.scorer, task.max_new_tokens)
             for task in load_tasks(SAMPLE)
@@ -155,11 +155,13 @@ class TestSampleFile:
             ("docvqa", "docvqa", "anls", 50),
             ("chartqa-human", "chartqa", "relaxed_accuracy", 50),
             ("chartqa-machine", "chartqa", "relaxed_accuracy", 50),
+            ("realworldqa", "realworldqa", "trimmed_match", 10),
         ]
 
     def test_its_paths_are_placeholders(self) -> None:
+        own = {"realworldqa": {"dataset_dir"}}
         for task in load_tasks(SAMPLE):
-            assert set(task.reader_args) == {"annotation_file", "image_root"}
+            assert set(task.reader_args) == own.get(task.reader, {"annotation_file", "image_root"})
             for value in task.reader_args.values():
                 assert Path(value).parent == SAMPLE.parent
                 assert Path(value).name.startswith("path-to-")

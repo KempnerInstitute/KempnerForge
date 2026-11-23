@@ -130,6 +130,21 @@ def _trimmed(text: str) -> str:
     return text.strip().lower().rstrip("?.!")
 
 
+def trimmed_match(prediction: str, answers: Sequence[str]) -> float:
+    """1 when ``prediction`` equals a reference once both are trimmed, and 0 otherwise.
+
+    The trim is the text rule of ``relaxed_accuracy``: each side is stripped of
+    surrounding whitespace, lowercased, and then stripped of trailing ``?``,
+    ``.`` and ``!``, in that order. Nothing else is normalized, and a number is
+    compared as text: ``" B."`` matches ``"b"``, while ``"B. Left"``, ``"(B)"``
+    and ``"3.0"`` do not match ``"B"`` or ``"3"``. With several references any
+    match counts. This is how the recipe scores RealWorldQA.
+    """
+    references = _references(prediction, answers)
+    predicted = _trimmed(prediction)
+    return float(any(predicted == _trimmed(answer) for answer in references))
+
+
 def _number(text: str) -> float | None:
     """``text`` as a number, a trailing ``%`` read as hundredths, or ``None`` when it is not one."""
     try:
@@ -209,6 +224,7 @@ SCORERS: dict[str, Scorer] = {
     "anls": Scorer(anls),
     "relaxed_accuracy": Scorer(relaxed_accuracy),
     "vqa_accuracy": Scorer(vqa_accuracy),
+    "trimmed_match": Scorer(trimmed_match),
 }
 
 
