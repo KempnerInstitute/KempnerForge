@@ -18,11 +18,11 @@ def resolve_resume_path(
     if not base.exists():
         return None
 
-    # 1. latest symlink
+    # 1. latest symlink, if every stage's DCP shards there are durable
     latest = base / "latest"
     if latest.exists():
         resolved = latest.resolve()
-        if resolved.exists():
+        if _dcp_durable(resolved, num_stages):
             return resolved
 
     # 2. newest step_N directory whose save completed
@@ -47,9 +47,12 @@ def resolve_resume_path(
 
 Two fallbacks:
 
-1. **`latest` symlink** — the canonical pointer, updated atomically
+1. **`latest` symlink**: the canonical pointer, updated atomically
    after every successful save (see [Symlink updates](#symlink-updates)
-   below). Used in all healthy cases.
+   below). Used in all healthy cases. Its target is checked like a
+   `step_N` below, every stage's `.metadata` included, so one that lost
+   files after it was committed is skipped with a warning and the scan
+   picks the checkpoint.
 2. **Newest complete `step_N` directory**: a safety net. If the symlink
    is missing (disk corruption, manual `rm`, never created because
    no save has completed), the resolver scans the `step_N` directories
@@ -243,11 +246,24 @@ committed and the save still succeeds on every rank.
   paths in resume.
 - **Empty checkpoint directory** — `resolve_resume_path` returns
   `None`, training starts from step 0. No error.
-- **`latest` symlink points at a removed directory** — the resolver
-  checks `resolved.exists()` after following the link; if it
-  doesn't, it falls through to the `step_N` scan. This
-  catches the case where someone rm-rf'd a checkpoint but left the
+- **`latest` points at a removed or damaged checkpoint**: if the link's
+  target is gone, the resolver goes straight to the `step_N` scan; if
+  the target is there but not every stage's DCP shards in it are
+  durable, it warns and falls through to the scan. This catches the
+  case where someone rm-rf'd a checkpoint, or part of one, but left the
   symlink.
+- **The checkpoint being resumed loses shards after it was resolved**:
+  on an auto-resume, rank 0 checks again in `ckpt_mgr.load` that every
+  stage directory in it holds DCP's `.metadata`. If not, it picks the
+  newest `step_N` beside it in which every stage directory does, and
+  logs a warning; with none, it keeps the checkpoint as resolved, and
+  the load fails on the stage that lacks its shards. This check has no
+  pipeline degree, so a stage that never created its directory is not
+  noticed here; the resolver, which has the degree, has already skipped
+  such a `latest`. Every rank loads
+  the checkpoint rank 0 picked, whatever its own view of the filesystem,
+  so no stage resumes a different step than another. A checkpoint named
+  by `load_path` is loaded as named.
 - **Corrupted `step_N` directory**: `resolve_resume_path` checks
   only that a save completed (DCP's `.metadata`, and `train_state.pt`
   when the shards hold optimizer state), not the contents. If DCP
