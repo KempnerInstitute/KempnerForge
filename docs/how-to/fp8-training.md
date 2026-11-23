@@ -13,17 +13,21 @@ page is the researcher-facing decision and workflow.
 | If… | FP8 is likely to help |
 |-----|:---------------------:|
 | You're on H100 / H200 | yes |
-| You're on A100 / V100 or older | no (falls back, no speedup) |
+| You're on A100 / V100 or older | no (`torch._scaled_mm` raises; FP8 does not run) |
 | Model is dense (no MoE) or MoE with heavy attention | yes |
 | Model is tiny (dim < ~1024) | marginal |
 | You need TP (`distributed.tp > 1`) | **blocked** — see below |
 | You need the absolute-best eval loss at small step counts | maybe not — see [Accuracy tradeoff](#accuracy-tradeoff) |
 
-Expected gain on Hopper: the FSDP2 all-gather moves half the bytes,
-and matmuls run on fourth-gen tensor cores instead of bf16 tensor
-cores. Exact MFU numbers are workload-dependent; consult
-[Reference § Benchmarks](../reference/benchmarks.md#mfu-scaling-dense)
-for measured values.
+Where the gain comes from on Hopper: the FSDP2 all-gather moves half
+the bytes, and the converted matmuls run as FP8 GEMMs, whose peak is
+twice the bf16 peak. How much of that reaches end-to-end throughput
+depends on the model and batch shape, so compare `tok/s` against a bf16
+run of the same config; the logged MFU uses the bf16 peak for both
+([MFU § FP8 caveat](../metrics-and-profiling/mfu.md#fp8-caveat)). No FP8
+throughput measurement has been published for this repo yet;
+[Reference § Benchmarks](../reference/benchmarks.md) covers bf16 runs
+only.
 
 ## Turn it on
 
@@ -43,7 +47,7 @@ before AC/FSDP2, and the master weights stay bf16, or fp32 with
 ### Reference config
 
 [`configs/train/7b_16gpu_fp8.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/7b_16gpu_fp8.toml)
-is a production-ready 7B Llama-3 recipe on 16 H100s:
+is the 7B Llama-3 FP8 recipe for 16 GPUs (4 nodes of 4):
 
 ```toml
 [train]
@@ -68,7 +72,7 @@ activations OOM.
 | Pairing | Works? | Notes |
 |---------|:------:|-------|
 | FP8 + FSDP2 | yes | Primary path. `enable_fsdp_float8_all_gather=True` is on by default. |
-| FP8 + TP | **no** | Config validation rejects this — see [`JobConfig.__post_init__`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/job.py). |
+| FP8 + TP | **no** | Config validation rejects this; see [`JobConfig.validate`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/job.py). |
 | FP8 + EP | yes | Experts and the router are excluded from FP8 conversion; attention and dense blocks still use FP8. |
 | FP8 + `torch.compile` | yes | Recommended combination. |
 | FP8 + PP | yes | PP stages compose with FP8 the same way as bf16. |
@@ -88,15 +92,25 @@ in bf16 and produces sensible loss curves. Check the rank-0 log at
 startup:
 
 ```
-Applied Float8 training: recipe=TENSORWISE, fsdp_float8_all_gather=True
+Applied Float8 training: recipe=TENSORWISE, fsdp_float8_all_gather=True, converted 225 of 225 Linear layers
 Optimizer groups: ...
 Model: ...
 ```
 
 The `Applied Float8 training` line (from
 [`apply_float8`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/parallel.py))
-is the confirmation. If it's missing, `mixed_precision` didn't resolve
-to `"fp8"`.
+is the confirmation, and its count says how many `Linear` layers run in
+FP8 (225 of 225 for `7b_16gpu_fp8.toml`). If it's missing,
+`mixed_precision` didn't resolve to `"fp8"`. A layer with a dimension
+that is not a multiple of 16 stays in bf16, and a warning right after
+names it (under pipeline parallelism, the line and the warning cover
+rank 0's stage only). For `configs/train/hf_wikitext.toml`, whose GPT-2
+vocabulary has 50257 tokens:
+
+```
+Applied Float8 training: recipe=TENSORWISE, fsdp_float8_all_gather=True, converted 56 of 57 Linear layers
+Float8 kept 1 Linear layer(s) in high precision because torch._scaled_mm needs both dimensions divisible by 16: output_head.proj (50257x512) x1
+```
 
 For a deeper check, profile one step:
 
@@ -118,13 +132,17 @@ for how to read the summary.
 Pulled from the filter in
 [`apply_float8`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/parallel.py):
 
-- **Converted** — attention (`q/k/v/o_proj`), dense MLP
+- **Converted**: attention (`q/k/v/o_proj`), dense MLP
   (`gate/up/down_proj`), final `output_head.proj`.
-- **Excluded** — routed MoE experts (`experts.*`) because they use
+- **Excluded**: routed MoE experts (`experts.*`) because they use
   `torch._grouped_mm` and bypass `Float8Linear.forward`; the shared
   expert (`shared_expert.*`), a plain `Linear` call, by convention to
   match them; the MoE router because its output dim is small and not
   compute-bound; embeddings and norms because they aren't `nn.Linear`.
+- **Kept in bf16**: a layer from the converted list whose
+  `in_features` or `out_features` is not a multiple of 16, which
+  `torch._scaled_mm` rejects. The startup warning names each one with
+  its shape.
 
 For an MoE model this means attention, dense-block MLPs and the output
 head are FP8, but the routed and shared experts run in bf16, so FP8
@@ -156,18 +174,49 @@ checkpoint-and-relaunch patterns.
 `config.train.mixed_precision == "fp8"` (not `"FP8"` or `"float8"`).
 The `Literal[...]` type in the dataclass lets only four values through.
 
+**`Float8 kept N Linear layer(s) in high precision` warning.** The
+named layers have a dimension that is not a multiple of 16, so they
+train in bf16 while the rest of the model runs in FP8. To run them in
+FP8 as well, make the dimension a multiple of 16: pad `vocab_size`
+(50272 instead of GPT-2's 50257), raise `n_kv_heads` so that
+`n_kv_heads * head_dim` is a multiple of 16, or pick an
+`ffn_hidden_dim` that is.
+
+**`ValueError: train.mixed_precision='fp8' needs model.dim divisible by 16`.**
+Every projection and the output head has `model.dim` on one side, so
+with this `dim` no layer could run in FP8. Use a `dim` that is a
+multiple of 16, or train in bf16.
+
+**`ValueError: train.mixed_precision='fp8' needs train.batch_size * train.seq_len divisible by 16`.**
+The FP8 weight gradient multiplies over the micro-batch's tokens, so
+the first backward would fail. Pick a `batch_size` or `seq_len` that
+makes the product a multiple of 16; a `seq_len` that is one works with
+any `batch_size`. VLM runs skip this check because their token counts
+depend on the data; there the symptom is an error in the first backward
+such as `Expected trailing dimension of mat1 to be divisible by 16 but
+got mat1 shape: (<out_features>x<tokens>)`. A packed VLM run
+(`data.pack_sequences = true`) is refused with FP8 when `JobConfig` is
+built.
+
+**`ValueError: Float8 converted 0 of N Linear layers`.** Every `Linear`
+is either excluded by name or has a dimension that is not a multiple of
+16, so the run would train entirely in bf16. The message names the
+layers the shape check kept; make those dimensions multiples of 16, or
+train in bf16.
+
 **`ValueError: FP8 + Tensor Parallelism is not yet supported`.** The
 config validator ran. Either set `distributed.tp = 1` (and let FSDP
 handle sharding) or drop `mixed_precision = "fp8"`.
 
-**`torch._scaled_mm` warning about unsupported hardware.** You're on
-a pre-Hopper GPU. FP8 falls back to bf16 matmul and you get no
-speedup — disable FP8 for this cluster.
+**`RuntimeError: torch._scaled_mm is only supported on CUDA devices with compute capability >= 9.0 or 8.9` in the first step.**
+The GPU is older than FP8 support (an A100 or older). FP8 does not fall
+back to bf16 matmuls there; train with `mixed_precision = "bf16"` on
+this cluster.
 
-**`aten.is_pinned` DTensor error at model build.** A TP + FP8
-combination slipped past the config check. The guard in
-[`apply_float8`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/parallel.py)
-is explicit about this.
+**`aten.is_pinned` DTensor error at model build.** `apply_float8` was
+called on a model with tensor-parallel weights outside the config path;
+the config check rejects FP8 with `tp > 1`. Build with `tp = 1`, or
+train without FP8.
 
 **Loss diverges in the first ~50 steps.** Expected early-step noise
 is subtle; an actual divergence usually means the LR is set for
@@ -193,7 +242,5 @@ slightly larger than bf16 matmul. Drop `batch_size` or switch to
   — the `FP8 + TP` check.
 - [Debug training regressions](debug-training-regressions.md) — the
   profiler workflow to verify FP8 kernels are firing.
-- [Reference § Benchmarks](../reference/benchmarks.md) — measured MFU
-  for FP8 runs at several model sizes.
 - [`configs/train/7b_16gpu_fp8.toml`](https://github.com/KempnerInstitute/KempnerForge/blob/main/configs/train/7b_16gpu_fp8.toml)
   — the reference recipe this page points at.

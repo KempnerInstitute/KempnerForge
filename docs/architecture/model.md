@@ -189,7 +189,12 @@ statistic from overflowing in bf16 for long sequences.
 
 When `ModelConfig.tie_embeddings=True` (and both layers exist), the head
 shares its weight with the embedding via `OutputHead.tie_weights(emb)`
-(`self.proj.weight = emb.embedding.weight`).
+(`self.proj.weight = emb.embedding.weight`). A meta-device build, which
+tensor parallelism uses, loses the tie in `to_empty()`, which gives each
+module a parameter of its own, unless FSDP2 wraps the model first, as on
+a mesh with a data-parallel dimension: its DTensor parameters are swapped
+in place. `init_weights_and_freqs()` ties the two again when needed,
+before it initializes the shared weight once.
 
 ## TransformerBlock
 
@@ -231,7 +236,8 @@ raises).
 Extra helpers on `Transformer`:
 
 - `init_weights_and_freqs()`: called after `model.to_empty(device=...)`
-  to fill parameter values after meta-device materialization
+  to fill parameter values after meta-device materialization, first
+  tying a tied output head to the embedding again
 - `set_moe_step(step, max_steps)`: forwards the current step to every
   `SigmoidTopKRouter`, each MoT modality's included, for the adaptive
   bias schedule
