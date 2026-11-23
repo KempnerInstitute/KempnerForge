@@ -190,6 +190,10 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `anneal_start_step` | `int` | `0` | syntactic sugar for a common 2-phase annealing pattern (`0` = disabled) |
 | `anneal_weights` | `dict[str, float]` | `{}` | per-dataset weights applied at `anneal_start_step` |
 
+A `[video]` run builds its dataset from `[video]`, so every `hf_*` field keeps
+its default there; see
+[Validation rules](validation-rules.md#video-and-the-data-hugging-face-fields).
+
 ### `DatasetSource`
 
 | Field | Type | Default | Purpose |

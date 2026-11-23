@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.checkpoint import CheckpointConfig
@@ -20,6 +20,17 @@ from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import MoMaConfig, MoTConfig, VLMConfig
 
 _HF_VISION_ENCODER_TYPES = frozenset({"siglip2", "clip"})
+
+_VIDEO_INSTEAD_OF_DATA_HF_FIELDS = {
+    "hf_dataset_name": "set video.data_root and video.dataset_name instead",
+    "hf_dataset_config": "no [video] counterpart",
+    "hf_dataset_split": "set video.split instead",
+    "hf_dataset_text_field": "no [video] counterpart",
+    "hf_dataset_image_field": "no [video] counterpart",
+    "hf_dataset_prompt_field": "set video.prompt instead, one instruction for every clip",
+    "hf_image_size": "set video.frame_size instead",
+    "hf_streaming": "no [video] counterpart",
+}
 
 
 def _arch_of(vlm: VLMConfig) -> str:
@@ -381,6 +392,25 @@ class JobConfig:
                     "Hugging Face model, but vision_encoder.path is empty; set "
                     "vision_encoder.path to the model's Hub id or local directory"
                 )
+            if self.video is not None:
+                defaults = {f.name: f.default for f in fields(DataConfig)}
+                unread = [
+                    name
+                    for name in _VIDEO_INSTEAD_OF_DATA_HF_FIELDS
+                    if getattr(self.data, name) != defaults[name]
+                ]
+                if unread:
+                    settings = "; ".join(
+                        f"data.{name} = {getattr(self.data, name)!r} "
+                        f"({_VIDEO_INSTEAD_OF_DATA_HF_FIELDS[name]})"
+                        for name in unread
+                    )
+                    reset = ", ".join(f"{name} = {defaults[name]!r}" for name in unread)
+                    raise ValueError(
+                        "[video] is set, so the dataset comes from [video] and these [data] "
+                        f"fields would be ignored: {settings}. Leave them at their defaults "
+                        f"({reset})."
+                    )
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)

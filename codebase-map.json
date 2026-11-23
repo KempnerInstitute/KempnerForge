@@ -193,7 +193,8 @@
         "tests/unit/test_annealing.py::TestTrainingPhase",
         "tests/unit/test_annealing.py::TestDataConfigPhases",
         "tests/unit/test_fp8.py::TestFP8Config",
-        "tests/unit/test_vision_config.py::TestHFEncoderPath"
+        "tests/unit/test_vision_config.py::TestHFEncoderPath",
+        "tests/unit/test_video_config.py::TestJobConfigVideoWiring"
       ]
     },
     "kempnerforge/config/vlm.py": {

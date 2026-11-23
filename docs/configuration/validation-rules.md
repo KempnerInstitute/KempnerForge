@@ -434,6 +434,30 @@ built: with `vision_encoder.feature_dim = 0`, a model whose config has no
 asks for `vision_encoder.feature_dim`, the width of the features its vision
 tower returns.
 
+### `[video]` and the `[data]` Hugging Face fields
+
+```
+video set && a data.hf_* field differs from its default  →  ValueError
+```
+
+A video run builds its dataset from `[video]`. From `[data]` it reads
+`tokenizer_path` and the loader settings (`num_workers`, `pin_memory`,
+`prefetch_factor`), so a Hugging Face field set there would be dropped
+silently. The error lists each such field, with the `[video]` field to set
+instead where there is one, and the defaults to put back:
+
+| `[data]` field | Set instead |
+|----------------|-------------|
+| `hf_dataset_name` | `video.data_root` and `video.dataset_name` |
+| `hf_dataset_split` | `video.split` |
+| `hf_dataset_prompt_field` | `video.prompt`, one instruction for every clip |
+| `hf_image_size` | `video.frame_size` |
+| `hf_dataset_config`, `hf_dataset_text_field`, `hf_dataset_image_field`, `hf_streaming` | no counterpart |
+
+The fields are compared with their defaults, so `hf_dataset_split = "train"`
+or `hf_image_size = 224` passes. `data.hf_max_images` is refused with
+`[video]` when `JobConfig` is built.
+
 ### MoE + torch.compile — warning, not error
 
 ```
