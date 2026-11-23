@@ -123,16 +123,31 @@ tests exercise this exact dispatch.
 Fallback when grouped GEMM can't run:
 
 ```python
-# kempnerforge/model/moe.py — MoEMLP._local_forward (trimmed)
+# kempnerforge/model/moe.py: MoEMLP._local_forward (trimmed)
+idle = []
 for i in range(self.num_experts):
     mask = (indices == i).any(dim=-1)
     if not mask.any():
+        idle.extend(self.experts[i].parameters())
         continue
     expert_input   = x_flat[mask]
     expert_output  = self.experts[i](expert_input)
     weight_for_i   = (weights * (indices == i).float()).sum(dim=-1)
     output[mask]  += weight_for_i[mask].unsqueeze(-1) * expert_output
+output = self._keep_in_graph(output, idle)   # output + sum(p.sum() for p in idle) * 0
 ```
+
+An expert that gets no tokens still gets a gradient, zero, from that
+last term. FSDP2 reduce-scatters only the parameters that have a
+gradient, so an expert idle on one rank but used on another would
+otherwise make the ranks' reduce-scatters differ in size: a hang over
+NCCL, a size mismatch over gloo. Packed experts always get one, since
+any expert that runs uses the packed tensors. A layer that gets no
+tokens at all, on either path, returns an empty output that carries the
+same term for every expert weight and for the routing weights, so the
+router's weights get a gradient too. Expert parallelism keeps its own
+version; see
+[Unused-expert kludge](../distributed/expert-parallelism.md#unused-expert-kludge).
 
 One kernel launch per expert (or more, per matmul). Fine for
 `num_experts ≤ 8`, painful at 32+.

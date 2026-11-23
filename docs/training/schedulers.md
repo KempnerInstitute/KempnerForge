@@ -17,7 +17,9 @@ the configured steps however many steps were skipped. A checkpoint
 whose scheduler had already fallen behind, saved by an earlier version
 that did not step it on skipped steps, keeps that lag after a resume. The Schedule-Free
 optimizer's own warmup (`optimizer.schedule_free_warmup_steps`) is
-different: it counts optimizer updates, so skipped steps delay it.
+different: it counts each parameter's own optimizer updates, so skipped
+steps delay it, and a parameter whose first gradient comes late starts
+its warmup then.
 
 ## Shared warmup
 
@@ -35,6 +37,18 @@ value takes the first step at `base_lr * warmup_start_factor` rather
 than at zero. With it, `cosine` reproduces torch's
 `SequentialLR([LinearLR(start_factor), CosineAnnealingLR(...)])` step
 for step.
+
+Step `k` of training runs at the factor of step `k - 1`: the loop calls
+`scheduler.step()` after each optimizer step. With the default factor
+of `0`, step 1 updates nothing (its LR is zero, though Adam's moments
+still take in its gradient), and the peak LR is first applied on step
+`warmup_steps + 1`. `train/lr` and `StepContext.lr` report the LR each
+step applied, so step 1 logs `0`. The zero first step is kept on purpose:
+the default schedule stays bit-identical to warming up from zero, and a
+`warmup_start_factor` above `0` takes the first step at a non-zero rate.
+For `schedule_free_adamw`, the
+optimizer applies its own warmup (`schedule_free_warmup_steps`) inside
+`step()`, so `train/lr` shows the rate before that warmup.
 
 So all the fields below describe the **decay** phase, after warmup
 completes.

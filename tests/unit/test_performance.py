@@ -17,6 +17,7 @@ from kempnerforge.metrics.mfu import (
     compute_mfu,
     estimate_model_flops_per_token,
     get_gpu_peak_tflops,
+    vision_flops_per_image,
 )
 from kempnerforge.model.moe import MoEMLP
 from kempnerforge.model.transformer import Transformer
@@ -195,6 +196,51 @@ class TestMFUMoEExperts:
         )
 
 
+class TestEstimatesCountTheBuiltMLP:
+    """Both estimates count the MLP matrices the model builds: three for SwiGLU
+    (``silu``) and two for the standard MLP (``gelu``, ``relu``), in dense layers
+    and in routed and shared experts alike. The MoE model alternates dense and MoE
+    layers, so its dense layers are counted too."""
+
+    @staticmethod
+    def _config(activation: str, moe: bool) -> ModelConfig:
+        experts = (
+            {"num_experts": 4, "moe_top_k": 2, "moe_shared_experts": 1, "moe_frequency": 2}
+            if moe
+            else {}
+        )
+        return ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=256,
+            max_seq_len=64,
+            activation=activation,
+            **experts,
+        )
+
+    @pytest.mark.parametrize("moe", [False, True])
+    @pytest.mark.parametrize("activation,matrices", [("silu", 3), ("gelu", 2), ("relu", 2)])
+    def test_mlp_matrices_follow_the_activation(self, activation, matrices, moe):
+        assert self._config(activation, moe).mlp_matrices == matrices
+
+    @pytest.mark.parametrize("moe", [False, True])
+    @pytest.mark.parametrize("activation", ["silu", "gelu", "relu"])
+    def test_num_params_estimate_matches_the_built_model(self, activation, moe):
+        config = self._config(activation, moe)
+        model = Transformer(config)
+        assert sum(p.numel() for p in model.parameters()) == config.num_params_estimate
+
+    @pytest.mark.parametrize("moe", [False, True])
+    @pytest.mark.parametrize("activation", ["silu", "gelu", "relu"])
+    def test_flops_match_the_built_model(self, activation, moe):
+        config = self._config(activation, moe)
+        model = Transformer(config)
+        assert estimate_model_flops_per_token(config, seq_len=64) == _built_flops_per_token(
+            model, 64
+        )
+
+
 class TestMFUDecoupledHeadDim:
     """The attention term scales with the attention width ``n_heads * head_dim``,
     which equals ``dim`` only while the head width is inferred."""
@@ -242,6 +288,68 @@ class TestMFUDecoupledHeadDim:
             return estimate_model_flops_per_token(cfg, seq_len=s)
 
         assert flops(64) - flops(32) == 12 * 2 * (4 * 32) * (64 - 32)
+
+
+class TestVisionFlops:
+    """The FLOPs one image costs a VLM's vision encoder and adapter (#444)."""
+
+    @staticmethod
+    def _vlm(encoder_trains: bool, adapter_trains: bool = True, tower=None) -> torch.nn.Module:
+        encoder = torch.nn.Linear(10, 10)
+        encoder.num_tokens = 4
+        if tower is not None:
+            encoder.vision_tower = tower
+        adapter = torch.nn.Linear(10, 20)
+        encoder.requires_grad_(encoder_trains)
+        adapter.requires_grad_(adapter_trains)
+        model = torch.nn.Module()
+        model.vision_encoder = encoder
+        model.adapter = adapter
+        return model
+
+    def test_a_frozen_encoder_runs_forward_and_a_trainable_adapter_backward_too(self):
+        assert vision_flops_per_image(self._vlm(False)) == 2 * 110 * 4 + 3 * 2 * 220 * 4
+
+    def test_a_trainable_encoder_runs_its_backward(self):
+        assert vision_flops_per_image(self._vlm(True, False)) == 3 * 2 * 110 * 4 + 2 * 220 * 4
+
+    def test_attention_counts_when_the_tower_config_gives_its_shape(self):
+        import types
+
+        config = types.SimpleNamespace(num_hidden_layers=2, hidden_size=8)
+        model = self._vlm(False, False, types.SimpleNamespace(config=config))
+        assert vision_flops_per_image(model) == 2 * 110 * 4 + 4 * 2 * 4**2 * 8 + 2 * 220 * 4
+
+    def test_the_adapter_counts_its_own_forward_flops(self):
+        from kempnerforge.model.adapter import AvgPoolAdapter
+
+        model = self._vlm(False)
+        model.adapter = AvgPoolAdapter(in_dim=10, out_dim=20, pool_window=2)
+        adapter_forward = model.adapter.forward_flops(4)
+        assert vision_flops_per_image(model) == 2 * 110 * 4 + 3 * adapter_forward
+
+    def test_an_average_pool_projects_its_pooled_tokens(self):
+        from kempnerforge.model.adapter import AvgPoolAdapter
+
+        adapter = AvgPoolAdapter(in_dim=16, out_dim=8, pool_window=2)
+        params = sum(p.numel() for p in adapter.parameters())
+        assert adapter.forward_flops(16) == 2 * params * 4
+
+    def test_an_attentional_pool_projects_keys_and_values_over_every_window_input(self):
+        from kempnerforge.model.adapter import AttentionalPoolAdapter
+
+        adapter = AttentionalPoolAdapter(in_dim=16, out_dim=8, pool_window=2, pool_heads=4)
+        square = 16 * 16 + 16
+        assert adapter.forward_flops(16) == 2 * (2 * square * 16 + (2 * square + 16 * 8 + 8) * 4)
+        assert adapter.forward_flops(9) == 2 * (2 * square * 16 + (2 * square + 16 * 8 + 8) * 4)
+
+    def test_a_compiled_model_reads_its_original_module(self):
+        compiled = torch.nn.Module()
+        compiled._orig_mod = self._vlm(False)
+        assert vision_flops_per_image(compiled) == vision_flops_per_image(compiled._orig_mod)
+
+    def test_a_model_without_a_vision_encoder_costs_nothing(self):
+        assert vision_flops_per_image(torch.nn.Linear(2, 2)) == 0.0
 
 
 class TestMemory:

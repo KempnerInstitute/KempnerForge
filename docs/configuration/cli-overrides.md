@@ -23,6 +23,19 @@ Each flag must begin with `--`. Parsing splits once on `=`:
   `--model.dim=512` becomes `{"model": {"dim": 512}}`.
 - Right of `=` is the literal value. The loader calls
   `ast.literal_eval` on it. If that raises, the raw string is kept.
+- A flag without `=` is shorthand for true: `--train.compile_model`
+  sets it to `true`.
+- The value has to follow `=`. A value passed as the next argument, as in
+  `--train.max_steps 7`, is refused with an error that shows
+  `--train.max_steps=7`.
+- A value with a space has to reach the loader as one argument, so quote
+  it: `'--metrics.wandb_run_name=7b baseline'`. Unquoted, the shell splits
+  off `baseline`, and an argument without `--` after an override is
+  refused with an error that shows the quoted form. Arguments without
+  `--` before the first override are skipped, such as the config path
+  when `load_config` reads `sys.argv[1:]` because it got no `cli_args`.
+- The SLURM launchers in `scripts/slurm/` pass each override on as one
+  argument, so a quoted value stays whole through them.
 
 ## Value parsing
 
@@ -91,6 +104,7 @@ the dataclass type hint and coerces:
 | `list[DatasetSource]` | `[{"path": …}]` | `[DatasetSource(path=…)]` (recursive) |
 | `Literal["bf16", "fp16", "fp32", "fp8"]` | anything else | `ValueError` |
 | `StrEnum` (`NormType`, `SchedulerType`, …) | `"rmsnorm"` | `NormType.rmsnorm` |
+| `SchedulerType`, `NormType`, `Activation` | a registered name | the name, as a `str` |
 | `X \| None` (Optional) | `None` → `None`; else coerce to `X` |
 
 `Literal` fields reject unknown strings at coercion time — a typo like
@@ -98,6 +112,20 @@ the dataclass type hint and coerces:
 training starts. `"fp16"` passes this check on purpose and is then
 rejected by `TrainConfig.__post_init__`, whose error explains that
 fp16 would train with no loss scaling.
+
+Three enums select a registry builder, so they also accept a name
+registered in their category: `scheduler.name` (`SchedulerType`,
+category `scheduler`), `model.norm_type` (`NormType`, `norm`) and
+`model.activation` (`Activation`, `mlp`). A plugin module in `plugins`
+registers its names before the overrides apply, so
+`--scheduler.name=my_sched` selects a scheduler it registered. A name
+that is neither a member nor registered raises a `ValueError` that
+lists both. The other enums (`train.activation_checkpointing`,
+`distributed.pp_schedule`, `checkpoint.async_mode`) accept only their
+members. `model.activation` also rejects core's own `mlp` keys
+(`swiglu`, `standard_gelu`, `standard_relu`) in favor of `silu`, `gelu`
+and `relu`, and rejects a plugin's MLP when `num_experts > 0`, since the
+MoE expert kernels compute core's MLPs from the expert weights.
 
 ## Unknown keys
 
@@ -109,6 +137,12 @@ $ uv run python scripts/train.py configs/train/debug.toml --model.dimm=512
 ValueError: Unknown config keys in ModelConfig: ['dimm'].
 Valid keys: ['activation', 'dim', ...]
 ```
+
+`--vlm.arch` is the one field an override cannot always change. Each
+arch has its own `[vlm]` config class, picked when the TOML's `[vlm]`
+section is built, and an override keeps that class; so when the TOML
+has a `[vlm]` section, `--vlm.arch` naming another arch is rejected with
+a `ValueError` that says to set `arch` in the TOML instead.
 
 ## Inspecting the final config
 
