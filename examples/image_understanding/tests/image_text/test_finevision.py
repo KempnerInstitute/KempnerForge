@@ -207,6 +207,109 @@ class TestConversion:
         nulls = pa.RecordBatch.from_pydict({"images": pa.array([None, None], type=pa.null())})
         assert converter.image_counts(nulls).tolist() == [0, 0]
 
+    def test_image_counts_leave_out_entries_without_bytes(self) -> None:
+        """A blank, null or path-only entry is no image, in a whole batch or a slice."""
+        converter = _converter()
+        struct = SCHEMA.field("images").type.value_type
+        real, blank = {"bytes": b"x", "path": None}, {"bytes": None, "path": None}
+        by_path = {"bytes": None, "path": "a.png"}
+        lists = [[real], [blank, real], [blank], [None, real], [], None, [by_path]]
+        batch = pa.RecordBatch.from_pydict({"images": pa.array(lists, pa.list_(struct))})
+        assert converter.image_counts(batch).tolist() == [1, 1, 0, 1, 0, 0, 0]
+        assert converter.image_counts(batch.slice(1, 6)).tolist() == [1, 0, 1, 0, 0, 0]
+
+    def test_image_counts_skip_the_entries_under_a_null_row(self) -> None:
+        """A null row whose offsets still span entries, as Arrow allows, holds no image."""
+        converter = _converter()
+        struct = SCHEMA.field("images").type.value_type
+        values = pa.array([{"bytes": b"x", "path": None}] * 4, struct)
+        offsets = pa.array([0, 1, 3, 4], pa.int32())
+        images = pa.ListArray.from_arrays(offsets, values, mask=pa.array([False, True, False]))
+        batch = pa.RecordBatch.from_pydict({"images": images})
+        assert converter.image_counts(batch).tolist() == [1, 0, 1]
+
+    def test_index_recounts_images_on_request(self, subset: Path) -> None:
+        """Counts a sidecar already holds are kept unless index is asked to recount."""
+        for meta in subset.glob("*.meta.npz"):
+            arrays = dict(np.load(meta))
+            arrays["num_images"] = arrays["num_images"] + 1
+            np.savez(meta, **arrays)
+        root = subset.parents[1]
+        args = ("index", "--src", str(root / "parquet"), "--dst", str(root / "arrow"))
+        _run(*args)
+        assert np.load(subset / "index.npz")["num_images"].tolist() == [2, 3, 2, 2, 2]
+        _run(*args, "--recount-images")
+        assert np.load(subset / "index.npz")["num_images"].tolist() == [1, 2, 1, 1, 1]
+        _run(*args)
+        assert np.load(subset / "index.npz")["num_images"].tolist() == [1, 2, 1, 1, 1]
+        assert sorted(p.name for p in subset.glob("*.tmp.npz")) == []
+
+    def test_each_sidecar_rewrite_has_a_temp_file_of_its_own(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two writers of one sidecar never share a temp file, and a failed write keeps the
+        sidecar and removes only its own temp file."""
+        converter = _converter()
+        sidecar = tmp_path / "train.meta.npz"
+        np.savez(sidecar, num_images=np.array([1, 2]))
+        temps: list[str] = []
+        savez = np.savez
+
+        def recording(path, **arrays):
+            temps.append(Path(path).name)
+            savez(path, **arrays)
+
+        monkeypatch.setattr(converter.np, "savez", recording)
+        converter._write_npz(sidecar, {"num_images": np.array([1, 1])})
+        converter._write_npz(sidecar, {"num_images": np.array([1, 0])})
+        assert len(set(temps)) == 2 and all(t.endswith(".tmp.npz") for t in temps)
+        assert np.load(sidecar)["num_images"].tolist() == [1, 0]
+
+        def failing(path, **arrays):
+            savez(path, **arrays)
+            raise OSError("disk full")
+
+        other = tmp_path / "train.meta.another-writer.tmp.npz"
+        other.write_bytes(b"in progress")
+        monkeypatch.setattr(converter.np, "savez", failing)
+        with pytest.raises(OSError, match="disk full"):
+            converter._write_npz(sidecar, {"num_images": np.array([0, 0])})
+        assert np.load(sidecar)["num_images"].tolist() == [1, 0]
+        assert sorted(p.name for p in tmp_path.glob("train.meta*")) == [other.name, sidecar.name]
+
+    @pytest.mark.parametrize("step", ["savez", "replace"])
+    def test_a_failed_index_write_keeps_the_index_and_removes_its_temp_file(
+        self, subset: Path, monkeypatch: pytest.MonkeyPatch, step: str
+    ) -> None:
+        """A failed write of index.npz keeps the old index and the sidecars, and removes only
+        the temp file of the run that failed."""
+        converter = _converter()
+        before = {p.name: p.read_bytes() for p in subset.glob("*.npz")}
+        other = subset / "index.another-writer.tmp.npz"
+        other.write_bytes(b"in progress")
+        calls: list[str] = []
+        savez = np.savez
+
+        def failing_savez(path, **arrays):
+            calls.append(Path(path).name)
+            savez(path, **arrays)
+            raise OSError("disk full")
+
+        def failing_replace(source, target):
+            calls.append(Path(source).name)
+            raise OSError("disk full")
+
+        if step == "savez":
+            monkeypatch.setattr(converter.np, "savez", failing_savez)
+        else:
+            monkeypatch.setattr(converter.os, "replace", failing_replace)
+        root = subset.parents[1]
+        with pytest.raises(OSError, match="disk full"):
+            converter._subset_index((root / "parquet", root / "arrow", subset.name, False))
+        assert len(calls) == 1 and calls[0].startswith("index.")
+        assert {p.name: p.read_bytes() for p in subset.glob("*.npz") if p != other} == before
+        assert sorted(p.name for p in subset.glob("*.tmp.npz")) == [other.name]
+
     def test_a_failed_file_is_reported_and_leaves_nothing_behind(self, tmp_path: Path) -> None:
         src, dst = tmp_path / "parquet", tmp_path / "arrow"
         _write_parquet(
@@ -474,10 +577,47 @@ class TestFineVisionArrow:
         _run("convert", "--src", str(src), "--dst", str(dst))
         _run("index", "--src", str(src), "--dst", str(dst))
         reader = FineVisionArrow(dst / "demo", max_images=None)
-        assert reader.rows.tolist() == [1, 2]
-        assert reader[0].turns[0].user == "Q2" and reader.skipped == 1
+        assert reader.rows.tolist() == [2]
+        assert reader[0].turns[0].user == "Q2" and reader.skipped == 0
         text = FineVisionArrow(dst / "demo", text_only=True)
-        assert text.rows.tolist() == [0] and text[0].images == ()
+        assert text.rows.tolist() == [0, 1]
+        assert text[0].images == () and text[1].images == ()
+
+    def test_a_blank_or_null_entry_is_not_an_image(self, tmp_path: Path) -> None:
+        """Each row with one image is read with it, and a row whose only entry is blank is a
+        text-only document."""
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        rows = [_row(1, [(f"Q{i}", f"A{i}")], 5) for i in range(5)]
+        blank = {"bytes": None, "path": None}
+        rows[1]["images"] = [blank, *rows[1]["images"]]
+        rows[2]["images"] = [blank]
+        rows[3]["images"] = [None, *rows[3]["images"]]
+        rows[4]["images"] = []
+        _write_parquet(src / "demo" / "train-00000-of-00001.parquet", [rows])
+        _run("convert", "--src", str(src), "--dst", str(dst))
+        _run("index", "--src", str(src), "--dst", str(dst))
+        assert np.load(dst / "demo" / "index.npz")["num_images"].tolist() == [1, 1, 0, 1, 0]
+        reader = FineVisionArrow(dst / "demo")
+        assert reader.rows.tolist() == [0, 1, 3]
+        documents = [reader[i] for i in range(len(reader))]
+        assert [d.turns[0].user for d in documents] == ["Q0", "Q1", "Q3"]
+        assert [len(d.images) for d in documents] == [1, 1, 1] and reader.skipped == 0
+        text = FineVisionArrow(dst / "demo", text_only=True)
+        assert text.rows.tolist() == [2, 4]
+        assert [text[i].images for i in range(2)] == [(), ()]
+
+    def test_a_row_counted_before_blank_entries_stopped_counting_is_passed_over(
+        self, tmp_path: Path
+    ) -> None:
+        src, dst = tmp_path / "parquet", tmp_path / "arrow"
+        blank_only, good = _row(1, [("Blank", "x")], 5), _row(1, [("Good", "y")], 5)
+        blank_only["images"] = [{"bytes": None, "path": None}]
+        _write_parquet(src / "demo" / "train-00000-of-00001.parquet", [[blank_only, good]])
+        _run("convert", "--src", str(src), "--dst", str(dst))
+        _run("index", "--src", str(src), "--dst", str(dst))
+        reader = FineVisionArrow(dst / "demo", num_images=np.array([1, 1]))
+        assert reader.rows.tolist() == [0, 1]
+        assert reader[0].turns[0].user == "Good" and reader.skipped == 1
 
     def test_an_undecodable_image_steps_to_the_next_row(self, tmp_path: Path) -> None:
         src, dst = tmp_path / "parquet", tmp_path / "arrow"
