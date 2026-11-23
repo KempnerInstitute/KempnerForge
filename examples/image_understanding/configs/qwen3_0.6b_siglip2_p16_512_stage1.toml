@@ -1,0 +1,83 @@
+[model]
+dim = 1024
+n_layers = 28
+n_heads = 16
+n_kv_heads = 8
+head_dim_override = 128
+vocab_size = 151936
+ffn_hidden_dim = 3072
+norm_type = "rmsnorm"
+norm_eps = 1e-6
+activation = "silu"
+qk_norm = true
+rope_theta = 1000000.0
+tie_embeddings = false
+max_seq_len = 12288
+attention_backend = "flex"
+
+[vision_encoder]
+type = "siglip2"
+path = "google/siglip2-so400m-patch16-512"
+drop_pooling_head = true
+mixed_precision = "fp32"
+
+[adapter]
+type = "avgpool"
+pool_window = 2
+hidden_dim = 1152
+activation = "gelu"
+pre_norm = "rmsnorm"
+
+[vlm]
+arch = "joint_decoder"
+freeze = [{ module = "transformer", frozen = true }]
+
+[data]
+tokenizer_path = "Qwen/Qwen3-0.6B"
+hf_image_size = 512
+pack_sequences = true
+num_workers = 12
+prefetch_factor = 16
+pin_memory = true
+
+[train]
+batch_size = 1
+seq_len = 12288
+max_steps = 50000
+grad_accum_steps = 1
+grad_clip_norm = inf
+seed = 1
+compile_model = false
+activation_checkpointing = "none"
+
+[distributed]
+dp_shard = 4
+dp_replicate = 4
+
+[optimizer]
+name = "adamw"
+lr = 2e-4
+weight_decay = 0.01
+betas = [0.9, 0.999]
+eps = 1e-8
+weight_decay_scope = "all"
+lr_multipliers = { vision_encoder = 0.03 }
+
+[scheduler]
+name = "cosine"
+warmup_steps = 5000
+warmup_start_factor = 5e-4
+min_lr_ratio = 0.1
+
+[checkpoint]
+dir = "path-to-output-dir"
+load_path = "path-to-converted-backbone-checkpoint"
+exclude_from_loading = ["optimizer"]
+interval = 10000
+keep_last_n = 0
+
+[metrics]
+log_interval = 20
+enable_wandb = false
+enable_tensorboard = true
+tensorboard_dir = "path-to-tensorboard-dir"

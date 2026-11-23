@@ -9,7 +9,9 @@ from typing import Any
 
 import pytest
 import torch
-from mixture import finevision_subsets, mixture_data_fn, mixture_sources
+from image_text.packing import PackedStreamLoader
+from mixture import finevision_subsets, mixture_data_fn, mixture_sources, stream_source
+from test_datacomp import _shards
 from test_finevision import _row, _run, _write_parquet
 
 from kempnerforge.config.loader import load_config
@@ -134,3 +136,48 @@ class TestMixture:
         data_fn = mixture_data_fn(_mixture(tmp_path, finevision, captions))
         with pytest.raises(ValueError, match="packed VLM"):
             data_fn(load_config(str(config_path), cli_args=[]), _runtime())
+
+
+def _datacomp_mixture(tmp_path: Path, shards: Path, extra: str = "") -> Path:
+    path = tmp_path / "datacomp.toml"
+    path.write_text(
+        "[render]\nanswer_only = false\nlead_space = true\n"
+        f'[[source]]\nreader = "datacomp"\nshard_dir = "{shards}"\n'
+        'prompt = "Caption it."\nopen_shards = 2\n' + extra
+    )
+    return path
+
+
+class TestDataCompMixture:
+    def test_the_data_fn_packs_the_stream(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "run.toml"
+        config_path.write_text(CONFIG)
+        config = load_config(str(config_path), cli_args=[])
+        shards = _shards(tmp_path / "shards", 2, 6)
+        data_fn = mixture_data_fn(_datacomp_mixture(tmp_path, shards))
+        loader = data_fn(config, _runtime(), tokens_per_image=4).dataloader
+        assert isinstance(loader, PackedStreamLoader)
+        assert (loader.seq_len, loader.tokens_per_image) == (384, 4)
+        assert loader.stream.documents.seed == 3
+        batch = next(iter(loader))
+        documents = int(batch["doc_ids"].max())
+        assert documents > 1 and batch["pixel_values"].shape == (5 * documents, 3, 8, 8)
+        assert loader.state_dict()["stream"]["positions"][0][2] >= documents
+
+    def test_a_stream_is_the_only_source_and_does_not_repeat(
+        self, tmp_path: Path, captions: dict[str, str]
+    ) -> None:
+        shards = _shards(tmp_path / "shards", 1, 1)
+        coco = (
+            '[[source]]\nreader = "coco_captions"\n'
+            f'annotation_file = "{captions["annotation_file"]}"\n'
+            f'image_root = "{captions["image_root"]}"\n'
+        )
+        from mixture import load_mixture
+
+        with pytest.raises(ValueError, match="only source"):
+            stream_source(load_mixture(_datacomp_mixture(tmp_path, shards, coco)))
+        with pytest.raises(ValueError, match="does not repeat"):
+            stream_source(load_mixture(_datacomp_mixture(tmp_path, shards, "repeat = 2\n")))
+        with pytest.raises(ValueError, match="datacomp streams alone"):
+            mixture_sources({"source": [{"reader": "datacomp"}]})

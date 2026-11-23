@@ -1,0 +1,9 @@
+[render]
+answer_only = false
+lead_space = true
+
+[[source]]
+reader = "datacomp"
+shard_dir = "path-to-datacomp-1b/raw/webdataset"
+prompt = "Provide a short caption for the image."
+open_shards = 4
