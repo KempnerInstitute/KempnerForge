@@ -60,12 +60,18 @@ What's in each:
 - **model state** — every parameter and buffer: weights,
   RMSNorm scales, learned RoPE frequencies (if present), and any
   registered buffer. Under FSDP2 these are `DTensor`s; under TP
-  they're `DTensor`s on a 2D mesh. DCP handles both.
+  they're `DTensor`s on a 2D mesh. DCP handles both. A
+  `schedule_free_adamw` run saves its averaged weights `x` here rather
+  than the training point `y` its parameters hold between steps: the
+  save swaps `x` in with the optimizer's `eval_params()` and back with
+  `train_params()` once DCP has staged the state.
 - **optimizer state** — AdamW's `exp_avg`, `exp_avg_sq`,
   `step` counters; Lion's `exp_avg`; Muon's `momentum_buffer`s plus
-  its inner AdamW's moments. All per-parameter tensors live on the
-  same device and parallelism shape as the parameter, so DCP saves
-  them symmetrically.
+  its inner AdamW's moments; Schedule-Free AdamW's `z`, `v`, `x`,
+  `weight_sum` and each parameter's `step`. All per-parameter state
+  tensors except the scalar `step` counts (and Schedule-Free's float
+  `weight_sum`) live on the same device and parallelism shape as the
+  parameter, so DCP saves them symmetrically.
 - **never-stepped record** — one entry per parameter the optimizer
   holds without any state, i.e. one that had not yet received a
   gradient. An optimizer creates per-parameter state lazily, so there
@@ -78,8 +84,8 @@ Before the first optimizer step (the step-0 checkpoint of a
 holds state, so the save writes neither the optimizer nor the record.
 There is nothing to save then, and reading the optimizer would create
 state: `get_optimizer_state_dict` first gives an optimizer that holds
-none a dummy `lr=0` step, which leaves AdamW one step ahead in its bias
-correction and makes `ScheduleFreeAdamW` divide by zero. A load that
+none a dummy `lr=0` step, which leaves AdamW and `ScheduleFreeAdamW`
+one step ahead in their bias correction. A load that
 finds no optimizer in a checkpoint — this one, or one holding model
 weights alone — loads it like a pretrained model: the weights and train
 state, with every checkpointed optimizer reset to its freshly built
@@ -250,7 +256,14 @@ the saved data, just the tensor metadata (and, crucially, the
 *allocated* optimizer moment tensors) DCP needs to know what to load
 where. `dcp.load` mutates those tensors in place with the loaded
 values; the setters then write them back into the live model and
-optimizer.
+optimizer. An optimizer with a `train_params()` method, as
+`ScheduleFreeAdamW` has, is then put back at its training point: the
+model entry held the averaged weights `x`, and `train_params()` rebuilds
+`y = (1 - beta1) * z + beta1 * x` from the loaded `z` and `x`: exactly
+the point the run was at when the parameter dtype is unchanged, and
+recomputed from the cast `z` and `x` in the new dtype when it changed.
+Excluding `model` does not keep the live weights of such an optimizer:
+restoring `z` and `x` restores `y`.
 
 > **Why the DCP-aware helpers, not `optimizer.state_dict()`?** On
 > resume the optimizer is freshly built, so `optimizer.state_dict()`
@@ -293,7 +306,12 @@ parameter when `optimizer.name` changes. The load compares the template's state
 entries with the checkpoint's metadata before reading anything and fails
 naming those parameters, instead of leaving `dcp.load` to stop at the
 first missing key. Continuing from the weights takes the same warm start,
-from a `checkpoint.dir` that holds no checkpoint yet. The comparison
+from a `checkpoint.dir` that holds no checkpoint yet. A parameter saved
+with only part of the state its optimizer keeps now fails the same way,
+before anything is read: a `schedule_free_adamw` checkpoint written
+before each parameter kept its own `step` has `z`, `v`, `x` and
+`weight_sum` but no `step`, so its run's step counts are gone and it
+cannot be continued exactly. The comparison
 covers only the optimizers the load restores, so a Muon checkpoint saved
 before the inner AdamW was checkpointed is not checked: a parameter that
 moved to the inner AdamW starts fresh, and one that moved to Muon still

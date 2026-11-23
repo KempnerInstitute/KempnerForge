@@ -35,6 +35,57 @@ class _Picked(Exception):
 
 
 class TestEvalScriptCheckpoint:
+    @pytest.mark.parametrize("rank", [0, 1])
+    def test_only_rank_zero_looks_for_the_checkpoint(self, monkeypatch, rank):
+        """Every rank evaluates the checkpoint rank 0 finds, so no two ranks load different ones."""
+        script = _eval_script()
+        looked: list[str] = []
+
+        def resolve(checkpoint_dir, **kwargs):
+            looked.append(checkpoint_dir)
+            return Path("/runs/a/step_7")
+
+        def broadcast(objects, src):
+            assert src == 0
+            if rank != 0:
+                objects[0] = {"path": "/runs/a/step_7", "error": None}
+
+        monkeypatch.setattr(script, "resolve_resume_path", resolve)
+        monkeypatch.setattr(script.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(script.dist, "get_rank", lambda: rank)
+        monkeypatch.setattr(script.dist, "broadcast_object_list", broadcast)
+        assert script._newest_save("/runs/a") == "/runs/a/step_7"
+        assert looked == (["/runs/a"] if rank == 0 else [])
+
+    def test_rank_zero_shares_an_error_it_hits_while_looking(self, monkeypatch):
+        """Rank 0 broadcasts its error before raising it, and another rank raises one naming it."""
+        script = _eval_script()
+
+        def resolve(checkpoint_dir, **kwargs):
+            raise PermissionError(13, "Permission denied", checkpoint_dir)
+
+        sent: list = []
+        rank = 0
+
+        def broadcast(objects, src):
+            if rank == 0:
+                sent.append(dict(objects[0]))
+            else:
+                objects[0] = sent[0]
+
+        monkeypatch.setattr(script, "resolve_resume_path", resolve)
+        monkeypatch.setattr(script.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(script.dist, "get_rank", lambda: rank)
+        monkeypatch.setattr(script.dist, "broadcast_object_list", broadcast)
+        with pytest.raises(PermissionError, match="Permission denied"):
+            script._newest_save("/runs/a")
+        assert sent == [
+            {"path": None, "error": "PermissionError: [Errno 13] Permission denied: '/runs/a'"}
+        ]
+        rank = 1
+        with pytest.raises(RuntimeError, match="Rank 0 could not find the checkpoint to evaluate"):
+            script._newest_save("/runs/a")
+
     def test_eval_loads_the_newest_save_even_without_its_train_state(self, tmp_path, monkeypatch):
         """Eval loads the weights alone, so a save that lacks only ``train_state.pt`` serves."""
         script = _eval_script()

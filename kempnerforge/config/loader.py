@@ -20,9 +20,49 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
+from kempnerforge.config.model import CORE_MLP_KEY_ACTIVATIONS, Activation, NormType
 from kempnerforge.config.registry import registry
+from kempnerforge.config.scheduler import SchedulerType
 from kempnerforge.config.schema import JobConfig
 from kempnerforge.config.vlm import VLMConfig
+
+_REGISTRY_ENUMS: dict[type[Enum], str] = {
+    SchedulerType: "scheduler",
+    NormType: "norm",
+    Activation: "mlp",
+}
+
+
+def _coerce_registry_enum(enum_type: type[Enum], category: str, value: Any) -> Any:
+    """Coerce ``value`` to an ``enum_type`` member, or keep a name ``category`` registers.
+
+    These enums select a registry builder, so a name a plugin registered is valid
+    though the enum does not list it, and it stays a plain ``str``. ``Activation``
+    reads ``mlp``: ``build_mlp`` maps the built-in activations to ``mlp`` keys and
+    looks any other name up there directly. Core's own ``mlp`` keys pass through
+    whatever was imported, so ``ModelConfig`` rejects each with the activation
+    that selects it, and they are left out of the names the error lists.
+
+    Raises:
+        ValueError: ``value`` is neither a member nor a registered name; the
+            message lists both.
+    """
+    try:
+        return enum_type(value)
+    except ValueError:
+        core_keys = frozenset(CORE_MLP_KEY_ACTIVATIONS) if enum_type is Activation else frozenset()
+        if isinstance(value, str) and value in core_keys:
+            return value
+        registered = [name for name in registry.list(category) if name not in core_keys]
+        if isinstance(value, str) and value in registered:
+            return value
+        members = [member.value for member in enum_type]
+        raise ValueError(
+            f"{value!r} is neither in {enum_type.__name__} nor registered under "
+            f"{category!r}. {enum_type.__name__} members: {members}. Registered "
+            f"{category!r} names: {sorted(registered)}. Modules listed in 'plugins' "
+            "register their names before this check."
+        ) from None
 
 
 def _coerce_value(field_type: Any, value: Any) -> Any:
@@ -47,6 +87,8 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
     if isinstance(field_type, type) and issubclass(field_type, Enum):
         if isinstance(value, field_type):
             return value
+        if field_type in _REGISTRY_ENUMS:
+            return _coerce_registry_enum(field_type, _REGISTRY_ENUMS[field_type], value)
         return field_type(value)
 
     if origin is tuple:
@@ -166,34 +208,45 @@ def _resolve_vlm_subclass(data: dict[str, Any]) -> type:
     """Resolve a TOML ``[vlm]`` table to the right ``VLMConfig`` subclass
     via the registered-arch lookup.
 
-    Mirrors ``VLMConfig.for_arch`` error semantics so error type is
-    independent of construction site (loader vs programmatic).
+    An unregistered arch raises the same ``ValueError`` as
+    ``VLMConfig.for_arch``, whichever site constructs the config.
     """
-    from kempnerforge.config.vlm import _RESERVED_ARCHS  # noqa: PLC0415
-
     arch = data.get("arch", "joint_decoder")
-    if arch in _RESERVED_ARCHS:
-        raise NotImplementedError(
-            f"vlm.arch={arch!r} is reserved; not yet implemented. "
-            f"Reserved: {sorted(_RESERVED_ARCHS)}."
-        )
     try:
         return registry.get_vlm_config(arch)
     except KeyError as e:
         raise ValueError(
-            f"Unknown vlm.arch: {arch!r}. "
-            f"Registered: {sorted(registry.list_vlm_configs())}. "
-            f"Reserved (not yet implemented): {sorted(_RESERVED_ARCHS)}."
+            f"Unknown vlm.arch: {arch!r}. Registered: {sorted(registry.list_vlm_configs())}."
         ) from e
+
+
+def _check_vlm_arch_override(current: VLMConfig, arch: Any) -> None:
+    """Reject an ``arch`` override whose registered config class is not ``current``'s.
+
+    Applying a dict keeps the class the ``[vlm]`` section was built with, so such
+    an override would build one arch's blocks behind another arch's strategy.
+    """
+    target = _resolve_vlm_subclass({"arch": arch})
+    if target is not type(current):
+        raise ValueError(
+            f"vlm.arch={arch!r} cannot be applied as an override: the [vlm] section was "
+            f"built as {type(current).__name__} (arch {type(current).declared_arch()!r}), and an "
+            f'override keeps that class. Set arch = "{arch}" in the TOML\'s [vlm] '
+            "section instead."
+        )
 
 
 def _apply_dict_to_dataclass(dc: Any, data: dict[str, Any]) -> Any:
     """Recursively apply a dict to a dataclass, creating a new instance.
 
-    Raises ValueError on unknown keys to catch typos early.
+    Raises ValueError on unknown keys to catch typos early, and on an ``arch``
+    for a ``VLMConfig`` that needs a different config class than ``dc``'s.
     """
     if not is_dataclass(dc):
         return dc
+
+    if isinstance(dc, VLMConfig) and "arch" in data:
+        _check_vlm_arch_override(dc, data["arch"])
 
     dc_type = type(dc)
     type_hints = _get_type_hints(dc_type)
@@ -272,21 +325,36 @@ def _plugin_module_names(raw: Any) -> list[str]:
     return names
 
 
+def _plugin_not_found(error: Exception, name: str) -> bool:
+    """Whether ``error`` says the plugin module ``name``, or a package above it, was not found."""
+    if not isinstance(error, ModuleNotFoundError) or error.name is None:
+        return False
+    parts = name.split(".")
+    return error.name in {".".join(parts[: i + 1]) for i in range(len(parts))}
+
+
 def _import_plugins(raw: Any) -> None:
     """Import config-declared modules for their registry side effects.
 
     ``import_module`` is idempotent, so repeated ``load_config`` calls in one
-    process never re-run a module body.
+    process never re-run a module body. A module that fails to import raises a
+    ``ValueError`` naming it. The ``sys.path`` hint is added only when the module
+    itself, or a package above it, was not found; any other failure, a missing
+    dependency of the module included, means the module was found.
     """
     for name in _plugin_module_names(raw):
         try:
             importlib.import_module(name)
         except Exception as e:
+            hint = (
+                " Plugin modules must be on sys.path (the launch directory is not): add "
+                "their directory to PYTHONPATH, or install them."
+                if _plugin_not_found(e, name)
+                else ""
+            )
             raise ValueError(
                 f"Failed to import plugin module {name!r} from config key 'plugins': "
-                f"{type(e).__name__}: {e}. Plugin modules must be on sys.path (the "
-                "launch directory is not) — add their directory to PYTHONPATH, or "
-                "install them."
+                f"{type(e).__name__}: {e}.{hint}"
             ) from e
 
 

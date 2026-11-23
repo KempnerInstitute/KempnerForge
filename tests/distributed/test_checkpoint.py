@@ -31,17 +31,6 @@ pytestmark = pytest.mark.skipif(
 
 SMALL_CONFIG = ModelConfig(dim=128, n_layers=2, n_heads=2, vocab_size=512, max_seq_len=64)
 REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
-RESUMABLE_OPTIMIZERS = [
-    pytest.param(
-        name,
-        marks=pytest.mark.xfail(
-            raises=ZeroDivisionError, strict=True, reason="#236: schedule_free_adamw cannot resume"
-        ),
-    )
-    if name == "schedule_free_adamw"
-    else name
-    for name in REGISTERED_OPTIMIZERS
-]
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _TEST_TMP = _PROJECT_ROOT / ".test_tmp"
@@ -324,7 +313,7 @@ class TestCheckpointRoundTrip:
             assert torch.equal(ref, a), "saving at step 0 changed the run"
             assert torch.equal(ref, b), "resuming from the step-0 checkpoint changed the run"
 
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_resume_restores_the_optimizer_exactly(self, distributed_env, shared_tmp_dir, name):
         """FSDP2 resume restores the optimizer state bit for bit and continues the run exactly."""
         from torch.distributed.tensor import DTensor
@@ -547,7 +536,7 @@ class TestAsyncCheckpointLatestSafety:
 
     def test_resume_falls_back_when_latest_incomplete(self, distributed_env, shared_tmp_dir):
         """Defense in depth: if `latest` points at an interrupted async
-        flush (no DCP `.metadata`), resume falls back to the newest
+        flush (no DCP `.metadata`), an exact resume falls back to the newest
         complete checkpoint instead of hard-failing in dcp.load."""
         mesh = distributed_env
         ckpt_dir = shared_tmp_dir
@@ -576,9 +565,59 @@ class TestAsyncCheckpointLatestSafety:
             tmp.rename(link)
         dist.barrier()
 
-        step, tokens_seen, _ = mgr.load()
+        step, tokens_seen, _ = mgr.load(exact_resume=True)
         assert step == 1, f"rank {rank}: expected fallback to step 1, got {step}"
         assert tokens_seen == 64
+
+
+class TestTornStageResume:
+    """Two pipeline stages of two ranks each: a step one stage cannot load is resumed by none."""
+
+    @pytest.mark.parametrize("torn", [0, 1], ids=["stage_0_torn", "stage_1_torn"])
+    def test_every_stage_resumes_the_same_step(self, distributed_env, shared_tmp_dir, torn):
+        """Each stage saves through its own group; stage ``torn`` loses its step-20 shards."""
+        if dist.get_world_size() != 4:
+            pytest.skip("needs 4 ranks, two stages of two")
+        rank = dist.get_rank()
+        stage = rank // 2
+        groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
+
+        def manager() -> tuple[torch.nn.Module, CheckpointManager]:
+            torch.manual_seed(stage)
+            model = torch.nn.Linear(16, 16).cuda()
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            config = CheckpointConfig(dir=shared_tmp_dir, keep_last_n=3)
+            return model, CheckpointManager(
+                config,
+                model,
+                optimizer,
+                process_group=groups[stage],
+                pp_rank=stage,
+                dp_info=(rank % 2, 2),
+            )
+
+        model, saver = manager()
+        model(torch.ones(2, 16, device="cuda")).sum().backward()
+        saver.optimizer.step()
+        saver.save(step=10, tokens_seen=100)
+        at_10 = model.weight.detach().clone()
+        with torch.no_grad():
+            model.weight.add_(1.0)
+        saver.save(step=20, tokens_seen=200)
+        dist.barrier()
+        if rank == 2 * torn:
+            (Path(shared_tmp_dir) / "step_20" / f"pp{torn}" / ".metadata").unlink()
+        dist.barrier()
+
+        model, loader = manager()
+        with torch.no_grad():
+            model.weight.zero_()
+        step, tokens_seen, _ = loader.load(
+            path=str(Path(shared_tmp_dir) / "step_20"), exact_resume=True
+        )
+        outcomes: list = [None] * 4
+        dist.all_gather_object(outcomes, (step, tokens_seen, torch.equal(model.weight, at_10)))
+        assert outcomes == [(10, 100, True)] * 4, f"(step, tokens, step 10's weights): {outcomes}"
 
 
 class TestAsyncSaveBarrierNoDeadlock:
