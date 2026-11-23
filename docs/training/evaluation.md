@@ -40,7 +40,7 @@ loader — if both are set, pre-tokenized takes precedence.
 def run_eval(
     model, eval_dataloader, loss_fn, device, eval_steps,
     *, pp_schedule=None, pp_rank=None, pp_size=None, pp_group=None,
-    pp_n_microbatches=None,
+    pp_n_microbatches=None, dp_groups=(),
 ) -> dict[str, float]:
 ```
 
@@ -52,6 +52,13 @@ Returns
 
 The `min(avg_loss, 20.0)` caps perplexity at `e^20 ≈ 5e8` so an early
 NaN-adjacent loss doesn't overflow the WandB / TensorBoard logger.
+
+Each data-parallel rank evaluates `eval_steps` batches of its own share
+of the eval set. With `dp_groups`, the `data_parallel_groups` of the
+mesh, which the training loop and `scripts/eval.py` pass, `avg_loss` is
+the mean over those ranks, so `eval/loss` covers `eval_steps * dp_size`
+batches, and the perplexity is the exponential of that mean. Without
+them, a rank reports its own batches only.
 
 `run_eval` toggles `model.eval()` on entry and `model.train()` on
 exit, so the training loop can call it mid-training without leaving the

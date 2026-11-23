@@ -86,7 +86,8 @@ freeze = []
   Ownership is decided over every parameter, frozen or not, so it does not change between
   freeze stages, and the build logs each module's parameters and the module it sits in.
 - Each listed module's rate is logged as `lr/<module>` on the metrics interval, the rate its
-  param groups step at next. Under `muon` that is the rate of its orthogonalized matrices,
+  param groups used for that step's update, read before `optimizer.step()` like `train/lr`.
+  Under `muon` that is the rate of its orthogonalized matrices,
   and the rate of its AdamW fallback is logged as `lr_adamw/<module>`. `train/lr` stays the
   rate of the first param group, which holds parameters outside the listed modules when
   there are any. No name nests under another, as `train/lr/<module>` would under `train/lr`,
