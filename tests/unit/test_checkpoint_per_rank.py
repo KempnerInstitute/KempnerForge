@@ -1098,21 +1098,26 @@ TOPOLOGIES = pytest.mark.parametrize(
 )
 
 
-def _install_recording_world(m, rank: int, world: int, calls: list) -> None:
+def _install_recording_world(
+    m, rank: int, world: int, calls: list, resolved: Path | None = None
+) -> None:
     """Simulate global rank ``rank`` of a ``world``-rank job whose collectives only record.
 
     Every broadcast, gather and all-reduce appends ``(rank, collective, the object it
-    carries)`` to ``calls`` and changes nothing.
+    carries)`` to ``calls`` and changes nothing, except that rank 0's broadcast of the
+    checkpoint it resolved delivers ``resolved`` to the other ranks.
     """
+
+    def broadcast(obj_list, src=0):
+        calls.append((rank, "broadcast", obj_list[0]))
+        if rank != 0 and isinstance(obj_list[0], dict) and obj_list[0].keys() == {"dir", "error"}:
+            obj_list[0] = {"dir": str(resolved), "error": None}
+
     m.setattr(mgr_mod.dist, "is_initialized", lambda: True)
     m.setattr(mgr_mod.dist, "get_rank", lambda group=None: rank)
     m.setattr(mgr_mod.dist, "get_world_size", lambda group=None: world)
     m.setattr(mgr_mod.dist, "new_group", lambda backend=None: "GLOO_PG")
-    m.setattr(
-        mgr_mod.dist,
-        "broadcast_object_list",
-        lambda obj_list, src=0: calls.append((rank, "broadcast", obj_list[0])),
-    )
+    m.setattr(mgr_mod.dist, "broadcast_object_list", broadcast)
     m.setattr(
         mgr_mod.dist,
         "all_gather_object",
@@ -1149,13 +1154,14 @@ class TestWeightsOnlyWarmStart:
 
     No rank restores loader or RNG state, its own entry or rank 0's copy, and no rank
     enters a collective of the train-state path (the existence and train-state broadcasts,
-    the data-parallel layout gather), so the ranks cannot disagree on one. Nothing is
+    the data-parallel layout gather), so the ranks cannot disagree on one; the only
+    collective is rank 0's broadcast of the checkpoint it resolved. Nothing is
     checked against the saved topology: the warm start begins a new run on any world size
     or layout without ``checkpoint.ignore_rank_state_mismatch``.
     """
 
     @TOPOLOGIES
-    def test_no_rank_restores_state_or_enters_a_collective(
+    def test_no_rank_restores_state_or_enters_a_train_state_collective(
         self, tmp_path, monkeypatch, world, layout
     ):
         ckpt_dir = _per_rank_checkpoint(tmp_path, monkeypatch)
@@ -1164,7 +1170,7 @@ class TestWeightsOnlyWarmStart:
             scheduler = _FakeScheduler(0.1)
             loader = MagicMock(spec=["load_state_dict"])
             with monkeypatch.context() as m:
-                _install_recording_world(m, r, world, calls)
+                _install_recording_world(m, r, world, calls, resolved=ckpt_dir)
                 mgr = _mock_mgr(tmp_path, m, dp_info=layout[r])
                 dcp_load = mgr_mod.dcp.load
                 fresh = _fresh_draw(r)
@@ -1181,12 +1187,14 @@ class TestWeightsOnlyWarmStart:
             assert mgr._pending_dataloader_state is None
             dcp_load.assert_called_once()
             assert set(dcp_load.call_args.args[0]) == {"model"}
-        assert calls == []
+        chosen = [{"dir": str(ckpt_dir) if r == 0 else None, "error": None} for r in range(world)]
+        assert calls == [(r, "broadcast", chosen[r]) for r in range(world)]
 
     @TOPOLOGIES
     def test_training_entry_warm_start(self, tmp_path, monkeypatch, world, layout):
-        """Through ``restore_checkpoint``, every rank's only collective is the broadcast
-        of the resume path, which finds nothing to resume in the new run's directory."""
+        """Through ``restore_checkpoint``, every rank's only collectives are the broadcast
+        of the resume path, which finds nothing to resume in the new run's directory, and
+        the load's broadcast of the checkpoint rank 0 resolved."""
         from kempnerforge.config.job import JobConfig
         from kempnerforge.training.entry import restore_checkpoint
 
@@ -1202,7 +1210,7 @@ class TestWeightsOnlyWarmStart:
             )
             scheduler = _FakeScheduler(0.1)
             with monkeypatch.context() as m:
-                _install_recording_world(m, r, world, calls)
+                _install_recording_world(m, r, world, calls, resolved=ckpt_dir)
                 m.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
                 model = torch.nn.Linear(4, 4)
                 opt = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -1213,7 +1221,9 @@ class TestWeightsOnlyWarmStart:
             assert scheduler.restored is None
             assert mgr._pending_dataloader_state is None
         nothing = {"path": None, "error": None}
-        assert calls == [(r, "broadcast", nothing) for r in range(world)]
+        chosen = [{"dir": str(ckpt_dir) if r == 0 else None, "error": None} for r in range(world)]
+        expected = [[(r, "broadcast", nothing), (r, "broadcast", chosen[r])] for r in range(world)]
+        assert calls == [call for pair in expected for call in pair]
 
     def test_an_exact_resume_that_skips_it_is_refused_before_any_collective(
         self, tmp_path, monkeypatch

@@ -66,7 +66,7 @@ Architecture hyperparameters and MoE knobs.
 | `qk_norm` | `bool` | `False` | RMSNorm over Q/K per head before RoPE |
 | `init_std` | `float` | `0.02` | weight-init std (GPT-2 / Llama convention) |
 | `model_type` | `str` | `"transformer"` | `model` registry key |
-| `sdpa_backend` | `str` | `"auto"` | one of `"auto"`, `"flash"`, `"efficient"`, `"cudnn"`, `"math"` |
+| `sdpa_backend` | `str` | `"auto"` | one of `"auto"`, `"flash"`, `"efficient"`, `"cudnn"`, `"math"`; `"flash"` takes no attention mask on CUDA, so training runs that build one are refused (see [Validation rules](validation-rules.md#flash-attention-and-masked-runs)) |
 | `attention_backend` | `str` | `"sdpa"` | `"sdpa"` or `"flex"`; `"flex"` routes packed batches (`data.pack_sequences`) through FlexAttention's block-sparse mask. Requires `train.seq_len ≥ 128` and `head_dim ≥ 16` |
 
 ### MoE (all defaults produce a dense model)
@@ -88,7 +88,7 @@ Architecture hyperparameters and MoE knobs.
 | `moe_router_z_loss_weight` | `float` | `0.0` | router-logit z-loss coefficient (`0` = off) |
 
 Computed properties: `is_moe`, `head_dim`, `computed_ffn_hidden_dim`,
-`computed_expert_ffn_hidden_dim`, `num_params_estimate`.
+`computed_expert_ffn_hidden_dim`, `mlp_matrices`, `num_params_estimate`.
 
 ## `[train]`: `TrainConfig`
 
