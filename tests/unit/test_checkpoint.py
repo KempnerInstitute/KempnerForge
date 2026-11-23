@@ -2260,7 +2260,10 @@ class TestPluginsRecord:
             else:
                 objects[0] = record
 
-        def unread(_ckpt_dir):
+        reads = []
+
+        def unread(ckpt_dir):
+            reads.append(ckpt_dir)
             raise AssertionError("only rank 0 reads metadata.json")
 
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
@@ -2271,6 +2274,7 @@ class TestPluginsRecord:
         monkeypatch.setattr(mgr_mod, "_read_metadata", unread)
         with pytest.raises(ValueError, match="was saved with plugins"):
             mgr.load(path=str(path), plugins_expected=[])
+        assert reads == []
         _, warnings = _manager_warnings(lambda: quiet._check_plugins(record, path, []))
         assert warnings == []
 
