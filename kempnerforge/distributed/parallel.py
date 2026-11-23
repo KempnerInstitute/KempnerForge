@@ -647,6 +647,7 @@ def _build_vlm(
         vision_config.path,
         num_tokens=vision_config.num_tokens if vision_config.num_tokens > 0 else None,
         feature_dim=vision_config.feature_dim if vision_config.feature_dim > 0 else None,
+        **({"drop_pooling_head": True} if vision_config.drop_pooling_head else {}),
     )
     in_dim = vision_config.feature_dim or encoder.feature_dim
 

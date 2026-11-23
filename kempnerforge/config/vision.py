@@ -45,13 +45,18 @@ if TYPE_CHECKING:
 
 @dataclass
 class VisionEncoderConfig:
-    """Configuration for the vision encoder component of a VLM."""
+    """Configuration for the vision encoder component of a VLM.
+
+    ``drop_pooling_head`` removes a SigLIP tower's attention-pooling head, whose
+    pooled output the encoder never returns.
+    """
 
     type: str = "random"
     path: str = ""
     feature_dim: int = 0
     num_tokens: int = 0
     mixed_precision: Literal["bf16", "fp32"] | None = None
+    drop_pooling_head: bool = False
 
     def __post_init__(self) -> None:
         import kempnerforge.model.vision  # noqa: F401, PLC0415
