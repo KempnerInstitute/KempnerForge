@@ -78,7 +78,7 @@
       ],
       "classes": {
         "TrainConfig": {
-          "purpose": "Training hyperparameters (steps, batch, seq_len, precision, loss, grad accum)",
+          "purpose": "Training hyperparameters (steps, batch, seq_len, precision, loss, grad accum, NaN detector action and threshold)",
           "properties": [
             "param_dtype",
             "is_fp8"
@@ -1424,11 +1424,12 @@
     "kempnerforge/resilience/health.py": {
       "classes": {
         "NaNDetector": {
-          "purpose": "Detect and track NaN/Inf in loss and gradients with configurable actions",
+          "purpose": "Detect and track NaN/Inf in loss and gradients with configurable actions (train.nan_action, train.nan_max_consecutive)",
           "methods": [
-            "check_loss(loss, step)",
-            "check_grads(model, step)",
-            "should_recommend_rollback()"
+            "check_loss(loss, step, grad_norm=None) -> bool (collective: one all-reduce of a flag, on CUDA or, without CUDA, on the CPU)",
+            "check_gradients(model, step) -> bool (collective: each rank checks the gradients it holds, one all-reduce gives every rank the verdict)",
+            "rollback_recommended (property; should_rollback is its deprecated alias)",
+            "reset()"
           ]
         }
       },
@@ -1438,6 +1439,7 @@
       ],
       "tested_by": [
         "tests/unit/test_resilience.py::TestNaNDetector",
+        "tests/unit/test_resilience.py::TestNaNDetectorAcrossRanks",
         "tests/unit/test_resilience.py::TestGPUHealth",
         "tests/distributed/test_resilience.py::TestNCCLHealth",
         "tests/distributed/test_resilience.py::TestNaNDetectorDistributed"
@@ -1570,7 +1572,7 @@
       "tests/unit/test_config.py": {
         "classes": [
           "TestModelConfig(23)",
-          "TestTrainConfig(3)",
+          "TestTrainConfig(24)",
           "TestOptimizerConfig(6)",
           "TestDistributedConfig(6)",
           "TestCheckpointConfig(2)",
@@ -1585,7 +1587,7 @@
           "TestRegistry(12)",
           "TestEvalConfig(7)"
         ],
-        "count": 107
+        "count": 128
       },
       "tests/unit/test_training.py": {
         "classes": [
@@ -1623,12 +1625,13 @@
       "tests/unit/test_resilience.py": {
         "classes": [
           "TestShutdownHandler(16)",
-          "TestNaNDetector(17)",
+          "TestNaNDetector(26)",
+          "TestNaNDetectorAcrossRanks(2)",
           "TestGPUHealth(2)",
           "TestSLURM(13)",
           "TestResumePathResolution(9)"
         ],
-        "count": 57
+        "count": 68
       },
       "tests/unit/test_shutdown_agreement.py": {
         "classes": [
@@ -1650,10 +1653,10 @@
           "TestFlushPendingSave(1)",
           "TestSaveVLMFreezeMetadata(3)",
           "TestLoadVLMFreezeCompare(9)",
-          "TestUnreadableTrainStateAcrossRanks(1)"
+          "TestUnreadableTrainStateAcrossRanks(1)",
           "TestTornStageAcrossRanks(1)"
         ],
-        "count": 52
+        "count": 53
       },
       "tests/unit/test_observability.py": {
         "classes": [
