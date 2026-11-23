@@ -548,11 +548,13 @@ image_root = "path-to-docvqa-images"
 
 RealWorldQA is read as the Hugging Face Hub publishes it (`xai-org/RealworldQA`,
 CC BY-ND 4.0): one `test` split of 765 questions, each about one image and with
-one reference answer, in parquet shards that hold the images. Download it once
-and point the task's `dataset_dir` at the download:
+one reference answer, in parquet shards that hold the images. Its card says the
+set will grow, so download it once at the revision of these 765 rows and point
+the task's `dataset_dir` at the download:
 
 ```bash
-hf download xai-org/RealworldQA --repo-type dataset --local-dir path-to-realworldqa
+hf download xai-org/RealworldQA --repo-type dataset \
+    --revision 17e7f75e092e47169732462ea3cdfebe911105dd --local-dir path-to-realworldqa
 ```
 
 `evaluation/realworldqa.py` reads the shards, `data/test-<i>-of-<n>.parquet`, in
