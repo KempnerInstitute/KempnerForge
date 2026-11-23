@@ -82,7 +82,10 @@ class JobConfig:
         ``validate(world_size)`` covers checks that depend on the
         distributed world size; everything that is decidable from the
         config alone runs here so loader-time mistakes surface before
-        any distributed init.
+        any distributed init. A check of a field that a TOML may leave to
+        a command-line override, such as ``vision_encoder.path``, runs in
+        ``validate`` instead: this also runs on the TOML layer alone, before
+        the overrides land (#526).
         """
         if not isinstance(self.plugins, list) or not all(isinstance(p, str) for p in self.plugins):
             raise ValueError(f"plugins must be a list of module paths (got {self.plugins!r})")

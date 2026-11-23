@@ -131,7 +131,9 @@ def build_my_pool(in_dim, out_dim, pool_window=2, **_):
 ```
 
 `my_pool` uses `pool_window`, so `type = "my_pool"` with `pool_heads = 8`
-fails to load. A parameter counts when it is named after an `AdapterConfig`
+fails to load. An adapter that pools, as this one does, also declares its
+token count; see
+[Adapters that pool declare their token count](#adapters-that-pool-declare-their-token-count). A parameter counts when it is named after an `AdapterConfig`
 field and can be passed by keyword; a positional-only one never receives the
 field. A builder with no `**` parameter at all is read the same way. The
 builder's own signature counts: a wrapper made with `functools.wraps` is read
@@ -169,7 +171,8 @@ When `vision_encoder.num_tokens` is set, the config checks, before any module
 exists, that the image tokens plus `vlm.max_text_len` fit `model.max_seq_len`
 (when `JobConfig` is built) and `train.seq_len` (in `JobConfig.validate`). It
 counts an image's tokens with `AdapterConfig.output_num_tokens`, which
-returns the `output_num_tokens` the adapter registered with: a callable that
+calls the `output_num_tokens` declaration the adapter registered with and
+returns the count that declaration returns. The declaration is a callable that
 takes the `AdapterConfig` and the encoder's tokens per image and returns the
 tokens the adapter emits. An adapter that registers none keeps the count, as
 the projection adapters do, so an adapter that pools declares its count. The

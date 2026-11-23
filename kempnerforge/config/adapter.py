@@ -156,12 +156,15 @@ class AdapterConfig:
 
         Mirrors the built module's ``output_num_tokens`` so config-time
         sequence-length checks match the build-time/runtime token budget.
-        The count is the ``output_num_tokens`` the adapter type registered
-        with (see ``registry.register_adapter``), which the pooling adapters
-        declare; an adapter that declares none keeps the count, as the
-        projection adapters do. Non-positive inputs (e.g. the
-        ``num_tokens=0`` "infer at build time" sentinel) pass through.
+        The count is the one the ``output_num_tokens`` declaration the
+        adapter type registered with returns (see
+        ``registry.register_adapter``), which the pooling adapters make; an
+        adapter that declares none keeps the count, as the projection
+        adapters do. Non-positive inputs (e.g. the ``num_tokens=0`` "infer
+        at build time" sentinel) pass through.
         """
+        import kempnerforge.model.adapter  # noqa: F401, PLC0415
+
         declared = registry.get_adapter_output_num_tokens(self.type)
         if num_input_tokens <= 0 or declared is None:
             return num_input_tokens

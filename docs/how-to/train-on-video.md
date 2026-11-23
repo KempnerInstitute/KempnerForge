@@ -95,8 +95,8 @@ build does when the encoder infers it.
 
 From `[data]`, a video run reads `tokenizer_path` and the loader settings
 (`num_workers`, `pin_memory`, `prefetch_factor`). The Hugging Face fields there
-(`hf_dataset_name`, `hf_dataset_split`, `hf_image_size`, ...) belong to image
-runs: `JobConfig.validate` refuses one set away from its default and names the
+(`hf_dataset_name`, `hf_dataset_split`, `hf_image_size`, ...) belong to the
+text and image Hugging Face paths: `JobConfig.validate` refuses one set away from its default and names the
 `[video]` field to set instead, such as `video.split` or `video.frame_size`; see
 [Validation rules](../configuration/validation-rules.md#video-and-the-data-hugging-face-fields).
 
