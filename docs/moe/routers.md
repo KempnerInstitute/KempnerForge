@@ -99,6 +99,15 @@ from `get_mot_expert_counts()`, keyed by layer and modality, since
 most recent forward. It's how hot/cold expert diagnosis works — see
 [MoE experiments § Hot/cold expert diagnosis](../how-to/moe-experiments.md).
 
+Under `activation_checkpointing = "full"` the backward runs each block's
+forward again, routers included. That recompute sets none of these: the
+attributes and the sigmoid router's `pending_counts` stay as the forward
+set them, and it routes every token as the forward did (see
+[Parallelism order § Activation checkpointing](../architecture/parallelism-order.md#4--activation-checkpointing-before-fsdp)).
+Once the training loop has added the routers' losses to the loss, it
+detaches `aux_loss` and `z_loss`, so that a term the loss leaves out,
+such as the z-loss at weight 0, keeps no graph.
+
 ## Builders
 
 Builders live in the same file and are registered at import time:
