@@ -1282,7 +1282,7 @@
         "dp_coordinates(value) -> (dp_rank, dp_size) | None (a valid pair of ints with 0 <= dp_rank < dp_size, else None)",
         "build_per_rank_envelope(entries, world_size, data_parallel) -> dict (versioned envelope of every rank's payload and the data-parallel layout)",
         "select_rank_state(envelope, rank, world_size, data_parallel) -> dict (this rank's payload; ValueError for an unsound envelope, RankStateMismatchError for another world size or layout, the same verdict on every rank)",
-        "saved_data_position(envelope) -> dict | None (the saved rank 0's loader state, checked on the topology that saved it, for a resume onto another topology)",
+        "saved_data_position(envelope, data_parallel) -> dict | None (the saved loader state a rank resumes from on another topology, checked on the topology that saved it: rank 0's, or for a stream on the saved data-parallel size the one its own data-parallel rank saved)",
         "_scheduler_state_for(scheduler, saved, saved_modules, lr_multipliers) -> dict (lays a LambdaLR state out by module for other param groups; a module with no saved group runs at the saved peak times its multiplier)"
       ],
       "tested_by": [
@@ -1729,7 +1729,7 @@
       },
       "tests/unit/test_checkpoint_per_rank.py": {
         "classes": [
-          "TestPerRankEnvelopeSchema(16)",
+          "TestPerRankEnvelopeSchema(17)",
           "TestEnvelopeValidatedBeforeSelection(6)",
           "TestGatherMustCoverTheWorld(2)",
           "TestAFailedCaptureFailsEveryRank(4)",
@@ -1740,7 +1740,7 @@
           "TestWeightsOnlyWarmStart(3)",
           "TestMidSaveInterruption(1)"
         ],
-        "count": 62
+        "count": 63
       },
       "tests/unit/test_observability.py": {
         "classes": [
@@ -2081,8 +2081,8 @@
         "count": 23
       },
       "tests/unit/test_streaming_resume.py": {
-        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning on another rank's position, replay past a shorter part warning in every rank's log, mid-pass restart with workers, replay progress, check_state's verdicts; gloo CheckpointManager auto-resume with ignore_rank_state_mismatch of a stream saved as dp 2 x tp 2: a restart on every rank on another data-parallel size, a restart on every rank when one rank sees a data file at another size, every rank raising together without the flag, and every rank stopping when one rank's check fails another way",
-        "count": 19
+        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning on another rank's position, replay past a shorter part warning in every rank's log, mid-pass restart with workers, replay progress, check_state's verdicts; gloo CheckpointManager auto-resume with ignore_rank_state_mismatch of a stream saved as dp 2 x tp 2: each data-parallel rank's own position on the saved data-parallel size, a restart on every rank on another, a restart on every rank when one rank sees a data file at another size, every rank raising together without the flag, and every rank stopping when one rank's check fails another way",
+        "count": 20
       }
     },
     "integration": {

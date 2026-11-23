@@ -513,9 +513,10 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         A position counted in batches replays to the same samples only while
         these, the batch size and the loader's worker count stay the same. The
         rank is not included, so a rank can replay another rank's count: an
-        auto-resume gives each rank its own, while a ``checkpoint.load_path``
-        warm start, or a resume that ``checkpoint.ignore_rank_state_mismatch``
-        lets onto another layout, gives every rank rank 0's.
+        auto-resume gives each rank its own, as does one that
+        ``checkpoint.ignore_rank_state_mismatch`` lets onto another layout of
+        the saved data-parallel size, while a ``checkpoint.load_path`` warm
+        start gives every rank rank 0's.
         ``StreamingDataLoader`` saves the rank that counted beside the count, as
         ``data_parallel_rank``. ``source`` describes the data rather than where
         it is stored: see ``_source``.

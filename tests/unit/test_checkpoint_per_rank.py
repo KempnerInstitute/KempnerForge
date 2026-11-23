@@ -305,6 +305,32 @@ class TestPerRankEnvelopeSchema:
             del p["dataloader"]
         assert saved_data_position(build_per_rank_envelope(payloads, world_size=WORLD)) is None
 
+    def test_saved_data_position_gives_a_stream_its_own_data_parallel_ranks_position(self):
+        """A stream's parts differ in length, so a rank on the saved data-parallel size
+        resumes from the position its own data-parallel rank saved.
+
+        Saved as dp 2 x tp 2: global ranks 0 and 1 hold data-parallel rank 0's count,
+        2 and 3 rank 1's. On another data-parallel size, or with no coordinates, every
+        rank gets rank 0's, which the streaming loader then refuses or replays as
+        before. A map-style position is rank 0's for every rank.
+        """
+        payloads, _ = _mk_payloads(seed_base=10, cursor_base=100)
+        for r, p in payloads.items():
+            p["dataloader"] = {
+                "epoch": 1,
+                "batches_yielded": 19 if r < 2 else 5,
+                "stream": {"data_parallel_size": 2},
+                "data_parallel_rank": r // 2,
+            }
+        env = build_per_rank_envelope(payloads, world_size=WORLD, data_parallel=DP2_TP2)
+        assert saved_data_position(env, (0, 2))["batches_yielded"] == 19
+        assert saved_data_position(env, (1, 2))["batches_yielded"] == 5
+        for other in [(1, 4), (0, 1), None]:
+            assert saved_data_position(env, other)["batches_yielded"] == 19, other
+        mapped, _ = _mk_payloads(seed_base=10, cursor_base=100)
+        env = build_per_rank_envelope(mapped, world_size=WORLD, data_parallel=DP2_TP2)
+        assert saved_data_position(env, (1, 2)) == {"cursor": 100, "prefetch_depth": 1}
+
     @pytest.mark.parametrize(
         ("defect", "reason"),
         [

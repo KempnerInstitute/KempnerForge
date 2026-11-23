@@ -321,12 +321,21 @@ def select_rank_state(
     return envelope["ranks"][rank]
 
 
-def saved_data_position(envelope: Any) -> dict[str, Any] | None:
-    """The saved rank 0's ``"dataloader"`` state, for a resume onto another topology.
+def saved_data_position(
+    envelope: Any, data_parallel: tuple[int, int] | None = None
+) -> dict[str, Any] | None:
+    """The saved ``"dataloader"`` state a rank resumes from on another topology.
 
     The position a ``StatefulDataLoader`` saves with a ``DistributedSampler``
     counts the samples all data-parallel ranks consumed, the same on every
-    rank, so rank 0's copy serves every rank of the new layout. The loader's
+    rank, and a mixture's counts one rank's samples, which every rank has
+    taken as many of, so rank 0's copy serves every rank of the new layout.
+    A stream's position counts one data-parallel rank's part of the stream,
+    and the parts differ in length, so a rank whose ``data_parallel``
+    coordinates, ``(dp_rank, dp_size)``, have the saved data-parallel size
+    gets the position its own data-parallel rank saved, found by the
+    ``data_parallel_rank`` the stream state records. Any other rank gets rank
+    0's, which the loader refuses on another data-parallel size. The loader's
     ``load_state_dict`` raises ``DataPositionError`` for a position that does
     not fit it, such as a mixture's on another data-parallel size. Returns
     None when the saved loaders kept no state.
@@ -337,7 +346,18 @@ def saved_data_position(envelope: Any) -> dict[str, Any] | None:
     """
     saved_world = envelope.get("world_size") if isinstance(envelope, dict) else None
     _check_envelope(envelope, saved_world if _is_int(saved_world) else 0, None)
-    return envelope["ranks"][0].get("dataloader")
+    ranks = envelope["ranks"]
+    first = ranks[0].get("dataloader")
+    if first is None or "stream" not in first or data_parallel is None:
+        return first
+    dp_rank, dp_size = data_parallel
+    for rank in sorted(ranks):
+        state = ranks[rank]["dataloader"]
+        stream = state.get("stream")
+        saved_size = stream.get("data_parallel_size") if isinstance(stream, dict) else None
+        if state.get("data_parallel_rank") == dp_rank and saved_size == dp_size:
+            return state
+    return first
 
 
 def _group_modules(scheduler: Any) -> list[str | None] | None:

@@ -665,6 +665,28 @@ def _stale_copy(corpus, directory: Path) -> str:
     return str(data)
 
 
+def test_a_flag_resume_on_the_saved_data_parallel_size_keeps_each_ranks_stream_position(
+    uneven_corpus, stream_checkpoint, tmp_path
+):
+    """Saved as dp 2 x tp 2 on 4 ranks, auto-resumed as dp 2 on 2 with the flag.
+
+    The two data-parallel parts differ in length, so their saved positions differ. Each
+    rank takes the one its own data-parallel rank saved and reads what the uninterrupted
+    run read next; the random streams restart, and no rank starts its data over.
+    """
+    data, tokenizer = (str(p) for p in uneven_corpus)
+    root, saved = stream_checkpoint
+    assert saved[0]["at"] != saved[2]["at"], "the saved positions should differ"
+    resumed = _resume_streams(tmp_path, root, [data, data], tokenizer, [(0, 2), (1, 2)], True)
+    for rank, report in enumerate(resumed):
+        assert report["error"] is None, report["error"]
+        assert report["next"] == saved[2 * rank]["next"], f"rank {rank} took another position"
+        assert report["draw"] == report["fresh"], f"rank {rank} restored a saved RNG stream"
+        kept = [w for w in report["warnings"] if "Kept: the saved data position" in w]
+        assert kept, report["warnings"]
+        assert not [w for w in report["warnings"] if "does not carry over" in w]
+
+
 def test_a_flag_resume_on_another_data_parallel_size_restarts_the_stream_on_every_rank(
     uneven_corpus, stream_checkpoint, tmp_path
 ):

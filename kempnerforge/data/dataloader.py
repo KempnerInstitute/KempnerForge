@@ -344,16 +344,16 @@ class StreamingDataLoader:
 
     Every rank saves its own position, with the data-parallel rank that saved it,
     and an exact resume (the training entry's auto-resume) gives every rank its
-    own, so the replay is exact in every pass. A load that gives every rank rank
-    0's copy instead, a ``checkpoint.load_path`` warm start or a resume that
-    ``checkpoint.ignore_rank_state_mismatch`` lets onto another layout, is exact
-    while every rank started its current pass on the same step, so in practice
-    until the first rank finishes a pass. Past that, a rank whose part of the
-    pass is shorter than rank 0's count runs off its end in the replay and
-    starts the next pass over, reading data again, and a rank that takes
-    another rank's count in a later pass may skip or repeat data. Either one
-    warns, with a record every rank's log shows, since rank 0 holds its own
-    position and stays silent.
+    own, as does one that ``checkpoint.ignore_rank_state_mismatch`` lets onto
+    another layout of the saved data-parallel size, so the replay is exact in
+    every pass. A ``checkpoint.load_path`` warm start gives every rank rank 0's
+    copy instead, which is exact while every rank started its current pass on
+    the same step, so in practice until the first rank finishes a pass. Past
+    that, a rank whose part of the pass is shorter than rank 0's count runs off
+    its end in the replay and starts the next pass over, reading data again,
+    and a rank that takes another rank's count in a later pass may skip or
+    repeat data. Either one warns, with a record every rank's log shows, since
+    rank 0 holds its own position and stays silent.
 
     Args:
         dataset: The streaming dataset.

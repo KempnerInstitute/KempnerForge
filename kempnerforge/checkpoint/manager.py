@@ -1210,9 +1210,9 @@ class CheckpointManager:
         every rank, unless that flag is set (see ``_resume_without_rank_state``).
 
         Returns:
-            The view, and whether its ``dataloader`` state is the saved rank 0's
-            data position carried onto a changed topology rather than this
-            rank's own state.
+            The view, and whether its ``dataloader`` state is a saved data
+            position carried onto a changed topology (see
+            ``saved_data_position``) rather than this rank's own state.
         """
         envelope = train_state.get(PER_RANK_KEY)
         if envelope is None:
@@ -1246,20 +1246,23 @@ class CheckpointManager:
 
         A changed world size or data-parallel layout (``RankStateMismatchError``)
         keeps the data position when the envelope is sound on the topology that
-        saved it: the view holds the saved rank 0's loader state, which
-        ``apply_dataloader_state`` resumes on every rank where the loader can
-        place it on this layout and restarts where it cannot. Any other refusal
-        drops the loader state too. No RNG state is restored either way, so the
-        random streams restart from this run's seeds. Reads only the broadcast
-        envelope and an error every rank met alike, so every rank keeps or drops
-        the position together.
+        saved it: the view holds the saved loader state this rank resumes from,
+        rank 0's, or for a stream on the saved data-parallel size the one its own
+        data-parallel rank saved (see ``saved_data_position``), which
+        ``apply_dataloader_state`` resumes on every rank where the loaders can
+        place it on this layout and restarts on every rank where one cannot. Any
+        other refusal drops the loader state too. No RNG state is restored either
+        way, so the random streams restart from this run's seeds. Whether a
+        position is kept depends only on the broadcast envelope, an error every
+        rank met alike and the configured layout, so every rank keeps or drops it
+        together.
         """
         position = None
         reason = str(error)
         if isinstance(error, RankStateMismatchError):
             reason = error.mismatch
             try:
-                position = saved_data_position(envelope)
+                position = saved_data_position(envelope, self._dp_info)
             except ValueError as e:
                 reason = str(e)
         if position is None:
@@ -1274,7 +1277,8 @@ class CheckpointManager:
         logger.warning(
             f"Resuming on a changed topology because checkpoint.ignore_rank_state_mismatch="
             f"true: {reason}. Kept: the saved data position, which every rank resumes from "
-            f"where its loader can place it on this layout. Dropped: every rank's saved RNG "
+            f"where the loaders can place it on this layout, a stream from the position its "
+            f"own data-parallel rank saved. Dropped: every rank's saved RNG "
             f"state, so the random streams restart from this run's seeds. Model, optimizer, "
             f"scheduler and step resume."
         )
