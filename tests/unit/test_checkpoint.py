@@ -2255,7 +2255,10 @@ class TestPluginsRecord:
         record = (json.loads((path / "metadata.json").read_text()), None)
 
         def broadcast(objects, src):
-            objects[0] = record
+            if isinstance(objects[0], dict) and objects[0].keys() == {"dir", "error"}:
+                objects[0] = {"dir": str(path.resolve()), "error": None}
+            else:
+                objects[0] = record
 
         def unread(_ckpt_dir):
             raise AssertionError("only rank 0 reads metadata.json")
