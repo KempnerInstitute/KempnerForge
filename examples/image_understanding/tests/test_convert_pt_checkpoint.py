@@ -61,11 +61,10 @@ def _source_key(converter: Any, target: str) -> str:
     return f"multimodal_core.layers.{layer}.{leaves['.'.join(leaf)]}"
 
 
-@pytest.fixture
-def config(tmp_path: Path) -> Path:
+def _config(tmp_path: Path, *, use_head: bool) -> Path:
     from transformers import SiglipVisionConfig, SiglipVisionModel
 
-    encoder = tmp_path / "siglip"
+    encoder = tmp_path / f"siglip-{use_head}"
     vision = SiglipVisionConfig(
         hidden_size=16,
         intermediate_size=32,
@@ -73,11 +72,17 @@ def config(tmp_path: Path) -> Path:
         num_attention_heads=2,
         image_size=16,
         patch_size=4,
+        vision_use_head=use_head,
     )
     SiglipVisionModel(vision).save_pretrained(encoder)
-    path = tmp_path / "run.toml"
+    path = tmp_path / f"run-{use_head}.toml"
     path.write_text(CONFIG.format(encoder=encoder))
     return path
+
+
+@pytest.fixture
+def config(tmp_path: Path) -> Path:
+    return _config(tmp_path, use_head=True)
 
 
 def _target(config: Path) -> dict[str, torch.Tensor]:
@@ -108,6 +113,20 @@ class TestConvertPtCheckpoint:
         dcp.load({"model": state}, checkpoint_id=str(out))
         for key, tensor in source.items():
             assert torch.equal(state[converter.map_key(key)], tensor), key
+
+    def test_a_pooling_head_the_model_lacks_is_dropped(self, tmp_path: Path) -> None:
+        converter = _converter()
+        source = _source(converter, _config(tmp_path, use_head=True))
+        headless = _config(tmp_path, use_head=False)
+        head = [key for key in source if ".vision_model.head." in key]
+        assert head and not any(".head." in key for key in _target(headless))
+        torch.save(source, tmp_path / "stage1.pt")
+        out = converter.convert(str(tmp_path / "stage1.pt"), str(headless), str(tmp_path / "dcp"))
+        state = {key: torch.empty_like(value) for key, value in _target(headless).items()}
+        dcp.load({"model": state}, checkpoint_id=str(out))
+        for key, tensor in source.items():
+            if key not in head:
+                assert torch.equal(state[converter.map_key(key)], tensor), key
 
     def test_a_source_key_without_a_target_is_refused(self, tmp_path: Path, config: Path) -> None:
         converter = _converter()
