@@ -619,23 +619,22 @@ def _check_saved_optimizer(
 def _load_train_state(path: Path) -> dict[str, Any]:
     """Load ``train_state.pt`` under an explicit trust boundary.
 
-    ``train_state.pt`` carries scheduler state, dataloader state, and a
-    caller-supplied ``extra`` dict, so it is loaded with ``weights_only=False``
-    (i.e. full pickle). Any object in the file whose class defines
-    ``__reduce__`` runs arbitrary Python during ``torch.load``. On shared
-    filesystems this is a real attack surface: anyone who can write into
-    another user's checkpoint directory gets code execution in that user's
-    training process on next resume.
+    ``train_state.pt`` carries scheduler state, dataloader state and the
+    caller's extra keys, so it is loaded with ``weights_only=False`` (i.e.
+    full pickle): an object in the file whose class defines ``__reduce__``
+    can run arbitrary Python during ``torch.load``. On shared filesystems
+    this is a real attack surface: anyone who can write into another user's
+    checkpoint directory can run code in that user's training process on
+    the next resume.
 
-    Refuses to load files not owned by the current UID and warns when the
-    file is group- or world-writable. This does not defend against a
-    same-UID compromise — if the attacker can write as you, they already
-    win — but it closes the common "group-writable shared checkpoint dir"
-    foot-gun and makes the trust boundary visible.
-
-    Checkpoints imported from outside the lab (HuggingFace Hub, colleague
-    transfers, etc.) will fail this check and must be either chown'd to the
-    current user after inspection or converted to a weights-only-safe form.
+    Refuses to load a file not owned by the current UID, and warns about,
+    but still loads, one that is group- or world-writable. It checks only the
+    file's owner and mode, which makes the trust boundary visible but does
+    not enforce it: a checkpoint the current user downloaded, copied or
+    extracted from an archive is theirs and loads, and an attacker who can
+    write as that user already wins. PyTorch also unpickles the DCP files'
+    ``.metadata`` index and the shards' non-tensor values, unchecked, before
+    this file is read. Load only checkpoints you trust.
     """
     st = path.stat()
     uid = os.getuid()
@@ -1651,18 +1650,7 @@ class CheckpointManager:
             )
             step, tokens_seen, extra = 0, 0, {}
         elif train_state_exists:
-            train_state = (
-                _load_train_state(train_state_path)
-                if self._rank == 0 or not dist.is_initialized()
-                else None
-            )
-
-            if dist.is_initialized():
-                object_list = [train_state if self._rank == 0 else None]
-                dist.broadcast_object_list(object_list, src=0)
-                train_state = object_list[0]
-
-            assert train_state is not None, "train_state broadcast failed"
+            train_state = self._broadcast_train_state(train_state_path)
             if (
                 self._lr_multipliers is not None
                 and metadata is None
@@ -1759,6 +1747,37 @@ class CheckpointManager:
         if failed:
             raise RuntimeError(f"Could not read the DCP index of the checkpoint on ranks {failed}")
         return bool(flags[1].any())
+
+    def _broadcast_train_state(self, path: Path) -> dict[str, Any]:
+        """Return rank 0's read of the ``train_state.pt`` at ``path`` on every rank.
+
+        Rank 0 alone reads the file (``_load_train_state``) and broadcasts the state, or in its
+        place why it could not read it, such as a torn file or one the ownership check refuses.
+        Every rank then fails at once, instead of the others waiting in the broadcast until the
+        process-group timeout. Every rank calls this or none does.
+
+        Raises:
+            Exception: On rank 0, or without a process group, what reading the file raised.
+            RuntimeError: On every other rank, naming rank 0's error.
+        """
+        state: dict[str, Any] | None = None
+        error: Exception | None = None
+        if self._rank == 0 or not dist.is_initialized():
+            try:
+                state = _load_train_state(path)
+            except Exception as e:
+                error = e
+        if dist.is_initialized():
+            reason = None if error is None else f"{type(error).__name__}: {_error_text(error)}"
+            outcome: list[tuple[dict[str, Any] | None, str | None]] = [(state, reason)]
+            dist.broadcast_object_list(outcome, src=0)
+            state, reason = outcome[0]
+            if error is None and reason is not None:
+                raise RuntimeError(f"Rank 0 could not read {path}: {reason}")
+        if error is not None:
+            raise error
+        assert state is not None
+        return state
 
     def _broadcast_metadata(self, ckpt_dir: Path) -> _MetadataOutcome:
         """Return rank 0's read of the checkpoint's ``metadata.json`` on every rank: the JSON
