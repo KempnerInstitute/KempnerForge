@@ -252,7 +252,7 @@ class TestLoadModel:
         with torch.no_grad():
             for router in before:
                 router.expert_bias.add_(0.125)
-                router.expert_ema.fill_(0.25)
+                router.expert_ema.copy_(torch.linspace(0.1, 0.4, router.expert_ema.numel()))
                 for name in SigmoidTopKRouter.derived_buffers:
                     router._buffers.pop(name)
         step_dir = tmp_path / "step_1"
