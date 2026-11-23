@@ -6,13 +6,10 @@ also when FSDP2 keeps the units gathered after a forward.
 
 from __future__ import annotations
 
-import socket
 from pathlib import Path
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
@@ -22,14 +19,9 @@ from kempnerforge.config.schema import CheckpointConfig, ModelConfig, OptimizerC
 from kempnerforge.distributed.parallel import apply_fsdp2, default_mp_policy
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.optimizer import build_optimizer, evaluation_point
+from tests.gloo_ranks import gloo_group, spawn
 
 CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _local(t: torch.Tensor) -> torch.Tensor:
@@ -41,10 +33,7 @@ def _same(a: list[torch.Tensor], b: list[torch.Tensor]) -> bool:
 
 
 def _resume_is_exact(rank: int, world: int, port: int, ckpt_dir: str) -> None:
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
 
         def build(seed):
@@ -87,16 +76,10 @@ def _resume_is_exact(rank: int, world: int, port: int, ckpt_dir: str) -> None:
         assert _same(
             [p.detach() for p in reference.parameters()], [p.detach() for p in model2.parameters()]
         ), "the resumed run diverged from the uninterrupted one"
-        dist.barrier()
-    finally:
-        dist.destroy_process_group()
 
 
 def _eval_leaves_the_run(rank: int, world: int, port: int, reshard_after_forward: bool) -> None:
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
         g = torch.Generator().manual_seed(7 + rank)
         batches = [torch.randint(0, 256, (2, 32), generator=g) for _ in range(8)]
@@ -124,18 +107,15 @@ def _eval_leaves_the_run(rank: int, world: int, port: int, reshard_after_forward
             return [p.detach() for p in model.parameters()]
 
         assert _same(run(eval_after=None), run(eval_after=3)), "the eval changed the run"
-        dist.barrier()
-    finally:
-        dist.destroy_process_group()
 
 
 class TestScheduleFreeUnderFsdp2:
     def test_a_checkpoint_holds_x_and_resumes_exactly(self, tmp_path: Path) -> None:
-        mp.spawn(_resume_is_exact, args=(2, _free_port(), str(tmp_path / "ckpt")), nprocs=2)
+        spawn(_resume_is_exact, 2, str(tmp_path / "ckpt"))
 
     @pytest.mark.parametrize("reshard_after_forward", [True, False])
     def test_an_eval_at_x_leaves_the_training_run_unchanged(
         self, reshard_after_forward: bool
     ) -> None:
         """Units kept gathered after the eval forward are resharded, so training sees y."""
-        mp.spawn(_eval_leaves_the_run, args=(2, _free_port(), reshard_after_forward), nprocs=2)
+        spawn(_eval_leaves_the_run, 2, reshard_after_forward)
