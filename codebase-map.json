@@ -1756,12 +1756,12 @@
           "TestFrozenBias(2)",
           "TestBalance(5)",
           "TestBalanceRouters(3)",
-          "TestCheckpointsThatTrainedTheBias(2)",
+          "TestCheckpointsThatTrainedTheBias(3)",
           "TestManagerResume(2)",
           "TestDerivedBufferOwners(1)",
           "TestFSDP2(1)"
         ],
-        "count": 16
+        "count": 17
       },
       "tests/unit/test_optimizer.py": {
         "classes": [
