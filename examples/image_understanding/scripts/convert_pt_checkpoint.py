@@ -8,7 +8,8 @@ patches, and a Qwen3 decoder as ``multimodal_core`` (Hugging Face layer names),
 ``text_preprocessor.embed`` and an untied ``text_head``. The target VLM is built
 from ``--config`` and every one of its tensors is filled from the source; nothing
 is written unless each source tensor maps onto a target tensor of the same shape
-and each target tensor is filled. The result is one DCP that
+and each target tensor is filled. The source's SigLIP attention-pooling head is
+dropped when the model has none. The result is one DCP that
 ``[checkpoint].load_path`` warm-starts from with
 ``exclude_from_loading = ["optimizer", "train_state"]``.
 
@@ -46,6 +47,7 @@ _RENAMES = {
     "text_head.weight": "transformer.output_head.proj.weight",
 }
 _VISION_PREFIX = ("image_encoder.model.vision_model.", "vision_encoder.vision_tower.")
+_POOLING_HEAD = "vision_encoder.vision_tower.head."
 _LAYER_KEY = re.compile(r"multimodal_core\.layers\.(\d+)\.(.+)")
 _LAYER_LEAVES = {
     "self_attn.q_proj.weight": "attention.q_proj.weight",
@@ -105,6 +107,11 @@ def convert(checkpoint: str, config_path: str, out: str) -> Path:
         frames_per_clip=config.views_per_sample,
     )
     target = wrapper.state_dict()
+    converted = {
+        key: tensor
+        for key, tensor in converted.items()
+        if key in target or not key.startswith(_POOLING_HEAD)
+    }
     extra = sorted(converted.keys() - target.keys())
     missing = sorted(target.keys() - converted.keys())
     if extra or missing:
