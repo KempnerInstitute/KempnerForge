@@ -1008,6 +1008,42 @@ class TestFlushPendingSave:
         wait_mock.assert_called_once()
 
 
+class TestHasPendingSave:
+    """``has_pending_save`` tells the training loop whether a drain (its final ``wait()``, a
+    shutdown's ``wait()`` or a freeze stage's ``flush_pending_save()``) has anything to
+    drain, so it times only a drain that happens."""
+
+    @staticmethod
+    def _mgr(tmp_path, mode):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        return CheckpointManager(CheckpointConfig(dir=str(tmp_path), async_mode=mode), model, opt)
+
+    def test_an_async_save_is_pending_until_wait(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.dcp.async_save", MagicMock(return_value=MagicMock())
+        )
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
+        assert not mgr.has_pending_save
+        mgr.save(step=1)
+        assert mgr.has_pending_save
+        mgr.wait()
+        assert not mgr.has_pending_save
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+
+    def test_a_synchronous_save_leaves_nothing_pending(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.save", MagicMock())
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
+        mgr.save(step=1)
+        assert not mgr.has_pending_save
+
+
 class TestSaveVLMFreezeMetadata:
     def test_save_writes_vlm_freeze_to_metadata(self, tmp_path, monkeypatch):
         import json
@@ -5117,3 +5153,31 @@ class TestWeightDecayScopeOnResume:
         self._as_rank(monkeypatch, manager, 1, sent=(None, "rank 0 could not read it"))
         with pytest.raises(ValueError, match="rank 0 could not read it"):
             manager.load()
+
+
+class TestRestoredExtra:
+    """The manager records the extra keys its last load restored, for the caller to read."""
+
+    def test_a_load_records_the_extra_keys_it_restored(self, tmp_path):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        saver = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        assert saver.restored_extra == {}
+        saver.save(step=2, tokens_seen=8, extra={"documents_seen": 5})
+        loader = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        assert loader.load()[2]["documents_seen"] == 5
+        assert loader.restored_extra["documents_seen"] == 5
+        loader.restored_extra["documents_seen"] = 0
+        assert loader.restored_extra["documents_seen"] == 5
+
+    def test_a_load_that_finds_nothing_restores_no_extra(self, tmp_path):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path / "none")), model, optimizer)
+        manager._restored_extra = {"documents_seen": 3}
+        assert manager.load() == (0, 0, {})
+        assert manager.restored_extra == {}

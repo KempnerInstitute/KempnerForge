@@ -195,6 +195,14 @@ class TestVideoCollator:
         batch = collator([self._sample(2, max_frames=4)])
         assert batch["frame_mask"][0].tolist() == [True, True, False, False]
 
+    def test_text_len_counts_each_rows_real_tokens(self):
+        """A sample's text_len, at most max_text_len; its length without one."""
+        collator = VideoCollator(pad_id=0, max_text_len=8)
+        samples = [self._sample(2), self._sample(3), self._sample(1)]
+        samples[0]["text_len"] = torch.tensor(5)
+        samples[1]["text_len"] = torch.tensor(12)
+        assert collator(samples)["text_len"].tolist() == [5, 8, 8]
+
     def test_empty_batch_raises(self):
         with pytest.raises(ValueError, match="empty batch"):
             VideoCollator(pad_id=0, max_text_len=8)([])
