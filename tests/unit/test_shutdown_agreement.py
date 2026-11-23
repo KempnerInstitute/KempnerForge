@@ -173,8 +173,10 @@ def _outcomes(
 
     The ranks get 240 s to reach ``part``, 45 s in it and 60 s to exit, so start-up and exit do
     not count against ``part``. Each test that calls this carries a 360 s timeout, which covers
-    all three and the 5 s grace period for stopping the ranks, so under CI's shorter default a
-    hung case still fails with its phase's message.
+    all three and the 5 s grace period for stopping the ranks, so CI's shorter default does not
+    cut a hung case short. A rank that has finished waits to leave the group for the group's
+    timeout, 30 s for the loop and 10 s for the votes, so a hung case usually fails with that
+    wait's error naming the stuck rank, or with the phase message if that comes first.
     """
     args = (case, str(tmp_path / "ckpt"))
     return run_to_outcomes(target, WORLD, args, tmp_path / "outcomes", part=part, part_s=DEADLINE_S)
