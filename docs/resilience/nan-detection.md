@@ -151,17 +151,22 @@ on the next step.
 bad_loss = not _is_finite(loss)
 bad_grad_norm = grad_norm is not None and not _is_finite(grad_norm)
 local_nan = bad_loss or bad_grad_norm
-if dist.is_initialized():
-    nan_flag = torch.tensor([1.0 if local_nan else 0.0], device="cuda")
-    dist.all_reduce(nan_flag)
-    any_nan = nan_flag.item() > 0
-else:
-    any_nan = local_nan
+any_nan = _any_rank_flagged(local_nan)
+
+# _any_rank_flagged(flag)
+if not dist.is_initialized():
+    return flag
+device = "cuda" if torch.cuda.is_available() else "cpu"
+reduced = torch.tensor([1.0 if flag else 0.0], device=device)
+dist.all_reduce(reduced)
+return reduced.item() > 0
 ```
 
 Four bytes per step — dwarfed by the gradient all-reduce. The
 `all_reduce` is a `SUM` (the default) — any rank with NaN lifts the
-flag above zero on every rank.
+flag above zero on every rank. The flag goes on the current CUDA device
+when CUDA is available, so NCCL reduces it, and on the CPU otherwise,
+so a gloo process group without CUDA (a CPU-only test) reduces it too.
 
 If `any_nan` is true but `local_nan` is false, the log line mentions
 "detected on another rank" so you can correlate which rank blew up from
@@ -278,7 +283,8 @@ every rank must call it.
   pathology; expect a small per-step cost (one `isfinite` + `.all()`
   per parameter).
 - **Loss is already a CPU scalar.** `check_loss` gets a Python float, so
-  the distributed sync creates a new tensor on CUDA and all-reduces it
+  the distributed sync creates a new tensor on CUDA (on the CPU when CUDA
+  is unavailable) and all-reduces it
   — a negligible one-off each step but not free. If you optimize this
   path, aggregate the NaN flag into the existing grad-norm all-reduce.
 

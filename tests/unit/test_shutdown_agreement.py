@@ -6,9 +6,8 @@ control group it made, and a NaN loss on one rank skips the step on every rank
 (#375).
 
 Two gloo ranks run the real ``run_training_loop`` and only one of them sees the
-event. ``NaNDetector.check_loss`` makes its flag on CUDA, so each rank swaps the
-health module's ``torch`` for one that makes it on the CPU, as the
-``test_resilience`` reduction tests do.
+event. Without CUDA, ``NaNDetector.check_loss`` reduces its flag on the CPU, so the
+NaN case runs the loop's real cross-rank check.
 """
 
 from __future__ import annotations
@@ -38,15 +37,6 @@ def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
-
-
-class _CpuTorch:
-    def __getattr__(self, name):
-        return getattr(torch, name)
-
-    @staticmethod
-    def tensor(data, device=None, **kwargs):
-        return torch.tensor(data, **kwargs)
 
 
 def _init(rank: int, port: int, timeout_s: float = PG_TIMEOUT_S) -> None:
@@ -133,7 +123,6 @@ def _run_loop(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
     """Run the loop on one rank and write how it ended, then wait for the other rank."""
     _init(rank, port)
     try:
-        import kempnerforge.resilience.health as health
         import kempnerforge.training.loop as loop
         from kempnerforge.checkpoint.manager import CheckpointManager
         from tests.unit.test_train_entry import (
@@ -144,7 +133,6 @@ def _run_loop(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
             make_session,
         )
 
-        health.torch = _CpuTorch()
         config = make_config(max_steps=6)
         config.checkpoint.dir = root
         config.checkpoint.interval = 100

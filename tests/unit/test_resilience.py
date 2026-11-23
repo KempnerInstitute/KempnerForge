@@ -60,6 +60,22 @@ def _check_ranks_agree(rank: int, world: int, port: int, nan_rank: int | None) -
         dist.destroy_process_group()
 
 
+def _check_loss_across_ranks(rank: int, world: int, port: int) -> None:
+    """Only rank 1 has a NaN loss, then a non-finite gradient norm; every rank fails both."""
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    try:
+        det = NaNDetector(action="warn")
+        assert det.check_loss(1.0, step=1) is True
+        assert det.check_loss(float("nan") if rank == 1 else 1.0, step=2) is False
+        assert det.check_loss(1.0, step=3, grad_norm=float("inf") if rank == 1 else 0.5) is False
+        assert det.state.consecutive_nans == 2
+        assert det.state.nan_steps == [2, 3]
+    finally:
+        dist.destroy_process_group()
+
+
 _TRITON_COMPILE_CHILD = """
 import importlib.util
 import os
@@ -425,18 +441,10 @@ class TestNaNDetector:
     def _fake_world(monkeypatch, remote_bad: bool) -> list[float]:
         """Run check_loss as one rank of a world whose other rank is bad or not.
 
-        The flag tensor is made on the CPU instead of CUDA, and all_reduce adds the
-        other rank's flag; returns the local flag seen by each all_reduce call.
+        all_reduce adds the other rank's flag; returns the local flag seen by each
+        all_reduce call.
         """
         import kempnerforge.resilience.health as health
-
-        class _CpuTorch:
-            def __getattr__(self, name):
-                return getattr(torch, name)
-
-            @staticmethod
-            def tensor(data, device=None, **kwargs):
-                return torch.tensor(data, **kwargs)
 
         seen: list[float] = []
 
@@ -444,7 +452,6 @@ class TestNaNDetector:
             seen.append(flag.item())
             flag.add_(1.0 if remote_bad else 0.0)
 
-        monkeypatch.setattr(health, "torch", _CpuTorch())
         monkeypatch.setattr(health.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(health.dist, "all_reduce", all_reduce)
         return seen
@@ -520,6 +527,18 @@ class TestNaNDetector:
         det = NaNDetector(action="raise")
         with pytest.raises(RuntimeError, match="NaN/Inf gradient"):
             det.check_gradients(model, step=1)
+
+
+class TestNaNDetectorAcrossRanks:
+    """Two gloo ranks started with CUDA hidden, as on a CPU-only host."""
+
+    @pytest.fixture(autouse=True)
+    def _hide_cuda(self, monkeypatch):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+
+    def test_check_loss_reduces_its_flag_over_gloo(self):
+        """Rank 0's own values are finite, so only the all-reduce can fail its check."""
+        mp.spawn(_check_loss_across_ranks, args=(2, _free_port()), nprocs=2)
 
 
 class TestParamsAreFinite:

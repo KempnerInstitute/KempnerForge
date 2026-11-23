@@ -65,7 +65,9 @@ class NaNDetector:
 
         When running distributed, all-reduces a NaN flag so ALL ranks agree
         on whether to skip. Prevents rank desync where one rank sees NaN and
-        skips its optimizer step while others proceed normally.
+        skips its optimizer step while others proceed normally. The flag is on
+        the current CUDA device, or on the CPU when CUDA is unavailable, so a
+        gloo process group without CUDA reduces it as well.
 
         A finite loss does not guarantee finite gradients: a micro-batch whose
         labels are all masked has an exact zero cross-entropy loss whatever its
@@ -89,13 +91,7 @@ class NaNDetector:
         bad_loss = not _is_finite(loss)
         bad_grad_norm = grad_norm is not None and not _is_finite(grad_norm)
         local_nan = bad_loss or bad_grad_norm
-
-        if dist.is_initialized():
-            nan_flag = torch.tensor([1.0 if local_nan else 0.0], device="cuda")
-            dist.all_reduce(nan_flag)
-            any_nan = nan_flag.item() > 0
-        else:
-            any_nan = local_nan
+        any_nan = _any_rank_flagged(local_nan)
 
         if not any_nan:
             self.state.consecutive_nans = 0
@@ -267,6 +263,21 @@ def check_nccl_health(timeout_sec: float = 10.0) -> bool:
     except RuntimeError as e:
         logger.error(f"NCCL health check failed: {e}")
         return False
+
+
+def _any_rank_flagged(flag: bool) -> bool:
+    """Whether ``flag`` is True on any rank of the default process group.
+
+    When running distributed this is one all-reduce of a one-element flag, so
+    every rank must call it. The flag is on the current CUDA device when CUDA
+    is available, for NCCL, and on the CPU otherwise, for gloo.
+    """
+    if not dist.is_initialized():
+        return flag
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    reduced = torch.tensor([1.0 if flag else 0.0], device=device)
+    dist.all_reduce(reduced)
+    return reduced.item() > 0
 
 
 def _is_finite(value: float) -> bool:
