@@ -149,6 +149,87 @@ class _FakeAutoModelSigLIP:
         return wrapper
 
 
+def _tiny_siglip(monkeypatch) -> torch.nn.Module:
+    """Make ``AutoModel.from_pretrained`` return copies of a tiny SigLIP, and return its tower."""
+    import copy
+    import sys
+
+    from transformers import SiglipConfig, SiglipModel
+
+    torch.manual_seed(0)
+    vision = {
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "image_size": 32,
+        "patch_size": 8,
+    }
+    text = {
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+    }
+    model = SiglipModel(SiglipConfig(vision_config=vision, text_config=text)).eval()
+
+    class _Auto:
+        @staticmethod
+        def from_pretrained(path: str) -> torch.nn.Module:  # noqa: ARG004
+            return copy.deepcopy(model)
+
+    fake_mod = type(sys)("transformers")
+    fake_mod.AutoModel = _Auto  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "transformers", fake_mod)
+    return copy.deepcopy(model.vision_model)
+
+
+def _head_params(module: torch.nn.Module) -> list[str]:
+    return [name for name, _ in module.named_parameters() if ".head." in f".{name}"]
+
+
+class TestSigLIPPoolingHead:
+    def test_the_head_is_kept_unless_dropped(self, monkeypatch):
+        reference = _tiny_siglip(monkeypatch)
+        builder = registry.get_vision_encoder("siglip2")
+        kept = builder("tiny").eval()
+        dropped = builder("tiny", drop_pooling_head=True).eval()
+        assert _head_params(reference) and _head_params(kept)
+        assert not _head_params(dropped)
+        pixels = torch.randn(2, 3, 32, 32)
+        with torch.no_grad():
+            expected = reference(pixel_values=pixels).last_hidden_state
+            for enc in (kept, dropped):
+                torch.testing.assert_close(enc(pixels), expected, rtol=0, atol=0)
+        assert dropped(pixels).shape == (2, dropped.num_tokens, dropped.feature_dim)
+
+    def test_a_tower_without_a_head_is_refused(self, monkeypatch):
+        import sys
+
+        fake_mod = type(sys)("transformers")
+        fake_mod.AutoModel = _FakeAutoModelSigLIP  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "transformers", fake_mod)
+        with pytest.raises(ValueError, match="no pooling head"):
+            registry.get_vision_encoder("siglip2")("fake", drop_pooling_head=True)
+
+    def test_the_config_option_reaches_the_built_model(self, monkeypatch):
+        from kempnerforge.config.adapter import AdapterConfig
+        from kempnerforge.config.model import ModelConfig
+        from kempnerforge.config.vision import VisionEncoderConfig
+        from kempnerforge.config.vlm import JointDecoderConfig
+        from kempnerforge.model.vlm import build_vlm_wrapper
+
+        _tiny_siglip(monkeypatch)
+        model = ModelConfig(dim=32, n_layers=1, n_heads=2, vocab_size=64, max_seq_len=128)
+
+        def build(drop: bool) -> torch.nn.Module:
+            vision = VisionEncoderConfig(type="siglip2", path="tiny", drop_pooling_head=drop)
+            vlm = JointDecoderConfig(max_text_len=32)
+            return build_vlm_wrapper(model, vision, AdapterConfig(), vlm)
+
+        assert _head_params(build(False)) and not _head_params(build(True))
+
+
 class TestHFVisionEncoderMocked:
     """Exercise the HF-encoder build/forward paths without network access by
     swapping ``transformers.AutoModel`` for an in-process fake."""
