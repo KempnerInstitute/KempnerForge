@@ -378,6 +378,22 @@ class _NoBatchSchedule:
         raise AssertionError("eval() called")
 
 
+class _GradDroppingSchedule:
+    """A pipeline schedule whose eval() records the stage's gradients, drops them and fails."""
+
+    scale_grads = True
+
+    def __init__(self, stage: nn.Module):
+        self.stage = stage
+        self.seen: list[torch.Tensor | None] = []
+
+    def eval(self, *args, **kwargs):
+        self.seen = [p.grad for p in self.stage.parameters()]
+        for p in self.stage.parameters():
+            p.grad = None
+        raise RuntimeError("eval failed")
+
+
 class TestRunEvalPipeline:
     @pytest.mark.parametrize("n_stages", [2, 3])
     @pytest.mark.parametrize("schedule_name", ["1f1b", "gpipe"])
@@ -444,4 +460,26 @@ class TestRunEvalPipeline:
                 pp_size=2,
                 pp_n_microbatches=2,
             )
+        assert schedule.scale_grads is True
+
+    def test_the_stage_gradients_are_set_aside_during_eval_and_put_back(self):
+        stage = _TinyLM()
+        for p in stage.parameters():
+            p.grad = torch.full_like(p, 0.5)
+        kept = [p.grad for p in stage.parameters()]
+        schedule = _GradDroppingSchedule(stage)
+        with pytest.raises(RuntimeError, match="eval failed"):
+            run_eval(
+                stage,
+                _make_eval_dataloader(),
+                _loss_fn,
+                torch.device("cpu"),
+                eval_steps=2,
+                pp_schedule=schedule,
+                pp_rank=0,
+                pp_size=2,
+                pp_n_microbatches=2,
+            )
+        assert schedule.seen and all(g is None for g in schedule.seen)
+        assert all(p.grad is g for p, g in zip(stage.parameters(), kept, strict=True))
         assert schedule.scale_grads is True

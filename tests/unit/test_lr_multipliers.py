@@ -956,9 +956,8 @@ class TestResume:
             (b'{"step": 3, "lr_module_patterns": {"head": "x"}}', "lists of patterns"),
             (b'{"step": 3, "lr_group_modules": "head"}', "a module name or null per"),
             (b'{"step": 3, "lr_group_modules": [null, 2]}', "a module name or null per"),
-            (b"[" * 100_000 + b"]" * 100_000, "RecursionError"),
         ],
-        ids=["bad-json", "list", "negative", "patterns", "group-modules", "group-module", "deep"],
+        ids=["bad-json", "list", "negative", "patterns", "group-modules", "group-module"],
     )
     @pytest.mark.parametrize("exclude", [[], ["optimizer"]], ids=["resume", "warm-start"])
     def test_an_invalid_record_is_refused(self, tmp_path, content, match, exclude):
@@ -966,6 +965,24 @@ class TestResume:
         (self._save(tmp_path, {"head": 2.0}) / "metadata.json").write_bytes(content)
         _, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
         with pytest.raises(ValueError, match=f"Cannot check the lr_multipliers.*{match}"):
+            manager.load(scheduler=scheduler, exclude_keys=exclude)
+        assert scheduler.last_epoch == 0
+
+    @pytest.mark.parametrize("exclude", [[], ["optimizer"]], ids=["resume", "warm-start"])
+    def test_a_read_that_fails_with_any_error_is_refused(self, tmp_path, monkeypatch, exclude):
+        """A read that fails with an error other than a ``ValueError`` still refuses the load,
+        and the refusal names the error's type."""
+        record = (self._save(tmp_path, {"head": 2.0}) / "metadata.json").read_text()
+        _, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
+        loads = json.loads
+
+        def fail_on_the_record(text, *args, **kwargs):
+            if text == record:
+                raise RecursionError("maximum recursion depth exceeded")
+            return loads(text, *args, **kwargs)
+
+        monkeypatch.setattr(json, "loads", fail_on_the_record)
+        with pytest.raises(ValueError, match="Cannot check the lr_multipliers.*RecursionError"):
             manager.load(scheduler=scheduler, exclude_keys=exclude)
         assert scheduler.last_epoch == 0
 

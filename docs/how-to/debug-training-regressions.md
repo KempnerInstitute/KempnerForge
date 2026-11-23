@@ -34,12 +34,12 @@ The training loop reacts:
 
 - Logs a warning on every NaN/Inf (from `check_loss`)
 - Zeros gradients and skips the optimizer step (in the loop, right
-  after `check_loss` returns False — preserves last-good weights)
+  after `check_loss` returns False, preserving last-good weights)
 - When `nan_detector.should_rollback` becomes true (consecutive count
   ≥ `max_consecutive`), rank 0 logs `"Too many consecutive NaNs — stopping"`
   and breaks the loop
 
-You still need to act — the detector doesn't roll back, it just keeps
+You still need to act: the detector doesn't roll back, it just keeps
 you from optimizing into garbage. The usual flow:
 
 1. Grep the log for the first NaN step → get `N`.
@@ -62,14 +62,14 @@ you from optimizing into garbage. The usual flow:
 ### Configuration caveat
 
 `action` and `max_consecutive` are **hardcoded** in
-`kempnerforge/training/entry.py` — there's no TOML knob. If you need
+`kempnerforge/training/entry.py`; there's no TOML knob. If you need
 `action="raise"` (fail fast) or `action="skip"` without the warning,
 edit the source. See
 [Resilience § NaN detection § Limitations](../resilience/nan-detection.md#limitations).
 
 ### Related signals
 
-Check `train/grad_norm` in your metrics dashboard before the NaN — a
+Check `train/grad_norm` in your metrics dashboard before the NaN: a
 visible spike (orders of magnitude above baseline) usually precedes it.
 If you see one, that's the real signal; the NaN is a consequence.
 
@@ -118,7 +118,7 @@ monitor.report(step)
 
 At step 2000 it dumps a pickle you upload to
 [pytorch.org/memory_viz](https://pytorch.org/memory_viz) for an
-interactive flamegraph — stack traces to allocation sites, so leaks
+interactive flamegraph: stack traces to allocation sites, so leaks
 reveal themselves. See
 [Metrics § Memory snapshot export](../metrics-and-profiling/memory-monitor.md#memory-snapshot-export)
 for the file layout.
@@ -126,14 +126,14 @@ for the file layout.
 ### Fragmentation vs genuine leaks
 
 If `reserved_gb - allocated_gb` grows over time, that's
-fragmentation — PyTorch's allocator holds memory even after tensors
+fragmentation: PyTorch's allocator holds memory even after tensors
 are freed. Usually fixable via:
 
 ```bash
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
 
-This is the same flag the 32-GPU MoE benchmark needs — see
+This is the same flag the 32-GPU MoE benchmark needs; see
 [Scaling guide § Mis-sized activation memory](scaling-guide.md#mis-sized-activation-memory).
 
 ## Shape 3: a rank hangs without error
@@ -158,11 +158,9 @@ See
 The check catches **partial-participation bugs**. The probe itself waits
 at most `timeout_sec` (10 seconds) and returns `False` on a timeout, but a
 rank that is genuinely dead usually stalls the step's own collectives
-before the probe runs. Those wait out their process group's timeout:
-`distributed.nccl_timeout_sec` (default 1800 seconds) on the default
-group, which plain FSDP uses, and PyTorch's 30-minute default on the
-groups `init_device_mesh` creates for the other mesh dimensions. To fail
-faster on the default group, lower it:
+before the probe runs. Those wait out `distributed.nccl_timeout_sec`
+(default 1800 seconds), the timeout of the default process group and of
+the group of every mesh dimension. To fail faster, lower it:
 
 ```bash
 sbatch scripts/slurm/multinode.sh configs/train/7b.toml --distributed.nccl_timeout_sec=600
@@ -222,7 +220,7 @@ Typical findings:
 - **Other kernels share climbs** → framework overhead grew, often due
   to a new Python loop over tensors.
 
-Chrome traces land in `trace_dir/` as JSON — open in
+Chrome traces land in `trace_dir/` as JSON; open them in
 `chrome://tracing` or `ui.perfetto.dev` for a timeline view. Look for
 gaps between kernels (exposed latency) and per-step regressions.
 
@@ -232,13 +230,13 @@ gaps between kernels (exposed latency) and per-step regressions.
 [`scripts/eval_harness.py`](run-evaluation.md#path-3-lm-eval-harness-for-downstream-tasks)
 reports lower HellaSwag / MMLU than expected.
 
-This is rarely a tool problem — it's a data or training-config
+This is rarely a tool problem: it's a data or training-config
 issue. Quick checks:
 
 1. **Data mixing drift.** If you changed `[[data.datasets]]` weights
    between runs, loss on the mixed distribution can match while
    downstream behavior changes. Re-run the lost-run eval on the
-   previous config's checkpoint at the same step — if downstream
+   previous config's checkpoint at the same step. If downstream
    matches, data mix is the cause.
 2. **LR / schedule change.** A lower peak LR often gives lower loss
    (training distribution is easier) but worse downstream (less
@@ -252,7 +250,7 @@ issue. Quick checks:
    with `prepare_data.py`".
 4. **Bias in sampling.** If you're comparing `--temperature 0`
    (greedy) on lm-eval-harness to a checkpoint that trained with
-   different temperature scaling or repetition penalty assumptions —
+   different temperature scaling or repetition penalty assumptions,
    the benchmark number is determined by decode settings you may not
    be matching.
 
@@ -274,22 +272,22 @@ Symptom
 
 Most of these leave a trace in metrics; start there and narrow down.
 Reaching for the profiler or a memory snapshot without a symptom wastes
-time — the profiler adds startup overhead, and a snapshot dumps several
+time: the profiler adds startup overhead, and a snapshot dumps several
 hundred MB per rank.
 
 ## See also
 
-- [Resilience § NaN detection](../resilience/nan-detection.md) —
+- [Resilience § NaN detection](../resilience/nan-detection.md):
   detector internals and the three `action` modes.
-- [Resilience § NCCL liveness](../resilience/nccl-liveness.md) —
+- [Resilience § NCCL liveness](../resilience/nccl-liveness.md):
   what the periodic probe checks and which timeouts bound a hang.
-- [Resilience § GPU health](../resilience/gpu-health.md) — on-demand
+- [Resilience § GPU health](../resilience/gpu-health.md): on-demand
   compute/memory probe for a specific device.
-- [Metrics § Memory monitor](../metrics-and-profiling/memory-monitor.md)
-  — `DeviceMemoryMonitor` and snapshot export.
-- [Metrics § Profiler](../metrics-and-profiling/profiler.md) —
+- [Metrics § Memory monitor](../metrics-and-profiling/memory-monitor.md):
+  `DeviceMemoryMonitor` and snapshot export.
+- [Metrics § Profiler](../metrics-and-profiling/profiler.md):
   `torch.profiler` schedule and kernel classification.
-- [Metrics § Metrics tracker](../metrics-and-profiling/metrics-tracker.md)
-  — the per-step metrics that feed the workflows above.
-- [Scaling guide § Common pitfalls](scaling-guide.md#common-pitfalls)
-  — regression modes specific to parallelism changes.
+- [Metrics § Metrics tracker](../metrics-and-profiling/metrics-tracker.md):
+  the per-step metrics that feed the workflows above.
+- [Scaling guide § Common pitfalls](scaling-guide.md#common-pitfalls):
+  regression modes specific to parallelism changes.
