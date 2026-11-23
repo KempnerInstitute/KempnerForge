@@ -256,13 +256,17 @@
         "load_config(config_path, cli_args) -> JobConfig",
         "_parse_cli_overrides(args) -> dict",
         "_apply_dict_to_dataclass(dc, data)",
-        "_coerce_value(field_type, value)",
+        "_coerce_value(field_type, value) (refuses a value that cannot stand for the type)",
+        "_coerce_bool(value) -> bool (a bool, 0 or 1, or a true/false spelling; else ValueError)",
+        "_coerce_number(field_type, value) (an int or float from a number or numeric string; refuses bools and fractional ints)",
+        "_coerce_field(dc_type, name, hint, raw) (_coerce_value whose errors name dc_type.name)",
         "_get_type_hints(dc_type) -> dict"
       ],
       "tested_by": [
         "tests/unit/test_config.py::TestTomlLoading",
         "tests/unit/test_config.py::TestCliOverrides",
         "tests/unit/test_config.py::TestCliParsing",
+        "tests/unit/test_config.py::TestScalarCoercion",
         "tests/unit/test_mixing.py::TestMixingTomlLoading",
         "tests/unit/test_annealing.py::TestAnnealingTomlLoading"
       ]
@@ -1604,11 +1608,12 @@
           "TestJobConfig(16)",
           "TestTomlLoading(12)",
           "TestCliOverrides(11)",
+          "TestScalarCoercion(13)",
           "TestCliParsing(6)",
           "TestRegistry(12)",
           "TestEvalConfig(7)"
         ],
-        "count": 112
+        "count": 125
       },
       "tests/unit/test_training.py": {
         "classes": [
