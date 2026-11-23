@@ -132,9 +132,16 @@ z_loss = z_loss_weight * mean(logsumexp(logits)^2)
 ```
 
 How it wires in: `build_loss_fn` wraps the base loss with a closure
-that adds `z_loss(logits, z_weight)` to the returned loss. The wrap
-happens once at setup; the per-step overhead is one `logsumexp` over
-the logit tensor.
+that adds `z_loss(logits, z_weight, chunk_size)` to the returned loss.
+The wrap happens once at setup. `chunk_size` is `ce_chunk_size` for
+`chunked_cross_entropy`; for `cross_entropy` every token is in one
+chunk. `z_loss` takes each token's log-sum-exp in float32 one chunk at
+a time and keeps only that per-token value for backward, which
+recomputes each chunk's softmax instead of keeping a float32 copy of
+the logits. Its memory cost is a gradient the size of the logits plus
+float32 temporaries for one chunk (the whole batch with
+`cross_entropy`). As with `fp32_cross_entropy`, the backward cannot
+itself be differentiated.
 
 Recommended weights from the literature:
 
@@ -144,9 +151,14 @@ Recommended weights from the literature:
 | `1e-4` – `2e-4` | Gemma |
 | `0.0` | off; default |
 
-`z_loss_weight = 0.0` makes the wrap a no-op — the closure still runs
-but `z_loss()` returns `0.0` immediately without computing
-`logsumexp`.
+With `z_loss_weight = 0.0`, `build_loss_fn` returns the base loss
+without the wrap; called directly, `z_loss(logits, 0.0)` returns `0.0`
+without computing `logsumexp`.
+
+With a positive weight, logits with no rows (the head's output for a
+packed VLM micro-batch without text) give an exact fp32 zero that stays
+on the autograd graph of the logits, chunked or not, so there is no NaN
+from averaging over zero tokens.
 
 ## MoE auxiliary loss is separate
 
