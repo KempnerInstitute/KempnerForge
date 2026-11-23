@@ -39,8 +39,8 @@ Key mechanics:
 - **Per-dataset metrics** — if the dataloader is a `MixtureDataset`,
   a step that will be logged counts the positions drawn from each source
   and sums each source's cross-entropy over its labeled tokens inside
-  the `no_sync` block while logits are still alive, in fp32,
-  `ce_chunk_size` tokens at a time. Both return on the `StepResult` by
+  the `no_sync` block while logits are still alive, in fp32, at most
+  1024 tokens at a time (`ce_chunk_size` when it is smaller). Both return on the `StepResult` by
   source index and are summed over the data-parallel ranks when logged.
 - **Loss scaling** — `loss / grad_accum_steps` keeps the effective
   learning rate invariant to the accumulation factor.

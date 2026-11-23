@@ -364,6 +364,9 @@ _PACKED_BATCH_KEYS = (
     "text_positions",
 )
 
+_SOURCE_CE_CHUNK = 1024
+"""Tokens the per-source cross-entropy runs at once, about 1 GB of fp32 at a 128k vocabulary."""
+
 
 def vlm_step(session: TrainingSession, step: int) -> StepResult:
     """VLM step (no PP): pixel_values + input_ids forward, with a text-token count.
@@ -597,7 +600,7 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
     if n_sources and session.tracker.is_log_step(step + 1):
         ds_tokens = torch.zeros(n_sources, dtype=torch.long)
         ds_losses = torch.zeros(2, n_sources, dtype=torch.float64, device=device)
-    ce_chunk = tc.ce_chunk_size if tc.ce_chunk_size > 0 else 4096
+    ce_chunk = min(tc.ce_chunk_size, _SOURCE_CE_CHUNK) if tc.ce_chunk_size > 0 else _SOURCE_CE_CHUNK
 
     for micro_step in range(tc.grad_accum_steps):
         batch: dict[str, torch.Tensor] = {}

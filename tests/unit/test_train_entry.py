@@ -4594,6 +4594,24 @@ class TestPerDatasetMetrics:
         assert small["loss/a"] == pytest.approx(whole["loss/a"], rel=1e-6)
         assert small["loss/b"] == pytest.approx(whole["loss/b"], rel=1e-6)
 
+    def test_the_source_loss_runs_at_most_1024_tokens_at_a_time(self, monkeypatch):
+        """A 4096-token fp32 chunk is about 4 GB at a 128k vocabulary, so the chunk is
+        capped at 1024 tokens; a smaller ``ce_chunk_size`` is kept."""
+        import kempnerforge.training.loop as loop
+
+        chunks: list[int] = []
+        source_ce = loop._source_cross_entropy
+
+        def record(logits, labels, sources, n_sources, chunk):
+            chunks.append(chunk)
+            return source_ce(logits, labels, sources, n_sources, chunk)
+
+        monkeypatch.setattr(loop, "_source_cross_entropy", record)
+        batches = [self._random_batch([0, 1, 0, 1], 4)]
+        for size in (0, 4096, 3):
+            self._logits_and_metrics(monkeypatch, batches, ce_chunk_size=size)
+        assert chunks == [1024, 1024, 3]
+
 
 class TestLoopPeriodicWork:
     def test_nccl_failure_fails_the_run_without_a_final_save(self, monkeypatch):
