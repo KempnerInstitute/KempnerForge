@@ -7,7 +7,6 @@ import json
 import os
 import random
 import re
-import shutil
 import stat
 import threading
 from concurrent.futures import Future
@@ -1781,6 +1780,10 @@ class TestSaveCheckpointRegistration:
     def test_record_skips_quietly_when_the_checkpoint_or_its_record_is_gone(
         self, tmp_path, monkeypatch
     ):
+        """step_1 is removed as the manager prunes, with _remove_tree's retries, since NFS
+        can keep a directory written a moment ago non-empty for a moment."""
+        from kempnerforge.checkpoint.manager import _remove_tree
+
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         live: list = [self.MLFLOW]
         registrar = _Registrar()
@@ -1792,7 +1795,7 @@ class TestSaveCheckpointRegistration:
         live.clear()
         mgr.save(step=3)
         texts = {step: (tmp_path / f"step_{step}" / "metadata.json").read_text() for step in (2, 3)}
-        shutil.rmtree(tmp_path / "step_1")
+        _remove_tree(tmp_path / "step_1", threading.Lock(), iter([0.05] * 40))
         warnings = self._log(monkeypatch, "warning")
         notes = self._log(monkeypatch, "debug")
         for record in registrar.records:
