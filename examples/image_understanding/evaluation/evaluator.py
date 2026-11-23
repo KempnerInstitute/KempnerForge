@@ -9,8 +9,8 @@ those of one process.
 A row is scored as it is or counted under a reason, never changed to fit:
 
 - ``unreadable_row``: the reader could not use the row and passed over it.
-- ``prompt_too_long``: the prompt and the task's ``max_new_tokens`` do not fit
-  ``vlm.max_text_len``, the text length training lays out.
+- ``prompt_too_long``: the document and the task's ``max_new_tokens`` do not fit
+  the lengths training lays out (``token_budgets``).
 - ``unrenderable_row``: the chat template does not lay the row out as training
   does, so training passes over it too.
 """
@@ -36,7 +36,6 @@ import torch.distributed as dist
 from image_text.document import Document, Turn
 from image_text.render import ChatRenderer, DocumentSource, UnrenderableDocumentError
 from image_text.skip import NoUsableRowError
-from PIL import Image
 
 from kempnerforge.config.distributed import DistributedConfig
 from kempnerforge.config.job import JobConfig
@@ -48,9 +47,10 @@ from kempnerforge.model.vlm import VLMWrapper
 from kempnerforge.training.runtime import apply_matmul_precision
 
 from .checkpoint import check_supported, load_model, read_step, resolve_checkpoint
-from .generation import greedy_decode, stop_token_ids
+from .generation import footprint, greedy_decode, stop_token_ids
 from .inputs import (
     ModelInputs,
+    RenderSettings,
     UnsupportedDocumentError,
     build_renderer,
     check_renderer_config,
@@ -85,36 +85,65 @@ class ClearedResults:
 
 
 @dataclass(frozen=True)
-class Decoder:
-    """The checkpoint's model with what a row is rendered, budgeted and ended by.
+class Budgets:
+    """The lengths a document and its answer must fit, as training laid documents out.
 
-    The renderer's ``max_text_len`` is the text length training lays out, which
-    a prompt and its answer must fit, and ``stop_ids`` holds the tokens that end
-    a reply. The rows of a task's batches are read and rendered by ``threads``
-    threads.
+    ``row_len`` bounds a document's views, prompt and answer together, and
+    ``text_len``, when set, its prompt and answer alone.
+    """
+
+    row_len: int
+    text_len: int | None = None
+
+
+def token_budgets(config: JobConfig) -> Budgets:
+    """The lengths of ``config``'s training: a packed row, or an unpacked sample's text."""
+    assert config.vlm is not None
+    if config.data.pack_sequences:
+        return Budgets(row_len=config.train.seq_len)
+    return Budgets(row_len=config.model.max_seq_len, text_len=config.vlm.max_text_len)
+
+
+@dataclass(frozen=True)
+class Decoder:
+    """The checkpoint's model with what a row is rendered, budgeted, attended and ended by.
+
+    ``budgets`` are the lengths a row must fit, ``view_groups`` says a view's
+    tokens see each other, and ``stop_ids`` holds the tokens that end a reply.
+    The rows of a task's batches are read and rendered by ``threads`` threads.
     """
 
     model: VLMWrapper
     renderer: ChatRenderer
     stop_ids: frozenset[int]
+    budgets: Budgets
+    view_groups: bool = False
     threads: int = 1
 
+    def fits(self, inputs: ModelInputs, max_new_tokens: int) -> bool:
+        """Whether a document with ``inputs`` and its answer fit the budgets."""
+        text_len = self.budgets.text_len
+        if text_len is not None and len(inputs.prompt_ids) + max_new_tokens > text_len:
+            return False
+        return footprint(self.model, inputs) + max_new_tokens <= self.budgets.row_len
 
-def check_token_budgets(renderer: ChatRenderer, tasks: Sequence[EvalTask]) -> None:
-    """Refuses a task whose answer cap leaves no room for a prompt in the text length.
 
-    A row is decoded when its prompt and the task's ``max_new_tokens`` fit the
-    renderer's ``max_text_len``, the text length training lays out. No prompt is
-    shorter than an empty question's, so a task that does not fit that one can
-    decode no row.
+def check_token_budgets(
+    renderer: ChatRenderer, tasks: Sequence[EvalTask], budgets: Budgets
+) -> None:
+    """Refuses a task whose answer cap leaves no room for a prompt in the budgets.
+
+    No prompt is shorter than an empty question's without an image, so a task
+    that does not fit that one can decode no row.
     """
-    blank = Document(images=(Image.new("RGB", (1, 1)),), turns=(Turn("", ("x",)),))
+    blank = Document(images=(), turns=(Turn("", ("x",)),))
     shortest = len(prompt_token_ids(renderer, blank))
+    limit = budgets.row_len if budgets.text_len is None else budgets.text_len
     for task in tasks:
-        if shortest + task.max_new_tokens > renderer.max_text_len:
+        if shortest + task.max_new_tokens > limit:
             raise ValueError(
                 f"task {task.name!r}: max_new_tokens={task.max_new_tokens} leaves no room for a "
-                f"prompt in vlm.max_text_len={renderer.max_text_len}; the prompt of an empty "
+                f"prompt in the {limit} tokens training lays out; the prompt of an empty "
                 f"question is already {shortest} tokens"
             )
 
@@ -178,10 +207,13 @@ def evaluate_batch(
     token, and its ``score``. A skipped row records the reason under ``skipped``.
     The rows are read and rendered by ``pool``, or by the calling thread without one.
 
+    A reader with a ``reference`` method gives each row's reference to score
+    against; otherwise it is the turn's answers.
+
     Raises:
         UnsupportedDocumentError: a row holds a document ``document_inputs`` refuses.
     """
-    prepare = partial(_prepare_row, decoder.renderer, task, reader)
+    prepare = partial(_prepare_row, decoder, task, reader)
     if pool is not None:
         prepared = list(pool.map(prepare, batch))
     else:
@@ -193,18 +225,19 @@ def evaluate_batch(
     renderer, scorer = decoder.renderer, get_scorer(task.scorer)
     generations = greedy_decode(
         decoder.model,
-        torch.stack([inputs.pixel_values for _, _, inputs in ready]),
-        [inputs.prompt_ids for _, _, inputs in ready],
+        [inputs for _, _, inputs in ready],
         max_new_tokens=task.max_new_tokens,
         stop_ids=decoder.stop_ids,
         pad_id=renderer.pad_id,
-        max_text_len=renderer.max_text_len,
+        row_len=decoder.budgets.row_len,
+        view_groups=decoder.view_groups,
     )
+    reference = getattr(reader, "reference", None)
     for (row, turn, _), generation in zip(ready, generations, strict=True):
         token_ids = list(generation.token_ids)
         text = renderer.tokenizer.decode(token_ids, skip_special_tokens=False)
         prediction = renderer.tokenizer.decode(token_ids, skip_special_tokens=True)
-        score = scorer.score(prediction, turn.answers)
+        score = scorer.score(prediction, turn.answers if reference is None else reference(row))
         records.append(
             {
                 "row": row,
@@ -265,16 +298,19 @@ def evaluate_checkpoint(
     batch_size: int = 32,
     publish: bool = True,
     cleared: ClearedResults | None = None,
+    settings: RenderSettings | None = None,
 ) -> Record | None:
     """Evaluate ``checkpoint`` on ``tasks`` and write the results under ``output``.
 
     ``config`` is the config the checkpoint was trained with and ``checkpoint``
     a run directory, whose latest checkpoint is evaluated, or a step directory.
-    The config, the tasks given and ``batch_size`` are checked before a process
-    group exists, as they come out the same on every rank. Launched as several
-    processes, this then joins them into a process group, or uses the one already
-    initialized. ``cleared`` is what the caller's ``clear_results`` did, or
-    ``None`` when the caller has not cleared, which this then does. In the first
+    ``settings`` are the rendering and view attention the run trained with (a
+    mixture's, ``RenderSettings.from_mixture``). The config, the tasks given and
+    ``batch_size`` are checked before a process group exists, as they come out
+    the same on every rank. Launched as several processes, this then joins them
+    into a process group, or uses the one already initialized. ``cleared`` is
+    what the caller's ``clear_results`` did, or ``None`` when the caller has not
+    cleared, which this then does. In the first
     step the ranks agree on, before the model is built, a failure that
     ``cleared`` records (a file of an earlier evaluation that could not be
     removed) is raised, the tokenizer is
@@ -311,14 +347,22 @@ def evaluate_checkpoint(
     started_group, rank, world_size, device = _join_ranks(config)
     apply_matmul_precision(config.train)
     output = Path(output)
+    settings = settings or RenderSettings()
+    budgets = token_budgets(config)
     renderer, readers = _on_every_rank(
-        partial(_prepare, config, tasks, cleared.failure), "Preparing the evaluation"
+        partial(_prepare, config, tasks, cleared.failure, settings, budgets),
+        "Preparing the evaluation",
     )
     resolved = _on_rank_zero(rank, partial(_start, output, checkpoint), "Starting the evaluation")
     step_dir = Path(_gather(resolved)[0])
     model = _on_every_rank(partial(load_model, config, step_dir, device), "Loading the checkpoint")
     decoder = Decoder(
-        model, renderer, stop_token_ids(renderer), threads=max(1, config.data.num_workers)
+        model,
+        renderer,
+        stop_token_ids(renderer),
+        budgets,
+        view_groups=settings.view_groups,
+        threads=max(1, config.data.num_workers),
     )
     logger.info(
         f"Evaluating {step_dir} on {len(tasks)} task(s) with {world_size} rank(s) and "
@@ -360,14 +404,14 @@ def _row(record: Record) -> int:
 
 
 def _prepare_row(
-    renderer: ChatRenderer, task: EvalTask, reader: DocumentSource, row: int
+    decoder: Decoder, task: EvalTask, reader: DocumentSource, row: int
 ) -> Record | tuple[int, Turn, ModelInputs]:
     """The row's turn and model inputs, or the record of why it is skipped."""
     document = read_row(reader, row)
     if document is None:
         return {"row": row, "skipped": UNREADABLE_ROW}
     try:
-        inputs = document_inputs(renderer, document)
+        inputs = document_inputs(decoder.renderer, document)
     except UnsupportedDocumentError as exc:
         raise UnsupportedDocumentError(f"task {task.name!r}, row {row}: {exc}") from exc
     except UnrenderableDocumentError as exc:
@@ -378,7 +422,7 @@ def _prepare_row(
             "error": str(exc),
         }
     turn = document.turns[0]
-    if len(inputs.prompt_ids) + task.max_new_tokens > renderer.max_text_len:
+    if not decoder.fits(inputs, task.max_new_tokens):
         return {
             "row": row,
             "question": turn.user,
@@ -429,13 +473,17 @@ def _check_arguments(config: JobConfig, tasks: Sequence[EvalTask], batch_size: i
 
 
 def _prepare(
-    config: JobConfig, tasks: Sequence[EvalTask], prior_failure: Exception | None
+    config: JobConfig,
+    tasks: Sequence[EvalTask],
+    prior_failure: Exception | None,
+    settings: RenderSettings,
+    budgets: Budgets,
 ) -> tuple[ChatRenderer, dict[str, DocumentSource]]:
     """Raise ``prior_failure``, then build the renderer, check the budgets and open every split."""
     if prior_failure is not None:
         raise prior_failure
-    renderer = build_renderer(config)
-    check_token_budgets(renderer, tasks)
+    renderer = build_renderer(config, settings)
+    check_token_budgets(renderer, tasks, budgets)
     return renderer, {task.name: _open_reader(task) for task in tasks}
 
 

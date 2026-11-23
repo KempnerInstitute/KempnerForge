@@ -71,13 +71,8 @@ class TestCheckSupported:
         config = load_config(write_config(video), cli_args=[])
         _refused(config, "a [video] config is not supported")
 
-    def test_a_tiled_config_is_refused(self, load: Callable[..., JobConfig]) -> None:
-        config = load("--vlm.tile_grid=2", "--model.max_seq_len=64")
-        _refused(
-            config,
-            "vlm.tile_grid=2 is not supported: the renderer makes one view of an image, and "
-            "this model takes 5",
-        )
+    def test_a_tiled_config_passes(self, load: Callable[..., JobConfig]) -> None:
+        check_supported(load("--vlm.tile_grid=2", "--model.max_seq_len=64"))
 
     def test_capped_expert_capacity_is_refused(self, load: Callable[..., JobConfig]) -> None:
         """A capped expert drops tokens by batch content, so a row would depend on its batch."""

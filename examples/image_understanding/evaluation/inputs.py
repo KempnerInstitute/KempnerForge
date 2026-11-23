@@ -2,24 +2,29 @@
 
 ``document_inputs`` is the one place a document becomes model inputs: the prompt
 the training renderer puts before the assistant's reply, tokenized, and the
-image as that renderer preprocesses it. It takes documents with one image and
-one turn; anything else is refused with ``UnsupportedDocumentError``.
-``build_prompt`` alone decides the prompt's text.
+document's images as that renderer preprocesses them, every view of each. It
+takes documents with one turn and any number of images, none included; anything
+else is refused with ``UnsupportedDocumentError``. ``build_prompt`` alone decides
+the prompt's text. ``RenderSettings`` holds what a training mixture changes about
+rendering and attention, read from its ``[render]`` and ``[packing]`` tables.
 """
 
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+import tomllib
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 import torch
 from image_text.document import Document
 from image_text.render import ChatRenderer
 
 from kempnerforge.config.job import JobConfig
-from kempnerforge.data.vlm_dataset import build_tokenizer, pil_to_tensor
+from kempnerforge.data.vlm_dataset import build_tokenizer
 
-_REPLY = "x"
 _ONE_TOKENIZER_CALL_AT_A_TIME = threading.Lock()
 
 
@@ -28,11 +33,40 @@ class UnsupportedDocumentError(ValueError):
 
 
 @dataclass(frozen=True)
+class RenderSettings:
+    """The ``ChatRenderer`` options a run trained with, and whether a view's tokens saw each other.
+
+    ``render`` holds ``ChatRenderer`` keyword options (``train_reply_prefix``,
+    ``lead_space``, ...) and ``view_groups`` says each image view's tokens attended
+    to each other in both directions, as a mixture's ``[packing]`` sets it.
+    """
+
+    render: Mapping[str, Any] = field(default_factory=dict)
+    view_groups: bool = False
+
+    @classmethod
+    def from_mixture(cls, path: str | Path | None) -> RenderSettings:
+        """The settings of the mixture file at ``path``, or the defaults without one."""
+        if path is None:
+            return cls()
+        with open(path, "rb") as file:
+            mixture = tomllib.load(file)
+        packing = mixture.get("packing", {})
+        unknown = sorted(set(packing) - {"view_groups"})
+        if unknown:
+            raise ValueError(
+                f"the mixture's [packing] holds options the evaluator lacks: {unknown}"
+            )
+        return cls(dict(mixture.get("render", {})), bool(packing.get("view_groups", False)))
+
+
+@dataclass(frozen=True)
 class ModelInputs:
     """One document as the model sees it.
 
-    ``pixel_values`` is the image as the renderer preprocesses it, ``(3, H, W)``,
-    and ``prompt_ids`` holds the tokens the reply is decoded after.
+    ``pixel_values`` is ``(N, 3, H, W)``, every view of every image of the
+    document as the renderer preprocesses it (``N = 0`` without an image), and
+    ``prompt_ids`` holds the tokens the reply is decoded after.
     """
 
     pixel_values: torch.Tensor
@@ -54,22 +88,30 @@ def check_renderer_config(config: JobConfig) -> None:
         )
 
 
-def build_renderer(config: JobConfig) -> ChatRenderer:
-    """The training renderer for ``config``: its tokenizer, text length and image size."""
+def build_renderer(config: JobConfig, settings: RenderSettings | None = None) -> ChatRenderer:
+    """The training renderer for ``config`` with ``settings``' options.
+
+    It takes the run's tokenizer, image size and tiling, and the text length an
+    unpacked run lays out; a packed run's text is uncut.
+    """
     check_renderer_config(config)
     assert config.vlm is not None
+    options: dict[str, Any] = {"answer_only": True}
+    options.update((settings or RenderSettings()).render)
     return ChatRenderer(
         build_tokenizer(config.data.tokenizer_path),
-        max_text_len=config.vlm.max_text_len,
+        max_text_len=None if config.data.pack_sequences else config.vlm.max_text_len,
         image_size=config.data.hf_image_size,
-        answer_only=True,
+        max_images=None,
+        tile_grid=config.vlm.tile_grid,
+        tile_global=config.vlm.tile_global,
+        **options,
     )
 
 
 def build_prompt(renderer: ChatRenderer, document: Document) -> str:
     """The text ``renderer`` puts before the assistant's reply to a one-turn ``document``."""
-    text, spans = renderer.text_and_reply_spans(document, [_REPLY])
-    return text[: spans[0][0]]
+    return renderer.prompt(document)
 
 
 def prompt_token_ids(renderer: ChatRenderer, document: Document) -> tuple[int, ...]:
@@ -86,18 +128,15 @@ def document_inputs(renderer: ChatRenderer, document: Document) -> ModelInputs:
     """The inputs the model answers ``document`` from, as ``renderer`` lays training out.
 
     The prompt is ``prompt_token_ids`` and the pixels are what the renderer puts
-    in a sample of this image. A document without exactly one image and one turn
-    raises ``UnsupportedDocumentError``. Several threads may call this.
+    in a sample of this document. A document with several turns raises
+    ``UnsupportedDocumentError``. Several threads may call this.
     """
-    if len(document.images) != 1:
-        raise UnsupportedDocumentError(
-            f"the evaluator takes documents with one image, got {len(document.images)}"
-        )
     if len(document.turns) != 1:
         raise UnsupportedDocumentError(
             f"the evaluator takes documents with one turn, got {len(document.turns)}"
         )
-    pixel_values = pil_to_tensor(
-        document.images[0], renderer.image_size, renderer.image_mean, renderer.image_std
+    pixels = renderer.pixels(document)
+    return ModelInputs(
+        pixel_values=pixels.reshape(-1, *pixels.shape[-3:]),
+        prompt_ids=prompt_token_ids(renderer, document),
     )
-    return ModelInputs(pixel_values=pixel_values, prompt_ids=prompt_token_ids(renderer, document))

@@ -1,21 +1,25 @@
 """Answer scorers for evaluation tasks, selected by name.
 
 A scorer rates one sample: the decoded prediction against that sample's
-reference, which for the scorers here is its reference answers. The text scorers
+reference, which is its reference answers for every scorer here but
+``points_in_masks``, whose reference is the objects' masks. The text scorers
 take the prediction as a ``str`` and the references as a non-empty sequence of
 ``str``; anything else raises before any scoring (``TypeError``, or
 ``ValueError`` for no reference). A sample's score
 is one value in [0, 1], or a mapping of named components for a scorer that
-reports several. A task's metrics are the scorer's aggregate of its samples'
-scores, by default the mean of each component.
+reports several (an error component may exceed 1). A task's metrics are the
+scorer's aggregate of its samples' scores, by default the mean of each component.
 """
 
 from __future__ import annotations
 
+import re
 import statistics
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+
+import numpy as np
 
 from .vqa_normalization import normalize_vqa_answer
 
@@ -173,6 +177,130 @@ def relaxed_accuracy(prediction: str, answers: Sequence[str]) -> float:
     )
 
 
+def exact_vqa_accuracy(prediction: str, answers: Sequence[str]) -> float:
+    """``min(1, m / 3)`` for the ``m`` references ``prediction`` equals exactly, as A-OKVQA scores.
+
+    Nothing is normalized and no annotator is left out, which is how the board
+    scores A-OKVQA's direct answers.
+    """
+    references = _references(prediction, answers)
+    matches = sum(prediction == answer for answer in references)
+    return min(1.0, matches / VQA_FULL_CREDIT_MATCHES)
+
+
+_COUNT_PHRASE = re.compile(r"\bi\s+count(?:ed)?\s+(\d+)", re.IGNORECASE)
+_TAG = re.compile(r"<[^>]*>")
+_INTEGER = re.compile(r"\d+")
+
+
+def stated_count(text: str) -> int | None:
+    """The count a counting answer states: the ``N`` of "I count N", else its last integer.
+
+    Point tags are dropped first, as their coordinates are numbers too.
+    """
+    prose = _TAG.sub(" ", text)
+    phrase = _COUNT_PHRASE.search(prose)
+    if phrase:
+        return int(phrase.group(1))
+    integers = _INTEGER.findall(prose)
+    return int(integers[-1]) if integers else None
+
+
+def count_accuracy(prediction: str, answers: Sequence[str]) -> dict[str, float]:
+    """Whether the stated count is the reference count, and how far off it is.
+
+    ``accuracy`` is 1 for the right count, and ``mae`` its absolute error; an
+    answer that states no count is wrong by the whole reference count.
+    """
+    reference = int(_references(prediction, answers)[0])
+    stated = stated_count(prediction)
+    if stated is None:
+        return {"accuracy": 0.0, "mae": float(reference)}
+    return {"accuracy": float(stated == reference), "mae": float(abs(stated - reference))}
+
+
+_POINT_TAG = re.compile(r"<points?\b([^>]*)(?:/?>|$)", re.IGNORECASE)
+_COORDINATE = re.compile(r"\b([xy])(\d*)\s*=\s*[\"']?\s*([-+]?\d*\.?\d+)", re.IGNORECASE)
+
+
+def parse_points(text: str) -> list[tuple[float, float]]:
+    """The ``(x, y)`` percent points of every ``<point>`` or ``<points>`` tag in ``text``.
+
+    A tag's ``x``/``y`` (or ``x1``/``y1``, ...) attributes pair by index, and the
+    parse is lenient: loose quotes and a missing tag end still yield points.
+    """
+    points: list[tuple[float, float]] = []
+    for tag in _POINT_TAG.finditer(text):
+        xs: dict[str, float] = {}
+        ys: dict[str, float] = {}
+        for coordinate in _COORDINATE.finditer(tag.group(1)):
+            axis, index, value = (
+                coordinate.group(1).lower(),
+                coordinate.group(2),
+                coordinate.group(3),
+            )
+            (xs if axis == "x" else ys)[index] = float(value)
+        for index in sorted(xs, key=lambda key: int(key) if key else 0):
+            if index in ys:
+                points.append((xs[index], ys[index]))
+    return points
+
+
+def points_in_masks(prediction: str, masks: Any) -> dict[str, float]:
+    """How the predicted points fall on the objects' masks, ``(objects, H, W)`` booleans.
+
+    ``precision`` is the share of points inside any object, ``recall`` the share
+    of objects with a point inside, and ``count_mae`` the gap between the counts
+    of points and objects. A point in percent lands on the nearest mask pixel.
+    Without an object, precision and recall are 0.
+    """
+    points = parse_points(prediction)
+    objects = int(masks.shape[0]) if masks.size else 0
+    count_mae = float(abs(len(points) - objects))
+    if objects == 0:
+        return {"precision": 0.0, "recall": 0.0, "count_mae": count_mae}
+    _, height, width = masks.shape
+    union = masks.any(axis=0)
+    inside = 0
+    found: set[int] = set()
+    for x, y in points:
+        column = min(width - 1, max(0, round(x / 100.0 * (width - 1))))
+        row = min(height - 1, max(0, round(y / 100.0 * (height - 1))))
+        inside += bool(union[row, column])
+        found.update(int(i) for i in np.flatnonzero(masks[:, row, column]))
+    return {
+        "precision": inside / len(points) if points else 0.0,
+        "recall": len(found) / objects,
+        "count_mae": count_mae,
+    }
+
+
+_NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+
+def final_number(prediction: str, answers: Sequence[str]) -> float:
+    """1 when the last number in ``prediction`` equals the reference number, as GSM8K scores."""
+    reference = _references(prediction, answers)[0]
+    numbers = _NUMBER.findall(prediction)
+    if not numbers:
+        return 0.0
+    stated = numbers[-1].replace(",", "").rstrip(".")
+    try:
+        return float(abs(float(stated) - float(reference)) < 1e-6)
+    except ValueError:
+        return float(stated == reference)
+
+
+_LETTER = re.compile(r"\b([ABCD])\b")
+
+
+def choice_letter(prediction: str, answers: Sequence[str]) -> float:
+    """1 when the first standalone capital A-D in ``prediction`` is the reference letter."""
+    reference = _references(prediction, answers)[0]
+    letter = _LETTER.search(prediction)
+    return float(letter is not None and letter.group(1) == reference)
+
+
 def mean_scores(scores: Iterable[SampleScore]) -> dict[str, float]:
     """The mean of each component over a task's samples.
 
@@ -207,6 +335,11 @@ class Scorer:
 
 SCORERS: dict[str, Scorer] = {
     "anls": Scorer(anls),
+    "choice_letter": Scorer(choice_letter),
+    "count_accuracy": Scorer(count_accuracy),
+    "exact_vqa_accuracy": Scorer(exact_vqa_accuracy),
+    "final_number": Scorer(final_number),
+    "points_in_masks": Scorer(points_in_masks),
     "relaxed_accuracy": Scorer(relaxed_accuracy),
     "vqa_accuracy": Scorer(vqa_accuracy),
 }

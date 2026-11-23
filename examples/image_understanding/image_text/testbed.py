@@ -140,6 +140,17 @@ def docvqa(annotation_file: str | Path, image_root: str | Path) -> ImageTextRows
     )
 
 
+def aokvqa(annotation_file: str | Path, image_root: str | Path) -> ImageTextRows:
+    """A-OKVQA, every direct answer kept as a candidate."""
+    rows = _load_json(annotation_file)
+    return ImageTextRows(
+        image_root,
+        [row["image"] for row in rows],
+        [row["question"] for row in rows],
+        [_answers(row["direct_answers"]) for row in rows],
+    )
+
+
 def chartqa(annotation_file: str | Path, image_root: str | Path) -> ImageTextRows:
     """ChartQA questions, human-written or augmented."""
     rows = _load_json(annotation_file)

@@ -145,7 +145,7 @@ class TestLoadTasks:
 
 
 class TestSampleFile:
-    def test_it_holds_the_five_tasks_and_their_caps(self) -> None:
+    def test_it_holds_vqav2_and_the_boards_tasks_with_their_caps(self) -> None:
         assert [
             (task.name, task.reader, task.scorer, task.max_new_tokens)
             for task in load_tasks(SAMPLE)
@@ -155,11 +155,18 @@ class TestSampleFile:
             ("docvqa", "docvqa", "anls", 50),
             ("chartqa-human", "chartqa", "relaxed_accuracy", 50),
             ("chartqa-machine", "chartqa", "relaxed_accuracy", 50),
+            ("aokvqa", "aokvqa", "exact_vqa_accuracy", 10),
+            ("pixmo-pointing", "pixmo_points_eval", "points_in_masks", 75),
+            ("pixmo-counting", "pixmo_count_eval", "count_accuracy", 20),
+            ("gsm8k", "gsm8k", "final_number", 256),
+            ("mmlu", "mmlu", "choice_letter", 10),
         ]
 
     def test_its_paths_are_placeholders(self) -> None:
         for task in load_tasks(SAMPLE):
-            assert set(task.reader_args) == {"annotation_file", "image_root"}
+            text_only = task.reader in ("gsm8k", "mmlu")
+            expected = {"annotation_file"} if text_only else {"annotation_file", "image_root"}
+            assert set(task.reader_args) == expected
             for value in task.reader_args.values():
                 assert Path(value).parent == SAMPLE.parent
                 assert Path(value).name.startswith("path-to-")

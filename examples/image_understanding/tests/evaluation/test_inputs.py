@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 import torch
 from evaluation.inputs import (
+    RenderSettings,
     UnsupportedDocumentError,
     build_prompt,
     build_renderer,
@@ -63,6 +64,20 @@ class TestBuildRenderer:
         assert renderer.tokenizer.eos_token == "<|im_end|>"
         assert renderer.turn_end == "<|im_end|>"
 
+    def test_a_packed_run_renders_uncut_with_its_tiling_and_mixture_options(
+        self, write_config: Callable[..., Path]
+    ) -> None:
+        config = load_config(
+            write_config(),
+            cli_args=["--data.pack_sequences=true", "--vlm.tile_grid=2", "--model.max_seq_len=64"],
+        )
+        renderer = build_renderer(
+            config, RenderSettings({"lead_space": True, "train_reply_prefix": True})
+        )
+        assert renderer.max_text_len is None
+        assert (renderer.tile_grid, renderer.tile_global, renderer.max_images) == (2, True, None)
+        assert renderer.lead_space and renderer.train_reply_prefix and renderer.answer_only
+
     def test_a_config_without_a_vlm_or_a_tokenizer_is_refused(
         self, write_config: Callable[..., Path]
     ) -> None:
@@ -71,6 +86,27 @@ class TestBuildRenderer:
         config = load_config(write_config(), cli_args=["--data.tokenizer_path="])
         with pytest.raises(ValueError, match="data.tokenizer_path is not set"):
             build_renderer(config)
+
+
+class TestRenderSettings:
+    def test_a_mixture_gives_its_render_options_and_view_groups(self, tmp_path: Path) -> None:
+        path = tmp_path / "mixture.toml"
+        path.write_text(
+            "[render]\nanswer_only = true\nlead_space = true\n[packing]\nview_groups = true\n"
+            '[[source]]\nreader = "vqav2"\n'
+        )
+        settings = RenderSettings.from_mixture(path)
+        assert settings.render == {"answer_only": True, "lead_space": True}
+        assert settings.view_groups
+
+    def test_without_a_mixture_nothing_changes(self) -> None:
+        assert RenderSettings.from_mixture(None) == RenderSettings()
+
+    def test_a_packing_option_the_evaluator_lacks_is_refused(self, tmp_path: Path) -> None:
+        path = tmp_path / "mixture.toml"
+        path.write_text("[packing]\nview_groups = true\nshuffle_rows = 3\n")
+        with pytest.raises(ValueError, match="shuffle_rows"):
+            RenderSettings.from_mixture(path)
 
 
 class TestCheckRendererConfig:
@@ -115,12 +151,21 @@ class TestBuildPrompt:
             "<|im_start|>user\nimage what is shown ?"
         )
 
+    @pytest.mark.parametrize("train_reply_prefix", [False, True])
     @pytest.mark.parametrize("kind", ["qa", "conversation"])
     def test_the_recipe_prompt_ends_with_the_empty_think_block(
-        self, bpe_tokenizer: Any, kind: str
+        self, bpe_tokenizer: Any, kind: str, train_reply_prefix: bool
     ) -> None:
+        """Training the think block or not, the prompt is the generation prompt that holds it."""
         document = _document(user="What is shown?", kind=kind)
-        assert build_prompt(_renderer(bpe_tokenizer), document) == THINKING_PROMPT
+        renderer = _renderer(bpe_tokenizer, train_reply_prefix=train_reply_prefix)
+        assert build_prompt(renderer, document) == THINKING_PROMPT
+
+    def test_a_lead_space_starts_the_question(self, bpe_tokenizer: Any) -> None:
+        renderer = _renderer(bpe_tokenizer, lead_space=True)
+        for images in (0, 1):
+            prompt = build_prompt(renderer, _document(user="What is shown?", images=images))
+            assert prompt == THINKING_PROMPT.replace("user\nWhat", "user\n What")
 
 
 class TestPromptTokenIds:
@@ -150,8 +195,8 @@ class TestDocumentInputs:
             "<|im_start|> user what is shown ? <|im_end|> <|im_start|> assistant"
         )
         sample = renderer.render(_document(), ["cat"])
-        assert torch.equal(inputs.pixel_values, sample["pixel_values"])
-        assert inputs.pixel_values.shape == (3, 16, 16)
+        assert torch.equal(inputs.pixel_values, sample["pixel_values"][None])
+        assert inputs.pixel_values.shape == (1, 3, 16, 16)
 
     def test_pixels_follow_the_renderers_size_and_normalization(self, tokenizer: Any) -> None:
         renderer = _renderer(
@@ -159,16 +204,25 @@ class TestDocumentInputs:
         )
         inputs = document_inputs(renderer, _document())
         assert torch.equal(
-            inputs.pixel_values, renderer.render(_document(), ["cat"])["pixel_values"]
+            inputs.pixel_values, renderer.render(_document(), ["cat"])["pixel_values"][None]
         )
-        assert inputs.pixel_values.shape == (3, 8, 8)
+        assert inputs.pixel_values.shape == (1, 3, 8, 8)
 
-    @pytest.mark.parametrize("images", [0, 2])
-    def test_a_document_without_exactly_one_image_is_refused(
-        self, tokenizer: Any, images: int
+    @pytest.mark.parametrize(
+        ("images", "tile_grid", "views"), [(0, 0, 0), (2, 0, 2), (0, 2, 0), (1, 2, 5), (2, 2, 10)]
+    )
+    @pytest.mark.parametrize("max_images", [1, None])
+    def test_every_view_of_every_image_is_an_input(
+        self, tokenizer: Any, images: int, tile_grid: int, views: int, max_images: int | None
     ) -> None:
-        with pytest.raises(UnsupportedDocumentError, match=f"one image, got {images}"):
-            document_inputs(_renderer(tokenizer), _document(images=images))
+        if max_images == 1 and images > 1:
+            return
+        renderer = _renderer(tokenizer, tile_grid=tile_grid, max_images=max_images)
+        inputs = document_inputs(renderer, _document(images=images))
+        assert inputs.pixel_values.shape == (views, 3, 16, 16)
+        if images:
+            sample = renderer.render(_document(images=images), ["cat"])["pixel_values"]
+            assert torch.equal(inputs.pixel_values, sample.reshape(-1, 3, 16, 16))
 
     def test_a_document_with_several_turns_is_refused(self, tokenizer: Any) -> None:
         document = Document(

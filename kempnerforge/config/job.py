@@ -70,6 +70,25 @@ class JobConfig:
         if not isinstance(self.plugins, list) or not all(isinstance(p, str) for p in self.plugins):
             raise ValueError(f"plugins must be a list of module paths (got {self.plugins!r})")
 
+        if self.data.hf_max_images != 1:
+            if self.vlm is None or self.video is not None:
+                raise ValueError(
+                    "data.hf_max_images applies to VLM image runs, not text runs or [video]"
+                )
+            if self.vlm.arch != "joint_decoder":
+                raise ValueError(
+                    "data.hf_max_images != 1 requires vlm.arch='joint_decoder' (got "
+                    f"{self.vlm.arch!r}); only its inline route places several images per document"
+                )
+            if self.train.is_fp8:
+                raise ValueError(
+                    "data.hf_max_images != 1 is not supported with train.mixed_precision='fp8'"
+                )
+            if self.model.sdpa_backend == "flash" and self.model.attention_backend == "sdpa":
+                raise ValueError(
+                    "data.hf_max_images != 1 is not supported with model.sdpa_backend='flash'"
+                )
+
         if self.video is not None:
             if self.vlm is None:
                 raise ValueError(
@@ -110,8 +129,7 @@ class JobConfig:
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
-                frames = self.views_per_sample
-                visual_tokens = frames * per_frame
+                visual_tokens = self.views_per_sample * self.images_per_document * per_frame
                 residual_image_tokens = self.vlm.residual_stream_image_tokens(visual_tokens)
                 required = residual_image_tokens + self.vlm.max_text_len
                 if self.model.max_seq_len < required:
@@ -156,6 +174,13 @@ class JobConfig:
                 f"attention_backend='flex' requires train.seq_len >= {FLEX_BLOCK_SIZE}, "
                 f"got {self.train.seq_len}. Use attention_backend='sdpa' for shorter sequences."
             )
+
+    @property
+    def images_per_document(self) -> int:
+        """Images one document may hold: the image cap, or one clip on a video run."""
+        if self.video is not None:
+            return 1
+        return self.data.hf_max_images
 
     @property
     def is_vlm(self) -> bool:
@@ -331,8 +356,7 @@ class JobConfig:
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)
-                frames = self.views_per_sample
-                visual_tokens = frames * per_frame
+                visual_tokens = self.views_per_sample * self.images_per_document * per_frame
                 residual_image_tokens = self.vlm.residual_stream_image_tokens(visual_tokens)
                 required = residual_image_tokens + self.vlm.max_text_len
                 if self.train.seq_len < required:

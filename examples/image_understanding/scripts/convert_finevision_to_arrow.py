@@ -3,8 +3,9 @@
 
 ``convert`` writes each ``<subset>/train-*.parquet`` as ``<subset>/<name>.arrow``,
 one record batch per row group so rows keep their order, plus a ``<name>.meta.npz``
-sidecar (rows per batch, per-row keep flag, image count, ratings and the size of
-the source file). Each file is claimed with an exclusive ``.claim`` file first, so
+sidecar (rows per batch, a per-row keep flag, image count, ratings and the size of
+the source file). A row is kept when its conversation holds a turn and the last
+turn has a reply. Each file is claimed with an exclusive ``.claim`` file first, so
 any number of ``convert`` processes can share the work and a rerun skips finished
 files; a claim is touched after every row group, and one older than
 ``--stale-claim-hours`` is taken over, so each process writes through temp files
@@ -66,22 +67,16 @@ def meta_path(arrow_file: Path) -> Path:
 
 
 def keep_flags(texts: pa.Array) -> np.ndarray:
-    """Which conversations open with a turn holding both a user message and a reply.
-
-    The reader keeps a conversation up to its first incomplete turn, so a row
-    without a complete first turn has nothing to train.
-    """
+    """Which conversations hold at least one turn and end with a turn carrying a reply."""
     offsets = texts.offsets.to_numpy()
     turns = texts.values
-
-    def present(name: str) -> np.ndarray:
-        text = pc.fill_null(turns.field(name).cast(pa.string()), "")
-        length = pc.utf8_length(pc.utf8_trim_whitespace(text))
-        return pc.greater(length, 0).to_numpy(zero_copy_only=False)
-
-    complete = np.concatenate([present("user") & present("assistant"), [False]])
+    reply = pc.fill_null(turns.field("assistant").cast(pa.string()), "")
+    replied = pc.greater(pc.utf8_length(reply), 0).to_numpy(zero_copy_only=False)
+    if turns.null_count:
+        replied &= turns.is_valid().to_numpy(zero_copy_only=False)
+    replied = np.concatenate([replied, [False]])
     starts, ends = offsets[:-1], offsets[1:]
-    flags = (ends > starts) & complete[np.minimum(starts, len(complete) - 1)]
+    flags = (ends > starts) & replied[np.maximum(ends - 1, 0)]
     if texts.null_count:
         flags &= ~texts.is_null().to_numpy(zero_copy_only=False)
     return flags

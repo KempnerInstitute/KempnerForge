@@ -2,15 +2,14 @@
 
 ``scripts/convert_finevision_to_arrow.py`` writes each parquet file of a subset as
 an Arrow IPC file with one record batch per row group, plus ``index.npz``: the
-file list, record batches per file, rows per batch, a per-row keep flag, per-row
-image counts and the rating columns. Rows are numbered across the subset in that
+file list, record batches per file, rows per batch, whether each row ends with a
+reply, per-row image counts and the rating columns. Rows are numbered across the subset in that
 file and batch order.
 """
 
 from __future__ import annotations
 
 import bisect
-import itertools
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -21,7 +20,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from .decode import decode_rgb
-from .document import Document, Turn, is_text
+from .document import Document, Turn
 from .skip import MAX_ATTEMPTS, SkipLog, UnusableRowError, check_max_attempts, first_usable
 
 RATING_COLUMNS = (
@@ -32,8 +31,10 @@ RATING_COLUMNS = (
 )
 
 
-def _complete(turn: dict[str, Any] | None) -> bool:
-    return turn is not None and is_text(turn.get("user")) and is_text(turn.get("assistant"))
+def _turn(turn: dict[str, Any] | None) -> Turn:
+    if turn is None:
+        raise UnusableRowError("a turn is null")
+    return Turn(turn.get("user") or "", (turn.get("assistant") or "",))
 
 
 def _decode(item: dict[str, Any] | None) -> Image.Image:
@@ -45,24 +46,26 @@ def _decode(item: dict[str, Any] | None) -> Image.Image:
 class FineVisionArrow(Dataset):
     """The kept conversations of one FineVision subset.
 
-    Rows pass when their keep flag is set, every ``min_ratings`` column meets its
-    threshold (a missing rating, stored as ``-1``, fails), and the row has between
-    1 and ``max_images`` images; ``None`` lifts the upper limit, for a renderer that
-    accepts documents with several images. A ``text_only`` reader keeps the rows
-    without images instead, and its documents carry none, for a renderer that
-    accepts those. ``num_images`` overrides the per-row image counts stored in
-    ``index.npz``. A conversation keeps its turns up to the first one missing its
-    user message or its reply, since later turns may refer to it; a row whose
-    first turn is incomplete, or whose image does not decode or holds no bytes, is
-    passed over for the next row, up to ``max_attempts`` in a row, and ``skipped``
-    counts them. At most ``max_open_files`` Arrow files stay mapped per process.
+    Rows pass when their conversation holds a turn and its last turn has a reply,
+    every ``min_ratings`` column meets its threshold (a missing rating, stored as
+    ``-1``, fails), and the row has between ``min_images`` and ``max_images``
+    images. The defaults keep every row: the rows without images as text-only
+    documents, and every image of the others. ``min_images=1`` leaves the text-only
+    rows out, and a ``text_only`` reader keeps only them, never reading the image
+    column. ``num_images`` overrides the per-row image counts stored in
+    ``index.npz``; they are needed only to filter by image count. Every turn is
+    kept, a missing user message or reply read as empty text; a row with a null
+    turn, or whose image does not decode or holds no bytes, is passed over for the
+    next row, up to ``max_attempts`` in a row, and ``skipped`` counts them. At most
+    ``max_open_files`` Arrow files stay mapped per process.
     """
 
     def __init__(
         self,
         subset_dir: str | Path,
         *,
-        max_images: int | None = 1,
+        max_images: int | None = None,
+        min_images: int = 0,
         num_images: np.ndarray | None = None,
         min_ratings: dict[str, int] | None = None,
         text_only: bool = False,
@@ -73,6 +76,12 @@ class FineVisionArrow(Dataset):
             raise ValueError(f"max_open_files must be positive, got {max_open_files}")
         if max_images is not None and max_images < 1:
             raise ValueError(f"max_images must be positive or None, got {max_images}")
+        if min_images < 0:
+            raise ValueError(f"min_images must not be negative, got {min_images}")
+        if max_images is not None and min_images > max_images:
+            raise ValueError(f"min_images={min_images} exceeds max_images={max_images}")
+        if text_only and min_images:
+            raise ValueError("text_only keeps the rows without images; min_images must be 0")
         self.subset_dir = Path(subset_dir)
         self.text_only = text_only
         self.max_attempts = check_max_attempts(max_attempts)
@@ -96,25 +105,23 @@ class FineVisionArrow(Dataset):
                 raise ValueError(f"{self.subset_dir / 'index.npz'} has no {name}; rebuild it")
             keep &= index[name] >= threshold
         counts = num_images if num_images is not None else index.get("num_images")
-        if counts is None:
-            raise ValueError(
-                f"{self.subset_dir / 'index.npz'} has no num_images; pass num_images "
-                "or rebuild the index with scripts/convert_finevision_to_arrow.py"
-            )
-        if len(counts) != len(keep):
-            raise ValueError(f"num_images has {len(counts)} rows, the index {len(keep)}")
-        if text_only:
-            keep &= counts == 0
-        else:
-            keep &= counts >= 1
-            if max_images is not None:
-                keep &= counts <= max_images
+        if text_only or min_images or max_images is not None:
+            if counts is None:
+                raise ValueError(
+                    f"{self.subset_dir / 'index.npz'} has no num_images; pass num_images "
+                    "or rebuild the index with scripts/convert_finevision_to_arrow.py"
+                )
+            if len(counts) != len(keep):
+                raise ValueError(f"num_images has {len(counts)} rows, the index {len(keep)}")
+            if text_only:
+                keep &= counts == 0
+            else:
+                keep &= counts >= min_images
+                if max_images is not None:
+                    keep &= counts <= max_images
         self.rows = np.flatnonzero(keep).astype(np.int64)
         if not len(self.rows):
-            raise ValueError(
-                f"no row of {self.subset_dir} passes the filters"
-                + ("" if text_only else "; a subset without images needs text_only")
-            )
+            raise ValueError(f"no row of {self.subset_dir} passes the filters")
         self._readers: OrderedDict[int, Any] = OrderedDict()
 
     @property
@@ -152,12 +159,9 @@ class FineVisionArrow(Dataset):
 
     def _read(self, index: int) -> Document:
         row = self.row(index)
-        turns = tuple(
-            Turn(t["user"], (t["assistant"],))
-            for t in itertools.takewhile(_complete, row["texts"] or [])
-        )
+        turns = tuple(map(_turn, row["texts"] or []))
         if not turns:
-            raise UnusableRowError("the first turn lacks its user message or its reply")
+            raise UnusableRowError("the conversation holds no turn")
         images = () if self.text_only else tuple(map(_decode, row.get("images") or []))
         return Document(images=images, turns=turns, kind="conversation")
 
