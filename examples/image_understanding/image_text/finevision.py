@@ -36,6 +36,11 @@ def _complete(turn: dict[str, Any] | None) -> bool:
     return turn is not None and is_text(turn.get("user")) and is_text(turn.get("assistant"))
 
 
+def _holds_image(item: Any) -> bool:
+    """Whether an images entry holds image bytes; a blank or null entry holds none."""
+    return isinstance(item, dict) and item.get("bytes") is not None
+
+
 def _decode(item: dict[str, Any] | None) -> Image.Image:
     if item is None or item.get("bytes") is None:
         raise UnusableRowError("an image holds no bytes")
@@ -50,11 +55,14 @@ class FineVisionArrow(Dataset):
     1 and ``max_images`` images; ``None`` lifts the upper limit, for a renderer that
     accepts documents with several images. A ``text_only`` reader keeps the rows
     without images instead, and its documents carry none, for a renderer that
-    accepts those. ``num_images`` overrides the per-row image counts stored in
-    ``index.npz``. A conversation keeps its turns up to the first one missing its
-    user message or its reply, since later turns may refer to it; a row whose
-    first turn is incomplete, or whose image does not decode or holds no bytes, is
-    passed over for the next row, up to ``max_attempts`` in a row, and ``skipped``
+    accepts those. An images entry without image bytes, blank or null, is not an
+    image: the converter does not count it and the reader leaves it out.
+    ``num_images`` overrides the per-row image counts stored in ``index.npz``. A
+    conversation keeps its turns up to the first one missing its user message or
+    its reply, since later turns may refer to it; a row whose first turn is
+    incomplete, whose image does not decode, or that an index counted before blank
+    entries stopped counting and that holds no image after all, is passed over for
+    the next row, up to ``max_attempts`` in a row, and ``skipped``
     counts them. At most ``max_open_files`` Arrow files stay mapped per process.
     """
 
@@ -158,7 +166,11 @@ class FineVisionArrow(Dataset):
         )
         if not turns:
             raise UnusableRowError("the first turn lacks its user message or its reply")
-        images = () if self.text_only else tuple(map(_decode, row.get("images") or []))
+        images = ()
+        if not self.text_only:
+            images = tuple(_decode(item) for item in row.get("images") or [] if _holds_image(item))
+            if not images:
+                raise UnusableRowError("no image entry holds image bytes")
         return Document(images=images, turns=turns, kind="conversation")
 
     def read_with_index(self, index: int) -> tuple[int, Document]:

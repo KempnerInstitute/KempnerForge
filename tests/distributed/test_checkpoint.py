@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -485,6 +486,33 @@ class TestCheckpointLoadDivergentExistence:
         assert tokens_seen == 100, (
             f"rank {rank}: expected tokens_seen=100 after load, got {tokens_seen}"
         )
+
+
+class TestCheckpointLoadUnreadableTrainState:
+    """Every rank raises at once when rank 0 cannot read ``train_state.pt`` (#546)."""
+
+    def test_a_torn_train_state_fails_every_rank_at_once(self, distributed_env, shared_tmp_dir):
+        mesh = distributed_env
+        rank = dist.get_rank()
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, mesh)
+        from kempnerforge.config.schema import OptimizerConfig
+
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        mgr = CheckpointManager(CheckpointConfig(dir=shared_tmp_dir), model, opt)
+        mgr.save(step=1, tokens_seen=100)
+        dist.barrier()
+        path = Path(shared_tmp_dir) / "step_1" / "train_state.pt"
+        if rank == 0:
+            path.write_bytes(path.read_bytes()[:100])
+        dist.barrier()
+        reason = "PytorchStreamReader"
+        if rank != 0:
+            reason = f"Rank 0 could not read {path}: RuntimeError: {reason}"
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match=re.escape(reason)):
+            mgr.load()
+        assert time.monotonic() - start < 60
 
 
 class TestAsyncCheckpointLatestSafety:
@@ -1118,3 +1146,54 @@ class TestWeightDecayScopeAcrossStages:
             pytest.raises(expected, match=reason),
         ):
             resumed.load()
+
+
+class TestPinnedSnapshot:
+    def test_a_pinned_save_snapshots_dtensors_when_it_returns(
+        self, distributed_env, shared_tmp_dir, monkeypatch
+    ):
+        """A sharded weight and a 0-dim replicated DTensor changed right after an
+        async_with_pinned_mem save returns load back as they were at save time. The
+        background write is held until they have changed."""
+        import threading
+
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.filesystem import FileSystemWriter
+        from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+
+        from kempnerforge.checkpoint.async_save import AsyncCheckpointer
+
+        mesh = distributed_env["dp_shard"]
+
+        def state(weight: float, scale: float) -> dict:
+            return {
+                "weight": distribute_tensor(
+                    torch.full((64, 32), weight, device="cuda"), mesh, [Shard(0)]
+                ),
+                "scale": distribute_tensor(torch.tensor(scale, device="cuda"), mesh, [Replicate()]),
+            }
+
+        release = threading.Event()
+        real_write = FileSystemWriter.write_data
+
+        def held_write(writer, plan, planner):
+            assert release.wait(timeout=60)
+            return real_write(writer, plan, planner)
+
+        monkeypatch.setattr(FileSystemWriter, "write_data", held_write)
+        live = state(1.0, 1.0)
+        checkpoint_id = os.path.join(shared_tmp_dir, "pinned")
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_pinned)
+        try:
+            ckpt.save(live, checkpoint_id=checkpoint_id)
+            with torch.no_grad():
+                for tensor in live.values():
+                    tensor.mul_(11.0)
+        finally:
+            release.set()
+        ckpt.wait()
+        dist.barrier()
+        loaded = state(0.0, 0.0)
+        dcp.load(loaded, checkpoint_id=checkpoint_id)
+        assert torch.equal(loaded["weight"].full_tensor(), torch.ones(64, 32, device="cuda"))
+        assert loaded["scale"].full_tensor().item() == 1.0
