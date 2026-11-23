@@ -16,7 +16,7 @@ set -euo pipefail
 
 CONFIG="${1:?Usage: launch.sh <config.toml> [overrides...]}"
 shift
-OVERRIDES="$@"
+OVERRIDES=("$@")
 
 NGPUS="${SLURM_GPUS_PER_NODE:-4}"
 
@@ -38,13 +38,13 @@ echo "Node:       $(hostname)"
 echo "GPUs:       ${NGPUS}"
 echo "IB iface:   ${IB_IFNAME}"
 echo "Config:     ${CONFIG}"
-echo "Overrides:  ${OVERRIDES}"
+echo "Overrides:  ${OVERRIDES[*]}"
 echo "============================"
 
 uv run torchrun \
     --standalone \
     --nproc_per_node="${NGPUS}" \
-    scripts/train.py "${CONFIG}" ${OVERRIDES} &
+    scripts/train.py "${CONFIG}" "${OVERRIDES[@]}" &
 launcher=$!
 forwarded=0
 trap '[ "$forwarded" = 1 ] || { forwarded=1; kill -TERM "${launcher}" 2>/dev/null || true; }' TERM USR1

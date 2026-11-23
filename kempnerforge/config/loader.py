@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import ast
 import importlib
+import itertools
+import shlex
 import sys
 import tomllib
 import types
@@ -286,13 +288,34 @@ def _parse_cli_overrides(args: list[str]) -> dict[str, Any]:
     Supports:
       --model.dim=512
       --train.compile_model=true
+      --train.compile_model (a bare key means true)
       --optimizer.betas=[0.9,0.95]
+
+    Arguments without ``--`` before the first override are skipped, such as the
+    config path when ``load_config`` reads ``sys.argv[1:]``.
+
+    Raises:
+        ValueError: An argument without ``--`` follows an override. After a bare key
+            it is the value of a space-separated ``--section.key value``, which would
+            otherwise be dropped while the key read as true; after a complete override
+            it is the rest of a value with a space that a shell split off, which would
+            otherwise be dropped from the value. The message shows the override with
+            the arguments up to the next override joined back, quoted for a shell.
     """
     overrides: dict[str, Any] = {}
 
-    for arg in args:
+    flag: str | None = None
+    for i, arg in enumerate(args):
         if not arg.startswith("--"):
+            if flag is not None:
+                rest = " ".join(itertools.takewhile(lambda a: not a.startswith("--"), args[i:]))
+                joined = f"{flag} {rest}" if "=" in flag else f"{flag}={rest}"
+                raise ValueError(
+                    f"Unexpected command-line argument {arg!r} after {flag}: "
+                    f"write {shlex.quote(joined)}"
+                )
             continue
+        flag = arg
         if "=" not in arg:
             key = arg[2:]
             value_str = "true"
