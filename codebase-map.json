@@ -1457,8 +1457,9 @@
         }
       },
       "functions": [
-        "check_gpu_health(device) -> bool",
-        "check_nccl_health(group, timeout_sec) -> bool"
+        "params_are_finite(model, device) -> bool (collective: one all-reduce of a flag on device)",
+        "check_gpu_health(device=0) -> dict[str, bool | str]",
+        "check_nccl_health(timeout_sec=10.0) -> bool"
       ],
       "tested_by": [
         "tests/unit/test_resilience.py::TestNaNDetector",

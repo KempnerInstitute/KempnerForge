@@ -1,9 +1,11 @@
 # NaN detection
 
 [`NaNDetector`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/health.py)
-watches for NaN / Inf in the loss and the gradient norm every step. When it fires, the
-training loop zeros gradients, skips the optimizer step, and increments
-a consecutive-NaN counter. The skipped step still counts as a step (see
+watches for NaN / Inf in the loss and the gradient norm every step. When it fires
+with the default `nan_action`, the training loop zeros gradients, skips the
+optimizer step, and increments a consecutive-NaN counter; `"raise"` stops the
+run instead (see [Three actions](#three-actions)). The skipped step still
+counts as a step (see
 [What a skipped step still does](#what-a-skipped-step-still-does)). If
 too many consecutive NaNs pile up, the loop stops so a human can roll
 back to an earlier checkpoint.

@@ -1,4 +1,4 @@
-"""GPU health monitoring and NaN detection.
+"""GPU and NCCL health checks and NaN detection.
 
 Provides utilities for detecting common failures during training:
   - NaN/Inf in loss, gradients or parameters
@@ -36,7 +36,8 @@ class NaNDetector:
 
     Supports three responses to NaN:
       - ``"warn"``: Log a warning and return False.
-      - ``"skip"``: The same, with a warning that the optimizer step is skipped.
+      - ``"skip"``: The same; :meth:`check_loss`'s warning also says the optimizer
+        step is skipped.
       - ``"raise"``: Raise a ``RuntimeError``.
 
     The training loop skips the optimizer step whenever a check returns False,

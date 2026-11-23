@@ -9,9 +9,9 @@ Three failure modes the module addresses:
 
 - **Preemption / manual stop** — SLURM sends a termination signal,
   KempnerForge catches it, writes an emergency checkpoint, and exits.
-- **Numerical blow-up** — NaN / Inf loss detected, optimizer step
-  skipped, gradient zeroed. If it persists, stop so a human can roll
-  back.
+- **Numerical blow-up** — NaN / Inf loss or gradient norm detected;
+  with the default `nan_action`, optimizer step skipped and gradients
+  zeroed. If it persists, stop so a human can roll back.
 - **Silent distributed hangs** — periodic NCCL liveness ping detects
   a dead peer before the training loop deadlocks.
 
