@@ -167,8 +167,8 @@ def _install_fake_load_world(
 ):
     """Simulate global rank ``rank`` of a ``world``-rank job during ``load()``.
 
-    Broadcasts deliver rank 0's values (the file-existence flag, then the
-    train state rank 0 reads). The gather delivers every rank's current
+    Broadcasts deliver rank 0's values (the checkpoint it picks, the file-existence
+    flag, then the train state rank 0 reads). The gather delivers every rank's current
     ``(global_rank, dp_coordinates)`` from ``layout`` and records what this
     rank contributed and on which group. The load's agreement reports no
     failure on any other rank.
@@ -181,6 +181,9 @@ def _install_fake_load_world(
     ts_path = ckpt_dir / "train_state.pt"
 
     def fake_broadcast(obj_list, src=0):
+        if isinstance(obj_list[0], dict) and obj_list[0].keys() == {"dir", "error"}:
+            obj_list[0] = {"dir": str(ckpt_dir), "error": None}
+            return
         if obj_list[0] is False:
             obj_list[0] = ts_path.exists()
         elif obj_list[0] is None:
@@ -1209,7 +1212,8 @@ class TestWeightsOnlyWarmStart:
             assert _draw() == fresh, f"rank {r} restored saved RNG state"
             assert scheduler.restored is None
             assert mgr._pending_dataloader_state is None
-        assert calls == [(r, "broadcast", "") for r in range(world)]
+        nothing = {"path": None, "error": None}
+        assert calls == [(r, "broadcast", nothing) for r in range(world)]
 
     def test_an_exact_resume_that_skips_it_is_refused_before_any_collective(
         self, tmp_path, monkeypatch

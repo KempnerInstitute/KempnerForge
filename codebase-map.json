@@ -1256,6 +1256,7 @@
             "_present_experts(dcp_state, load_from, saved_keys) (EP experts placed among all of them before DCP; a load refuses a checkpoint of fewer experts than the model; the ranks agree before DCP)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
+            "_agreed_resume_dir(path) -> Path | None (exact resume: rank 0 resolves the checkpoint, takes the newest step_N beside it that every stage saved when that one is not, and broadcasts its choice or its error)",
             "_cleanup()"
           ]
         }
@@ -1647,9 +1648,10 @@
           "TestPeekSavedStep(5)",
           "TestFlushPendingSave(1)",
           "TestSaveVLMFreezeMetadata(3)",
-          "TestLoadVLMFreezeCompare(9)"
+          "TestLoadVLMFreezeCompare(9)",
+          "TestTornStageAcrossRanks(1)"
         ],
-        "count": 51
+        "count": 52
       },
       "tests/unit/test_observability.py": {
         "classes": [
