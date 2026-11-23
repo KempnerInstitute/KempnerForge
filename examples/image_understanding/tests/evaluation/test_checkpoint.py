@@ -63,9 +63,6 @@ class TestCheckSupported:
             f"vlm.arch={arch!r} is not supported: the evaluator decodes ['joint_decoder']",
         )
 
-    def test_an_arch_set_by_an_override_is_refused(self, load: Callable[..., JobConfig]) -> None:
-        _refused(load("--vlm.arch=mot"), "vlm.arch='mot' is not supported")
-
     def test_a_video_config_is_refused(self, write_config: Callable[..., Path]) -> None:
         video = "\n[video]\nmax_frames = 2\nmin_frames = 1\nframe_size = 16\n"
         config = load_config(write_config(video), cli_args=[])

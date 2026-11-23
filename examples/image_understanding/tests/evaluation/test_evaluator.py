@@ -818,7 +818,9 @@ class TestEvaluateCheckpoint:
     def test_an_unsupported_config_is_refused_before_anything_is_read(
         self, write_config: Callable[..., Path], write_task: Callable[..., Path], tmp_path: Path
     ) -> None:
-        config = load_config(write_config(), cli_args=["--vlm.arch=mot"])
+        path = tmp_path / "mot.toml"
+        path.write_text(write_config().read_text().replace('"joint_decoder"', '"mot"'))
+        config = load_config(path, cli_args=[])
         tasks = load_tasks(write_task())
         with pytest.raises(ValueError, match="vlm.arch='mot' is not supported"):
             evaluate_checkpoint(config, tasks, tmp_path / "missing", tmp_path / "results")

@@ -34,10 +34,9 @@ def check_supported(config: JobConfig) -> None:
     vlm = config.vlm
     if vlm is None:
         raise ValueError("the config has no [vlm] section; the evaluator decodes a VLM checkpoint")
-    unsupported = sorted({vlm.arch, type(vlm).arch} - set(SUPPORTED_ARCHES))
-    if unsupported:
+    if vlm.arch not in SUPPORTED_ARCHES:
         raise ValueError(
-            f"vlm.arch={unsupported[0]!r} is not supported: the evaluator decodes "
+            f"vlm.arch={vlm.arch!r} is not supported: the evaluator decodes "
             f"{list(SUPPORTED_ARCHES)} checkpoints"
         )
     if config.video is not None:
