@@ -203,13 +203,39 @@ breaks the internal averaging.
 
 Gotchas:
 
-- **Eval mode switch**: call `optimizer.eval_params()` before
-  validation and `optimizer.train_params()` after, to swap in the
-  averaged weights `x` and restore the iterate `z`. This is not
-  automatic in the current loop.
+- **Evaluation point**: between steps the parameters hold the training
+  point `y = (1 - beta1) * z + beta1 * x`, where the gradients are taken.
+  In-loop eval runs at the averaged weights `x`: the loop calls
+  `optimizer.eval_params()` before `run_eval` and
+  `optimizer.train_params()` after, which restores `y` bit for bit. A
+  checkpoint's model entry holds `x` as well, so `scripts/eval.py`,
+  `scripts/convert_checkpoint.py`, `scripts/generate.py` and a warm start
+  with `checkpoint.exclude_from_loading = ["optimizer"]` all read `x`.
+  A resume loads `z` and `x` and rebuilds `y` from them: exactly when the
+  parameter dtype is unchanged, and from the cast `z` and `x` in the new
+  dtype when it changed. Wrap any other evaluation in
+  `evaluation_point(optimizer, model)` from
+  `kempnerforge.training.optimizer`. Pass the model: an FSDP2 unit that
+  does not reshard after its forward stays gathered after the eval
+  forward, holding `x`, and `evaluation_point` reshards every unit around
+  the swap so the next training forward gathers `y`.
+- **Per-parameter step counts**: each parameter keeps its own `step` in
+  the optimizer state, and its warmup, second-moment bias correction and
+  average all count from its first gradient, so a parameter whose `grad`
+  stays `None` for its first steps starts the way a fresh parameter does.
+  A zero gradient still counts as a step: an MoE expert that gets no
+  tokens receives zeros on the grouped-GEMM path and with packed experts,
+  so its count advances anyway. The counts are saved with the rest of the
+  optimizer state, so a resume continues them.
+- **Older checkpoints**: a checkpoint written before the step counts were
+  saved holds none, so its run cannot continue exactly, and its model
+  entry is `y`. The load refuses it and says how to start a fresh
+  optimizer from its weights: `checkpoint.load_path` pointing at it with
+  `checkpoint.exclude_from_loading = ["optimizer"]`, from a
+  `checkpoint.dir` that holds no checkpoint yet.
 - **Internal warmup**: `schedule_free_warmup_steps` is the optimizer's
-  own linear warmup, independent of any external scheduler. Zero
-  disables it.
+  own linear warmup, independent of any external scheduler and counted
+  for each parameter from its first gradient. Zero disables it.
 - **LR is 10-100× larger than AdamW's** — the Polyak averaging absorbs
   aggressive step sizes.
 
