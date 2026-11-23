@@ -1,7 +1,8 @@
 # Evaluation tasks of the image-understanding recipe: the split each task reads,
 # the scorer of its answers and the cap on a decoded answer. Paths are
 # placeholders: point each annotation_file at the split to evaluate, in the
-# layout its reader takes.
+# layout its reader takes. The tasks after VQAv2 are the board's, with its
+# answer caps.
 
 [[tasks]]
 name = "vqav2"
@@ -52,3 +53,51 @@ max_new_tokens = 50
 [tasks.reader_args]
 annotation_file = "path-to-chartqa-machine-annotations"
 image_root = "path-to-chartqa-images"
+
+[[tasks]]
+name = "aokvqa"
+reader = "aokvqa"
+scorer = "exact_vqa_accuracy"
+max_new_tokens = 10
+
+[tasks.reader_args]
+annotation_file = "path-to-aokvqa-val-annotations"
+image_root = "path-to-coco-images"
+
+[[tasks]]
+name = "pixmo-pointing"
+reader = "pixmo_points_eval"
+scorer = "points_in_masks"
+max_new_tokens = 75
+
+[tasks.reader_args]
+annotation_file = "path-to-pixmo-points-eval-annotations"
+image_root = "path-to-pixmo-images"
+
+[[tasks]]
+name = "pixmo-counting"
+reader = "pixmo_count_eval"
+scorer = "count_accuracy"
+max_new_tokens = 20
+
+[tasks.reader_args]
+annotation_file = "path-to-pixmo-count-test-annotations"
+image_root = "path-to-pixmo-images"
+
+[[tasks]]
+name = "gsm8k"
+reader = "gsm8k"
+scorer = "final_number"
+max_new_tokens = 256
+
+[tasks.reader_args]
+annotation_file = "path-to-gsm8k-test-parquet"
+
+[[tasks]]
+name = "mmlu"
+reader = "mmlu"
+scorer = "choice_letter"
+max_new_tokens = 10
+
+[tasks.reader_args]
+annotation_file = "path-to-mmlu-test-parquet"

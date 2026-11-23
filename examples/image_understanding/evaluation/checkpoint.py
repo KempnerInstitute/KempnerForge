@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -22,13 +23,12 @@ _TRAIN_STATE_FILE = "train_state.pt"
 def check_supported(config: JobConfig) -> None:
     """Refuses a config whose checkpoints the evaluator cannot decode, before anything is built.
 
-    The decode handles an arch of ``SUPPORTED_ARCHES`` that sees one view of one
-    image per document, and it relies on a row's output not depending on the
-    rows it is batched with.
+    The decode handles an arch of ``SUPPORTED_ARCHES``, and it relies on a row's
+    output not depending on the rows it is batched with.
 
     Raises:
         ValueError: the config has no ``[vlm]`` section, names another arch, has
-            a ``[video]`` section, tiles images, caps MoE expert capacity or
+            a ``[video]`` section, caps MoE expert capacity or
             trains with pipeline parallelism.
     """
     vlm = config.vlm
@@ -43,11 +43,6 @@ def check_supported(config: JobConfig) -> None:
     if config.video is not None:
         raise ValueError(
             "a [video] config is not supported: the evaluator renders one image per document"
-        )
-    if config.views_per_sample != 1:
-        raise ValueError(
-            f"vlm.tile_grid={vlm.tile_grid} is not supported: the renderer makes one view of an "
-            f"image, and this model takes {config.views_per_sample}"
         )
     if config.model.is_moe and config.model.moe_capacity_factor > 0:
         raise ValueError(
@@ -116,12 +111,17 @@ def load_model(config: JobConfig, step_dir: Path, device: torch.device) -> VLMWr
     ``train.mixed_precision``. The image encoder computes in
     ``vision_encoder.mixed_precision`` when that is set and otherwise in the
     dtype it loads in, which is how a training build on one device leaves it.
-    The calling process loads the whole model, whatever saved it.
+    The calling process loads the whole model, whatever saved it. Attention runs
+    on SDPA, whose masks need no compile for each row length the decode meets.
     """
     vision, adapter, vlm = config.vision_encoder, config.adapter, config.vlm
     assert vision is not None and adapter is not None and vlm is not None
     model = build_vlm_wrapper(
-        config.model, vision, adapter, vlm, frames_per_clip=config.views_per_sample
+        dataclasses.replace(config.model, attention_backend="sdpa"),
+        vision,
+        adapter,
+        vlm,
+        frames_per_clip=config.views_per_sample,
     )
     model.transformer.to(device=device, dtype=config.train.param_dtype)
     model.adapter.to(device=device, dtype=config.train.param_dtype)

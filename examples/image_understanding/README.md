@@ -16,7 +16,7 @@ examples/image_understanding/
 ├── evaluate_checkpoint.py   # evaluation entry point (below)
 ├── mixture.py            # packed loader over a mixture of image-text sources
 ├── configs/
-│   ├── eval_tasks.toml   # sample evaluation tasks, with placeholder paths
+│   ├── eval_tasks.toml   # the board's evaluation tasks, with placeholder paths
 │   ├── evaluate_checkpoint.sbatch   # sample job script for evaluating one checkpoint
 │   └── qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml  # stage 2 on the packed mixture
 ├── mixtures/
@@ -324,22 +324,30 @@ The model is built from the config and loads the checkpoint's weights; every
 rank holds all of it, whatever parallelism the run trained with. The language
 model and the adapter compute in the dtype of `train.mixed_precision`, the image
 encoder in `vision_encoder.mixed_precision` when that is set and otherwise in
-the dtype it loads in. The decode takes a `joint_decoder` that sees one view of
-one image, so another arch, a `[video]` config or `vlm.tile_grid` is refused
-before anything is built. So is `model.moe_capacity_factor > 0`, which drops
-tokens by what else is in the batch. A save from pipeline parallelism
+the dtype it loads in. The decode takes a `joint_decoder`, so another arch or a
+`[video]` config is refused before anything is built. So is
+`model.moe_capacity_factor > 0`, which drops tokens by what else is in the batch.
+A save from pipeline parallelism
 (`distributed.pp > 1`) is refused too: it holds one set of shards per stage, and
 every rank here loads the whole model from one set.
 
 The inputs are training's. Each document goes through the training
-`ChatRenderer`: the prompt is the text it puts before the assistant's reply, and
-the image is preprocessed as in a training sample. A document needs one image
-and one turn; any other stops the run with the limit named
-(`evaluation/inputs.py` is where a document becomes model inputs).
+`ChatRenderer`: the prompt is the generation prompt it puts before the
+assistant's reply (with Qwen3's template, ending in the empty think block, even
+when training trained that block with `train_reply_prefix`), and every image is
+preprocessed as in a training sample, cut into views per `vlm.tile_grid`. A
+document may hold any number of images, none included; one with several turns
+stops the run (`evaluation/inputs.py` is where a document becomes model inputs).
+A run trained on a mixture is evaluated with `--mixture=<file>`: its `[render]`
+options (`lead_space`, say) shape the prompt, and its `[packing]` `view_groups`
+lets each view's tokens see each other as training did.
 
-Decoding is greedy. A batch is laid out like a training row (image tokens, then
-text, padding last), each image is encoded once, and a row ends at the turn end
-or EOS, or after the task's `max_new_tokens`. A split is cut into consecutive
+Decoding is greedy. Each row of a batch is one document laid out as a packed
+training row lays it out (every view's tokens, then the text, padding last),
+each view is encoded once, and a row ends at the turn end or EOS, or after the
+task's `max_new_tokens`. Attention runs on SDPA whatever the config's
+`model.attention_backend`, as the row length grows with every step. A split is
+cut into consecutive
 batches, the ranks take them in turn, and rank 0 merges the rows, each scored
 once. Every batch holds the same rows whatever the number of ranks, so with one
 `--batch-size` the scores are the same on any number of GPUs of one kind. Causal
@@ -351,8 +359,9 @@ A row is scored as it is or counted under a reason, never changed to fit:
 
 - `unreadable_row`: the reader passed over the row because its image does not
   decode. The row it moved on to is not scored in its place.
-- `prompt_too_long`: the prompt and `max_new_tokens` do not fit
-  `vlm.max_text_len`, the text length training lays out.
+- `prompt_too_long`: the document and `max_new_tokens` do not fit what training
+  lays out: `train.seq_len` positions for the views and text of a packed run, and
+  `vlm.max_text_len` for the text of an unpacked one.
 - `unrenderable_row`: the chat template does not lay the row out as training
   does (a `conversation` document whose turn the template mangles), so training
   passes over it too. Its record holds the error text.
@@ -412,7 +421,9 @@ Its placeholders are `{config}` and `{tasks}` (the two files above), `{checkpoin
 (the step directory), `{step}`, `{output}` (that step's directory under
 `--eval-output`, `step_<N>`) and `{overrides}`, which stands for the run's
 `--section.key=value` overrides as separate arguments, so the evaluation builds the
-model the run trained. `{checkpoint}` and `{output}` are required. Every path is
+model the run trained, led by `--mixture=<file>` (made absolute) when the run trains
+on one, so the evaluation renders as training did. `{checkpoint}` and `{output}` are
+required. Every path is
 filled in absolute, and the task file's own relative paths are taken from its
 directory, so the command may change directory, as the job script below does;
 relative paths in the config are read from the working directory, as in training.
@@ -505,6 +516,7 @@ the run saves is treated as one it saves again, with a warning.
 The evaluator reads a step directory while the run goes on, and the run removes old
 ones (`checkpoint.keep_last_n`). Keep as many as the evaluations in flight need,
 or the evaluator stops on a directory that is gone.
+
 ## Stage 2 on the packed mixture
 
 `configs/qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml` trains every module of
@@ -551,8 +563,9 @@ uv run torchrun --nnodes=4 --nproc_per_node=4 examples/image_understanding/train
 the scorers of their answers.
 
 - `tasks.py`: `load_tasks` reads a TOML task file into frozen `EvalTask`s. A task
-  has a unique `name`, a `reader` (one of the `testbed.py` loaders) with that
-  loader's arguments in `reader_args`, a `scorer`, and `max_new_tokens`, the cap
+  has a unique `name`, a `reader` (a `testbed.py` loader or one of
+  `readers.py`) with that loader's arguments in `reader_args`, a `scorer`, and
+  `max_new_tokens`, the cap
   on a decoded answer. `reader_args` is a read-only copy. The file is checked as
   it loads, before a reader opens anything: an unknown key, reader or scorer, an
   unknown or missing reader argument, a required reader parameter that cannot be
@@ -564,9 +577,18 @@ the scorers of their answers.
   path given to a reader parameter annotated `Path`, as the testbed loaders'
   `annotation_file` and `image_root` are, is taken from the task file's
   directory, so a task file reads the same data from any working directory.
+- `readers.py`: the splits no training source reads. `pixmo_points_eval` asks
+  "Point to the {label}." of each PixMo pointing image and gives `reference(row)`,
+  the row's object masks, read from its line only when scored. `pixmo_count_eval`
+  asks "How many {label} are in the image?". `gsm8k` and `mmlu` are text-only,
+  from their test parquet files: GSM8K's answer is the number after the
+  solution's `####`, and MMLU's question lists the options as `A.` to `D.`,
+  then "Answer with the letter of the correct option.", answered by the letter.
+  `testbed.py`'s `aokvqa` reads A-OKVQA with every direct answer kept.
 - `scorers.py`: a scorer rates one prediction against a sample's reference
   answers with a value in [0, 1], and a task's score is the mean over its
-  samples. The text scorers take the prediction as a `str` and the references as
+  samples. A reader with a `reference(row)` method gives the reference instead.
+  The text scorers take the prediction as a `str` and the references as
   a non-empty sequence of `str`; anything else raises before any scoring, naming
   the argument. `get_scorer` returns one by name; its `score` rates a sample and its
   `aggregate` turns a task's sample scores into the task's metrics.
@@ -591,9 +613,24 @@ the scorers of their answers.
     `%` makes hundredths, as in Pix2Struct's relaxed correctness: `45%` matches
     `0.45` and `45.1%` but not `45`. `1,000` is text, while `1_000` is 1000.
 
-`configs/eval_tasks.toml` is a sample with five tasks and their caps (VQAv2 10,
-TextVQA 75, DocVQA 50, ChartQA human and machine 50); its paths are
-placeholders:
+  - `exact_vqa_accuracy` (A-OKVQA): `min(1, m / 3)` for the `m` direct answers
+    the prediction equals exactly, nothing normalized.
+  - `count_accuracy` (PixMo counting): the stated count is the `N` of "I count
+    N", else the last integer outside point tags; `accuracy` is whether it is the
+    reference count and `mae` how far off it is (the whole count without one).
+  - `points_in_masks` (PixMo pointing): the points of every `<point>`/`<points>`
+    tag, in percent, land on the nearest mask pixel; `precision` is the share
+    inside any object, `recall` the share of objects hit, `count_mae` the gap
+    between the counts of points and objects.
+  - `final_number` (GSM8K): 1 when the last number, commas dropped, equals the
+    reference.
+  - `choice_letter` (MMLU): 1 when the first standalone capital `A` to `D` is the
+    reference letter.
+
+`configs/eval_tasks.toml` is a sample with VQAv2 (10) and the nine tasks of the
+board, with its caps: A-OKVQA 10, DocVQA 50, TextVQA 75, ChartQA human and
+machine 50, PixMo pointing 75 and counting 20, GSM8K 256 and MMLU 10. Its paths
+are placeholders:
 
 ```toml
 [[tasks]]
@@ -620,8 +657,7 @@ or in core where it belongs:
   DataComp), chat-template rendering with the loss on the assistant turns only
 - Typed stage contract and pinned source manifest, which fix the stage presets
 - Per-module learning rates and schedules
-- Evaluation: PixMo point and count scorers, documents with several images or
-  none, image attention when decoding, and a KV cache for decoding
+- Evaluation: a KV cache for decoding
 - Run-comparison metrics: documents seen, token counts, MFU with the encoder
 
 ## Tests

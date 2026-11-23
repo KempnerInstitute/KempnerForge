@@ -70,6 +70,11 @@ def test_the_loaded_config_and_tasks_are_handed_off(
         "docvqa",
         "chartqa-human",
         "chartqa-machine",
+        "aokvqa",
+        "pixmo-pointing",
+        "pixmo-counting",
+        "gsm8k",
+        "mmlu",
     ]
     assert {key: seen[key] for key in ("checkpoint", "output", "batch_size", "publish")} == {
         "checkpoint": "runs/a",

@@ -34,9 +34,10 @@ from evaluation.evaluator import (
     read_row,
     shard_batches,
     summarize,
+    token_budgets,
 )
-from evaluation.generation import Generation, stop_token_ids
-from evaluation.inputs import UnsupportedDocumentError, build_renderer
+from evaluation.generation import Generation, greedy_decode, stop_token_ids
+from evaluation.inputs import UnsupportedDocumentError, build_renderer, document_inputs
 from evaluation.scorers import SCORERS, Scorer, anls
 from evaluation.tasks import READERS, EvalTask, build_reader, load_tasks
 from image_text.document import Document, Turn
@@ -96,7 +97,7 @@ def _corrupt(tasks: Path, row: int) -> None:
 def _decoder(run: Run) -> Decoder:
     renderer = build_renderer(run.config)
     model = load_model(run.config, run.step_dir, torch.device("cpu"))
-    return Decoder(model, renderer, stop_token_ids(renderer))
+    return Decoder(model, renderer, stop_token_ids(renderer), token_budgets(run.config))
 
 
 def _batch_records(run: Run, tasks: Path, batch: range) -> list[dict[str, Any]]:
@@ -392,34 +393,68 @@ class TestEvaluateBatch:
         monkeypatch.setattr(evaluator, "greedy_decode", None)
         assert _batch_records(run, tasks, range(1)) == [{"row": 0, "skipped": UNREADABLE_ROW}]
 
-    @pytest.mark.parametrize(
-        ("document", "limit"),
-        [
-            (Document(images=(), turns=(Turn("how many ?", ("one",)),)), "one image, got 0"),
-            (
-                Document(
-                    images=(Image.new("RGB", (4, 4)),) * 2, turns=(Turn("how many ?", ("one",)),)
-                ),
-                "one image, got 2",
-            ),
-            (
-                Document(
-                    images=(Image.new("RGB", (4, 4)),),
-                    turns=(Turn("how many ?", ("one",)), Turn("which color ?", ("red",))),
-                    kind="conversation",
-                ),
-                "one turn, got 2",
-            ),
-        ],
-    )
     def test_a_document_outside_the_limits_fails_with_its_task_and_row(
-        self, run: Run, monkeypatch: pytest.MonkeyPatch, document: Document, limit: str
+        self, run: Run, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         usable = Document(images=(Image.new("RGB", (4, 4)),), turns=(Turn("how many ?", ("one",)),))
+        document = Document(
+            images=(Image.new("RGB", (4, 4)),),
+            turns=(Turn("how many ?", ("one",)), Turn("which color ?", ("red",))),
+            kind="conversation",
+        )
         monkeypatch.setitem(READERS, "mixed", lambda: [usable, document])
         task = EvalTask("mixed-task", "mixed", "anls", 4)
-        with pytest.raises(UnsupportedDocumentError, match=f"task 'mixed-task', row 1: .*{limit}"):
+        with pytest.raises(
+            UnsupportedDocumentError, match="task 'mixed-task', row 1: .*one turn, got 2"
+        ):
             evaluate_batch(_decoder(run), task, build_reader(task), range(2))
+
+    def test_documents_with_any_number_of_images_are_scored_as_they_decode(
+        self, run: Run, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        turn = Turn("how many ?", ("one",))
+        image = Image.new("RGB", (4, 4), (200, 30, 30))
+        documents = [
+            Document(images=(), turns=(turn,)),
+            Document(images=(image,), turns=(turn,)),
+            Document(images=(image, image), turns=(turn,)),
+        ]
+        monkeypatch.setitem(READERS, "mixed", lambda: documents)
+        task = EvalTask("mixed-task", "mixed", "anls", 4)
+        decoder = _decoder(run)
+        records = evaluate_batch(decoder, task, build_reader(task), range(3))
+        for row, document in enumerate(documents):
+            inputs = document_inputs(decoder.renderer, document)
+            assert inputs.pixel_values.shape[0] == len(document.images)
+            (alone,) = greedy_decode(
+                decoder.model,
+                [inputs],
+                max_new_tokens=4,
+                stop_ids=decoder.stop_ids,
+                pad_id=decoder.renderer.pad_id,
+                row_len=decoder.budgets.row_len,
+            )
+            prediction = decoder.renderer.tokenizer.decode(
+                list(alone.token_ids), skip_special_tokens=True
+            )
+            assert records[row]["prediction"] == prediction
+
+    def test_a_reader_with_references_is_scored_against_them(
+        self, run: Run, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class Referenced(list):
+            def reference(self, row: int) -> list[str]:
+                return [f"reference {row}"]
+
+        documents = Referenced([Document(images=(), turns=(Turn("how many ?", ("one",)),))] * 2)
+        monkeypatch.setitem(READERS, "referenced", lambda: documents)
+        seen: list[Any] = []
+        monkeypatch.setitem(
+            SCORERS, "seen", Scorer(lambda prediction, reference: seen.append(reference) or 0.0)
+        )
+        task = EvalTask("referenced-task", "referenced", "seen", 2)
+        evaluate_batch(_decoder(run), task, build_reader(task), range(2))
+        assert seen == [["reference 0"], ["reference 1"]]
 
     def test_a_missing_image_file_fails(self, run: Run, write_task: Callable[..., Path]) -> None:
         tasks = write_task(rows=2)
@@ -831,11 +866,11 @@ class TestEvaluateCheckpoint:
         fits = load_tasks(
             write_task(name="fits", max_new_tokens=MAX_TEXT_LEN - EMPTY_PROMPT_TOKENS)
         )
-        check_token_budgets(renderer, fits)
+        check_token_budgets(renderer, fits, token_budgets(run.config))
         tasks = write_task(max_new_tokens=MAX_TEXT_LEN - EMPTY_PROMPT_TOKENS + 1)
         message = (
-            "task 'docvqa': max_new_tokens=28 leaves no room for a prompt in "
-            "vlm.max_text_len=32; the prompt of an empty question is already 5 tokens"
+            "task 'docvqa': max_new_tokens=28 leaves no room for a prompt in the 32 tokens "
+            "training lays out; the prompt of an empty question is already 5 tokens"
         )
         with pytest.raises(ValueError, match=message):
             _evaluate(run, tasks, tmp_path / "results")
@@ -1151,7 +1186,7 @@ def _evaluate_on_rank(
         assert dist.is_initialized(), "the split was opened before the ranks were joined"
         raise OSError("the split is not on this node")
 
-    def load_tokenizer(config: Any) -> Any:
+    def load_tokenizer(config: Any, settings: Any) -> Any:
         assert dist.is_initialized(), "the tokenizer was loaded before the ranks were joined"
         raise OSError("the tokenizer is not on this node")
 

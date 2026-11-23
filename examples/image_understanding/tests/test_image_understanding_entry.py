@@ -145,6 +145,27 @@ def test_the_flags_turn_periodic_evaluation_on_and_leave_the_overrides_alone(
     assert hook.settings.output_root == str(tmp_path / "results")
 
 
+def test_the_mixture_reaches_training_and_each_evaluation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, evaluation_flags: list[str]
+) -> None:
+    config_path = tmp_path / "run.toml"
+    config_path.write_text(VLM_CONFIG)
+    module = _load_entry_point()
+    monkeypatch.setattr(module, "mixture_data_fn", lambda path: ("data_fn", path))
+    monkeypatch.chdir(tmp_path)
+    seen = _run_main(
+        module,
+        monkeypatch,
+        str(config_path),
+        "--mixture=mix.toml",
+        "--train.tf32",
+        *evaluation_flags,
+    )
+    assert seen["data_fn"] == ("data_fn", "mix.toml")
+    (hook,) = seen["hooks"].hooks
+    assert hook.settings.overrides == (f"--mixture={tmp_path / 'mix.toml'}", "--train.tf32")
+
+
 @pytest.mark.parametrize("missing", ["--eval-tasks", "--eval-command", "--eval-output"])
 def test_every_evaluation_flag_is_needed_with_the_others(
     tmp_path: Path,

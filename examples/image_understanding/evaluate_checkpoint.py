@@ -17,6 +17,11 @@ Usage:
     uv run torchrun --nproc_per_node=4 examples/image_understanding/evaluate_checkpoint.py \
         <config.toml> --checkpoint <run or step dir> --tasks <tasks.toml> \
         --output <results dir> --batch-size 64 --section.key=value
+
+    # A run trained on a mixture renders and attends as its mixture file says
+    uv run python examples/image_understanding/evaluate_checkpoint.py <config.toml> \
+        --checkpoint <run or step dir> --tasks <tasks.toml> --output <results dir> \
+        --mixture=<mixture.toml>
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from __future__ import annotations
 import argparse
 
 from evaluation.evaluator import clear_results, evaluate_checkpoint
+from evaluation.inputs import RenderSettings
 from evaluation.tasks import load_tasks
 
 from kempnerforge.config.loader import load_config
@@ -46,6 +52,10 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--output", required=True, help="directory the results are written to")
     parser.add_argument(
         "--batch-size", type=int, default=32, help="rows decoded together (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--mixture",
+        help="mixture file the run trained on; its [render] and [packing] options apply",
     )
     parser.add_argument(
         "--no-publish",
@@ -71,6 +81,7 @@ def main() -> None:
         batch_size=args.batch_size,
         publish=not args.no_publish,
         cleared=cleared,
+        settings=RenderSettings.from_mixture(args.mixture),
     )
 
 

@@ -42,17 +42,23 @@ from pathlib import Path
 from types import MappingProxyType, UnionType
 from typing import TYPE_CHECKING, Any, Union, get_args, get_origin, get_type_hints
 
-from image_text.testbed import chartqa, coco_captions, docvqa, textvqa, vqav2
+from image_text.testbed import aokvqa, chartqa, coco_captions, docvqa, textvqa, vqav2
 
+from .readers import gsm8k, mmlu, pixmo_count_eval, pixmo_points_eval
 from .scorers import SCORERS
 
 if TYPE_CHECKING:
     from image_text.render import DocumentSource
 
 READERS: dict[str, Callable[..., DocumentSource]] = {
+    "aokvqa": aokvqa,
     "chartqa": chartqa,
     "coco_captions": coco_captions,
     "docvqa": docvqa,
+    "gsm8k": gsm8k,
+    "mmlu": mmlu,
+    "pixmo_count_eval": pixmo_count_eval,
+    "pixmo_points_eval": pixmo_points_eval,
     "textvqa": textvqa,
     "vqav2": vqav2,
 }

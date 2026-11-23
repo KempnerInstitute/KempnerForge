@@ -196,6 +196,14 @@ class ChatRenderer:
             )
         return text, spans
 
+    def prompt(self, document: Document) -> str:
+        """The text before the first reply, the reply prefix included, as generation prompts it."""
+        text, spans = self.text_and_reply_spans(document, ["x"] * len(document.turns))
+        start = spans[0][0]
+        if self.train_reply_prefix and text.startswith(self._reply_prefix, start):
+            start += len(self._reply_prefix)
+        return text[:start]
+
     def _reply_start(self, text: str, at: int, reply: str) -> tuple[int, int]:
         """Where the assistant turn at ``at`` ends its header, and where ``reply`` starts."""
         if text.startswith(self._header, at):
@@ -249,13 +257,14 @@ class ChatRenderer:
         input_ids[:n] = ids_t
         labels[: n - 1] = torch.where(torch.tensor(trained[1:]), ids_t[1:], -100)
         return {
-            "pixel_values": self._pixels(document),
+            "pixel_values": self.pixels(document),
             "input_ids": input_ids,
             "labels": labels,
             "text_len": torch.tensor(n, dtype=torch.long),
         }
 
-    def _pixels(self, document: Document) -> torch.Tensor:
+    def pixels(self, document: Document) -> torch.Tensor:
+        """The sample's ``pixel_values`` for ``document``."""
         if not document.images:
             views = self.tile_grid**2 + int(self.tile_global) if self.tile_grid else 0
             tiled = (views,) if views and self.max_images == 1 else ()

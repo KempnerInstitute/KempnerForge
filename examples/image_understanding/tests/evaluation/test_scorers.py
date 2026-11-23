@@ -5,18 +5,33 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 
+import numpy as np
 import pytest
 from evaluation.scorers import (
     SCORERS,
     Scorer,
     anls,
+    choice_letter,
+    count_accuracy,
+    exact_vqa_accuracy,
+    final_number,
     get_scorer,
     mean_scores,
+    parse_points,
+    points_in_masks,
     relaxed_accuracy,
+    stated_count,
     vqa_accuracy,
 )
 
-TEXT_SCORERS = {"anls": anls, "relaxed_accuracy": relaxed_accuracy, "vqa_accuracy": vqa_accuracy}
+TEXT_SCORERS = {
+    "anls": anls,
+    "choice_letter": choice_letter,
+    "exact_vqa_accuracy": exact_vqa_accuracy,
+    "final_number": final_number,
+    "relaxed_accuracy": relaxed_accuracy,
+    "vqa_accuracy": vqa_accuracy,
+}
 
 
 def _votes(matching: int, total: int) -> list[str]:
@@ -286,6 +301,94 @@ class TestReferences:
     def test_a_score_is_a_float_between_zero_and_one(self, name: str, prediction: str) -> None:
         score = TEXT_SCORERS[name](prediction, _votes(7, 10))
         assert type(score) is float and 0.0 <= score <= 1.0
+
+
+class TestExactVQAAccuracy:
+    @pytest.mark.parametrize(("matching", "expected"), [(0, 0.0), (1, 1 / 3), (3, 1.0), (5, 1.0)])
+    def test_a_third_per_exact_match(self, matching: int, expected: float) -> None:
+        assert exact_vqa_accuracy("yes", _votes(matching, 10)) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("prediction", ["Yes", "yes.", " yes", "a yes"])
+    def test_nothing_is_normalized(self, prediction: str) -> None:
+        assert exact_vqa_accuracy(prediction, _votes(10, 10)) == 0.0
+
+
+class TestCountAccuracy:
+    @pytest.mark.parametrize(
+        ("text", "count"),
+        [
+            ("I count 5 people in the image.", 5),
+            ('<points x1="12.5" y1="40" x2="3" y2="4">2 cats</points> i counted 2', 2),
+            ("There are 3 cats and 4 dogs.", 4),
+            ('<point x="10" y="20" alt="dog">dog</point>', None),
+            ("none", None),
+        ],
+    )
+    def test_the_stated_count_prefers_the_counting_phrase(self, text: str, count: int) -> None:
+        assert stated_count(text) == count
+
+    def test_the_count_scores_accuracy_and_error(self) -> None:
+        assert count_accuracy("I count 5.", ["5"]) == {"accuracy": 1.0, "mae": 0.0}
+        assert count_accuracy("I count 2.", ["5"]) == {"accuracy": 0.0, "mae": 3.0}
+        assert count_accuracy("Many.", ["5"]) == {"accuracy": 0.0, "mae": 5.0}
+
+
+class TestPointsInMasks:
+    def test_points_are_read_from_every_tag(self) -> None:
+        text = '<point x="10.0" y="20.0" alt="a">a</point> then <points x1=1 y1=2 x2="3" y2=\'4\''
+        assert parse_points(text) == [(10.0, 20.0), (1.0, 2.0), (3.0, 4.0)]
+        assert parse_points("no points here") == []
+
+    def test_precision_recall_and_count_error(self) -> None:
+        masks = np.zeros((2, 3, 5), dtype=bool)
+        masks[0, 0, 0] = True
+        masks[1, 2, 4] = True
+        prediction = '<points x1="0" y1="0" x2="100" y2="100" x3="50" y3="50">'
+        assert points_in_masks(prediction, masks) == {
+            "precision": 2 / 3,
+            "recall": 1.0,
+            "count_mae": 1.0,
+        }
+        assert points_in_masks('<point x="0" y="0">', masks) == {
+            "precision": 1.0,
+            "recall": 0.5,
+            "count_mae": 1.0,
+        }
+        assert points_in_masks("none", masks) == {"precision": 0.0, "recall": 0.0, "count_mae": 2.0}
+
+    def test_without_an_object_only_the_count_error_moves(self) -> None:
+        empty = np.zeros((0, 0, 0), dtype=bool)
+        assert points_in_masks('<point x="1" y="1">', empty) == {
+            "precision": 0.0,
+            "recall": 0.0,
+            "count_mae": 1.0,
+        }
+
+
+class TestFinalNumber:
+    @pytest.mark.parametrize(
+        ("prediction", "expected"),
+        [
+            ("So the answer is 1,234.", 1.0),
+            ("First 3, then 1234", 1.0),
+            ("1234.0", 1.0),
+            ("1234 apples, then 12", 0.0),
+            ("no number", 0.0),
+        ],
+    )
+    def test_the_last_number_is_compared(self, prediction: str, expected: float) -> None:
+        assert final_number(prediction, ["1234"]) == expected
+
+
+class TestChoiceLetter:
+    @pytest.mark.parametrize(
+        ("prediction", "expected"),
+        [("C", 1.0), ("The answer is C.", 1.0), ("a C", 1.0), ("B or C", 0.0), ("c", 0.0)],
+    )
+    def test_the_first_standalone_capital_letter_is_the_choice(
+        self, prediction: str, expected: float
+    ) -> None:
+        assert choice_letter(prediction, ["C"]) == expected
 
 
 class TestMeanScores:

@@ -12,7 +12,7 @@ Periodic evaluation is off by default. With ``--eval-tasks``, ``--eval-command``
 started once the checkpoint is complete and never waited for while the run trains, and
 the output is the directory that gets one results directory per step. Every other
 argument must then be a ``--section.key=value`` override: the evaluations receive the
-same overrides and refuse any other argument.
+same overrides, and ``--mixture=<file>`` with them, and refuse any other argument.
 
 Usage:
     # Multi-GPU (single node, via torchrun)
@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from mixture import mixture_data_fn
 
@@ -104,6 +105,7 @@ def main() -> None:
     from evaluation.checkpoint import check_supported
     from evaluation.periodic import PeriodicEvaluation, PeriodicEvaluationHook
 
+    passed_on = [f"{MIXTURE_FLAG}{Path(mixtures[0]).resolve()}"] if mixtures else []
     try:
         check_supported(config)
         settings = PeriodicEvaluation(
@@ -111,7 +113,7 @@ def main() -> None:
             tasks=parsed.eval_tasks,
             command=parsed.eval_command,
             output_root=parsed.eval_output,
-            overrides=tuple(overrides),
+            overrides=(*passed_on, *overrides),
         )
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
