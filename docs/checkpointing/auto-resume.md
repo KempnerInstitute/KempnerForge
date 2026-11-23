@@ -92,9 +92,16 @@ step, tokens_seen = 0, 0
 if resume_path and config.checkpoint.load_path:
     logger.warning(...)  # rank 0, unless load_path is resume_path: load_path is not used
 if resume_path or config.checkpoint.load_path:
+    warm_start_exclude = (
+        (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
+    )
+    vlm_freeze_expected = ...  # VLM runs only: the freeze expected at the saved step
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
         scheduler=scheduler,
+        warm_start=resume_path is None,
+        exclude_keys=warm_start_exclude,
+        vlm_freeze_expected=vlm_freeze_expected,
         exact_resume=resume_path is not None,
     )
     if resume_path:
@@ -124,13 +131,20 @@ as with a mixture or a streamed dataset on another data-parallel size, a
 switch of `data.hf_streaming`, a changed stream, or a checkpoint saved
 before the loader recorded its batch size on another data-parallel size,
 the warm start logs a warning that names the reason and starts the data
-at its first sample. A resume from `checkpoint.dir` raises
-`DataPositionError` in those cases instead. With
+at its first sample. A resume from `checkpoint.dir` stops instead. A
+checkpoint with per-rank state refuses a resume onto another world size
+or data-parallel layout with a `RankStateMismatchError`, before any data
+position is applied; on the topology that saved it, a position that
+does not fit, after a switch of `data.hf_streaming` or a changed
+stream, raises `DataPositionError`. A checkpoint saved before per-rank
+state was recorded applies rank 0's position on every rank and raises
+`DataPositionError` where it cannot carry over. With
 `checkpoint.ignore_rank_state_mismatch` set, a resume onto another world
-size or data-parallel layout, or of a checkpoint saved before per-rank
-state was recorded, treats the data position as a warm start does;
-without it, a checkpoint with per-rank state refuses a resume onto
-another world size or layout before the data position is applied (see
+size or layout, and any resume of a checkpoint saved before per-rank
+state was recorded, even on the topology that saved it, treats the data
+position as a warm start does and restarts the RNG streams. The flag
+does not cover a position that does not fit on the topology that saved
+per-rank state: it still raises `DataPositionError` (see
 [Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size)).
 
 If both are set, `resume_path` wins (auto-resume takes precedence

@@ -170,15 +170,15 @@ the mismatch, what was kept and what was dropped:
 |-------|-------------------|
 | `step`, `tokens_seen` | continue |
 | Model, optimizer, scheduler | continue, resharded by DCP onto the new topology |
-| Dataloader position | continues at the same sample where it carries over (below); otherwise restarts from the first sample, with a warning |
+| Dataloader position | continues from the saved rank 0's position where it carries over (below), at the same sample for a single map-style dataset; otherwise restarts from the first sample, with a warning |
 | RNG streams | restart from the run's seeds |
 
 The data position kept is the one the saved rank 0 reached, and every
 rank's loader applies it by the loader's own rule
 ([Stateful dataloader § Resuming on another data-parallel size](../data/stateful-dataloader.md#resuming-on-another-data-parallel-size)).
-A single dataset's position (`data.dataset_path`, an in-memory
-Hugging Face dataset or a VLM dataset) counts the samples of the
-epoch's order that all data-parallel ranks consumed, so it carries
+A single map-style dataset's position (`data.dataset_path`, an
+in-memory Hugging Face dataset or a VLM dataset) counts the samples of
+the epoch's order that all data-parallel ranks consumed, so it carries
 over to any data-parallel size and batch size: each rank resumes at
 its first sample past that count, and no sample is skipped or read
 twice. Three positions carry over only on the saved data-parallel
@@ -186,9 +186,13 @@ size: a weighted mixture (`data.datasets`), a streamed dataset
 (`data.hf_streaming`), and a checkpoint saved before the loader
 recorded its batch size. On another data-parallel size their data
 restarts from the first sample, with a warning that names the reason,
-and the resume goes on, since the flag opted in. The data order does
-not depend on the RNG streams: the samplers and the stream shuffle
-with the data seed and the epoch.
+and the resume goes on, since the flag opted in. A stream resumed this
+way on the saved data-parallel size continues from rank 0's count on
+every rank, which is exact only until the first rank finishes its part
+of a pass; past that a rank can skip or read data again, and it warns
+([Stateful dataloader § Several ranks](../data/stateful-dataloader.md#several-ranks)).
+The data order does not depend on the RNG streams: the samplers and
+the stream shuffle with the data seed and the epoch.
 
 Two cases keep no data position. A loader other than
 `StatefulDataLoader` and `StreamingDataLoader`, passed to
@@ -202,8 +206,8 @@ to compare, so it cannot show whether the topology changed. Without the
 flag every rank applies rank 0's data position and RNG streams, and a
 position that cannot carry over stops the resume with a
 `DataPositionError`; with the flag the resume goes on as if the topology
-changed, with rank 0's data position by the rule above and fresh RNG
-streams.
+changed, even on the topology that saved it, with rank 0's data
+position by the rule above and fresh RNG streams.
 
 Resharding model and optimizer state never needs the flag; it is
 untouched by the per-rank state. Nor do the loads that are not an
