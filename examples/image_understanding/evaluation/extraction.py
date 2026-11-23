@@ -16,6 +16,7 @@ their scores.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ logger = get_logger(__name__)
 EXTRACTOR_MODEL = "google/bigbird-base-trivia-itc"
 EXTRACTOR_REVISION = "b653c106e2cae13eea0d8d08b5c73101eb923fc3"
 EXTRACTOR_FILES = ("config.json", "pytorch_model.bin", "spiece.model")
+EXTRACTOR_LOAD_TIMEOUT_SEC = 600.0
 MAX_ANSWER_TOKENS = 15
 CANDIDATE_SPANS = 12
 WINDOW_STRIDE = 128
@@ -185,6 +187,32 @@ def answer_spans(start: np.ndarray, end: np.ndarray, kept: np.ndarray) -> list[S
     return spans[:CANDIDATE_SPANS]
 
 
+def _within[T](seconds: float, action: Callable[[], T], overdue: str) -> T:
+    """``action()``, run on a daemon thread and abandoned after ``seconds``.
+
+    An exception ``action`` raises is raised here, and one that runs longer
+    raises ``TimeoutError(overdue)``; its thread keeps running and does not hold
+    up the process's exit.
+    """
+    outcome: list[T] = []
+    failure: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            outcome.append(action())
+        except BaseException as exc:
+            failure.append(exc)
+
+    worker = threading.Thread(target=run, name="answer-extractor-load", daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        raise TimeoutError(overdue)
+    if failure:
+        raise failure[0]
+    return outcome[0]
+
+
 def _characters(window: Encoding, first: int, last: int) -> tuple[int, int]:
     """The context characters of the words holding tokens ``first`` to ``last``.
 
@@ -202,12 +230,19 @@ def _characters(window: Encoding, first: int, last: int) -> tuple[int, int]:
 class AnswerExtractor:
     """Reads the answer to a question out of a reply, the span a model takes to answer it.
 
-    ``load`` builds the model on ``device``, ``load_bigbird`` when it is ``None``;
+    ``device`` ``cuda`` without an index is the CUDA device current when the
+    extractor is made, each rank's own under several processes. ``load`` builds
+    the model on it, ``load_bigbird`` when ``load`` is ``None``;
     it runs on the first call, which a reply that needs no model never makes, and
-    a load that raises is tried again by the next call. Calling the extractor
-    returns the span of ``context`` that answers ``question``, as described in
-    this module, or ``""`` when the context holds no token (only whitespace),
-    where the pipeline finds no answer at all.
+    a load that raises is tried again by the next call. A load, download
+    included, that takes longer than ``load_timeout`` seconds raises
+    ``TimeoutError``: under several processes the others wait for this one at
+    the end of the task, and a cache lock or a download can block without end,
+    so the deadline sits well inside the process group's timeout (1,800 s by
+    default) and the evaluation stops on every rank with the reason. Calling the
+    extractor returns the span of ``context`` that answers ``question``, as
+    described in this module, or ``""`` when the context holds no token (only
+    whitespace), where the pipeline finds no answer at all.
 
     Raises:
         ValueError: ``device`` is not a torch device, or is a CUDA device and
@@ -215,7 +250,10 @@ class AnswerExtractor:
     """
 
     def __init__(
-        self, device: str = "cpu", load: Callable[[torch.device], SpanModel] | None = None
+        self,
+        device: str = "cpu",
+        load: Callable[[torch.device], SpanModel] | None = None,
+        load_timeout: float = EXTRACTOR_LOAD_TIMEOUT_SEC,
     ) -> None:
         try:
             self.device = torch.device(device)
@@ -223,14 +261,22 @@ class AnswerExtractor:
             raise ValueError(f"extractor_device {device!r} is not a torch device: {exc}") from exc
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise ValueError(f"extractor_device {device!r} needs CUDA, which is not available")
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self._load = load
+        self.load_timeout = load_timeout
         self._loaded: SpanModel | None = None
 
     def _span_model(self) -> SpanModel:
         if self._loaded is None:
             started = time.perf_counter()
             load = self._load if self._load is not None else load_bigbird
-            self._loaded = load(self.device)
+            overdue = (
+                f"loading the answer extractor took longer than {self.load_timeout:g} s; fetch "
+                f"{EXTRACTOR_MODEL} at revision {EXTRACTOR_REVISION} into the Hugging Face cache "
+                "before the evaluation"
+            )
+            self._loaded = _within(self.load_timeout, lambda: load(self.device), overdue)
             logger.info(
                 f"Loaded the answer extractor on {self.device} in "
                 f"{time.perf_counter() - started:.1f} s"

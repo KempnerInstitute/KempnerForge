@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -266,6 +268,45 @@ class TestAnswerExtractor:
             extract("what?", "a cat")
         assert extract("what?", "a cat") == "a"
         assert len(attempts) == 2
+
+    def test_a_load_past_its_deadline_stops_with_the_model_to_fetch(
+        self, spiece_model: Path
+    ) -> None:
+        released = threading.Event()
+
+        def stuck(device: torch.device) -> SpanModel:
+            released.wait(30)
+            raise OSError("released")
+
+        extract = AnswerExtractor(load=stuck, load_timeout=0.2)
+        started = time.monotonic()
+        try:
+            with pytest.raises(TimeoutError, match=f"longer than 0.2 s; fetch {EXTRACTOR_MODEL}"):
+                extract("what?", "a cat")
+        finally:
+            released.set()
+        assert time.monotonic() - started < 10
+
+    def test_a_load_runs_off_the_calling_thread(self, spiece_model: Path) -> None:
+        tokenizer = bigbird_tokenizer(spiece_model, TOKENS)
+        span_model = SpanModel(tokenizer, _Logits({}, {}), _id(tokenizer, "[CLS]"))
+        threads: list[threading.Thread] = []
+
+        def load(device: torch.device) -> SpanModel:
+            threads.append(threading.current_thread())
+            return span_model
+
+        AnswerExtractor(load=load)("what?", "a cat")
+        assert threads and threads[0] is not threading.current_thread()
+        assert threads[0].daemon
+
+    def test_cuda_without_an_index_is_the_current_device(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+        assert AnswerExtractor("cuda").device == torch.device("cuda", 3)
+        assert AnswerExtractor("cuda:1").device == torch.device("cuda", 1)
 
     def test_a_device_torch_cannot_read_is_refused(self) -> None:
         with pytest.raises(ValueError, match="extractor_device 'gpu0' is not a torch device"):
