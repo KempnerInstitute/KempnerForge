@@ -48,6 +48,35 @@ and `lm_head.weight`, the head as a copy of the embedding, since safetensors
 refuses tensors that share memory. `config.json` sets `tie_word_embeddings`,
 so transformers ties the two again when it loads the export.
 
+### What transformers can load
+
+transformers builds a dense export as `LlamaForCausalLM` and an MoE export
+as `MixtralForCausalLM`. Both have SwiGLU MLPs or experts and RMSNorm, and
+neither has a query or key norm, so `dcp-to-hf` refuses, before it reads the
+checkpoint, a model with an `activation` other than `"silu"`,
+`norm_type = "layernorm"` or `qk_norm = true`, and an MoE model with what
+Mixtral lacks (see [MoE](#moe)). It names each setting; transformers would
+load such an export with those parts dropped or left random.
+`--no-architecture-check` exports such a model anyway, with a warning, for
+`hf-to-dcp` to read back (see [Resharding](resharding.md)).
+
+### MoE
+
+An MoE model exports as `MixtralForCausalLM`, under the names a Mixtral
+checkpoint uses (see [Key mapping](#key-mapping)); transformers 5 packs each
+layer's experts when it loads them. Packed experts (`moe_packed_experts`) are
+written as one tensor per expert, like unpacked ones.
+
+A Mixtral model routes with softmax top-k in every layer and has no shared
+experts, so besides the settings above `dcp-to-hf` refuses an MoE model with
+`moe_shared_experts > 0`, `moe_frequency > 1` or a `moe_router` other than
+`"softmax_topk"` (see [What transformers can load](#what-transformers-can-load)).
+
+transformers has no expert capacity: the export of a model with
+`moe_capacity_factor > 0` drops no tokens, where KempnerForge drops those
+past an expert's capacity in evaluation as in training. `dcp-to-hf` warns
+about it.
+
 ### Dtypes
 
 The export dtype is the first of:
@@ -68,6 +97,15 @@ The script logs the dtype and where it came from, e.g.
 `torch_dtype` in the exported `config.json`, so
 `from_pretrained(..., dtype="auto")` loads the weights at the precision
 they were written in.
+
+At bfloat16 or float16, transformers' logits can differ from
+KempnerForge's at the same precision, enough to change some predicted
+tokens: it rounds the normalized activations before scaling them by the
+norm weight, where KempnerForge scales first, and Mixtral's router takes
+its softmax in float32, so a token whose top experts nearly tie can route
+to another one. A float32 export of an MoE model that passes the
+architecture check gives the same logits while no token passes an expert's
+capacity (see [MoE](#moe)).
 
 No optimizer / scheduler / RNG — only weights. If you need those,
 keep the DCP checkpoint; HF format doesn't carry them. A
@@ -154,14 +192,27 @@ main translations:
 | `layers.{i}.mlp_norm.weight` | `model.layers.{i}.post_attention_layernorm.weight` |
 | `layers.{i}.mlp.{gate,up,down}_proj.weight` | `model.layers.{i}.mlp.{gate,up,down}_proj.weight` |
 
-MoE-specific:
+MoE-specific, in Mixtral's names:
 
 | KempnerForge | HuggingFace |
 |--------------|-------------|
-| `layers.{i}.mlp.router.gate.weight` | `model.layers.{i}.mlp.gate.weight` |
-| `layers.{i}.mlp.router.expert_bias` | `model.layers.{i}.mlp.expert_bias` |
-| `layers.{i}.mlp.shared_expert.*` | `model.layers.{i}.mlp.shared_experts.*` (plural in HF) |
-| `layers.{i}.mlp.experts.{j}.*` | `model.layers.{i}.mlp.experts.{j}.*` (identical) |
+| `layers.{i}.mlp.router.gate.weight` | `model.layers.{i}.block_sparse_moe.gate.weight` |
+| `layers.{i}.mlp.experts.{j}.gate_proj.weight` | `model.layers.{i}.block_sparse_moe.experts.{j}.w1.weight` |
+| `layers.{i}.mlp.experts.{j}.down_proj.weight` | `model.layers.{i}.block_sparse_moe.experts.{j}.w2.weight` |
+| `layers.{i}.mlp.experts.{j}.up_proj.weight` | `model.layers.{i}.block_sparse_moe.experts.{j}.w3.weight` |
+| `layers.{i}.mlp.{gate,down,up}_w` (packed) | the same `w1`, `w2`, `w3` of each expert, its slice transposed |
+
+`hf-to-dcp` reads these names, and the ones exports used before them:
+`model.layers.{i}.mlp.gate.weight` for the router and
+`model.layers.{i}.mlp.experts.{j}.{gate,up,down}_proj.weight` for the
+experts. From a hub ID it reads a loaded model, whose experts transformers
+5 packs into `mlp.experts.gate_up_proj` and `mlp.experts.down_proj`, and
+splits them. For a model with packed experts it stacks each layer's experts
+into `gate_w`, `up_w` and `down_w`. Mixtral has no expert bias or shared
+experts: `dcp-to-hf` refuses models with them unless given
+`--no-architecture-check` (see [MoE](#moe)), and then writes them as
+`model.layers.{i}.mlp.expert_bias` and `model.layers.{i}.mlp.shared_experts.*`,
+which `hf-to-dcp` reads back.
 
 The sigmoid router's `fp32_ema_bits` and `fp32_bias_bits`, FP32 masters
 of its balancing state held as int32 bit patterns, are not exported.
@@ -208,8 +259,9 @@ For a dense model:
 `torch_dtype` is the export dtype, so a `float32` or `float16` export
 names that dtype instead of `bfloat16`.
 
-For MoE the architecture is `MixtralForCausalLM` and three extra
-fields (`num_local_experts`, `num_experts_per_tok`,
+For MoE the architecture is `MixtralForCausalLM`, `intermediate_size`
+is the width of one expert (`computed_expert_ffn_hidden_dim`), and three
+extra fields (`num_local_experts`, `num_experts_per_tok`,
 `router_aux_loss_coef`) are added.
 
 Not included: tokenizer files. Copy `tokenizer.json`, `tokenizer_config.json`,
