@@ -26,6 +26,7 @@ from convert_checkpoint import (
     main,
 )
 
+from kempnerforge.checkpoint.manager import derive_buffers, derived_buffer_owners
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.model.router import SigmoidTopKRouter
@@ -486,12 +487,17 @@ class TestExportDtypePrecedence:
 
 
 def _random_dcp(path: Path, model_config: ModelConfig, std: float = 1.0) -> Transformer:
-    """Save a model whose every weight, norms included, is drawn at random; return it."""
+    """Save a model whose every weight, norms included, is drawn at random; return it.
+
+    Buffers derived from the weights, such as the sigmoid router's FP32 masters, are
+    derived again from the drawn ones, as a trained model keeps them.
+    """
     model = Transformer(model_config)
     generator = torch.Generator().manual_seed(0)
     with torch.no_grad():
         for param in model.parameters():
             param.normal_(std=std, generator=generator)
+    derive_buffers(model, derived_buffer_owners(model))
     dcp.save({"model": model.state_dict()}, checkpoint_id=str(path))
     return model
 
