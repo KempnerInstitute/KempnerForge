@@ -1623,7 +1623,7 @@ class TestLayoutChange:
         return model, optimizer, scheduler
 
     @pytest.mark.parametrize("at_once", [False, True], ids=["before-the-stage", "at-the-stage"])
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_a_save_without_a_staged_module_resumes_like_an_unbroken_run(
         self, tmp_path, name, at_once
     ):
@@ -1661,7 +1661,7 @@ class TestLayoutChange:
         for (n, p), q in zip(resumed.named_parameters(), expected.parameters(), strict=True):
             assert torch.equal(p, q), n
 
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_a_module_unfrozen_without_a_stage_is_refused_by_the_group_check(self, tmp_path, name):
         """With no stage the encoder's parameters do not resume fresh, so its groups are not
         taken, and the refusal is the one that names the layout change and the way out."""
