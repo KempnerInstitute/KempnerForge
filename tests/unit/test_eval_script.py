@@ -35,6 +35,57 @@ class _Picked(Exception):
 
 
 class TestEvalScriptCheckpoint:
+    @pytest.mark.parametrize("rank", [0, 1])
+    def test_only_rank_zero_looks_for_the_checkpoint(self, monkeypatch, rank):
+        """Every rank evaluates the checkpoint rank 0 finds, so no two ranks load different ones."""
+        script = _eval_script()
+        looked: list[str] = []
+
+        def resolve(checkpoint_dir, **kwargs):
+            looked.append(checkpoint_dir)
+            return Path("/runs/a/step_7")
+
+        def broadcast(objects, src):
+            assert src == 0
+            if rank != 0:
+                objects[0] = {"path": "/runs/a/step_7", "error": None}
+
+        monkeypatch.setattr(script, "resolve_resume_path", resolve)
+        monkeypatch.setattr(script.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(script.dist, "get_rank", lambda: rank)
+        monkeypatch.setattr(script.dist, "broadcast_object_list", broadcast)
+        assert script._newest_save("/runs/a") == "/runs/a/step_7"
+        assert looked == (["/runs/a"] if rank == 0 else [])
+
+    def test_rank_zero_shares_an_error_it_hits_while_looking(self, monkeypatch):
+        """Rank 0 broadcasts its error before raising it, and another rank raises one naming it."""
+        script = _eval_script()
+
+        def resolve(checkpoint_dir, **kwargs):
+            raise PermissionError(13, "Permission denied", checkpoint_dir)
+
+        sent: list = []
+        rank = 0
+
+        def broadcast(objects, src):
+            if rank == 0:
+                sent.append(dict(objects[0]))
+            else:
+                objects[0] = sent[0]
+
+        monkeypatch.setattr(script, "resolve_resume_path", resolve)
+        monkeypatch.setattr(script.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(script.dist, "get_rank", lambda: rank)
+        monkeypatch.setattr(script.dist, "broadcast_object_list", broadcast)
+        with pytest.raises(PermissionError, match="Permission denied"):
+            script._newest_save("/runs/a")
+        assert sent == [
+            {"path": None, "error": "PermissionError: [Errno 13] Permission denied: '/runs/a'"}
+        ]
+        rank = 1
+        with pytest.raises(RuntimeError, match="Rank 0 could not find the checkpoint to evaluate"):
+            script._newest_save("/runs/a")
+
     def test_eval_loads_the_newest_save_even_without_its_train_state(self, tmp_path, monkeypatch):
         """Eval loads the weights alone, so a save that lacks only ``train_state.pt`` serves."""
         script = _eval_script()
@@ -66,3 +117,58 @@ class TestEvalScriptCheckpoint:
             script.main()
 
         assert loads == [{"path": str(run / "step_20"), "exclude_keys": ["optimizer"]}]
+
+    def test_eval_averages_the_loss_over_the_data_parallel_groups(self, tmp_path, monkeypatch):
+        """``run_eval`` gets the data-parallel groups of the job's mesh, so the loss the
+        script prints covers every rank's share of the eval set, not rank 0's alone."""
+        script = _eval_script()
+        run = tmp_path / "run"
+        _saved(run / "step_10", train_state=True)
+        config_path = tmp_path / "eval.toml"
+        config_path.write_text("")
+        mesh, groups = object(), (object(),)
+        calls: list[dict] = []
+
+        class LoadingManager:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def load(self, **kwargs):
+                return 10, 0, {}
+
+        class FourSamples(torch.utils.data.Dataset):
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def __len__(self) -> int:
+                return 4
+
+            def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+                tokens = torch.zeros(4, dtype=torch.long)
+                return {"input_ids": tokens, "labels": tokens}
+
+        def run_eval(*args, **kwargs) -> dict[str, float]:
+            calls.append(kwargs)
+            return {"eval/loss": 1.0, "eval/perplexity": 2.0}
+
+        monkeypatch.setattr(script, "get_world_info", lambda: (0, 0, 1))
+        monkeypatch.setattr(script, "init_distributed", lambda *args, **kwargs: mesh)
+        monkeypatch.setattr(script, "get_dp_info", lambda device_mesh: (0, 1))
+        monkeypatch.setattr(
+            script,
+            "data_parallel_groups",
+            lambda device_mesh: groups if device_mesh is mesh else (),
+        )
+        monkeypatch.setattr(
+            script, "build_parallel_model", lambda *args, **kwargs: torch.nn.Linear(2, 2)
+        )
+        monkeypatch.setattr(script, "CheckpointManager", LoadingManager)
+        monkeypatch.setattr(script, "MemoryMappedDataset", FourSamples)
+        monkeypatch.setattr(script, "run_eval", run_eval)
+        monkeypatch.setattr(script, "destroy_distributed", lambda: None)
+        argv = [str(config_path), f"--checkpoint.dir={run}", f"--eval.dataset_path={tmp_path}"]
+        monkeypatch.setattr(sys, "argv", ["eval.py", *argv])
+
+        script.main()
+
+        assert [call.get("dp_groups") for call in calls] == [groups]

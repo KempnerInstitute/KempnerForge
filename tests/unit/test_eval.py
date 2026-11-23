@@ -366,6 +366,54 @@ def _check_two_stage_fsdp_eval(
         dist.destroy_process_group()
 
 
+def _check_data_parallel_eval(rank: int, world: int, port: int) -> None:
+    """Each rank evaluates its own batches; with the DP groups every rank reports their mean."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from kempnerforge.distributed.utils import data_parallel_groups
+
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
+        torch.manual_seed(0)
+        model = _TinyLM()
+        torch.manual_seed(100 + rank)
+        loader = _make_eval_dataloader(num_samples=12)
+        with torch.no_grad():
+            own = [_loss_fn(model(b["input_ids"]), b["labels"]).item() for b in loader]
+        mine = sum(own) / len(own)
+        everyone: list = [None] * world
+        dist.all_gather_object(everyone, mine)
+        mean = sum(everyone) / world
+        metrics = run_eval(
+            model,
+            loader,
+            _loss_fn,
+            torch.device("cpu"),
+            len(own),
+            dp_groups=data_parallel_groups(mesh),
+        )
+        assert metrics["eval/loss"] == pytest.approx(mean, rel=1e-6), (rank, metrics, everyone)
+        assert metrics["eval/perplexity"] == pytest.approx(math.exp(mean), rel=1e-6)
+        assert run_eval(model, loader, _loss_fn, torch.device("cpu"), len(own))[
+            "eval/loss"
+        ] == pytest.approx(mine, rel=1e-6)
+    finally:
+        dist.destroy_process_group()
+
+
+class TestRunEvalOverDataParallel:
+    def test_the_loss_is_the_mean_over_dp_ranks(self):
+        """``eval/loss`` covers every DP rank's batches, and the perplexity is the
+        exponential of that mean; without the groups a rank reports its own."""
+        import torch.multiprocessing as mp
+
+        mp.spawn(_check_data_parallel_eval, args=(2, _free_port()), nprocs=2)
+
+
 class _NoBatchSchedule:
     """A pipeline schedule that must not be reached."""
 

@@ -40,7 +40,7 @@ loader — if both are set, pre-tokenized takes precedence.
 def run_eval(
     model, eval_dataloader, loss_fn, device, eval_steps,
     *, pp_schedule=None, pp_rank=None, pp_size=None, pp_group=None,
-    pp_n_microbatches=None,
+    pp_n_microbatches=None, dp_groups=(),
 ) -> dict[str, float]:
 ```
 
@@ -52,6 +52,13 @@ Returns
 
 The `min(avg_loss, 20.0)` caps perplexity at `e^20 ≈ 5e8` so an early
 NaN-adjacent loss doesn't overflow the WandB / TensorBoard logger.
+
+Each data-parallel rank evaluates `eval_steps` batches of its own share
+of the eval set. With `dp_groups`, the `data_parallel_groups` of the
+mesh, which the training loop and `scripts/eval.py` pass, `avg_loss` is
+the mean over those ranks, so `eval/loss` covers `eval_steps * dp_size`
+batches, and the perplexity is the exponential of that mean. Without
+them, a rank reports its own batches only.
 
 `run_eval` toggles `model.eval()` on entry and `model.train()` on
 exit, so the training loop can call it mid-training without leaving the
@@ -121,6 +128,16 @@ if eval_config.enabled and eval_dataloader is not None \
     hook_runner.on_eval_end(eval_metrics, step)
 ```
 
+The call runs inside `evaluation_point(optimizer, model)` from
+`kempnerforge.training.optimizer`. An optimizer that evaluates at
+another point than it trains at, as `schedule_free_adamw` does, has
+`eval_params()` and `train_params()`: eval then sees its averaged
+weights `x`, and training continues from the training point `y`, bit
+for bit. Every FSDP2 unit of the model is resharded before the swap and
+after it, so a unit that stays gathered after the eval forward
+(`reshard_after_forward` false) does not hand `x` to the next training
+step. Every other optimizer evaluates the live weights.
+
 Cadence tuning:
 
 - `interval = 1000` with `steps = 50` means eval runs ~50 batches
@@ -143,7 +160,9 @@ Cadence tuning:
 4. Creates a dummy `torch.optim.SGD(lr=0.0)` — unused, but required by
    `CheckpointManager.load()`'s signature.
 5. Loads the checkpoint with `exclude_keys=["optimizer"]` so the
-   dummy SGD state isn't overwritten.
+   dummy SGD state isn't overwritten. A `schedule_free_adamw`
+   checkpoint's model entry holds the averaged weights `x`, so this
+   evaluates `x`; one written before checkpoints held `x` has `y`.
 6. Builds the eval dataloader (pre-tokenized or HF-streaming).
 7. Calls `run_eval` and prints the results + a JSON line for
    programmatic consumption.
