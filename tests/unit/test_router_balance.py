@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -15,13 +16,17 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+
+from generate import _load_model
+
 from kempnerforge.checkpoint.manager import (
     CheckpointManager,
     derived_buffer_owners,
     drop_derived_model_keys,
 )
 from kempnerforge.config.model import ModelConfig
-from kempnerforge.config.schema import CheckpointConfig, OptimizerConfig
+from kempnerforge.config.schema import CheckpointConfig, JobConfig, OptimizerConfig
 from kempnerforge.distributed.parallel import apply_fsdp2
 from kempnerforge.model.router import SigmoidTopKRouter
 from kempnerforge.model.transformer import Transformer
@@ -244,6 +249,22 @@ class TestCheckpointsThatTrainedTheBias:
         model, _, manager = _manager(tmp_path, trained_bias=False, **groups)
         manager.load(exclude_keys=["optimizer"])
         assert torch.equal(_routers(model)[0].expert_bias.detach(), saved)
+
+    def test_generate_loads_it_with_the_masters_derived(self, tmp_path: Path) -> None:
+        """scripts/generate.py starts the masters from the loaded EMA and bias, as the manager
+        does, instead of failing on the keys the checkpoint predates."""
+        saved = _save_as_main(tmp_path)
+        config = JobConfig(
+            model=_config(), checkpoint=CheckpointConfig(load_path=str(tmp_path / "step_1"))
+        )
+        model = _load_model(config, torch.device("cpu"), torch.float32)
+        routers = _routers(model)
+        assert torch.equal(routers[0].expert_bias.detach(), saved)
+        for router in routers:
+            ema, bias = router._masters()
+            assert torch.equal(bias, router.expert_bias.detach().float())
+            assert torch.equal(router.expert_ema, EMA)
+            assert torch.equal(ema, EMA)
 
 
 def _bf16_managers(directory: Path, count: int = 2):
