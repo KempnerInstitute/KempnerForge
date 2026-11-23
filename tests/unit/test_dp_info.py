@@ -625,6 +625,11 @@ class TestDataParallelReduction:
 
 
 class TestLoggedMetricsOverDataParallel:
+    @pytest.fixture(autouse=True)
+    def _hide_cuda(self, monkeypatch):
+        """Start the ranks with CUDA hidden, so the loop's NaN check reduces a CPU flag."""
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+
     def test_train_and_eval_loss_are_dp_means_on_every_rank(self):
         """The tracker, the hooks and eval see the mean over the DP ranks, not each
         rank's own loss, so rank 0's backends log the whole job's loss."""

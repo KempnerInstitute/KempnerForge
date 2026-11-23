@@ -6,8 +6,8 @@ control group it made, and a NaN loss on one rank skips the step on every rank
 (#375).
 
 Two gloo ranks run the real ``run_training_loop`` and only one of them sees the
-event. Without CUDA, ``NaNDetector.check_loss`` reduces its flag on the CPU, so the
-NaN case runs the loop's real cross-rank check.
+event. The loop tests start the ranks with CUDA hidden, so ``NaNDetector.check_loss``
+reduces its flag on the CPU and the NaN case runs the loop's real cross-rank check.
 """
 
 from __future__ import annotations
@@ -221,6 +221,11 @@ class TestAnyRank:
 
 
 class TestLoopStopsOnEveryRank:
+    @pytest.fixture(autouse=True)
+    def _hide_cuda(self, monkeypatch):
+        """Start the ranks with CUDA hidden, so the loop's NaN check reduces a CPU flag."""
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+
     def test_a_shutdown_seen_on_one_rank_stops_every_rank_at_that_step(self, tmp_path):
         outcomes = _outcomes(tmp_path, "shutdown")
         assert outcomes == {r: "step=2 saves=[2] nans=0" for r in range(WORLD)}
