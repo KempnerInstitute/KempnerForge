@@ -41,8 +41,9 @@ Three things to note:
 
   ```toml
   [train]
-  nan_action          = "raise"   # fail fast on the first NaN / Inf step
-  nan_max_consecutive = 20        # or tolerate a longer run of them
+  nan_action = "raise"         # fail fast on the first NaN / Inf step
+  # or keep "warn" and tolerate a longer run of them:
+  # nan_max_consecutive = 20
   ```
 - **The gradient norm is checked with the loss.** A finite loss can come with
   non-finite gradients: a micro-batch whose labels are all `-100` has an exact
