@@ -1315,10 +1315,16 @@ class TestHfEncoderOverrideWarning:
         )
 
     def test_warns_when_clip_paired_with_feature_dim(self, caplog):
+        """The warning also says when feature_dim is needed, which the build's
+        error for a model config without hidden_size asks for."""
         with caplog.at_level("WARNING", logger="kempnerforge.config.job"):
             self._vlm_config_with(type="clip", feature_dim=768)
         assert any(
-            "clip" in r.getMessage() and "feature_dim=768" in r.getMessage() for r in caplog.records
+            "clip" in r.getMessage()
+            and "feature_dim=768" in r.getMessage()
+            and "feature_dim is needed only for a model whose config has no hidden_size"
+            in r.getMessage()
+            for r in caplog.records
         )
 
     def test_warns_with_both_overrides(self, caplog):

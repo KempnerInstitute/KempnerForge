@@ -297,3 +297,67 @@ class TestHFVisionEncoderMocked:
         enc = builder("dummy/path")
         assert enc.feature_dim == 32
         assert enc.num_tokens == 16
+
+    @staticmethod
+    def _install_tower_without_hidden_size(monkeypatch, has_cls_token: bool) -> None:
+        """Swap in an ``AutoModel`` whose vision tower's config has no ``hidden_size``."""
+        import sys
+
+        class _NoHiddenSizeAuto:
+            @staticmethod
+            def from_pretrained(path: str) -> torch.nn.Module:  # noqa: ARG004
+                tower = _FakeVisionTower(has_cls_token=has_cls_token)
+                del tower.config.hidden_size
+                wrapper = torch.nn.Module()
+                wrapper.vision_model = tower  # type: ignore[attr-defined]
+                return wrapper
+
+        fake_mod = type(sys)("transformers")
+        fake_mod.AutoModel = _NoHiddenSizeAuto  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "transformers", fake_mod)
+
+    @pytest.mark.parametrize(
+        ("builder_name", "has_cls_token"), [("siglip2", False), ("clip", True)]
+    )
+    def test_a_tower_without_hidden_size_asks_for_feature_dim(
+        self, monkeypatch, builder_name, has_cls_token
+    ):
+        """The width of the features is unknown, so the build names the encoder
+        path and the key that sets the width rather than passing -1 on."""
+        self._install_tower_without_hidden_size(monkeypatch, has_cls_token)
+        builder = registry.get_vision_encoder(builder_name)
+        with pytest.raises(
+            ValueError,
+            match=r"vision_encoder\.path = 'org/tower' has no hidden_size in its config, so the "
+            r"width of its features is unknown; set vision_encoder\.feature_dim to that width",
+        ):
+            builder("org/tower")
+
+    @pytest.mark.parametrize(
+        ("builder_name", "has_cls_token"), [("siglip2", False), ("clip", True)]
+    )
+    def test_feature_dim_stands_in_for_a_missing_hidden_size(
+        self, monkeypatch, builder_name, has_cls_token
+    ):
+        self._install_tower_without_hidden_size(monkeypatch, has_cls_token)
+        enc = registry.get_vision_encoder(builder_name)("org/tower", feature_dim=64)
+        assert enc.feature_dim == 64
+        assert enc(torch.zeros(1, 3, 224, 224)).shape == (1, 196, 64)
+
+    def test_a_vlm_build_reports_the_encoder_not_the_adapter(self, monkeypatch):
+        """The -1 width used to reach the adapter, which raised
+        'MLP2LayerAdapter in_dim and out_dim must be positive'."""
+        from kempnerforge.config.adapter import AdapterConfig
+        from kempnerforge.config.model import ModelConfig
+        from kempnerforge.config.vision import VisionEncoderConfig
+        from kempnerforge.config.vlm import VLMConfig
+        from kempnerforge.model.vlm import build_vlm_wrapper
+
+        self._install_tower_without_hidden_size(monkeypatch, has_cls_token=False)
+        with pytest.raises(ValueError, match=r"set vision_encoder\.feature_dim"):
+            build_vlm_wrapper(
+                ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=256, max_seq_len=512),
+                VisionEncoderConfig(type="siglip2", path="org/tower"),
+                AdapterConfig(),
+                VLMConfig(max_text_len=32),
+            )

@@ -380,7 +380,7 @@
           "purpose": "Test-stub vision encoder: deterministic random features by image_id hash. No download; used for VLM smokes"
         },
         "_HFVisionEncoder(VisionEncoder)": {
-          "purpose": "Wraps a HuggingFace vision model (SigLIP2 or CLIP). Optionally strips the [CLS] token. Stays in HF's loaded dtype; the adapter casts at the boundary"
+          "purpose": "Wraps a HuggingFace vision model (SigLIP2 or CLIP). Optionally strips the [CLS] token. Stays in HF's loaded dtype; the adapter casts at the boundary. feature_dim is the builder's, else the tower config's hidden_size; a config without one raises asking for vision_encoder.feature_dim"
         }
       },
       "registry": [
@@ -391,7 +391,8 @@
       "tested_by": [
         "tests/unit/test_vision.py::TestRandomVisionEncoder",
         "tests/unit/test_vision.py::TestHFEncoders",
-        "tests/unit/test_vision.py::TestVisionEncoderRegistry"
+        "tests/unit/test_vision.py::TestVisionEncoderRegistry",
+        "tests/unit/test_vision.py::TestHFVisionEncoderMocked"
       ]
     },
     "kempnerforge/model/vlm.py": {
@@ -1927,9 +1928,9 @@
           "TestRandomVisionEncoder(6)",
           "TestHFEncoders(1)",
           "TestVisionEncoderRegistry(3)",
-          "TestHFVisionEncoderMocked(5)"
+          "TestHFVisionEncoderMocked(11)"
         ],
-        "count": 15
+        "count": 21
       },
       "tests/unit/test_cross_attention.py": {
         "classes": [

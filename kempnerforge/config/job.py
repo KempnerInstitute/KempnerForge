@@ -123,7 +123,8 @@ class JobConfig:
                 logging.getLogger(__name__).warning(
                     "vision_encoder.type=%r is HF-backed and probes its own dims; "
                     "setting %s overrides the probe and may desync from the loaded "
-                    "model. Leave both at 0 to use the probed values.",
+                    "model. Leave both at 0 to use the probed values; feature_dim is "
+                    "needed only for a model whose config has no hidden_size.",
                     self.vision_encoder.type,
                     " and ".join(overrides),
                 )

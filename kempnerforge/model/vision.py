@@ -100,6 +100,10 @@ def _build_random(
 class _HFVisionEncoder(VisionEncoder):
     """Shared wrapper for HuggingFace vision encoders (SigLIP2, CLIP, ...).
 
+    ``feature_dim`` is the width of the features the tower returns. Left
+    ``None``, it is read from the tower config's ``hidden_size``, and a config
+    without one raises ``ValueError`` asking for ``vision_encoder.feature_dim``.
+
     The HF model's vision tower produces patch tokens. CLIP-family towers
     prepend a CLS token at position 0; SigLIP/SigLIP2 towers do not. The
     ``has_cls_token`` flag tells the encoder which architecture it wraps so
@@ -112,6 +116,7 @@ class _HFVisionEncoder(VisionEncoder):
         path: str,
         strip_cls: bool = False,
         has_cls_token: bool = True,
+        feature_dim: int | None = None,
     ) -> None:
         super().__init__()
         if strip_cls and not has_cls_token:
@@ -139,7 +144,15 @@ class _HFVisionEncoder(VisionEncoder):
         patch_size = getattr(cfg, "patch_size", 16) if cfg is not None else 16
         hidden = getattr(cfg, "hidden_size", None) if cfg is not None else None
         n_patches = (image_size // patch_size) ** 2
-        self.feature_dim = int(hidden) if hidden else -1
+        if feature_dim is None:
+            if not hidden:
+                raise ValueError(
+                    f"The vision tower loaded from vision_encoder.path = {path!r} has no "
+                    "hidden_size in its config, so the width of its features is unknown; set "
+                    "vision_encoder.feature_dim to that width"
+                )
+            feature_dim = int(hidden)
+        self.feature_dim = feature_dim
         if has_cls_token and not strip_cls:
             self.num_tokens = n_patches + 1
         else:
@@ -161,11 +174,9 @@ def _build_siglip2(
     **_: Any,
 ) -> VisionEncoder:
     """Builder for a SigLIP2 vision tower. SigLIP2 has no CLS token."""
-    enc = _HFVisionEncoder(path, strip_cls=False, has_cls_token=False)
+    enc = _HFVisionEncoder(path, strip_cls=False, has_cls_token=False, feature_dim=feature_dim)
     if num_tokens is not None:
         enc.num_tokens = num_tokens
-    if feature_dim is not None:
-        enc.feature_dim = feature_dim
     return enc
 
 
@@ -180,9 +191,7 @@ def _build_clip(
     token; we strip it so ``num_tokens`` matches the number of image
     patches.
     """
-    enc = _HFVisionEncoder(path, strip_cls=True, has_cls_token=True)
+    enc = _HFVisionEncoder(path, strip_cls=True, has_cls_token=True, feature_dim=feature_dim)
     if num_tokens is not None:
         enc.num_tokens = num_tokens
-    if feature_dim is not None:
-        enc.feature_dim = feature_dim
     return enc
