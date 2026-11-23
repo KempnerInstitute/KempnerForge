@@ -37,6 +37,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Collection, Container, Iterable, Iterator, Mapping, Sequence
+from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeGuard, cast
@@ -744,6 +745,9 @@ class CheckpointManager:
             peak times its multiplier (see ``restore_train_state``).
         module_patterns: Module name to fnmatch patterns, such as ``VLMConfig.module_patterns``.
             Required for every module ``lr_multipliers`` lists.
+        group_timeout_sec: Collective timeout of the gloo group the manager creates to order
+            its saves across ranks, ``distributed.nccl_timeout_sec`` in training. None leaves
+            PyTorch's default.
     """
 
     def __init__(
@@ -757,6 +761,7 @@ class CheckpointManager:
         weight_decay_scope: str | None = None,
         lr_multipliers: Mapping[str, float] | None = None,
         module_patterns: Mapping[str, Sequence[str]] | None = None,
+        group_timeout_sec: float | None = None,
     ) -> None:
         self._dp_info = dp_coordinates(dp_info) if dp_info is not None else None
         if dp_info is not None and self._dp_info is None:
@@ -792,11 +797,14 @@ class CheckpointManager:
         self._tracking_source: TrackingSource | None = None
         self._registrar: CheckpointRegistrar | None = None
         self._sidecar_lock = threading.Lock()
-        self._sync_group: dist.ProcessGroup | None = (
-            cast("dist.ProcessGroup", dist.new_group(backend="gloo"))
-            if dist.is_initialized()
-            else None
-        )
+        self._sync_group: dist.ProcessGroup | None = None
+        if dist.is_initialized():
+            self._sync_group = cast(
+                "dist.ProcessGroup",
+                dist.new_group(backend="gloo")
+                if group_timeout_sec is None
+                else dist.new_group(backend="gloo", timeout=timedelta(seconds=group_timeout_sec)),
+            )
 
     def _checkpoint_dir(self, step: int) -> Path:
         return self.base_dir / f"step_{step}"

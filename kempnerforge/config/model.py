@@ -18,6 +18,12 @@ class Activation(StrEnum):
     relu = "relu"
 
 
+CORE_MLP_KEY_ACTIVATIONS: dict[str, Activation] = {
+    "swiglu": Activation.silu,
+    "standard_gelu": Activation.gelu,
+    "standard_relu": Activation.relu,
+}
+
 FLEX_BLOCK_SIZE = 128
 
 FLEX_MIN_HEAD_DIM = 16
@@ -25,7 +31,13 @@ FLEX_MIN_HEAD_DIM = 16
 
 @dataclass
 class ModelConfig:
-    """Architecture hyperparameters for a transformer model."""
+    """Architecture hyperparameters for a transformer model.
+
+    ``activation`` is an ``Activation`` member, or the name of an MLP a plugin registered
+    under ``mlp``. Core's own ``mlp`` keys (``CORE_MLP_KEY_ACTIVATIONS``) are rejected in
+    favor of the activation that selects each, and a plugin's MLP is rejected with
+    ``num_experts > 0``: the MoE expert kernels compute core's SwiGLU or standard MLP.
+    """
 
     dim: int = 4096
     n_layers: int = 32
@@ -87,9 +99,28 @@ class ModelConfig:
                 f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads}) "
                 "unless head_dim_override is set"
             )
+        if self.head_dim_override == 0 and (self.dim // self.n_heads) % 2:
+            raise ValueError(
+                f"dim ({self.dim}) // n_heads ({self.n_heads}) gives an odd head_dim "
+                f"({self.dim // self.n_heads}), and rotary embeddings need an even one; "
+                "change dim or n_heads, or set an even head_dim_override"
+            )
         if self.n_heads % self.n_kv_heads != 0:
             raise ValueError(
                 f"n_heads ({self.n_heads}) must be divisible by n_kv_heads ({self.n_kv_heads})"
+            )
+        if self.activation in CORE_MLP_KEY_ACTIVATIONS:
+            selects = CORE_MLP_KEY_ACTIVATIONS[self.activation].value
+            raise ValueError(
+                f"activation={self.activation!r} is the mlp registry key that "
+                f"activation={selects!r} selects; set activation={selects!r} instead"
+            )
+        if self.num_experts > 0 and self.activation not in Activation:
+            raise ValueError(
+                f"activation={self.activation!r} selects a plugin-registered MLP, which MoE "
+                f"experts do not support (num_experts={self.num_experts}): the expert kernels "
+                "compute core's SwiGLU or standard MLP from the expert weights. Use 'silu', "
+                "'gelu' or 'relu' with MoE, or set num_experts = 0"
             )
 
         if self.sdpa_backend not in ("auto", "flash", "efficient", "cudnn", "math"):
