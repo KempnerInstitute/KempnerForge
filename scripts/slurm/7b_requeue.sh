@@ -17,7 +17,7 @@
 set -euo pipefail
 
 CONFIG="configs/train/7b_16gpu_adamw.toml"
-OVERRIDES="$@"
+OVERRIDES=("$@")
 
 NNODES="${SLURM_NNODES}"
 NGPUS_PER_NODE="${SLURM_GPUS_PER_NODE:-4}"
@@ -45,9 +45,9 @@ echo "Total GPUs:   $((NNODES * NGPUS_PER_NODE))"
 echo "Master:       ${MASTER_ADDR}:${MASTER_PORT}"
 echo "IB interface: ${IB_IFNAME}"
 echo "Config:       ${CONFIG}"
-echo "Overrides:    ${OVERRIDES}"
+echo "Overrides:    ${OVERRIDES[*]}"
 echo "Restart cnt:  ${SLURM_RESTART_COUNT:-0}"
 echo "=================================================="
 
 srun --kill-on-bad-exit=1 \
-    uv run python scripts/train.py "${CONFIG}" ${OVERRIDES}
+    uv run python scripts/train.py "${CONFIG}" "${OVERRIDES[@]}"

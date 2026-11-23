@@ -27,9 +27,15 @@ Each flag must begin with `--`. Parsing splits once on `=`:
   sets it to `true`.
 - The value has to follow `=`. A value passed as the next argument, as in
   `--train.max_steps 7`, is refused with an error that shows
-  `--train.max_steps=7`. Other arguments without `--` are skipped, such
-  as the config path when `load_config` reads `sys.argv[1:]` because it
-  got no `cli_args`.
+  `--train.max_steps=7`.
+- A value with a space has to reach the loader as one argument, so quote
+  it: `'--metrics.wandb_run_name=7b baseline'`. Unquoted, the shell splits
+  off `baseline`, and an argument without `--` after an override is
+  refused with an error that shows the quoted form. Arguments without
+  `--` before the first override are skipped, such as the config path
+  when `load_config` reads `sys.argv[1:]` because it got no `cli_args`.
+- The SLURM launchers in `scripts/slurm/` pass each override on as one
+  argument, so a quoted value stays whole through them.
 
 ## Value parsing
 

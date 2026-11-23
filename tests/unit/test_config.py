@@ -1690,8 +1690,34 @@ class TestCliParsing:
         """A notebook kernel's argv, read when load_config gets no cli_args, is skipped."""
         assert _parse_cli_overrides(["-f", "/run/kernel-1.json"]) == {}
 
-    def test_skips_an_argument_after_a_complete_override(self):
-        assert _parse_cli_overrides(["--model.dim=512", "extra"]) == {"model": {"dim": 512}}
+    @pytest.mark.parametrize(
+        "args,fix",
+        [
+            (["--model.dim=512", "extra"], "'--model.dim=512 extra'"),
+            (["--metrics.wandb_run_name=7b", "baseline"], "'--metrics.wandb_run_name=7b baseline'"),
+            (["--checkpoint.dir=/some", "dir"], "'--checkpoint.dir=/some dir'"),
+            (
+                ["--metrics.wandb_run_name=my", "long", "name", "--train.max_steps=7"],
+                "'--metrics.wandb_run_name=my long name'",
+            ),
+            (["--checkpoint.dir", "/some", "dir"], "'--checkpoint.dir=/some dir'"),
+        ],
+    )
+    def test_an_argument_after_an_override_is_refused_with_the_fix(self, args, fix):
+        """An argument without -- after an override, such as the rest of a value with a
+        space that a shell split off, is refused instead of dropped, and the message
+        joins the arguments up to the next override back into the override."""
+        with pytest.raises(ValueError, match=f"write {re.escape(fix)}$"):
+            _parse_cli_overrides(args)
+
+    @pytest.mark.parametrize("value", ["7b baseline", "/some dir", "a  b", "x -7"])
+    def test_following_the_suggestion_after_a_split_value_gives_the_value(self, value):
+        """Typing the suggestion for a value a shell split on spaces passes it whole."""
+        with pytest.raises(ValueError) as refused:
+            _parse_cli_overrides(f"--metrics.wandb_run_name={value}".split())
+        suggestion = str(refused.value).split("write ", 1)[1]
+        expected = {"metrics": {"wandb_run_name": " ".join(value.split())}}
+        assert _parse_cli_overrides(shlex.split(suggestion)) == expected
 
     @pytest.mark.parametrize(
         "args,fix",
@@ -1722,6 +1748,13 @@ class TestCliParsing:
     def test_load_config_refuses_a_space_separated_override(self):
         with pytest.raises(ValueError, match="write --train.max_steps=7"):
             load_config("configs/train/debug.toml", cli_args=["--train.max_steps", "7"])
+
+    def test_load_config_refuses_an_argument_after_a_complete_override(self):
+        with pytest.raises(ValueError, match="write '--metrics.wandb_run_name=7b baseline'"):
+            load_config(
+                "configs/train/debug.toml",
+                cli_args=["--metrics.wandb_run_name=7b", "baseline"],
+            )
 
     def test_documented_commands_write_each_override_with_an_equals_sign(self):
         """Commands in the docs pass --section.key=value, since a value after a space is

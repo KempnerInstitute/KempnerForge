@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import itertools
 import shlex
 import sys
 import tomllib
@@ -237,27 +238,31 @@ def _parse_cli_overrides(args: list[str]) -> dict[str, Any]:
       --train.compile_model (a bare key means true)
       --optimizer.betas=[0.9,0.95]
 
-    Other arguments without ``--`` are skipped, such as the config path when
-    ``load_config`` reads ``sys.argv[1:]``.
+    Arguments without ``--`` before the first override are skipped, such as the
+    config path when ``load_config`` reads ``sys.argv[1:]``.
 
     Raises:
-        ValueError: An argument without ``--`` follows a bare key, as the value of a
-            space-separated ``--section.key value`` would, which would otherwise be
-            dropped while the key read as true. The message shows the override joined
-            with ``=`` and quoted for a shell.
+        ValueError: An argument without ``--`` follows an override. After a bare key
+            it is the value of a space-separated ``--section.key value``, which would
+            otherwise be dropped while the key read as true; after a complete override
+            it is the rest of a value with a space that a shell split off, which would
+            otherwise be dropped from the value. The message shows the override with
+            the arguments up to the next override joined back, quoted for a shell.
     """
     overrides: dict[str, Any] = {}
 
-    bare_key: str | None = None
-    for arg in args:
+    flag: str | None = None
+    for i, arg in enumerate(args):
         if not arg.startswith("--"):
-            if bare_key is not None:
+            if flag is not None:
+                rest = " ".join(itertools.takewhile(lambda a: not a.startswith("--"), args[i:]))
+                joined = f"{flag} {rest}" if "=" in flag else f"{flag}={rest}"
                 raise ValueError(
-                    f"Unexpected command-line argument {arg!r} after {bare_key}: "
-                    f"write {shlex.quote(f'{bare_key}={arg}')}"
+                    f"Unexpected command-line argument {arg!r} after {flag}: "
+                    f"write {shlex.quote(joined)}"
                 )
             continue
-        bare_key = None if "=" in arg else arg
+        flag = arg
         if "=" not in arg:
             key = arg[2:]
             value_str = "true"
