@@ -191,7 +191,7 @@ def build_checkpoint_manager(
         from kempnerforge.distributed.pipeline_parallel import build_stage_group
 
         ckpt_pp_rank = pipeline.rank
-        ckpt_pg = build_stage_group(device_mesh)
+        ckpt_pg = build_stage_group(device_mesh, config.distributed.nccl_timeout_sec)
     return CheckpointManager(
         config.checkpoint,
         model,
@@ -202,6 +202,7 @@ def build_checkpoint_manager(
         weight_decay_scope=config.optimizer.weight_decay_scope,
         lr_multipliers=config.optimizer.lr_multipliers,
         module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
+        group_timeout_sec=config.distributed.nccl_timeout_sec,
     )
 
 
