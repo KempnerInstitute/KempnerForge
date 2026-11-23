@@ -14,7 +14,6 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from image_text.decode import decode_rgb
 from image_text.document import Document, Turn, is_text
@@ -43,7 +42,11 @@ def _is_image_type(kind: pa.DataType) -> bool:
 
 
 def _read_table(path: Path) -> pa.Table:
-    """The columns of ``COLUMNS`` in the file at ``path``, refused unless they have their types."""
+    """The columns of ``COLUMNS`` in the file at ``path``, the image struct flattened.
+
+    The struct's fields become columns named ``image.<field>``, null where the
+    struct is null. A file whose columns lack their types raises ``ValueError``.
+    """
     schema = pq.read_schema(path)
     kinds = {field.name: field.type for field in schema}
     usable = (
@@ -58,7 +61,7 @@ def _read_table(path: Path) -> pa.Table:
             f"{path}: a RealWorldQA file has an image struct with the encoded image in "
             f"its bytes field, and question and answer strings; its columns are {found}"
         )
-    return pq.read_table(path, columns=list(COLUMNS))
+    return pq.read_table(path, columns=list(COLUMNS)).flatten()
 
 
 class RealWorldQARows(Dataset):
@@ -82,7 +85,7 @@ class RealWorldQARows(Dataset):
         self._rows: list[tuple[int, int, str, str]] = []
         for number, path in enumerate(files):
             table = _read_table(Path(path))
-            self._images.append(pc.struct_field(table["image"], "bytes"))
+            self._images.append(table["image.bytes"])
             pairs = zip(table["question"].to_pylist(), table["answer"].to_pylist(), strict=True)
             for row, (question, answer) in enumerate(pairs):
                 if is_text(question) and is_text(answer):
