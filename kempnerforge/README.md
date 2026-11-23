@@ -19,7 +19,7 @@ PyTorch-native framework for fault-tolerant distributed training of foundation m
 - **Mechanistic interpretability**: activation extraction hooks at any layer with CPU offload; attention weight capture records each head's softmax(QK^T/√d) matrix.
 - **Sparse architecture research**: switch between dense and MoE by setting `num_experts` (0 for dense, >0 for MoE). Softmax top-k or DeepSeek-V3 sigmoid routing, shared experts, configurable MoE frequency.
 - **Optimizer and scheduler comparison**: 4 optimizers (AdamW, Muon, Lion, Schedule-Free AdamW) × 6 LR schedulers, composable via config. Data annealing phases for curriculum learning.
-- **Long-running jobs on shared clusters**: SLURM preemption handling, async DCP checkpointing, auto-resume, NaN detection, GPU/NCCL health monitoring.
+- **Long-running jobs on shared clusters**: SLURM preemption handling, async DCP checkpointing, auto-resume, NaN detection, opt-in NCCL liveness checks.
 - **Representation analysis for NeuroAI**: batch activation extraction via `ActivationStore` and `extract_representations()`, saved to `.npz` for downstream comparison against neural recordings.
 
 ## Features
@@ -39,7 +39,7 @@ PyTorch-native framework for fault-tolerant distributed training of foundation m
 - DCP async checkpointing with auto-resume
 - Stateful data pipeline, multi-dataset mixing, data annealing, HuggingFace integration (eager + streaming)
 - SLURM preemption, multi-node launch, `TrainingHook` extensibility
-- NaN / GPU / NCCL health monitoring, MFU tracking, WandB / TensorBoard backends
+- NaN detection, opt-in NCCL liveness checks, an on-demand GPU health check, MFU tracking, WandB / TensorBoard backends
 
 **Interpretability**
 - Activation hooks with CPU offload for probing, CKA, SVCCA

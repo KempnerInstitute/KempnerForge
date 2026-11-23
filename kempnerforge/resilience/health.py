@@ -131,21 +131,42 @@ class NaNDetector:
     def check_gradients(self, model: torch.nn.Module, step: int) -> bool:
         """Check model gradients for NaN/Inf before optimizer step.
 
+        Each rank checks the gradients it holds (the local shard of a
+        ``DTensor``). When running distributed, one all-reduce of a flag, as in
+        :meth:`check_loss`, gives every rank the same verdict, so this is a
+        collective that every rank must call, and the ranks all skip the step or
+        all take it. Unlike :meth:`check_loss` it leaves :attr:`state` as it is.
+
         Args:
-            model: The model to check.
+            model: The model to check, or this rank's pipeline stage of it.
             step: Current training step.
 
         Returns:
-            True if all gradients are finite.
+            True if all gradients are finite on ALL ranks, False if any rank
+            holds a NaN/Inf gradient.
+
+        Raises:
+            RuntimeError: If action is "raise" and any rank holds a NaN/Inf gradient.
         """
+        bad_name: str | None = None
         for name, param in model.named_parameters():
-            if param.grad is not None and not torch.isfinite(param.grad).all():
-                msg = f"NaN/Inf gradient in {name} at step {step}"
-                if self.action == "raise":
-                    raise RuntimeError(msg)
-                logger.warning(msg)
-                return False
-        return True
+            grad = param.grad
+            if grad is None:
+                continue
+            local = grad.to_local() if isinstance(grad, DTensor) else grad
+            if not torch.isfinite(local).all():
+                bad_name = name
+                break
+        if not _any_rank_flagged(bad_name is not None):
+            return True
+        if bad_name is not None:
+            msg = f"NaN/Inf gradient in {bad_name} at step {step}"
+        else:
+            msg = f"NaN/Inf gradient detected on another rank at step {step}"
+        if self.action == "raise":
+            raise RuntimeError(msg)
+        logger.warning(msg)
+        return False
 
     @property
     def should_rollback(self) -> bool:

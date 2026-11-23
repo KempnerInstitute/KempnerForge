@@ -76,6 +76,35 @@ def _check_loss_across_ranks(rank: int, world: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+def _check_gradients_across_ranks(rank: int, world: int, port: int) -> None:
+    """Only rank 1 holds a NaN gradient, then in its shard of a sharded one; every rank fails."""
+    dist.init_process_group(
+        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    try:
+        det = NaNDetector(action="warn")
+        model = torch.nn.Linear(3, 2)
+        model.weight.grad = torch.zeros(2, 3)
+        assert det.check_gradients(model, step=1) is True
+        if rank == 1:
+            model.weight.grad[0, 0] = float("nan")
+        assert det.check_gradients(model, step=2) is False
+        with pytest.raises(RuntimeError, match="NaN/Inf gradient"):
+            NaNDetector(action="raise").check_gradients(model, step=3)
+
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
+        sharded = torch.nn.Linear(3, 2 * world)
+        sharded.weight = torch.nn.Parameter(
+            distribute_tensor(torch.zeros(2 * world, 3), mesh, [Shard(0)])
+        )
+        grad = torch.zeros(2 * world, 3)
+        grad[2] = float("nan")
+        sharded.weight.grad = distribute_tensor(grad, mesh, [Shard(0)])
+        assert det.check_gradients(sharded, step=4) is False
+    finally:
+        dist.destroy_process_group()
+
+
 _TRITON_COMPILE_CHILD = """
 import importlib.util
 import os
@@ -539,6 +568,10 @@ class TestNaNDetectorAcrossRanks:
     def test_check_loss_reduces_its_flag_over_gloo(self):
         """Rank 0's own values are finite, so only the all-reduce can fail its check."""
         mp.spawn(_check_loss_across_ranks, args=(2, _free_port()), nprocs=2)
+
+    def test_check_gradients_gives_every_rank_the_same_verdict(self):
+        """Rank 0's own gradients are finite, so only the all-reduce can fail its check."""
+        mp.spawn(_check_gradients_across_ranks, args=(2, _free_port()), nprocs=2)
 
 
 class TestParamsAreFinite:

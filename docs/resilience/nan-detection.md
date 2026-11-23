@@ -42,8 +42,10 @@ Two things to note:
   its NaN gradients would reach `optimizer.step()`. The norm goes into the same
   all-reduced flag as the loss, so every rank skips the step together even when
   a non-finite gradient reaches only some ranks' norms.
-- **`check_gradients` is *not* called by the training loop.** It returns a
-  rank-local verdict; the gradient norm check above covers non-finite gradients.
+- **`check_gradients` is *not* called by the training loop.** The gradient
+  norm check above covers non-finite gradients. Like `check_loss`, it is a
+  collective that gives every rank the same verdict (see
+  [Manual use](#manual-use)).
 
 ## What a skipped step still does
 
@@ -262,10 +264,14 @@ for step, batch in enumerate(loader):
     det.check_loss(loss, step)    # raises on first NaN
 ```
 
-`check_gradients(model, step)` does the same but walks
-`model.named_parameters()` and returns `False` on the first NaN grad.
-The `action="raise"` mode raises `RuntimeError` instead of returning
-`False` (the warning case still returns `False`).
+`check_gradients(model, step)` does the same for the gradients. Each
+rank walks `model.named_parameters()` and checks the gradients it holds
+(the local shard of a `DTensor`); when running distributed, one
+all-reduce of a flag gives every rank the same verdict, so every rank
+must call it. It returns `False` on every rank if any rank holds a
+NaN / Inf gradient, and the `action="raise"` mode raises `RuntimeError`
+on every rank instead. Unlike `check_loss`, it leaves the consecutive-NaN
+count as it is.
 
 `params_are_finite(model, device)` from
 `kempnerforge.resilience.health` checks the parameters themselves and
@@ -280,8 +286,8 @@ every rank must call it.
   if you need something different.
 - **No gradient scan in the hot path.** `check_gradients` exists but
   isn't wired in. Add it if you're hunting a specific gradient
-  pathology; expect a small per-step cost (one `isfinite` + `.all()`
-  per parameter).
+  pathology, on every rank; expect a small per-step cost (one
+  `isfinite` + `.all()` per parameter, plus one all-reduce).
 - **Loss is already a CPU scalar.** `check_loss` gets a Python float, so
   the distributed sync creates a new tensor on CUDA (on the CPU when CUDA
   is unavailable) and all-reduces it

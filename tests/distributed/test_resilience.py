@@ -65,7 +65,7 @@ class TestNaNDetectorDistributed:
         assert loss_ok is True
 
     def test_nan_detected_across_ranks(self):
-        """Inject NaN on one rank and verify detection."""
+        """A NaN gradient injected on rank 0 alone fails the check on every rank."""
         rank, local_rank, _ = get_world_info()
         device = torch.device(f"cuda:{local_rank}")
 
@@ -78,12 +78,7 @@ class TestNaNDetectorDistributed:
             model.weight.grad[0, 0] = float("nan")
 
         det = NaNDetector(action="warn")
-        result = det.check_gradients(model, step=1)
-
-        if rank == 0:
-            assert result is False
-        else:
-            assert result is True
+        assert det.check_gradients(model, step=1) is False
 
     def test_bad_grad_norm_on_one_rank_skips_on_every_rank(self):
         """A NaN gradient norm on rank 0 alone, with finite losses, fails the check everywhere."""
