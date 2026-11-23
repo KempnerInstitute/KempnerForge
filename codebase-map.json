@@ -170,7 +170,9 @@
         "JobConfig": {
           "purpose": "Top-level config aggregating all sub-configs, cross-section validation",
           "methods": [
-            "validate(world_size)"
+            "validate(world_size)",
+            "masks_frames_in_backend_attention() (whether frame masks reach self-attention under model.sdpa_backend: the arch picks the strategy, the class the attention)",
+            "check_flash_attention_masks() (refuses sdpa_backend=flash for a training run whose batches carry a mask; the training setup calls it on CUDA)"
           ]
         }
       },
@@ -466,7 +468,7 @@
         "Attention": {
           "purpose": "Grouped-Query Attention with RoPE, SDPA or FlexAttention over the one attn_mask built per forward, optional QK-norm, lower-right causal bias for tokens appended to a KV cache, attention weight capture",
           "methods": [
-            "forward(x, rope_cos, rope_sin, *, kv_cache, attn_mask)",
+            "forward(x, rope_cos, rope_sin, *, kv_cache, attn_mask) (refuses a dense attn_mask under sdpa_backend=flash on CUDA)",
             "_sdpa_context()",
             "_attention_with_weights(q, k, v, seq_len, attn_mask, kv_cache)"
           ],
@@ -1573,7 +1575,7 @@
           "TestRMSNorm(3)",
           "TestBuildNorm(3)",
           "TestRoPE(7)",
-          "TestAttention(10)",
+          "TestAttention(13)",
           "TestMLP(5)",
           "TestEmbedding(3)",
           "TestTransformerBlock(2)",
@@ -1586,7 +1588,7 @@
           "TestMoT(10)",
           "TestInitWeights(5)"
         ],
-        "count": 77
+        "count": 80
       },
       "tests/unit/test_config.py": {
         "classes": [
@@ -1599,14 +1601,14 @@
           "TestDataConfig(2)",
           "TestMetricsConfig(2)",
           "TestProfilingConfig(1)",
-          "TestJobConfig(11)",
+          "TestJobConfig(16)",
           "TestTomlLoading(12)",
           "TestCliOverrides(11)",
           "TestCliParsing(6)",
           "TestRegistry(12)",
           "TestEvalConfig(7)"
         ],
-        "count": 107
+        "count": 112
       },
       "tests/unit/test_training.py": {
         "classes": [

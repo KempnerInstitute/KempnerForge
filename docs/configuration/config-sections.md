@@ -66,7 +66,7 @@ Architecture hyperparameters and MoE knobs.
 | `qk_norm` | `bool` | `False` | RMSNorm over Q/K per head before RoPE |
 | `init_std` | `float` | `0.02` | weight-init std (GPT-2 / Llama convention) |
 | `model_type` | `str` | `"transformer"` | `model` registry key |
-| `sdpa_backend` | `str` | `"auto"` | one of `"auto"`, `"flash"`, `"efficient"`, `"cudnn"`, `"math"` |
+| `sdpa_backend` | `str` | `"auto"` | one of `"auto"`, `"flash"`, `"efficient"`, `"cudnn"`, `"math"`; `"flash"` takes no attention mask on CUDA, so training runs that build one are refused (see [Validation rules](validation-rules.md#flash-attention-and-masked-runs)) |
 | `attention_backend` | `str` | `"sdpa"` | `"sdpa"` or `"flex"`; `"flex"` routes packed batches (`data.pack_sequences`) through FlexAttention's block-sparse mask. Requires `train.seq_len ≥ 128` and `head_dim ≥ 16` |
 
 ### MoE (all defaults produce a dense model)

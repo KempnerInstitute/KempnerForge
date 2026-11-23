@@ -3614,18 +3614,52 @@ class TestVlmSourceBuilders:
             dp.build_data_pipeline(config, _runtime(), tokens_per_image=too_many)
         assert "dataset" not in seen
 
-    def test_text_only_rows_are_refused_with_flash_attention(self, monkeypatch):
+    def test_text_only_rows_are_refused_with_flash_attention_on_cuda(self, monkeypatch):
+        """Their frame mask reaches SDPA under flex as well; CPU's flash kernel takes it."""
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
         self._stub_vlm_modules(monkeypatch, seen)
         config = self._vlm_data_config()
         config.model.sdpa_backend = "flash"
-        dp.build_data_pipeline(config, _runtime())
+        cuda = dataclasses.replace(_runtime(), device=torch.device("cuda", 0))
+        dp.build_data_pipeline(config, cuda)
         monkeypatch.setattr(FakeDataset, "has_text_only_rows", True)
-        with pytest.raises(ValueError, match="sdpa_backend='flash'"):
+        for backend in ("sdpa", "flex"):
+            config.model.attention_backend = backend
+            with pytest.raises(ValueError, match="sdpa_backend='flash'"):
+                dp.build_data_pipeline(config, cuda)
             dp.build_data_pipeline(config, _runtime())
-        config.model.attention_backend = "flex"
-        dp.build_data_pipeline(config, _runtime())
+        config.model.sdpa_backend = "auto"
+        dp.build_data_pipeline(config, cuda)
+
+    @pytest.mark.parametrize(
+        ("built", "named", "refused"),
+        [
+            ("cross_attention", "joint_decoder", True),
+            ("joint_decoder", "cross_attention", False),
+            ("mot", "joint_decoder", False),
+            ("moma", "mot", True),
+        ],
+    )
+    def test_the_text_only_refusal_follows_the_strategy_and_the_attention_built(
+        self, monkeypatch, built, named, refused
+    ):
+        from kempnerforge.config.vlm import VLMConfig
+
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        monkeypatch.setattr(FakeDataset, "has_text_only_rows", True)
+        config = self._vlm_data_config()
+        config.model.sdpa_backend = "flash"
+        config.vlm = VLMConfig.for_arch(built, max_text_len=config.vlm.max_text_len)
+        config.vlm.arch = named
+        cuda = dataclasses.replace(_runtime(), device=torch.device("cuda", 0))
+        if refused:
+            with pytest.raises(ValueError, match="sdpa_backend='flash'"):
+                dp.build_data_pipeline(config, cuda)
+        else:
+            dp.build_data_pipeline(config, cuda)
 
     def test_packed_image_path_takes_the_model_token_count(self, monkeypatch):
         import kempnerforge.data.vlm_dataset as vlmd
@@ -4090,6 +4124,29 @@ class TestSetupDistributed:
         with pytest.raises(ValueError, match=r"train\.seq_len \(128\) exceeds model\.max_seq_len"):
             rt.setup_distributed(make_config(seq_len=128))
         assert inits == []
+
+    @pytest.mark.parametrize("cuda", [False, True])
+    def test_a_flash_run_with_masks_is_refused_on_cuda_before_the_process_group(
+        self, monkeypatch, cuda
+    ):
+        import kempnerforge.training.runtime as rt
+
+        inits: list = []
+        monkeypatch.setattr(rt, "get_world_info", lambda: (0, 0, 1))
+        monkeypatch.setattr(rt, "init_distributed", lambda cfg, seed: inits.append(seed))
+        monkeypatch.setattr(rt, "log_job_info", lambda: None)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+        config = make_config()
+        config.model.sdpa_backend = "flash"
+        config.data.pack_sequences = True
+        config.data.dataset_path = "/some/data"
+        if cuda:
+            with pytest.raises(ValueError, match="sdpa_backend='flash'"):
+                rt.setup_distributed(config)
+            assert inits == []
+        else:
+            rt.setup_distributed(config)
+            assert len(inits) == 1
 
     def test_seed_is_threaded_into_init(self, monkeypatch):
         import kempnerforge.training.runtime as rt
