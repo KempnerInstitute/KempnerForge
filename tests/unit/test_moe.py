@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import time
+from datetime import timedelta
+from pathlib import Path
+
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn.functional as F
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import DistributedConfig, JobConfig, ModelConfig, TrainConfig
+from kempnerforge.distributed.parallel import apply_fsdp2
 from kempnerforge.model.mlp import StandardMLP, SwiGLUMLP, build_mlp
 from kempnerforge.model.moe import MoEMLP, build_moe
 from kempnerforge.model.router import SigmoidTopKRouter, SoftmaxTopKRouter
@@ -1424,3 +1434,166 @@ class TestPackedExperts:
 
         assert len(unpacked_expert_weights) == 3 * num_experts
         assert len(packed_expert_weights) == 3
+
+
+def _moe(packed: bool, router: str = "softmax_topk") -> MoEMLP:
+    torch.manual_seed(0)
+    layer = build_moe(
+        dim=32, hidden_dim=64, num_experts=8, top_k=1, router_type=router, packed_experts=packed
+    )
+    return layer.to(DEVICE)
+
+
+def _expert_grads(moe: MoEMLP, i: int) -> list[torch.Tensor | None]:
+    """The gradients of expert ``i``'s weights: its rows of the packed tensors, or its own."""
+    if moe.packed_experts:
+        packed = [moe.up_w, moe.down_w] + ([moe.gate_w] if moe._is_swiglu else [])
+        return [None if t.grad is None else t.grad[i] for t in packed]
+    return [p.grad for p in moe.experts[i].parameters()]
+
+
+def _assert_zero_grads(moe: MoEMLP) -> None:
+    for name, param in moe.named_parameters():
+        assert param.grad is not None, name
+        assert not torch.count_nonzero(param.grad), name
+
+
+def _fsdp2_backward(
+    rank: int, world: int, store: str, case: str, packed: bool, router: str
+) -> None:
+    """One fp32 FSDP2 step on gloo where the ranks leave different weights without tokens."""
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"file://{store}",
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
+        fp32 = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
+        torch.manual_seed(0)
+        if case == "idle":
+            config = ModelConfig(
+                dim=64,
+                n_layers=2,
+                n_heads=4,
+                vocab_size=128,
+                max_seq_len=16,
+                num_experts=8,
+                moe_top_k=1,
+                moe_router=router,
+                moe_packed_experts=packed,
+            )
+            model = Transformer(config)
+            apply_fsdp2(model, mesh, mp_policy=fp32)
+            torch.manual_seed(1 + rank)
+            tokens = torch.randint(0, 128, (1, 4))
+            targets = torch.randint(0, 128, (4,))
+            F.cross_entropy(model(tokens).flatten(0, 1), targets).backward()
+        else:
+            moe = build_moe(
+                dim=32,
+                hidden_dim=64,
+                num_experts=4,
+                top_k=1,
+                router_type=router,
+                packed_experts=packed,
+            )
+            fully_shard(moe, mesh=mesh, mp_policy=fp32)
+            x = torch.randn(1, 0 if rank == 1 else 4, 32, requires_grad=True)
+            moe(x).sum().backward()
+    finally:
+        dist.destroy_process_group()
+
+
+def _spawn_fsdp2(store: Path, case: str, packed: bool, router: str) -> None:
+    """Run ``_fsdp2_backward`` on two ranks; stop them if they have not finished in two minutes."""
+    ranks = mp.spawn(
+        _fsdp2_backward, args=(2, str(store), case, packed, router), nprocs=2, join=False
+    )
+    deadline = time.monotonic() + 120
+    try:
+        while not ranks.join(timeout=5):
+            assert time.monotonic() < deadline, "the FSDP2 ranks did not finish"
+    finally:
+        for process in ranks.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=10)
+            if process.is_alive():
+                process.kill()
+                process.join()
+        for error_file in ranks.error_files:
+            Path(error_file).unlink(missing_ok=True)
+
+
+class TestIdleExperts:
+    """Every expert and router weight gets a gradient, zero when it took no part, so the ranks'
+    FSDP2 reduce-scatters line up whichever experts their tokens leave idle (#567, #483)."""
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_the_sequential_path_gives_an_idle_expert_a_zero_gradient(self, packed: bool) -> None:
+        moe = _moe(packed)
+        x = torch.randn(1, 3, 32, device=DEVICE, requires_grad=True)
+        moe(x).sum().backward()
+        used = (moe.expert_counts > 0).tolist()
+        assert any(used) and not all(used)
+        for i, has_tokens in enumerate(used):
+            for grad in _expert_grads(moe, i):
+                assert grad is not None
+                assert bool(torch.count_nonzero(grad)) == has_tokens
+
+    @pytest.mark.parametrize("router", ["softmax_topk", "sigmoid_topk"])
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_a_layer_without_tokens_gives_every_weight_a_zero_gradient(
+        self, packed: bool, router: str
+    ) -> None:
+        """Its empty output alone keeps every expert and router weight in the graph."""
+        moe = _moe(packed, router)
+        x = torch.randn(1, 0, 32, device=DEVICE, requires_grad=True)
+        out = moe(x)
+        assert out.shape == (1, 0, 32)
+        out.sum().backward()
+        _assert_zero_grads(moe)
+
+    @pytest.mark.skipif(not hasattr(torch, "_grouped_mm"), reason="needs torch._grouped_mm")
+    @pytest.mark.parametrize("router", ["softmax_topk", "sigmoid_topk"])
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_a_bf16_layer_without_tokens_gives_every_weight_a_zero_gradient(
+        self, packed: bool, router: str
+    ) -> None:
+        """bf16 activations take the grouped path, on any device."""
+        moe = _moe(packed, router).to(dtype=torch.bfloat16)
+        x = torch.randn(1, 0, 32, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+        out = moe(x)
+        assert out.shape == (1, 0, 32) and out.dtype == torch.bfloat16
+        out.float().sum().backward()
+        _assert_zero_grads(moe)
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_the_zero_term_leaves_the_output_as_it_was(self, packed: bool, monkeypatch) -> None:
+        moe = _moe(packed)
+        x = torch.randn(1, 3, 32, device=DEVICE)
+        with torch.no_grad():
+            kept = moe(x)
+            monkeypatch.setattr(
+                MoEMLP, "_keep_in_graph", lambda self, output, params: output, raising=False
+            )
+            plain = moe(x)
+        assert torch.equal(kept, plain)
+
+    @pytest.mark.parametrize("router", ["softmax_topk", "sigmoid_topk"])
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_fsdp2_ranks_with_different_idle_experts_finish_the_backward(
+        self, tmp_path: Path, packed: bool, router: str
+    ) -> None:
+        """The two ranks' tokens leave different experts of each MoE layer idle (#483)."""
+        _spawn_fsdp2(tmp_path / "store", "idle", packed, router)
+
+    @pytest.mark.parametrize("router", ["softmax_topk", "sigmoid_topk"])
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_fsdp2_a_rank_whose_layer_gets_no_tokens_finishes_the_backward(
+        self, tmp_path: Path, packed: bool, router: str
+    ) -> None:
+        _spawn_fsdp2(tmp_path / "store", "empty", packed, router)
