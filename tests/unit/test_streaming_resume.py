@@ -11,11 +11,17 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import shutil
+import socket
+from datetime import timedelta
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from kempnerforge.config.schema import CheckpointConfig, DataConfig, JobConfig, TrainConfig
 from kempnerforge.data.dataloader import DataPositionError, StatefulDataLoader, StreamingDataLoader
@@ -30,19 +36,17 @@ SHARDS, DOCS_PER_SHARD = 4, 50
 ALL_SHARDS = tuple(range(SHARDS))
 
 
-@pytest.fixture(scope="module")
-def corpus(tmp_path_factory) -> tuple[Path, Path]:
-    """Local JSONL shards and a local tokenizer that maps every word to its document."""
+def _write_corpus(root: Path, docs_per_shard: tuple[int, ...]) -> tuple[Path, Path]:
+    """JSONL shards of ``docs_per_shard`` documents each, and a tokenizer for their words."""
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
 
-    root = tmp_path_factory.mktemp("stream")
     data = root / "corpus"
     data.mkdir()
     doc = 0
-    for shard in range(SHARDS):
+    for shard, documents in enumerate(docs_per_shard):
         with open(data / f"shard_{shard}.jsonl", "w") as f:
-            for _ in range(DOCS_PER_SHARD):
+            for _ in range(documents):
                 f.write(json.dumps({"text": " ".join([f"w{doc}"] * (3 + doc * 7 % 11))}) + "\n")
                 doc += 1
     vocab = {"<eos>": 0, "<unk>": 1, **{f"w{i}": i + 2 for i in range(doc)}}
@@ -51,6 +55,18 @@ def corpus(tmp_path_factory) -> tuple[Path, Path]:
     fast = PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token="<eos>", unk_token="<unk>")
     fast.save_pretrained(str(root / "tokenizer"))
     return data, root / "tokenizer"
+
+
+@pytest.fixture(scope="module")
+def corpus(tmp_path_factory) -> tuple[Path, Path]:
+    """Local JSONL shards and a local tokenizer that maps every word to its document."""
+    return _write_corpus(tmp_path_factory.mktemp("stream"), (DOCS_PER_SHARD,) * SHARDS)
+
+
+@pytest.fixture(scope="module")
+def uneven_corpus(tmp_path_factory) -> tuple[Path, Path]:
+    """A corpus whose first shard holds most documents, so data-parallel parts differ."""
+    return _write_corpus(tmp_path_factory.mktemp("uneven"), (60, 10, 10, 10))
 
 
 def _config(corpus, num_workers: int = 0, batch_size: int = 2, seq_len: int = 8) -> JobConfig:
@@ -223,6 +239,25 @@ def test_map_style_and_stream_positions_do_not_mix(corpus):
         mapped.load_state_dict(stream.state_dict())
     with pytest.raises(DataPositionError, match="streams its data"):
         _stream_loader(corpus).load_state_dict(mapped.state_dict())
+
+
+def test_check_state_refuses_what_load_state_dict_refuses_and_moves_nothing(corpus):
+    """``CheckpointManager`` checks a position on every rank before any rank applies it.
+
+    So ``check_state`` gives ``load_state_dict``'s verdict without applying the position.
+    """
+    loader = _stream_loader(corpus)
+    iterator = iter(loader)
+    for _ in range(3):
+        next(iterator)
+    state = loader.state_dict()
+    fresh = _stream_loader(corpus)
+    fresh.check_state(state)
+    assert (fresh.state_dict()["epoch"], fresh.state_dict()["batches_yielded"]) == (0, 0)
+    with pytest.raises(DataPositionError, match="stream changed"):
+        _stream_loader(corpus, seed=7).check_state(state)
+    with pytest.raises(DataPositionError, match="streams its data"):
+        fresh.check_state({"epoch": 0, "batches_yielded": 3})
 
 
 def test_a_replay_past_the_end_of_the_stream_starts_the_next_epoch(corpus, caplog, monkeypatch):
@@ -452,3 +487,261 @@ def test_the_replay_logs_its_progress(corpus, caplog, monkeypatch):
         next(iter(resumed))
     assert "Replaying 10 batches (160 tokens)" in caplog.text
     assert "Replayed 10 of 10 batches" in caplog.text and "tokens/s" in caplog.text
+
+
+DP2_TP2 = [(0, 2), (0, 2), (1, 2), (1, 2)]
+
+
+def _free_port() -> int:
+    """An unused local TCP port for the gloo rendezvous."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _init_gloo(rank: int, world: int, port: int) -> None:
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"tcp://127.0.0.1:{port}",
+        timeout=timedelta(seconds=120),
+    )
+
+
+def _seed_all(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def _draw() -> list[float]:
+    """One draw from each generator a checkpoint captures on CPU."""
+    return [random.random(), float(np.random.random()), float(torch.rand(()))]
+
+
+class _Collect(logging.Handler):
+    """Keeps the message of every warning it handles."""
+
+    def __init__(self, messages: list[str]) -> None:
+        super().__init__(logging.WARNING)
+        self.messages = messages
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+def _part_loader(data: str, tokenizer: str, dp: tuple[int, int]) -> StreamingDataLoader:
+    """A loader over data-parallel part ``dp[0]`` of ``dp[1]`` of the stream."""
+    dataset = StreamingHuggingFaceDataset(
+        data, "train", "text", seq_len=8, tokenizer_path=tokenizer, rank=dp[0], world_size=dp[1]
+    )
+    return StreamingDataLoader(
+        dataset, batch_size=2, config=DataConfig(num_workers=0, pin_memory=False)
+    )
+
+
+def _next_batches(stream: BatchStream, count: int = 3) -> list:
+    return [stream.next_batch()["input_ids"].tolist() for _ in range(count)]
+
+
+def _stream_manager(root: str, dp: tuple[int, int], lenient: bool):
+    """A manager that records this rank's data-parallel coordinates, as the training entry's."""
+    from kempnerforge.checkpoint.manager import CheckpointManager
+
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    config = CheckpointConfig(dir=root, ignore_rank_state_mismatch=lenient)
+    return CheckpointManager(config, model, optimizer, dp_info=dp)
+
+
+def _save_stream_job(
+    rank: int, world: int, port: int, root: str, data: str, tokenizer: str, steps: int, out: str
+) -> None:
+    """One rank of a 4-rank gloo job, laid out as dp 2 x tp 2, that saves its stream position.
+
+    Global rank ``r`` reads data-parallel part ``r // 2`` of 2 and takes ``steps``
+    batches, moving to the next pass where its part ends, as training does. After the
+    save, rank 0 writes every rank's saved pass and count and its next 3 batches, which
+    an exact resume of that data-parallel rank must read next.
+    """
+    _init_gloo(rank, world, port)
+    try:
+        loader = _part_loader(data, tokenizer, DP2_TP2[rank])
+        stream = BatchStream(DataPipeline(dataloader=loader))
+        for _ in range(steps):
+            stream.next_batch()
+        _stream_manager(root, DP2_TP2[rank], lenient=False).save(step=1, dataloader=loader)
+        state = loader.state_dict()
+        report = {"at": [state["epoch"], state["batches_yielded"]], "next": _next_batches(stream)}
+        gathered: list = [None] * world
+        dist.all_gather_object(gathered, report)
+        if rank == 0:
+            Path(out).write_text(json.dumps(gathered))
+    finally:
+        dist.destroy_process_group()
+
+
+def _resume_stream_job(
+    rank: int,
+    world: int,
+    port: int,
+    root: str,
+    views: list[str],
+    tokenizer: str,
+    layout: list[tuple[int, int]],
+    lenient: bool,
+    out: str,
+) -> None:
+    """One rank of a gloo job that auto-resumes the stream checkpoint, as the training entry does.
+
+    Rank ``r`` reads data-parallel part ``layout[r]`` of the stream in ``views[r]``,
+    loads with ``exact_resume=True`` and ``lenient`` as
+    ``checkpoint.ignore_rank_state_mismatch``, then applies the position with
+    ``apply_dataloader_state``. It seeds its generators with ``555 + r`` just before the
+    load. Rank 0 writes every rank's report: the error the resume raised or the next 3
+    batches, the next random draw and the one the fresh seeds give, and the warnings.
+    """
+    _init_gloo(rank, world, port)
+    warnings: list[str] = []
+    try:
+        dp = (layout[rank][0], layout[rank][1])
+        manager = _stream_manager(root, dp, lenient)
+        loader = _part_loader(views[rank], tokenizer, dp)
+        logging.getLogger("kempnerforge").addHandler(_Collect(warnings))
+        _seed_all(555 + rank)
+        report: dict = {"fresh": _draw(), "error": None, "next": []}
+        _seed_all(555 + rank)
+        try:
+            manager.load(exact_resume=True)
+            manager.apply_dataloader_state(loader)
+        except Exception as e:
+            report["error"] = f"{type(e).__name__}: {e}"
+        report["draw"] = _draw()
+        if report["error"] is None:
+            report["next"] = _next_batches(BatchStream(DataPipeline(dataloader=loader)))
+        report["warnings"] = warnings
+        gathered: list = [None] * world
+        dist.all_gather_object(gathered, report)
+        if rank == 0:
+            Path(out).write_text(json.dumps(gathered))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.fixture(scope="module")
+def stream_checkpoint(uneven_corpus, tmp_path_factory) -> tuple[str, list[dict]]:
+    """A stream position saved by 4 gloo ranks as dp 2 x tp 2, and the save job's reports.
+
+    The ranks take a few batches more than the longer data-parallel part holds, so each
+    part is in its second pass, at a count that differs between the parts.
+    """
+    data, tokenizer = (str(p) for p in uneven_corpus)
+    parts = [sum(1 for _ in _part_loader(data, tokenizer, (d, 2))) for d in range(2)]
+    assert parts[0] != parts[1], parts
+    root = tmp_path_factory.mktemp("stream_checkpoint")
+    out = str(root / "saved.json")
+    args = (4, _free_port(), str(root / "ckpt"), data, tokenizer, max(parts) + 3, out)
+    mp.spawn(_save_stream_job, args=args, nprocs=4)
+    return str(root / "ckpt"), json.loads(Path(out).read_text())
+
+
+def _resume_streams(tmp_path, root, views, tokenizer, layout, lenient) -> list[dict]:
+    out = str(tmp_path / "resumed.json")
+    args = (len(layout), _free_port(), root, views, tokenizer, layout, lenient, out)
+    mp.spawn(_resume_stream_job, args=args, nprocs=len(layout))
+    return json.loads(Path(out).read_text())
+
+
+def _fresh_batches(data: str, tokenizer: str, dp: tuple[int, int]) -> list:
+    return _next_batches(BatchStream(DataPipeline(dataloader=_part_loader(data, tokenizer, dp))))
+
+
+def _stale_copy(corpus, directory: Path) -> str:
+    """A copy of the corpus in which one data file has an extra document, so its size differs."""
+    data, _ = _copy(corpus, directory)
+    with open(data / "shard_3.jsonl", "a") as f:
+        f.write(json.dumps({"text": "w0 w0 w0"}) + "\n")
+    return str(data)
+
+
+def test_a_flag_resume_on_another_data_parallel_size_restarts_the_stream_on_every_rank(
+    uneven_corpus, stream_checkpoint, tmp_path
+):
+    """Resumed as dp 4 on 4 ranks, the positions saved on dp 2 have no counterpart.
+
+    Every rank warns with the reason and starts its part of the stream at its first
+    document, and the random streams restart.
+    """
+    data, tokenizer = (str(p) for p in uneven_corpus)
+    root, _ = stream_checkpoint
+    layout = [(r, 4) for r in range(4)]
+    resumed = _resume_streams(tmp_path, root, [data] * 4, tokenizer, layout, True)
+    for rank, report in enumerate(resumed):
+        assert report["error"] is None, report["error"]
+        assert report["next"] == _fresh_batches(data, tokenizer, layout[rank])
+        assert report["draw"] == report["fresh"], f"rank {rank} restored a saved RNG stream"
+        restarted = [w for w in report["warnings"] if "does not carry over" in w]
+        assert restarted and "data_parallel_size: saved 2, now 4" in restarted[0], restarted
+
+
+def test_a_flag_resume_restarts_every_rank_when_one_rank_sees_a_file_at_another_size(
+    uneven_corpus, stream_checkpoint, tmp_path
+):
+    """Rank 1 reads a copy with one data file grown, so only rank 1 cannot place its position.
+
+    The ranks agree before applying it: both start their parts of the stream at the
+    first document, rank 0's warning names rank 1 and why, and the random streams
+    restart. Before the agreement, rank 0 kept its position and rank 1 restarted.
+    """
+    data, tokenizer = (str(p) for p in uneven_corpus)
+    root, _ = stream_checkpoint
+    views = [data, _stale_copy(uneven_corpus, tmp_path / "stale")]
+    resumed = _resume_streams(tmp_path, root, views, tokenizer, [(0, 2), (1, 2)], True)
+    for rank, report in enumerate(resumed):
+        assert report["error"] is None, report["error"]
+        assert report["next"] == _fresh_batches(views[rank], tokenizer, (rank, 2)), f"rank {rank}"
+        assert report["draw"] == report["fresh"], f"rank {rank} restored a saved RNG stream"
+        restarted = [w for w in report["warnings"] if "does not carry over" in w]
+        assert restarted and "source data files differ" in restarted[0], report["warnings"]
+        assert "ranks [1]" in restarted[0], restarted[0]
+
+
+def test_without_the_flag_a_file_one_rank_sees_at_another_size_stops_every_rank(
+    uneven_corpus, stream_checkpoint, tmp_path
+):
+    """On the layout that saved it, a position that rank 3 alone cannot place stops every rank.
+
+    Every rank raises ``DataPositionError`` together, naming rank 3's reason, instead
+    of rank 3 raising alone while the others go on into the next collective.
+    """
+    data, tokenizer = (str(p) for p in uneven_corpus)
+    root, _ = stream_checkpoint
+    views = [data, data, data, _stale_copy(uneven_corpus, tmp_path / "stale")]
+    resumed = _resume_streams(tmp_path, root, views, tokenizer, DP2_TP2, False)
+    for rank, report in enumerate(resumed):
+        assert report["error"] is not None, f"rank {rank} resumed past rank 3's refusal"
+        assert report["error"].startswith("DataPositionError: "), report["error"]
+        assert "source data files differ" in report["error"], report["error"]
+        assert report["next"] == [], f"rank {rank} read data"
+
+
+def test_a_check_that_fails_on_one_rank_another_way_stops_every_rank(
+    uneven_corpus, stream_checkpoint, tmp_path
+):
+    """Rank 1's data directory is missing, so its check fails with an error of its own.
+
+    The ranks gather that verdict too: rank 1 raises its error and rank 0 a
+    ``RuntimeError`` naming rank 1, instead of waiting for it in the next collective.
+    """
+    data, tokenizer = (str(p) for p in uneven_corpus)
+    root, _ = stream_checkpoint
+    views = [data, str(tmp_path / "missing")]
+    resumed = _resume_streams(tmp_path, root, views, tokenizer, [(0, 2), (1, 2)], True)
+    assert resumed[1]["error"] is not None, "rank 1 resumed from a missing directory"
+    assert not resumed[1]["error"].startswith("RuntimeError: Checking"), resumed[1]["error"]
+    assert resumed[0]["error"] is not None, "rank 0 resumed without rank 1"
+    assert resumed[0]["error"].startswith(
+        "RuntimeError: Checking the saved data position failed on ranks [1]"
+    ), resumed[0]["error"]
+    assert [r["next"] for r in resumed] == [[], []]

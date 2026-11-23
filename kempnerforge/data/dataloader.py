@@ -31,8 +31,12 @@ class DataPositionError(ValueError):
 
     ``load_state_dict`` raises it when the saved position has no exact
     counterpart for this loader, such as a mixture position saved on another
-    data-parallel size. The saved state and the loader settings are the same on
-    every rank, so every rank raises it together.
+    data-parallel size, and ``check_state`` raises it without changing the
+    loader. A rank's view of the data, such as a stream's data file sizes, can
+    differ from another's, so ``CheckpointManager.apply_dataloader_state``
+    shares every rank's verdict before any rank applies a position, and every
+    rank raises it together, or restarts the data together where a warm start
+    or ``checkpoint.ignore_rank_state_mismatch`` allows.
     """
 
 
@@ -198,12 +202,7 @@ class StatefulDataLoader:
                 position is per rank (a mixture's, or one that predates the saved
                 batch size), or the state is a streaming position.
         """
-        if "stream" in state:
-            raise DataPositionError(
-                "The checkpoint holds a streaming data position, but this run reads a "
-                "map-style dataset (data.hf_streaming changed), so it has no sample to "
-                "resume at."
-            )
+        self.check_state(state)
         sampler_state = state.get("sampler", {})
         replicas = self.sampler.num_replicas
         saved_replicas = sampler_state.get("num_replicas", replicas)
@@ -212,7 +211,7 @@ class StatefulDataLoader:
         global_order = isinstance(self.sampler, DistributedSampler)
         if global_order and "global_position" in state:
             start = state["global_position"]
-        elif saved_replicas == replicas:
+        else:
             per_rank = state.get("samples_consumed")
             if per_rank is None:
                 per_rank = state.get("batches_yielded", 0) * self.batch_size
@@ -223,8 +222,6 @@ class StatefulDataLoader:
                         f"another batch size at the save, samples are skipped or repeated"
                     )
             start = per_rank * replicas if global_order else per_rank
-        else:
-            raise DataPositionError(self._refusal(state, saved_replicas, global_order))
 
         self._epoch = epoch
         self.sampler.load_state_dict(sampler_state)
@@ -253,6 +250,27 @@ class StatefulDataLoader:
         self._warn_if_reordered(state, sampler_state)
 
         logger.info(f"Resumed DataLoader: epoch={self._epoch}, position={self._start}")
+
+    def check_state(self, state: dict) -> None:
+        """Raise the ``DataPositionError`` that ``load_state_dict`` raises for ``state``.
+
+        Changes nothing, so ``CheckpointManager`` can learn whether every rank's
+        loader takes a saved position before any rank applies one.
+
+        Raises:
+            DataPositionError: As ``load_state_dict``.
+        """
+        if "stream" in state:
+            raise DataPositionError(
+                "The checkpoint holds a streaming data position, but this run reads a "
+                "map-style dataset (data.hf_streaming changed), so it has no sample to "
+                "resume at."
+            )
+        replicas = self.sampler.num_replicas
+        saved_replicas = state.get("sampler", {}).get("num_replicas", replicas)
+        global_order = isinstance(self.sampler, DistributedSampler)
+        if not (global_order and "global_position" in state) and saved_replicas != replicas:
+            raise DataPositionError(self._refusal(state, saved_replicas, global_order))
 
     def _refusal(self, state: dict, saved_replicas: int, global_order: bool) -> str:
         """Why a position saved on ``saved_replicas`` ranks cannot resume here, and the way out."""
@@ -458,12 +476,16 @@ class StreamingDataLoader:
             "data_parallel_rank": self.dataset.rank,
         }
 
-    def load_state_dict(self, state: dict) -> None:
-        """Restore the position; the next ``iter()`` replays the stream to it.
+    def check_state(self, state: dict) -> None:
+        """Raise the ``DataPositionError`` that ``load_state_dict`` raises for ``state``.
+
+        Changes nothing, so ``CheckpointManager`` can learn whether every rank's
+        loader takes a saved position before any rank applies one. The check
+        compares the stream as this rank sees it, its data files' sizes included,
+        so it can pass on one rank and fail on another.
 
         Raises:
-            DataPositionError: The state is a map-style position, or something
-                that changes the stream differs from when it was saved.
+            DataPositionError: As ``load_state_dict``.
         """
         saved = state.get("stream")
         if saved is None:
@@ -479,6 +501,15 @@ class StreamingDataLoader:
                 f"Cannot replay the stream to its saved position because the stream "
                 f"changed ({detail}). Resume with the saved values."
             )
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore the position; the next ``iter()`` replays the stream to it.
+
+        Raises:
+            DataPositionError: The state is a map-style position, or something
+                that changes the stream differs from when it was saved.
+        """
+        self.check_state(state)
         self._epoch = state.get("epoch", 0)
         self._batches_yielded = state.get("batches_yielded", 0)
         saved_rank = state.get("data_parallel_rank")

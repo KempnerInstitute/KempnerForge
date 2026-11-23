@@ -2021,19 +2021,26 @@ class CheckpointManager:
         This method applies the stashed state once the loader exists.
 
         No-op if no state is pending, or if the loader does not support
-        ``load_state_dict`` (e.g., a plain torch DataLoader). A position the
-        loader cannot carry over raises ``DataPositionError`` on a resume; after
-        a ``warm_start`` load, or an exact resume that
+        ``load_state_dict`` (e.g., a plain torch DataLoader). A
+        ``StatefulDataLoader`` or ``StreamingDataLoader`` checks the position on
+        every rank first (``check_state``), and the ranks share their verdicts
+        before any rank applies it, since a rank's view of the data, such as a
+        data file's size, can differ from another's: every rank applies the
+        position, or none does. A position that some rank's loader cannot place
+        raises ``DataPositionError`` on every rank on a resume; after a
+        ``warm_start`` load, or an exact resume that
         ``checkpoint.ignore_rank_state_mismatch`` let onto a changed topology or
-        past a checkpoint with no per-rank state, the data starts at its first
-        sample instead, with a warning that names
-        the reason. On such a resume only a ``StatefulDataLoader`` or
-        ``StreamingDataLoader`` takes the saved rank 0's position, since they
-        check that it fits the new layout; another loader's state may be rank
-        0's own, so it is dropped with a warning and the data starts at its
-        first sample. A restored checkpoint that holds no data position, such
-        as a streaming checkpoint saved before streaming positions were
-        recorded, leaves a stateful loader at its first sample, with a warning.
+        past a checkpoint with no per-rank state, every rank starts the data at
+        its first sample instead, with a warning that names the ranks that cannot
+        place it and why. Whether the ranks share verdicts follows from the
+        broadcast train state and the loader's type alone, so every rank reaches
+        that collective or none does. On such a flag resume only these two
+        loaders take the saved position, since they check that it fits the new
+        layout; another loader's state may be rank 0's own, so it is dropped with
+        a warning and the data starts at its first sample. A restored checkpoint
+        that holds no data position, such as a streaming checkpoint saved before
+        streaming positions were recorded, leaves a stateful loader at its first
+        sample, with a warning.
         """
         missing, self._pending_dataloader_missing = self._pending_dataloader_missing, False
         if self._pending_dataloader_state is None:
@@ -2047,33 +2054,101 @@ class CheckpointManager:
             return
         state, self._pending_dataloader_state = self._pending_dataloader_state, None
         carried, self._pending_dataloader_carried = self._pending_dataloader_carried, False
+        warm_start = self._pending_dataloader_warm_start
         if dataloader is None or not hasattr(dataloader, "load_state_dict"):
             return
-        if carried and not isinstance(dataloader, (StatefulDataLoader, StreamingDataLoader)):
-            logger.warning(
-                f"Dropping the saved data position on the changed topology: a "
-                f"{type(dataloader).__name__} may keep one rank's own position, which does "
-                f"not fit the other ranks, so the data starts at its first sample"
-            )
-            return
-        try:
-            dataloader.load_state_dict(state)
-        except DataPositionError as e:
-            if self._pending_dataloader_warm_start:
+        if not isinstance(dataloader, (StatefulDataLoader, StreamingDataLoader)):
+            if carried:
+                logger.warning(
+                    f"Dropping the saved data position on the changed topology: a "
+                    f"{type(dataloader).__name__} may keep one rank's own position, which does "
+                    f"not fit the other ranks, so the data starts at its first sample"
+                )
+                return
+            try:
+                dataloader.load_state_dict(state)
+            except DataPositionError as e:
+                if not warm_start:
+                    raise
                 logger.warning(
                     f"The warm start's data position does not carry over to this run, so the "
                     f"data starts at its first sample: {e}"
                 )
                 return
-            if carried:
+            logger.info("Applied stashed dataloader state")
+            return
+        refusals, world = self._position_refusals(dataloader, state)
+        if refusals:
+            mine = refusals.get(self._rank)
+            first = min(refusals)
+            reason = mine if mine is not None else f"rank {first}: {refusals[first]}"
+            where = "" if len(refusals) == world else f" on ranks {sorted(refusals)}"
+            if warm_start:
                 logger.warning(
-                    f"The saved data position does not carry over to the changed topology, so "
-                    f"the data starts at its first sample (checkpoint.ignore_rank_state_mismatch"
-                    f"=true): {e}"
+                    f"The warm start's data position does not carry over to this run{where}, so "
+                    f"the data starts at its first sample on every rank: {reason}"
                 )
                 return
-            raise
+            if carried:
+                logger.warning(
+                    f"The saved data position does not carry over to the changed topology"
+                    f"{where}, so the data starts at its first sample on every rank "
+                    f"(checkpoint.ignore_rank_state_mismatch=true): {reason}"
+                )
+                return
+            if mine is not None:
+                raise DataPositionError(mine)
+            raise DataPositionError(f"The saved data position cannot be resumed{where}: {reason}")
+        dataloader.load_state_dict(state)
         logger.info("Applied stashed dataloader state")
+
+    def _position_refusals(
+        self, dataloader: Any, state: dict[str, Any]
+    ) -> tuple[dict[int, str], int]:
+        """Why each rank's loader cannot place ``state``, gathered on every rank.
+
+        Every rank checks the position against its own loader with ``check_state``,
+        which changes nothing. A rank's view of the data, such as a data file's
+        size, can differ from another's, so the ranks gather their verdicts before
+        any rank applies a position. A check that fails some other way is gathered
+        too, so every rank raises together. Collective on the dedicated gloo group;
+        ``apply_dataloader_state`` calls it whenever a position is pending for one of
+        the loaders that check it, which the broadcast train state and the
+        configured loader decide alike on every rank.
+
+        Returns:
+            Global rank -> why its loader cannot place the position (empty when
+            every rank's can), and the number of ranks that checked.
+
+        Raises:
+            Exception: On a rank whose check failed other than with
+                ``DataPositionError``, that error; ``RuntimeError`` on every other rank.
+        """
+        failure: Exception | None = None
+        verdict: tuple[str, str] | None = None
+        try:
+            dataloader.check_state(state)
+        except DataPositionError as e:
+            verdict = ("refused", str(e))
+        except Exception as e:
+            failure = e
+            verdict = ("failed", f"{type(e).__name__}: {_error_text(e)}")
+        verdicts: dict[int, tuple[str, str] | None] = {self._rank: verdict}
+        if dist.is_initialized():
+            gathered: list[Any] = [None] * dist.get_world_size(self._sync_group)
+            dist.all_gather_object(gathered, verdict, group=self._sync_group)
+            verdicts = dict(enumerate(gathered))
+        if failure is not None:
+            raise failure
+        failed = {rank: v[1] for rank, v in verdicts.items() if v is not None and v[0] == "failed"}
+        if failed:
+            first = min(failed)
+            raise RuntimeError(
+                f"Checking the saved data position failed on ranks {sorted(failed)}: "
+                f"rank {first}: {failed[first]}"
+            )
+        refusals = {rank: v[1] for rank, v in verdicts.items() if v is not None}
+        return refusals, len(verdicts)
 
     def _resolve_load_path(self, path: str | None = None) -> Path | None:
         """Resolve the checkpoint path to load from.

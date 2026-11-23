@@ -225,6 +225,21 @@ def test_a_mixture_position_in_a_single_dataset_run_names_the_mixture():
         _loader(_Indices(1_000), 2, 0, 4).load_state_dict(_mixture_state(4))
 
 
+def test_check_state_refuses_what_load_state_dict_refuses_and_moves_nothing():
+    """``CheckpointManager`` checks a position on every rank before any rank applies it.
+
+    So ``check_state`` gives ``load_state_dict``'s verdict without applying the position.
+    """
+    _, state = _run(_Indices(4_096), 4, 4, steps=10)
+    loader = _loader(_Indices(4_096), 2, 0, 4)
+    loader.check_state(state)
+    assert loader.state_dict()["global_position"] == 0
+    with pytest.raises(DataPositionError, match="draws each rank's samples"):
+        _mixture(2, 0, 4).check_state(_mixture_state(4))
+    with pytest.raises(DataPositionError, match="streaming data position"):
+        loader.check_state({"stream": {}, "epoch": 0, "batches_yielded": 3})
+
+
 def _warnings(caplog, monkeypatch, action) -> str:
     """Run ``action`` and return the warnings it logged.
 

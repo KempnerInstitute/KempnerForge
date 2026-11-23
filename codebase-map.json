@@ -1025,7 +1025,7 @@
     "kempnerforge/data/dataloader.py": {
       "classes": {
         "DataPositionError": {
-          "purpose": "ValueError for a saved data position this loader cannot resume from; every rank raises it together"
+          "purpose": "ValueError for a saved data position this loader cannot resume from; CheckpointManager shares every rank's verdict first, so every rank raises it together"
         },
         "StatefulDataLoader": {
           "purpose": "DataLoader wrapper with checkpoint/resume state tracking; with a DistributedSampler the position is global, so it resumes on another data-parallel size or batch size",
@@ -1036,6 +1036,7 @@
             "_consumed()",
             "state_dict()",
             "load_state_dict(state)",
+            "check_state(state) (raises the DataPositionError load_state_dict would, changing nothing)",
             "_refusal(state, saved_replicas, global_order)",
             "_warn_if_reordered(state, sampler_state)"
           ]
@@ -1049,6 +1050,7 @@
             "__next__()",
             "_identity()",
             "state_dict()",
+            "check_state(state) (raises the DataPositionError load_state_dict would, changing nothing; compares the stream as this rank sees it)",
             "load_state_dict(state)"
           ]
         }
@@ -1314,7 +1316,8 @@
             "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
             "_check_lr_multipliers(metadata, ckpt_dir) -> saved group modules | None (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
             "_present_experts(dcp_state, load_from, saved_keys) (EP experts placed among all of them before DCP; a load refuses a checkpoint of fewer experts than the model; the ranks agree before DCP)",
-            "apply_dataloader_state(dataloader) (a position that cannot carry over raises DataPositionError on a resume and starts the data fresh with a warning on a warm start or a carried position; a carried position goes only to a StatefulDataLoader or StreamingDataLoader)",
+            "apply_dataloader_state(dataloader) (every rank checks the position and the ranks share their verdicts before any rank applies it; a position some rank cannot place raises DataPositionError on every rank on a resume and starts the data fresh on every rank, with a warning, on a warm start or a carried position; a carried position goes only to a StatefulDataLoader or StreamingDataLoader)",
+            "_position_refusals(dataloader, state) -> (refusals, world) (each rank's check_state verdict, gathered on every rank on the gloo group; a check that fails another way raises on every rank)",
             "restored_extra (property: the extra keys the last load restored)",
             "_resolve_load_path(path)",
             "_agreed_load_dir(path, fall_back) -> Path | None (every load: rank 0 resolves the checkpoint, on an exact resume that reads shards takes the newest step_N beside it that every stage saved when that one is not, and broadcasts its choice or its error)",
@@ -2074,12 +2077,12 @@
         "count": 4
       },
       "tests/unit/test_data_position.py": {
-        "note": "Module-level pytest functions (no Test* classes): the data position across data-parallel and batch size changes, the in-step clamp, mixture and legacy refusals, seed and dataset-length warnings, load_path warm starts through restore_checkpoint and load(dataloader=...), gloo CheckpointManager resume on another world size; gloo CheckpointManager auto-resume (exact_resume) saved on 4 ranks: on 2 ranks with ignore_rank_state_mismatch at the exact global position with fresh RNG, refused on every rank without it, a mixture restarting with a warning, and the saved layout restoring each rank's own state",
-        "count": 22
+        "note": "Module-level pytest functions (no Test* classes): the data position across data-parallel and batch size changes, the in-step clamp, mixture and legacy refusals, seed and dataset-length warnings, load_path warm starts through restore_checkpoint and load(dataloader=...), gloo CheckpointManager resume on another world size; gloo CheckpointManager auto-resume (exact_resume) saved on 4 ranks: on 2 ranks with ignore_rank_state_mismatch at the exact global position with fresh RNG, refused on every rank without it, a mixture restarting with a warning, and the saved layout restoring each rank's own state; check_state's verdicts",
+        "count": 23
       },
       "tests/unit/test_streaming_resume.py": {
-        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning on another rank's position, replay past a shorter part warning in every rank's log, mid-pass restart with workers, replay progress",
-        "count": 14
+        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning on another rank's position, replay past a shorter part warning in every rank's log, mid-pass restart with workers, replay progress, check_state's verdicts; gloo CheckpointManager auto-resume with ignore_rank_state_mismatch of a stream saved as dp 2 x tp 2: a restart on every rank on another data-parallel size, a restart on every rank when one rank sees a data file at another size, every rank raising together without the flag, and every rank stopping when one rank's check fails another way",
+        "count": 19
       }
     },
     "integration": {
