@@ -191,7 +191,7 @@ def _changed(row: int, **fields: Any) -> list[dict[str, Any]]:
 
 class TestMathVista:
     def test_a_row_asks_its_query_of_its_image(self, write_mathvista: Callable[..., Path]) -> None:
-        reader = MathVistaRows(write_mathvista(MATHVISTA_PROBLEMS), _extract)
+        reader = MathVistaRows(write_mathvista(MATHVISTA_PROBLEMS), lambda: _extract)
         assert len(reader) == 3
         for row, problem in enumerate(MATHVISTA_PROBLEMS):
             document = reader[row]
@@ -203,7 +203,7 @@ class TestMathVista:
     def test_the_reference_is_the_problem_with_the_extractor(
         self, write_mathvista: Callable[..., Path]
     ) -> None:
-        reader = MathVistaRows(write_mathvista(MATHVISTA_PROBLEMS), _extract)
+        reader = MathVistaRows(write_mathvista(MATHVISTA_PROBLEMS), lambda: _extract)
         assert reader.reference(0) == MathVistaReference(
             answer="8/11",
             query=MATHVISTA_PROBLEMS[0]["query"],
@@ -222,7 +222,7 @@ class TestMathVista:
     ) -> None:
         image = {"bytes": _png(), "path": "1.png"}
         path = write_mathvista(MATHVISTA_PROBLEMS, images=[broken, image, image])
-        reader = MathVistaRows(path, _extract)
+        reader = MathVistaRows(path, lambda: _extract)
         assert reader.read_with_index(0)[0] == 1
         assert reader.skipped == 1
 
@@ -233,7 +233,7 @@ class TestMathVista:
         path = write_mathvista(MATHVISTA_PROBLEMS)
         pq.write_table(pq.read_table(path).drop_columns([column]), path)
         with pytest.raises(ValueError, match=re.escape(f"has no ['{column}'] column")):
-            MathVistaRows(path, _extract)
+            MathVistaRows(path, lambda: _extract)
 
     @pytest.mark.parametrize(
         ("problems", "error"),
@@ -250,7 +250,19 @@ class TestMathVista:
     ) -> None:
         path = write_mathvista(problems)
         with pytest.raises(ValueError, match=error):
-            MathVistaRows(path, _extract)
+            MathVistaRows(path, lambda: _extract)
+
+    def test_a_split_that_is_refused_makes_no_extractor(
+        self, write_mathvista: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        made: list[str] = []
+        path = write_mathvista(_changed(1, answer=""))
+        with pytest.raises(ValueError, match="problem 2"):
+            MathVistaRows(path, lambda: made.append("made") or _extract)
+        monkeypatch.setattr(extraction, "fetch_bigbird", lambda: made.append("fetched") or tmp_path)
+        with pytest.raises(ValueError, match="problem 2"):
+            mathvista(path, extractor_device="cpu")
+        assert made == []
 
     def test_the_factory_gives_each_row_an_extractor_on_the_device(
         self, write_mathvista: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path

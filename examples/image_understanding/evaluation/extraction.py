@@ -208,19 +208,27 @@ def _characters(window: Encoding, first: int, last: int) -> tuple[int, int]:
     return window.offsets[first][0], window.offsets[last][1]
 
 
-def extractor_device(device: str) -> torch.device:
-    """``device`` as a torch device, refused when this process cannot use it.
+def check_extractor_device(device: str) -> torch.device:
+    """``device`` as a torch device, refused unless it is the CPU or a CUDA device this process has.
 
     Raises:
-        ValueError: ``device`` is not a torch device, or is a CUDA device and
-            this process has no CUDA.
+        ValueError: ``device`` is not a torch device, is neither ``cpu`` nor
+            ``cuda``, or is a CUDA device and this process has no CUDA or no
+            device of that index.
     """
     try:
         resolved = torch.device(device)
     except RuntimeError as exc:
         raise ValueError(f"extractor_device {device!r} is not a torch device: {exc}") from exc
+    if resolved.type not in ("cpu", "cuda"):
+        raise ValueError(f"extractor_device {device!r} must be a cpu or cuda device")
     if resolved.type == "cuda" and not torch.cuda.is_available():
         raise ValueError(f"extractor_device {device!r} needs CUDA, which is not available")
+    if resolved.type == "cuda" and (resolved.index or 0) >= torch.cuda.device_count():
+        raise ValueError(
+            f"extractor_device {device!r} names a CUDA device this process does not have; "
+            f"it sees {torch.cuda.device_count()}"
+        )
     return resolved
 
 
@@ -235,11 +243,11 @@ class AnswerExtractor:
     pipeline finds no answer at all.
 
     Raises:
-        ValueError: ``device`` is refused by ``extractor_device``.
+        ValueError: ``device`` is refused by ``check_extractor_device``.
     """
 
     def __init__(self, device: str, load: Callable[[torch.device], SpanModel]) -> None:
-        self.device = extractor_device(device)
+        self.device = check_extractor_device(device)
         self._load = load
         self._loaded: SpanModel | None = None
 
@@ -301,8 +309,8 @@ def bigbird_extractor(device: str = "cpu") -> AnswerExtractor:
     extractor's first call.
 
     Raises:
-        ValueError: ``device`` is refused by ``extractor_device``, which is
+        ValueError: ``device`` is refused by ``check_extractor_device``, which is
             checked before anything is fetched.
     """
-    extractor_device(device)
+    check_extractor_device(device)
     return AnswerExtractor(device, partial(load_bigbird, folder=fetch_bigbird()))

@@ -23,7 +23,7 @@ from evaluation.extraction import (
     answer_spans,
     bigbird_extractor,
     bigbird_tokenizer,
-    extractor_device,
+    check_extractor_device,
     fetch_bigbird,
     load_bigbird,
 )
@@ -282,8 +282,23 @@ class TestAnswerExtractor:
     def test_a_cuda_device_needs_cuda(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         with pytest.raises(ValueError, match="needs CUDA"):
-            extractor_device("cuda")
-        assert extractor_device("cpu") == torch.device("cpu")
+            check_extractor_device("cuda")
+        assert check_extractor_device("cpu") == torch.device("cpu")
+
+    @pytest.mark.parametrize("device", ["mps", "meta", "xpu:0"])
+    def test_only_the_cpu_and_cuda_are_extractor_devices(self, device: str) -> None:
+        with pytest.raises(ValueError, match="must be a cpu or cuda device"):
+            check_extractor_device(device)
+
+    def test_a_cuda_index_must_be_a_device_the_process_has(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+        assert check_extractor_device("cuda:1") == torch.device("cuda", 1)
+        assert check_extractor_device("cuda") == torch.device("cuda")
+        with pytest.raises(ValueError, match="it sees 2"):
+            check_extractor_device("cuda:2")
 
 
 @pytest.fixture

@@ -9,9 +9,11 @@ asks each problem's query.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +32,7 @@ from image_text.skip import (
 from image_text.testbed import ImageTextRows
 from torch.utils.data import Dataset
 
-from .extraction import bigbird_extractor
+from .extraction import bigbird_extractor, check_extractor_device
 from .scorers import MathVistaReference
 
 MMLU_LETTERS = ("A", "B", "C", "D")
@@ -146,16 +148,21 @@ class TextRows(Dataset):
         return Document(images=(), turns=(Turn(self._questions[index], (self._answers[index],)),))
 
 
+def _unset_extractor(question: str, reply: str) -> str:
+    raise RuntimeError("the extractor is set once the split is checked")
+
+
 class MathVistaRows(Dataset):
     """MathVista problems from a split's parquet file, as the dataset publishes it.
 
     A row asks its ``query`` (the question with its hint and any lettered
     options) of its ``decoded_image`` and is answered by ``answer``.
     ``reference(row)`` is the row's ``MathVistaReference``, whose ``extract`` is
-    ``extractor``. Every row is checked as the file is read, so a split the
-    scorer cannot score is refused before anything is decoded (the test split
-    publishes no answers). An image that does not decode, or a row without
-    image bytes, is passed over as ``ImageTextRows`` does.
+    what ``make_extractor()`` returns. Every row is checked as the file is read,
+    before ``make_extractor`` is called, so a split the scorer cannot score is
+    refused before anything is decoded or fetched (the test split publishes no
+    answers). An image that does not decode, or a row without image bytes, is
+    passed over as ``ImageTextRows`` does.
 
     Raises:
         ValueError: the file lacks a column of ``MATHVISTA_COLUMNS``, or a row
@@ -165,7 +172,7 @@ class MathVistaRows(Dataset):
     def __init__(
         self,
         annotation_file: str | Path,
-        extractor: Callable[[str, str], str],
+        make_extractor: Callable[[], Callable[[str, str], str]],
         max_attempts: int = MAX_ATTEMPTS,
     ) -> None:
         self.annotation_file = Path(annotation_file)
@@ -181,7 +188,11 @@ class MathVistaRows(Dataset):
         self._images = table.column("decoded_image")
         self._pids: list[str] = table.column("pid").to_pylist()
         problems = table.drop_columns(["decoded_image"]).to_pylist()
-        self._references = [self._reference(problem, extractor) for problem in problems]
+        checked = [self._reference(problem, _unset_extractor) for problem in problems]
+        extractor = make_extractor()
+        self._references = [
+            dataclasses.replace(reference, extract=extractor) for reference in checked
+        ]
 
     def _reference(
         self, problem: dict[str, Any], extractor: Callable[[str, str], str]
@@ -287,7 +298,9 @@ def mathvista(annotation_file: str | Path, extractor_device: str = "cpu") -> Mat
 
     ``annotation_file`` is a split's parquet file as published (``testmini``,
     the split with answers). A reply that needs its answer extracted is read by
-    ``bigbird_extractor`` on ``extractor_device``, whose files are fetched when
-    the reader is made and whose model is loaded when a row first needs it.
+    ``bigbird_extractor`` on ``extractor_device``. The device is checked first,
+    then the split, and only then are the extractor's files fetched; its model
+    is loaded when a row first needs it.
     """
-    return MathVistaRows(annotation_file, bigbird_extractor(extractor_device))
+    check_extractor_device(extractor_device)
+    return MathVistaRows(annotation_file, partial(bigbird_extractor, extractor_device))
