@@ -11,6 +11,9 @@ if TYPE_CHECKING:
 
 FP32_CROSS_ENTROPY_LOSSES = ("cross_entropy", "chunked_cross_entropy")
 
+FP8_DIM_MULTIPLE = 16
+"""``torch._scaled_mm`` needs both dimensions of an FP8 weight to be multiples of this."""
+
 _FP16_UNSUPPORTED = (
     "train.mixed_precision='fp16' is not supported: it would train in pure fp16 "
     "with no loss scaling, so small gradients underflow to zero. Use 'bf16', or "
