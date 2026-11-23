@@ -1096,13 +1096,16 @@
         "destroy_distributed()",
         "_detect_ib_interface() -> str | None",
         "_set_nccl_env()",
-        "_set_seed(seed, rank, pp_rank)"
+        "_set_seed(seed, rank, pp_rank)",
+        "_timeout_options(timeout) -> ProcessGroupNCCL.Options"
       ],
       "tested_by": [
         "tests/unit/test_distributed.py::TestDetectIBInterface",
         "tests/unit/test_distributed.py::TestSetNcclEnv",
         "tests/unit/test_distributed.py::TestGetWorldInfo",
-        "tests/distributed/test_fsdp.py::TestInitDistributed"
+        "tests/unit/test_collective_timeouts.py::TestGroupTimeouts",
+        "tests/distributed/test_fsdp.py::TestInitDistributed",
+        "tests/distributed/test_group_timeouts.py::TestGroupTimeouts"
       ]
     },
     "kempnerforge/distributed/parallel.py": {
@@ -1952,9 +1955,10 @@
         "classes": [
           "TestNcclAsyncErrorHandlingEnvGuard(3)",
           "TestCheckNcclHealthTimeout(4)",
-          "TestBarrierWithTimeout(3)"
+          "TestBarrierWithTimeout(3)",
+          "TestGroupTimeouts(5)"
         ],
-        "count": 10
+        "count": 15
       },
       "tests/unit/test_dataset_mmap_cleanup.py": {
         "note": "Module-level pytest functions (no Test* classes): mmap close on partial-open failure, idempotent close, mmap retention on success, .bin variant",
@@ -2041,6 +2045,11 @@
         "classes": [
           "TestNCCLHealth(2)",
           "TestNaNDetectorDistributed(3)"
+        ]
+      },
+      "tests/distributed/test_group_timeouts.py": {
+        "classes": [
+          "TestGroupTimeouts(4)"
         ]
       },
       "tests/distributed/test_tp.py": {
