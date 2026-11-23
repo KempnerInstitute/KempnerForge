@@ -7,6 +7,7 @@ import importlib.util
 import io
 import os
 import pickle
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -72,6 +73,12 @@ def _converter() -> Any:
     return module
 
 
+def _listing(directory: Path) -> list[str]:
+    """The sorted names in ``directory``, without the ``.nfs*`` entries an NFS client can keep
+    for a removed file for a moment after the removal."""
+    return sorted(p.name for p in directory.iterdir() if not p.name.startswith(".nfs"))
+
+
 @pytest.fixture
 def subset(tmp_path: Path) -> Path:
     src, dst = tmp_path / "parquet", tmp_path / "arrow"
@@ -131,7 +138,12 @@ class TestConversion:
         reader = FineVisionArrow(dst / "demo")
         assert [reader[i].turns[0].user for i in range(len(reader))] == ["Q0", "Q1"]
 
-    def test_a_stale_claim_is_taken_over_and_a_live_one_respected(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("nfs_held", [False, True])
+    def test_a_stale_claim_is_taken_over_and_a_live_one_respected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nfs_held: bool
+    ) -> None:
+        """With ``nfs_held`` each removed claim stays under a ``.nfs`` name, as an NFS client
+        can keep a removed file for a moment; the listing leaves those entries out."""
         src, dst = tmp_path / "parquet", tmp_path / "arrow"
         parquet = src / "demo" / "train-00000-of-00001.parquet"
         _write_parquet(parquet, [[_row(1, [("Q0", "A0")], 5)]])
@@ -143,8 +155,23 @@ class TestConversion:
         assert converter._convert_job((parquet, arrow, 3600.0)) == 0
         assert not arrow.exists() and claim.read_text() == "otherhost-1 0\n"
         os.utime(claim, (0, 0))
+        held: list[Path] = []
+        if nfs_held:
+            unlink = Path.unlink
+
+            def keep_under_nfs_name(path: Path, missing_ok: bool = False) -> None:
+                if path.exists():
+                    held.append(path.with_name(f".nfs{len(held) + 1:024x}"))
+                    os.link(path, held[-1])
+                unlink(path, missing_ok=missing_ok)
+
+            monkeypatch.setattr(Path, "unlink", keep_under_nfs_name)
         assert converter._convert_job((parquet, arrow, 3600.0)) > 0
-        assert sorted(p.name for p in (dst / "demo").iterdir()) == [
+        tag = f"{socket.gethostname()}-{os.getpid()}"
+        assert [p.read_text().split()[0] for p in held] == (
+            ["otherhost-1", tag] if nfs_held else []
+        )
+        assert _listing(dst / "demo") == [
             "train-00000-of-00001.arrow",
             "train-00000-of-00001.meta.npz",
         ]
@@ -189,7 +216,7 @@ class TestConversion:
         stderr = _run_failing("convert", "--src", str(src), "--dst", str(dst))
         assert "train-00001-of-00002.parquet" in stderr and "1 files failed" in stderr
         assert (dst / "demo" / "train-00000-of-00002.meta.npz").exists()
-        assert sorted(p.name for p in (dst / "demo").iterdir()) == [
+        assert _listing(dst / "demo") == [
             "train-00000-of-00002.arrow",
             "train-00000-of-00002.meta.npz",
         ]
@@ -293,11 +320,11 @@ class TestConversion:
         finally:
             (dst / "locked").chmod(0o755)
         assert "PermissionError" in stderr and "1 files failed" in stderr
-        assert sorted(p.name for p in (dst / "demo").iterdir()) == [
+        assert _listing(dst / "demo") == [
             "train-00000-of-00001.arrow",
             "train-00000-of-00001.meta.npz",
         ]
-        assert list((dst / "locked").iterdir()) == []
+        assert _listing(dst / "locked") == []
 
     def test_a_failed_claim_write_leaves_no_claim(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -317,7 +344,7 @@ class TestConversion:
 
         monkeypatch.setattr(converter.os, "write", full_once)
         assert "Disk quota exceeded" in converter._convert_job((parquet, arrow, 3600.0))
-        assert list((dst / "demo").iterdir()) == []
+        assert _listing(dst / "demo") == []
         assert converter._convert_job((parquet, arrow, 3600.0)) > 0
 
     def test_the_recorded_source_size_is_the_converted_file(self, tmp_path: Path) -> None:
