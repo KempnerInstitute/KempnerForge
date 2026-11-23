@@ -219,8 +219,9 @@ for the whole job. `checkpoint/save_sec` is the time each save held the
 loop (for an async save, the wait for the previous upload, the staging and
 the dispatch); `checkpoint/wait_sec` is the time spent draining an async
 save, logged only when one is pending: at the end of the run, when a
-shutdown finds this step already saved, and when a freeze stage flushes. Neither is
-in `step_time`, except a freeze stage's flush, which runs inside its step.
+shutdown finds this step already saved, and when a freeze stage
+flushes. Neither is in `step_time`, except a freeze stage's flush,
+which runs inside its step.
 
 A VLM run's data metrics are each summed over the data-parallel ranks:
 `data/text_tokens_trained` counts the supervised text tokens of the step,

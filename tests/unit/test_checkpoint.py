@@ -758,8 +758,9 @@ class TestFlushPendingSave:
 
 
 class TestHasPendingSave:
-    """``has_pending_save`` tells the training loop whether its final ``wait()`` drains
-    anything, so it times only a drain that happens."""
+    """``has_pending_save`` tells the training loop whether a drain (its final ``wait()``, a
+    shutdown's ``wait()`` or a freeze stage's ``flush_pending_save()``) has anything to
+    drain, so it times only a drain that happens."""
 
     @staticmethod
     def _mgr(tmp_path, mode):

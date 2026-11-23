@@ -4595,8 +4595,8 @@ class TestPerDatasetMetrics:
         assert small["loss/b"] == pytest.approx(whole["loss/b"], rel=1e-6)
 
     def test_the_source_loss_runs_at_most_1024_tokens_at_a_time(self, monkeypatch):
-        """A 4096-token fp32 chunk is about 4 GB at a 128k vocabulary, so the chunk is
-        capped at 1024 tokens; a smaller ``ce_chunk_size`` is kept."""
+        """At a 128k vocabulary a 4096-token chunk's fp32 logits and log-softmax are about
+        4 GB, so the chunk is capped at 1024 tokens; a smaller ``ce_chunk_size`` is kept."""
         import kempnerforge.training.loop as loop
 
         chunks: list[int] = []
@@ -4899,13 +4899,19 @@ class TestFreezeStageFence:
         assert order == ["flush", "freeze"]
 
     def test_stage_logs_its_flush_as_checkpoint_wait_time(self, monkeypatch):
-        """A save still in flight at the stage makes its flush a wait to log."""
+        """A save still in flight at the stage is drained before the flip, and the drain is
+        logged as the step's wait."""
+        import time
+
+        clock = [0.0]
+        monkeypatch.setattr(time, "perf_counter", lambda: clock[0])
         order: list = []
         session = self._vlm_session(monkeypatch, start_step=2, order=order)
         ckpt = session.checkpointer
         ckpt.has_pending_save = True  # type: ignore
 
         def flush() -> None:
+            clock[0] += 2.0
             order.append("flush")
             ckpt.has_pending_save = False  # type: ignore
 
@@ -4913,8 +4919,9 @@ class TestFreezeStageFence:
         logged: list = []
         monkeypatch.setattr(session.tracker, "log_eval", lambda m, s: logged.append((s, dict(m))))
         run_training_loop(session)
-        waits = [step for step, metrics in logged if "checkpoint/wait_sec" in metrics]
-        assert waits == [2]
+        waits = [(s, m["checkpoint/wait_sec"]) for s, m in logged if "checkpoint/wait_sec" in m]
+        assert waits == [(2, 2.0)]
+        assert order == ["flush", "freeze"]
 
     def test_stage_with_no_save_in_flight_logs_no_wait(self, monkeypatch):
         """The flush still runs on every rank; with nothing pending it has no wait to log."""
