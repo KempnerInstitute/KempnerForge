@@ -201,7 +201,7 @@ After the step body, before advancing:
 | Eval | `step % eval_config.interval == 0` | [`run_eval`](evaluation.md), `on_eval_end` hook |
 | Profiler | every step | `prof.step()` advances the schedule |
 | Checkpoint | `checkpoint.should_save(step)`: `dyn_ckpt_window` milestones inside the window, every `checkpoint.interval` steps outside it | `ckpt_mgr.save(step)`, logged as `checkpoint/save_sec`, then the `on_checkpoint_save` hook |
-| Shutdown | SIGTERM / SIGUSR1 pending on any rank | `ckpt_mgr.save(step)` (`checkpoint/save_sec`), or `ckpt_mgr.wait()` (`checkpoint/wait_sec`) when the checkpoint tick just saved this step; then break |
+| Shutdown | SIGTERM / SIGUSR1 pending on any rank | `ckpt_mgr.save(step)` (`checkpoint/save_sec`), or `ckpt_mgr.wait()` when the checkpoint tick just saved this step (`checkpoint/wait_sec` if that save is still pending); then break |
 
 The two stop rows are votes. Each row all-reduces the ranks' own
 verdicts, a failed probe or a pending signal, over
@@ -229,10 +229,10 @@ runs. See [Resilience § NCCL health](../resilience/index.md).
 None of this periodic work is inside the step's `step_time`, so `tok/s`
 and MFU leave it out. Each checkpoint save (startup, scheduled,
 emergency or final) logs the time the loop waited for it as
-`checkpoint/save_sec`, and each drain of an async save (the final
-`wait()` when a save is still pending, the wait when a shutdown finds
-its step already saved, a freeze stage's flush) logs
-`checkpoint/wait_sec`. A freeze stage's flush runs inside its step, so
+`checkpoint/save_sec`, and each drain that finds an async save pending
+(the final `wait()`, the wait when a shutdown finds its step already
+saved, a freeze stage's flush) logs `checkpoint/wait_sec`; a drain with
+nothing pending logs nothing. A freeze stage's flush runs inside its step, so
 it is also in that step's `step_time`.
 
 ## Entry-point setup

@@ -218,8 +218,8 @@ data-parallel ranks as the training loss, so rank 0's backends log values
 for the whole job. `checkpoint/save_sec` is the time each save held the
 loop (for an async save, the wait for the previous upload, the staging and
 the dispatch); `checkpoint/wait_sec` is the time spent draining an async
-save: at the end of the run when a save is still pending, when a shutdown
-finds this step already saved, and when a freeze stage flushes. Neither is
+save, logged only when one is pending: at the end of the run, when a
+shutdown finds this step already saved, and when a freeze stage flushes. Neither is
 in `step_time`, except a freeze stage's flush, which runs inside its step.
 
 A VLM run's data metrics are each summed over the data-parallel ranks:

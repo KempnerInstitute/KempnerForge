@@ -793,8 +793,12 @@ def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     pending_stages = [s for s in vlm_cfg.freeze_schedule if s.start_step == step]
     if not pending_stages:
         return
-    with _logged_time(session.tracker, "checkpoint/wait_sec", step):
-        session.checkpointer.flush_pending_save()
+    ckpt_mgr = session.checkpointer
+    if ckpt_mgr.has_pending_save:
+        with _logged_time(session.tracker, "checkpoint/wait_sec", step):
+            ckpt_mgr.flush_pending_save()
+    else:
+        ckpt_mgr.flush_pending_save()
     for stage in pending_stages:
         flipped = apply_freeze_specs(session.model, stage.specs, vlm_cfg.module_patterns)
         logger.info(f"FreezeStage at step={step}: applied {flipped}")
@@ -856,7 +860,10 @@ def _shutdown_if_requested(
             f"Shutdown requested at step {step}; "
             "its scheduled checkpoint is the emergency checkpoint"
         )
-        with _logged_time(session.tracker, "checkpoint/wait_sec", step):
+        if ckpt_mgr.has_pending_save:
+            with _logged_time(session.tracker, "checkpoint/wait_sec", step):
+                ckpt_mgr.wait()
+        else:
             ckpt_mgr.wait()
     elif nan_skipped and not params_are_finite(session.model, session.runtime.device):
         logger.error(

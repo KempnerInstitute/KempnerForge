@@ -4726,9 +4726,9 @@ class TestLoopPeriodicWork:
 
 
 class TestCheckpointTiming:
-    """Every save the loop makes logs ``checkpoint/save_sec`` and every drain of an
-    async save logs ``checkpoint/wait_sec``; neither is part of ``step_time``, except a
-    freeze stage's flush, which runs inside its step."""
+    """Every save the loop makes logs ``checkpoint/save_sec`` and every drain that finds an
+    async save pending logs ``checkpoint/wait_sec``; neither is part of ``step_time``, except
+    a freeze stage's flush, which runs inside its step."""
 
     @staticmethod
     def _session(monkeypatch, config, *, async_saves: bool = True, **overrides):
@@ -4795,6 +4795,24 @@ class TestCheckpointTiming:
         run_training_loop(session)
         assert self._times(logged, "checkpoint/save_sec") == [(1, 7.0)]
         assert self._times(logged, "checkpoint/wait_sec") == [(1, 2.0)]
+
+    def test_an_emergency_checkpoint_saved_synchronously_logs_no_wait(self, monkeypatch):
+        """A synchronous save leaves the shutdown's drain nothing to wait for; both drains
+        still run."""
+        config = make_config(max_steps=5)
+        config.checkpoint.interval = 1
+        session, logged = self._session(
+            monkeypatch,
+            config,
+            async_saves=False,
+            shutdown_handler=FakeShutdownHandler(after_steps=1),
+        )
+        run_training_loop(session)
+        ckpt = session.checkpointer
+        assert isinstance(ckpt, FakeCheckpointManager)
+        assert self._times(logged, "checkpoint/save_sec") == [(1, 7.0)]
+        assert self._times(logged, "checkpoint/wait_sec") == []
+        assert ckpt.waits == 2
 
     def test_a_run_with_nothing_pending_logs_no_final_wait(self, monkeypatch):
         """Synchronous saves leave nothing to drain, so the run's end logs no wait."""
@@ -4863,13 +4881,32 @@ class TestFreezeStageFence:
         assert order == ["flush", "freeze"]
 
     def test_stage_logs_its_flush_as_checkpoint_wait_time(self, monkeypatch):
+        """A save still in flight at the stage makes its flush a wait to log."""
+        order: list = []
+        session = self._vlm_session(monkeypatch, start_step=2, order=order)
+        ckpt = session.checkpointer
+        ckpt.has_pending_save = True  # type: ignore
+
+        def flush() -> None:
+            order.append("flush")
+            ckpt.has_pending_save = False  # type: ignore
+
+        ckpt.flush_pending_save = flush  # type: ignore
+        logged: list = []
+        monkeypatch.setattr(session.tracker, "log_eval", lambda m, s: logged.append((s, dict(m))))
+        run_training_loop(session)
+        waits = [step for step, metrics in logged if "checkpoint/wait_sec" in metrics]
+        assert waits == [2]
+
+    def test_stage_with_no_save_in_flight_logs_no_wait(self, monkeypatch):
+        """The flush still runs on every rank; with nothing pending it has no wait to log."""
         order: list = []
         session = self._vlm_session(monkeypatch, start_step=2, order=order)
         logged: list = []
         monkeypatch.setattr(session.tracker, "log_eval", lambda m, s: logged.append((s, dict(m))))
         run_training_loop(session)
-        waits = [step for step, metrics in logged if "checkpoint/wait_sec" in metrics]
-        assert waits[0] == 2
+        assert order == ["flush", "freeze"]
+        assert not [step for step, metrics in logged if "checkpoint/wait_sec" in metrics]
 
     def test_no_stage_at_this_step_does_not_flush(self, monkeypatch):
         order: list = []
