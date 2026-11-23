@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import statistics
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -47,6 +47,7 @@ from PIL import Image
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.loader import load_config
 from kempnerforge.metrics.mlflow.publish import PublishRefused
+from tests.gloo_ranks import gloo_group, held_store
 
 LONG_QUESTION_ROW = 4
 LONG_PROMPT_TOKENS = 21
@@ -1048,16 +1049,16 @@ class TestJoiningRanks:
         import torch.distributed as dist
 
         started: list[Any] = []
+        group = ExitStack()
 
         def start_group(config: Any, seed: int) -> None:
             started.append((config.backend, seed))
-            dist.init_process_group(
-                "gloo", rank=0, world_size=1, init_method=f"tcp://127.0.0.1:{_free_port()}"
-            )
+            port = group.enter_context(held_store())
+            group.enter_context(gloo_group(0, 1, port))
 
         def end_group() -> None:
             started.append("ended")
-            dist.destroy_process_group()
+            group.close()
 
         monkeypatch.setattr(evaluator, "get_world_info", lambda: (0, 0, 2))
         monkeypatch.setattr(evaluator, "init_distributed", start_group)
@@ -1120,12 +1121,6 @@ class TestPublishing:
         assert f"{run.step_dir.resolve()} --metrics {output / 'metrics.json'}" in warning
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def _evaluate_on_rank(
     rank: int,
     world: int,
@@ -1144,6 +1139,7 @@ def _evaluate_on_rank(
     import torch.distributed as dist
 
     notes = Path(output).parent
+    group = ExitStack()
 
     def publish(checkpoint_dir: Path, metrics: dict[str, float]) -> Any:
         (notes / f"published-{rank}").write_text(json.dumps([str(checkpoint_dir), metrics]))
@@ -1158,17 +1154,14 @@ def _evaluate_on_rank(
         raise OSError("the tokenizer is not on this node")
 
     def start_group(config: Any, seed: int) -> None:
-        dist.init_process_group(
-            "gloo",
-            rank=rank,
-            world_size=world,
-            init_method=f"tcp://127.0.0.1:{port}",
-            timeout=timedelta(seconds=GROUP_TIMEOUT_SEC),
+        group.enter_context(
+            gloo_group(rank, world, port, timeout=timedelta(seconds=GROUP_TIMEOUT_SEC))
         )
 
     os.environ.update(RANK=str(rank), LOCAL_RANK="0", WORLD_SIZE=str(world))
     evaluator.publish_metrics = publish
     evaluator.init_distributed = start_group
+    evaluator.destroy_distributed = group.close
     if rank == broken_rank:
         if broken == "split":
             evaluator.build_reader = open_split
@@ -1187,8 +1180,7 @@ def _evaluate_on_rank(
     except Exception as exc:
         ended = f"{type(exc).__name__}: {exc}"
     (notes / f"ended-{rank}").write_text(ended)
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    group.close()
 
 
 def _spawn_ranks(
@@ -1201,28 +1193,29 @@ def _spawn_ranks(
     """
     import torch.multiprocessing as mp
 
-    args = (
-        world,
-        _free_port(),
-        str(run.config_path),
-        str(run.step_dir),
-        str(tasks),
-        str(output),
-        broken_rank,
-        broken,
-    )
-    context = mp.start_processes(
-        _evaluate_on_rank, args=args, nprocs=world, join=False, start_method="spawn"
-    )
-    deadline = time.monotonic() + RANKS_BOUND_SEC
-    try:
-        while not context.join(timeout=1):
-            if time.monotonic() > deadline:
-                pytest.fail(f"the ranks did not all end within {RANKS_BOUND_SEC} s")
-    finally:
-        for process in context.processes:
-            if process.is_alive():
-                process.kill()
+    with held_store(world) as port:
+        args = (
+            world,
+            port,
+            str(run.config_path),
+            str(run.step_dir),
+            str(tasks),
+            str(output),
+            broken_rank,
+            broken,
+        )
+        context = mp.start_processes(
+            _evaluate_on_rank, args=args, nprocs=world, join=False, start_method="spawn"
+        )
+        deadline = time.monotonic() + RANKS_BOUND_SEC
+        try:
+            while not context.join(timeout=1):
+                if time.monotonic() > deadline:
+                    pytest.fail(f"the ranks did not all end within {RANKS_BOUND_SEC} s")
+        finally:
+            for process in context.processes:
+                if process.is_alive():
+                    process.kill()
     return [(output.parent / f"ended-{rank}").read_text() for rank in range(world)]
 
 
