@@ -1273,7 +1273,7 @@
             "apply_dataloader_state(dataloader)",
             "restored_extra (property: the extra keys the last load restored)",
             "_resolve_load_path(path)",
-            "_agreed_resume_dir(path) -> Path | None (exact resume: rank 0 resolves the checkpoint, takes the newest step_N beside it that every stage saved when that one is not, and broadcasts its choice or its error)",
+            "_agreed_load_dir(path, fall_back) -> Path | None (every load: rank 0 resolves the checkpoint, on an exact resume that reads shards takes the newest step_N beside it that every stage saved when that one is not, and broadcasts its choice or its error)",
             "_cleanup()"
           ]
         }
