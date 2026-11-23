@@ -180,8 +180,11 @@ A single map-style dataset's position (`data.dataset_path`, an
 in-memory Hugging Face dataset or a VLM dataset) counts the samples of
 the epoch's order that all data-parallel ranks consumed, so it carries
 over to any data-parallel size and batch size: each rank resumes at
-its first sample past that count, and no sample is skipped or read
-twice. Three positions carry over only on the saved data-parallel
+its first sample past that count, and no sample is read twice. To keep
+the ranks in step, up to one sample per rank at the end of that epoch
+goes unread, beside the partial batch `drop_last` drops (see
+[Stateful dataloader § Resuming on another data-parallel size](../data/stateful-dataloader.md#resuming-on-another-data-parallel-size)).
+Three positions carry over only on the saved data-parallel
 size: a weighted mixture (`data.datasets`), a streamed dataset
 (`data.hf_streaming`), and a checkpoint saved before the loader
 recorded its batch size. On another data-parallel size their data

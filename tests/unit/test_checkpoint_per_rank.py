@@ -1139,16 +1139,17 @@ class TestDataParallelLayout:
     ):
         """On the layout that saved it each rank resumes its own position, flag or not.
 
-        The flag lets only a changed topology through, so a position the loader cannot
-        place, here a stream's in a map-style run, still raises.
+        On a sound envelope the flag lets only a changed topology through, so a position
+        the loader cannot place, here a stream's in a map-style run, still raises. Each
+        rank saved its own count, so the pending state shows whose position it holds.
         """
         from kempnerforge.config.schema import DataConfig
         from kempnerforge.data.dataloader import DataPositionError, StatefulDataLoader
         from kempnerforge.data.sampler import DistributedSampler
 
         payloads, _ = _mk_payloads(seed_base=1000, cursor_base=100)
-        for p in payloads.values():
-            p["dataloader"] = {"stream": {}, "epoch": 0, "batches_yielded": 3}
+        for r, p in payloads.items():
+            p["dataloader"] = {"stream": {}, "epoch": 0, "batches_yielded": 3 + r}
         _save_four_rank_ckpt(tmp_path, monkeypatch, payloads, step=7, layout=DP4)
         dataset = list(range(64))
         for r in range(WORLD):
@@ -1157,6 +1158,11 @@ class TestDataParallelLayout:
             )
             assert step == 7
             assert not mgr._pending_dataloader_carried
+            assert mgr._pending_dataloader_state == {
+                "stream": {},
+                "epoch": 0,
+                "batches_yielded": 3 + r,
+            }, f"rank {r} did not get its own position"
             loader = StatefulDataLoader(
                 dataset,
                 batch_size=2,

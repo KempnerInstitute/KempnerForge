@@ -86,11 +86,15 @@ holds a complete save, it says so at ERROR level.
 ## Where it's called
 
 `training/entry.py::restore_checkpoint` calls this **once**, right after creating the
-`CheckpointManager`:
+`CheckpointManager`; with a process group, rank 0 calls it and broadcasts the
+path, or the error it raised, to every rank:
 
 ```python
 num_stages = config.distributed.pp if config.distributed.pp > 1 else None
-resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
+if dist.is_initialized():
+    resume_path = _resume_path_on_rank_zero(config.checkpoint.dir, num_stages)
+else:
+    resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
 step, tokens_seen = 0, 0
 if resume_path and config.checkpoint.load_path:
     logger.warning(...)  # rank 0, unless load_path is resume_path: load_path is not used
@@ -98,7 +102,7 @@ if resume_path or config.checkpoint.load_path:
     warm_start_exclude = (
         (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
     )
-    vlm_freeze_expected = ...  # VLM runs only: the freeze expected at the saved step
+    vlm_freeze_expected = ...  # VLM runs, unless a weights-only warm start
     step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
         path=str(resume_path) if resume_path else None,
         scheduler=scheduler,
@@ -145,9 +149,12 @@ state was recorded applies rank 0's position on every rank and raises
 `checkpoint.ignore_rank_state_mismatch` set, a resume onto another world
 size or layout, and any resume of a checkpoint saved before per-rank
 state was recorded, even on the topology that saved it, treats the data
-position as a warm start does and restarts the RNG streams. The flag
-does not cover a position that does not fit on the topology that saved
-per-rank state: it still raises `DataPositionError` (see
+position as a warm start does and restarts the RNG streams. Per-rank
+state that is unreadable or incomplete even on the topology that saved
+it is the exception: the flag keeps no data position from it, so the
+data starts at its first sample. The flag does not cover a position
+that does not fit on the topology that saved per-rank state: it still
+raises `DataPositionError` (see
 [Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size)).
 
 If both are set, `resume_path` wins (auto-resume takes precedence

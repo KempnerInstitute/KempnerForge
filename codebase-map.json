@@ -1646,9 +1646,10 @@
           "TestDistributedSampler(8)",
           "TestStatefulDataLoader(3)",
           "TestHuggingFaceDataset(6)",
+          "TestTextReadersReadOnlyTheText(2)",
           "TestStreamingHuggingFaceDataset(8)"
         ],
-        "count": 34
+        "count": 36
       },
       "tests/unit/test_distributed.py": {
         "classes": [
