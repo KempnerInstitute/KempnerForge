@@ -57,9 +57,9 @@ Architecture hyperparameters and MoE knobs.
 | `vocab_size` | `int` | `32000` | embedding table size |
 | `ffn_dim_multiplier` | `float` | `1.0` | scales Llama-style `4·dim·(2/3)` hidden width |
 | `ffn_hidden_dim` | `int \| None` | `None` | hard-override the computed FFN width |
-| `norm_type` | `"rmsnorm" \| "layernorm"` | `"rmsnorm"` | registry key for norm builder |
+| `norm_type` | `"rmsnorm" \| "layernorm"` or a registered `norm` name | `"rmsnorm"` | registry key for norm builder |
 | `norm_eps` | `float` | `1e-5` | norm epsilon |
-| `activation` | `"silu" \| "gelu" \| "relu"` | `"silu"` | MLP activation (`silu` → SwiGLU) |
+| `activation` | `"silu" \| "gelu" \| "relu"` or a plugin's registered `mlp` name | `"silu"` | MLP activation (`silu` → SwiGLU); a plugin's `mlp` name selects that builder, but not with `num_experts > 0`; core's `swiglu`, `standard_gelu` and `standard_relu` are rejected in favor of `silu`, `gelu` and `relu` |
 | `max_seq_len` | `int` | `2048` | RoPE table length; `train.seq_len` must be ≤ this |
 | `rope_theta` | `float` | `10000.0` | RoPE frequency base |
 | `tie_embeddings` | `bool` | `False` | share embedding and output-head weight |
@@ -151,7 +151,7 @@ LR schedule shape and warmup.
 
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
-| `name` | `"cosine" \| "linear" \| "wsd" \| "constant" \| "rex" \| "none"` | `"cosine"` | `scheduler` registry key |
+| `name` | `"cosine" \| "linear" \| "wsd" \| "constant" \| "rex" \| "none"` or a registered `scheduler` name | `"cosine"` | `scheduler` registry key |
 | `warmup_steps` | `int` | `2000` | linear warmup length |
 | `warmup_start_factor` | `float` | `0.0` | LR factor the warmup starts from (torch `LinearLR` `start_factor`) |
 | `decay_steps` | `int \| None` | `None` | `None` → decay over remaining steps |
@@ -181,6 +181,7 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `hf_dataset_image_field` | `str` | `"image"` | VLM only: image column |
 | `hf_dataset_prompt_field` | `str` | `""` | VLM only: prompt column (`""` = no prompt mask) |
 | `hf_image_size` | `int` | `224` | VLM only: target square image size |
+| `hf_max_images` | `int` | `1` | VLM only: images a document may hold; rows holding more are skipped when the dataset is loaded, and one warning counts them. `n ≥ 2` places a document's images' tokens before its text and, without packing, lays each document out on its own row of `train.seq_len` (Joint-Decoder only, not with `train.mixed_precision = "fp8"` or, under `attention_backend = "sdpa"`, `model.sdpa_backend = "flash"`) |
 | `hf_streaming` | `bool` | `False` | use `IterableDataset` for large corpora |
 | `pack_sequences` | `bool` | `False` | document-aware packing with cross-doc isolation (feeds `doc_ids` to attention); on a Joint-Decoder VLM run, packs `train.batch_size` image-text documents per micro-batch into rows of `train.seq_len`, each document's image tokens before its text, positions restarting per document |
 | `datasets` | `list[DatasetSource]` | `[]` | multi-dataset mixture (overrides `dataset_path`/`hf_dataset_name` when non-empty) |

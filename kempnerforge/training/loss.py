@@ -176,7 +176,37 @@ def chunked_cross_entropy_loss(
     return total_loss / valid_tokens
 
 
-def z_loss(logits: torch.Tensor, weight: float) -> torch.Tensor:
+class _ChunkedLogSumExp(torch.autograd.Function):
+    """Float32 log-sum-exp of each row of 2D logits, ``chunk_size`` rows at a time.
+
+    Saves the logits and the per-row result rather than a float32 copy of the logits,
+    and recomputes each chunk's softmax in backward, so the float32 temporaries cover
+    one chunk at a time.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, logits: torch.Tensor, chunk_size: int) -> torch.Tensor:
+        lse = torch.empty(logits.shape[0], dtype=torch.float32, device=logits.device)
+        for start in range(0, logits.shape[0], chunk_size):
+            stop = start + chunk_size
+            lse[start:stop] = torch.logsumexp(logits[start:stop].float(), dim=-1)
+        ctx.save_for_backward(logits, lse)
+        ctx.chunk_size = chunk_size
+        return lse
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx: Any, grad_lse: torch.Tensor) -> tuple[torch.Tensor, None]:
+        logits, lse = ctx.saved_tensors
+        grad = torch.empty_like(logits)
+        for start in range(0, logits.shape[0], ctx.chunk_size):
+            stop = start + ctx.chunk_size
+            part = logits[start:stop].float() - lse[start:stop].unsqueeze(-1)
+            grad[start:stop] = part.exp_().mul_(grad_lse[start:stop].unsqueeze(-1))
+        return grad, None
+
+
+def z_loss(logits: torch.Tensor, weight: float, chunk_size: int | None = None) -> torch.Tensor:
     """Logit magnitude regularizer (PaLM / Gemini).
 
     Penalizes large logit magnitudes to prevent logit drift that causes
@@ -184,20 +214,30 @@ def z_loss(logits: torch.Tensor, weight: float) -> torch.Tensor:
 
     Formula: weight * mean(logsumexp(logits, dim=-1) ** 2)
 
+    The log-sum-exp runs in float32, ``chunk_size`` tokens at a time, and keeps only
+    its per-token result for backward, which recomputes the softmax one chunk at a time
+    instead of keeping a float32 copy of the logits.
+
     Args:
-        logits: Model output logits, shape (batch, seq, vocab) or (tokens, vocab).
+        logits: Model output logits, shape (batch, seq, vocab) or (tokens, vocab). A plain
+            tensor, not a DTensor: under TP the output head returns a local tensor
+            (``use_local_output``), so a DTensor never reaches the loss.
         weight: Regularization weight (PaLM uses 1e-4).
+        chunk_size: Tokens per float32 chunk. ``None`` takes every token at once.
 
     Returns:
         Scalar z-loss term to add to the main loss; zero on the graph for logits
         with no rows (a packed micro-batch without text).
     """
+    if chunk_size is not None and chunk_size <= 0:
+        raise ValueError(f"z_loss chunk_size must be positive (got {chunk_size})")
     if weight == 0.0:
         return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
-    flat = logits.view(-1, logits.shape[-1]).float()
+    flat = logits.view(-1, logits.shape[-1])
     if flat.shape[0] == 0:
-        return flat.sum()
-    lse = torch.logsumexp(flat, dim=-1)
+        return _zero_on_graph(logits)
+    size = flat.shape[0] if chunk_size is None else chunk_size
+    lse = _ChunkedLogSumExp.apply(flat, size)
     return weight * (lse**2).mean()
 
 
@@ -206,11 +246,12 @@ def build_loss_fn(config) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor
 
     Follows the build_optimizer pattern: config in, callable out.
     Binds chunk_size for chunked CE and ``fp32`` when ``train.fp32_cross_entropy`` is set,
-    and composes z-loss, so the caller
-    gets a clean ``(logits, labels) -> Tensor`` interface.
+    and composes z-loss with the same chunk size (every token at once for unchunked CE),
+    so the caller gets a clean ``(logits, labels) -> Tensor`` interface.
     """
     base_fn = registry.get_loss(config.loss_fn)
 
+    chunk_size = None
     if config.loss_fn == "chunked_cross_entropy":
         chunk_size = config.ce_chunk_size if config.ce_chunk_size > 0 else 4096
         base_fn = functools.partial(base_fn, chunk_size=chunk_size)
@@ -228,7 +269,7 @@ def build_loss_fn(config) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor
         _inner = base_fn
 
         def composed(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-            return _inner(logits, labels) + z_loss(logits, z_weight)
+            return _inner(logits, labels) + z_loss(logits, z_weight, chunk_size)
 
         return composed
 
