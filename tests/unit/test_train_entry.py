@@ -3300,7 +3300,12 @@ class TestVlmSourceBuilders:
 
     @pytest.mark.parametrize(
         ("built", "named", "refused"),
-        [("cross_attention", "joint_decoder", True), ("joint_decoder", "cross_attention", False)],
+        [
+            ("cross_attention", "joint_decoder", True),
+            ("joint_decoder", "cross_attention", False),
+            ("mot", "joint_decoder", False),
+            ("moma", "mot", True),
+        ],
     )
     def test_the_text_only_refusal_follows_the_strategy_and_the_attention_built(
         self, monkeypatch, built, named, refused

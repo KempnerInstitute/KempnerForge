@@ -224,7 +224,10 @@ class JobConfig:
         frames of a video run are masked under either backend where
         ``masks_frames_in_backend_attention`` says so: Joint-Decoder and MoMa. The training
         setup calls this on CUDA, after the CLI overrides and before the process group
-        starts; evaluation and generation, whose forwards carry no mask, do not.
+        starts. Evaluation and generation are not checked at setup: on CUDA, a forward
+        there that passes a dense mask to ``Attention``, such as video evaluation's frame
+        mask under Joint-Decoder or MoMa, raises the ``ValueError`` from
+        ``Attention.forward``.
 
         Raises:
             ValueError: The run would train with ``sdpa_backend="flash"`` and a mask.

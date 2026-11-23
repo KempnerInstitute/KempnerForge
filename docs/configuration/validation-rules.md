@@ -394,8 +394,11 @@ model.sdpa_backend == "flash" && (
 
 Checked by the training setup on CUDA, after the CLI overrides and
 before the process group starts
-(`JobConfig.check_flash_attention_masks`); evaluation and generation,
-whose forwards carry no mask, are not. PyTorch's CUDA FlashAttention
+(`JobConfig.check_flash_attention_masks`). Evaluation and generation
+are not checked at setup; on CUDA, a forward there that passes a dense
+mask to `Attention`, such as video evaluation's frame mask under
+Joint-Decoder or MoMa, raises the `ValueError` from
+`Attention.forward`. PyTorch's CUDA FlashAttention
 kernel takes no attention mask, and these runs build one: packed rows
 read from a dataset mask their documents from each other, and the padded
 frames of a video run are masked in self-attention, under

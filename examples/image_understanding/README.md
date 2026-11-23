@@ -223,10 +223,11 @@ cross-attention blocks: their attention and MLP updates are zeroed for that
 row, so its text runs through the backbone alone. On `mot` the hidden blank
 image's tokens still pass through the image experts. On `moma` they are dropped
 before routing, so they take no expert capacity; a micro-batch with no image
-gives the image experts zero gradients. On `joint_decoder` and `moma` the
-FlashAttention kernel takes no mask, so an unpacked dataset with text-only rows
-is refused with `model.sdpa_backend = "flash"` under `attention_backend =
-"sdpa"`.
+gives the image experts zero gradients. On `joint_decoder` and `moma` the frame
+mask reaches attention under `model.sdpa_backend`, whose `"flash"` kernel takes
+no mask on CUDA, so on CUDA an unpacked dataset with text-only rows and
+`data.hf_max_images = 1` is refused with `model.sdpa_backend = "flash"` under
+either `attention_backend`, `"sdpa"` or `"flex"`; on CPU it is not.
 
 ## Documents with several images
 
