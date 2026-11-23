@@ -167,23 +167,35 @@ def _build_my_mlp(dim: int, hidden_dim: int) -> MyCustomMLP:
 registry.register("mlp", "my_mlp", _build_my_mlp)
 ```
 
-Import it before training starts (in `scripts/train.py` or a plugin
-module), then:
+List the module in the config's `plugins` key, so `load_config` imports
+it before it reads `[model]`, then:
 
 ```toml
+plugins = ["my_project.mlp_variants"]
+
 [model]
 activation = "my_mlp"   # matches the registry key
 ```
 
 The activation-name → MLP-key mapping covers `silu`/`gelu`/`relu`; any
 other string is looked up directly in the `"mlp"` category, so your
-key just works.
+key just works in dense layers. Two limits apply:
+
+- **Not inside MoE experts.** With `num_experts > 0` the config is
+  rejected: the MoE expert kernels (grouped GEMM, packed experts and
+  expert parallelism; MoT's MoE layers included) compute core's SwiGLU
+  or standard MLP from the expert weights instead of calling your
+  module. MoMa's experts do call it, so a MoMa run can use it.
+- **Not core's own keys.** `activation = "swiglu"`, `"standard_gelu"`
+  or `"standard_relu"` is rejected; use `silu`, `gelu` or `relu`,
+  which select those MLPs.
 
 ```{note}
-The registry is a global singleton; `registry.get("mlp", "my_mlp")`
-raises `ValueError` if the module containing the `register()` call
-wasn't imported. Import it at the top of `scripts/train.py` or in your
-package's `__init__.py`.
+The registry is a global singleton. If the module containing the
+`register()` call wasn't imported before `load_config`, the loader
+rejects `activation = "my_mlp"` with a `ValueError` that lists the
+registered `mlp` names. List the module in `plugins`, or import it at
+the top of your entry point before it calls `load_config`.
 ```
 
 ## What's *not* registered

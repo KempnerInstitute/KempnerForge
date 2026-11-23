@@ -24,7 +24,7 @@ fp8
 | [Tensor parallelism](tensor-parallelism.md) | `ColwiseParallel` / `RowwiseParallel` / `SequenceParallel` plan, forward / post-hooks on embeddings + attention + MLP, meta-device init, head divisibility |
 | [Expert parallelism](expert-parallelism.md) | All-to-all dispatch + combine, unused-expert grad kludge, EP + TP + FSDP composition, expert gradients and clipping, gradient scaling |
 | [Pipeline parallelism](pipeline-parallelism.md) | Layer assignment, `PipelineStageModule`, 1F1B / GPipe / interleaved schedules, per-stage DCP checkpointing |
-| [FP8](fp8.md) | `torchao.float8` conversion, filter rules (no experts / router), `enable_fsdp_float8_all_gather`, TP incompatibility |
+| [FP8](fp8.md) | `torchao.float8` conversion, filter rules (no experts / router, no dimension that is not a multiple of 16), `enable_fsdp_float8_all_gather`, TP incompatibility |
 
 ## Cross-cutting references
 
