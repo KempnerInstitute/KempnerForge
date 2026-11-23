@@ -34,7 +34,7 @@ Each arch gets its own ``VLMConfig`` subclass, registered via
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from typing import Any
 
 from kempnerforge.config.registry import registry
@@ -73,9 +73,6 @@ class FreezeStage:
     specs: tuple[FreezeSpec, ...]
 
 
-_RESERVED_ARCHS: tuple[str, ...] = ()
-
-
 @dataclass
 class VLMConfig:
     """Base VLM configuration.
@@ -89,8 +86,8 @@ class VLMConfig:
     Field summary (full per-field docs are picked up from autodoc):
 
     - ``arch`` VLM architecture discriminator. Subclasses set this via
-      field default; direct construction with an arch name not backed by
-      a registered subclass raises.
+      field default; construction raises when it names an arch that is
+      not registered, or one other than the class's own default.
     - ``max_text_len`` fixed text padding length used by ``VLMCollator``.
       Enforces rank-consistent batches under FSDP2.
     - ``tile_grid`` how the image path cuts each image into views: ``0``
@@ -117,17 +114,16 @@ class VLMConfig:
     )
 
     def __post_init__(self) -> None:
-        if self.arch in _RESERVED_ARCHS:
-            raise NotImplementedError(
-                f"vlm.arch={self.arch!r} is reserved; not yet implemented. "
-                f"Reserved: {sorted(_RESERVED_ARCHS)}."
-            )
         registered = tuple(registry.list_vlm_configs())
         if self.arch not in registered:
+            raise ValueError(f"Unknown vlm.arch: {self.arch!r}. Registered: {sorted(registered)}.")
+        declared = type(self).declared_arch()
+        if self.arch != declared:
             raise ValueError(
-                f"Unknown vlm.arch: {self.arch!r}. "
-                f"Registered: {sorted(registered)}. "
-                f"Reserved (not yet implemented): {sorted(_RESERVED_ARCHS)}."
+                f"vlm.arch={self.arch!r} does not match {type(self).__name__}.arch "
+                f"({declared!r}). Each arch has its own config class, so build it "
+                "with VLMConfig.for_arch(arch, ...); a registered subclass must default "
+                "arch to the name it is registered under."
             )
         if self.max_text_len < 2:
             raise ValueError("vlm.max_text_len must be >= 2 (a caption token plus its target)")
@@ -181,14 +177,32 @@ class VLMConfig:
         return True
 
     @classmethod
+    def declared_arch(cls) -> str:
+        """The ``arch`` default this class declares, which its configs must carry.
+
+        Read from the dataclass field, not the class attribute: that is a slot
+        descriptor on a ``slots=True`` subclass, and the base's default when a
+        subclass sets ``arch`` with a ``default_factory``.
+
+        Raises:
+            TypeError: the class declares ``arch`` without a default.
+        """
+        arch = next(f for f in fields(cls) if f.name == "arch")
+        if arch.default_factory is not MISSING:
+            return arch.default_factory()
+        if arch.default is MISSING:
+            raise TypeError(
+                f"{cls.__name__} declares arch without a default; default it to the name "
+                "the class is registered under"
+            )
+        return arch.default
+
+    @classmethod
     def for_arch(cls, arch: str, **kwargs: Any) -> VLMConfig:
         """Resolve ``arch`` to a registered subclass and instantiate.
 
         Raises:
             ValueError: ``arch`` is not registered.
-            NotImplementedError: ``arch`` is reserved (in
-                ``_RESERVED_ARCHS``) matches loader semantics so the
-                error type is independent of construction site.
 
         Example:
             >>> cfg = VLMConfig.for_arch(
@@ -197,18 +211,11 @@ class VLMConfig:
             ...     cross_attention_every_n_layers=4,
             ... )
         """
-        if arch in _RESERVED_ARCHS:
-            raise NotImplementedError(
-                f"vlm.arch={arch!r} is reserved; not yet implemented. "
-                f"Reserved: {sorted(_RESERVED_ARCHS)}."
-            )
         try:
             sub = registry.get_vlm_config(arch)
         except KeyError as e:
             raise ValueError(
-                f"Unknown vlm.arch: {arch!r}. "
-                f"Registered: {sorted(registry.list_vlm_configs())}. "
-                f"Reserved (not yet implemented): {sorted(_RESERVED_ARCHS)}."
+                f"Unknown vlm.arch: {arch!r}. Registered: {sorted(registry.list_vlm_configs())}."
             ) from e
         return sub(**kwargs)
 
