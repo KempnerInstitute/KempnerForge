@@ -516,6 +516,28 @@ class TestNaNDetector:
             det.check_loss(1.0, step=1, grad_norm=float("inf"))
         assert seen == [1.0]
 
+    @pytest.mark.parametrize(("cuda", "device"), [(True, "cuda"), (False, "cpu")])
+    def test_the_flag_goes_on_cuda_only_when_cuda_is_available(self, monkeypatch, cuda, device):
+        """The flag is asked for on the device NCCL or gloo reduces, then made on the CPU."""
+        import kempnerforge.resilience.health as health
+
+        devices: list[str] = []
+
+        class _RecordingTorch:
+            def __getattr__(self, name):
+                return getattr(torch, name)
+
+            @staticmethod
+            def tensor(data, device=None, **kwargs):
+                devices.append(device)
+                return torch.tensor(data, **kwargs)
+
+        self._fake_world(monkeypatch, remote_bad=False)
+        monkeypatch.setattr(health, "torch", _RecordingTorch())
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+        assert NaNDetector(action="warn").check_loss(1.0, step=1) is True
+        assert devices == [device]
+
     def test_last_good_loss_tracked(self):
         det = NaNDetector(action="warn")
         det.check_loss(3.0, step=1)

@@ -1648,13 +1648,13 @@
       "tests/unit/test_resilience.py": {
         "classes": [
           "TestShutdownHandler(16)",
-          "TestNaNDetector(26)",
+          "TestNaNDetector(27)",
           "TestNaNDetectorAcrossRanks(2)",
           "TestGPUHealth(2)",
           "TestSLURM(13)",
           "TestResumePathResolution(9)"
         ],
-        "count": 68
+        "count": 69
       },
       "tests/unit/test_shutdown_agreement.py": {
         "classes": [
