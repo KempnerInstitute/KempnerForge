@@ -724,11 +724,10 @@
           ]
         },
         "ScheduleFreeAdamW": {
-          "purpose": "Schedule-Free AdamW (Defazio & Mishchenko 2024), eliminates LR schedule via iterate averaging",
+          "purpose": "Schedule-Free AdamW (Defazio & Mishchenko 2024), eliminates LR schedule via iterate averaging; each parameter's step count lives in its optimizer state",
           "methods": [
             "step(closure)",
-            "state_dict()",
-            "load_state_dict(state_dict)",
+            "load_state_dict(state_dict) (maps a legacy optimizer-wide _k onto each parameter's step)",
             "eval_params()",
             "train_params()"
           ]
@@ -744,6 +743,7 @@
       },
       "functions": [
         "build_optimizer(model, config, module_patterns=None) -> Optimizer",
+        "evaluation_point(optimizer, model=None) -> context manager (eval_params() inside, train_params() after; reshards the model's FSDP2 units around the swap)",
         "module_learning_rates(optimizer) -> dict[str, float] (keyed lr/<module>, lr_adamw/<module>)",
         "_split_by_module(model, param_groups, config, module_patterns) -> list[dict]",
         "_module_owners(model, modules, module_patterns) -> (owners, enclosing) (over every parameter name; a parameter several listed modules match goes to the one whose matches the others strictly contain; identical or partly overlapping matches are refused)",
@@ -921,6 +921,7 @@
         "checkpoint_extra(config, step, phases) -> dict"
       ],
       "tested_by": [
+        "tests/unit/test_train_entry.py::TestLoopPeriodicWork",
         "tests/unit/test_train_entry.py::TestRunTrainingLoop",
         "tests/unit/test_train_entry.py::TestBatchStream",
         "tests/unit/test_train_entry.py::TestMoEMetrics",
@@ -1251,11 +1252,13 @@
             "_read_saved_keys(dcp_dir) -> (keys, restored_on_any_rank) (this rank's DCP keys; with a scope or multipliers an all-reduce on the gloo group tells every rank whether any rank's index holds optimizer state)",
             "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope, multipliers and group-layout checks all decide from it)",
             "_check_plugins(metadata, ckpt_dir, expected) (every rank refuses another plugins list before any state is read, unless checkpoint.ignore_plugins_mismatch)",
+            "_broadcast_train_state(path) -> dict (rank 0 reads train_state.pt and broadcasts the state or why it could not; rank 0 re-raises its error, every other rank raises a RuntimeError naming it)",
             "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
             "_check_lr_multipliers(metadata, ckpt_dir) -> saved group modules | None (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
             "_present_experts(dcp_state, load_from, saved_keys) (EP experts placed among all of them before DCP; a load refuses a checkpoint of fewer experts than the model; the ranks agree before DCP)",
             "apply_dataloader_state(dataloader)",
             "_resolve_load_path(path)",
+            "_agreed_load_dir(path, fall_back) -> Path | None (every load: rank 0 resolves the checkpoint, on an exact resume that reads shards takes the newest step_N beside it that every stage saved when that one is not, and broadcasts its choice or its error)",
             "_cleanup()"
           ]
         }
@@ -1284,6 +1287,8 @@
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
         "tests/unit/test_ep_checkpoint.py",
         "tests/unit/test_checkpoint.py::TestCheckpointManagerLoad",
+        "tests/unit/test_checkpoint.py::TestScheduleFreeCheckpoint",
+        "tests/unit/test_schedule_free_fsdp.py::TestScheduleFreeUnderFsdp2",
         "tests/distributed/test_checkpoint.py"
       ]
     },
@@ -1645,9 +1650,11 @@
           "TestPeekSavedStep(5)",
           "TestFlushPendingSave(1)",
           "TestSaveVLMFreezeMetadata(3)",
-          "TestLoadVLMFreezeCompare(9)"
+          "TestLoadVLMFreezeCompare(9)",
+          "TestUnreadableTrainStateAcrossRanks(1)",
+          "TestTornStageAcrossRanks(1)"
         ],
-        "count": 51
+        "count": 52
       },
       "tests/unit/test_observability.py": {
         "classes": [
@@ -1839,11 +1846,11 @@
       "tests/unit/test_additional_optimizers.py": {
         "classes": [
           "TestLion(10)",
-          "TestScheduleFreeAdamW(9)",
+          "TestScheduleFreeAdamW(21)",
           "TestNoneScheduler(3)",
           "TestOptimizerConfig(3)"
         ],
-        "count": 25
+        "count": 37
       },
       "tests/unit/test_scheduler_extensions.py": {
         "classes": [

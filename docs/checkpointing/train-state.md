@@ -71,7 +71,11 @@ and `latest` stays on the previous checkpoint.
 
 On load, rank 0 reads the file and broadcasts it to every rank
 via `dist.broadcast_object_list`; all ranks agree on `step` and
-scheduler state. On an exact resume (the training entry's auto-resume
+scheduler state. When rank 0 cannot read it, a torn file or one the
+ownership check refuses, it broadcasts why in place of the state: it
+raises its own error, and every other rank raises a `RuntimeError`
+naming it at once, instead of waiting in the broadcast until the
+process-group timeout. On an exact resume (the training entry's auto-resume
 of the run's own checkpoint, `load(..., exact_resume=True)`) each rank
 then restores **its own** entry from `per_rank["ranks"]`, keyed by
 global rank. Any other load (a `load_path` warm start,
