@@ -100,8 +100,7 @@ rank's experts (see
 `NaNDetector.check_loss` returns `False` when the loss or the gradient norm is
 NaN / Inf on any rank; the loop then zeroes the gradients and skips the step.
 The detector escalates to `rollback_recommended` after `max_consecutive` bad steps
-in a row (`NaNDetector(max_consecutive=10)` in
-`kempnerforge/training/entry.py`; see
+in a row (`train.nan_max_consecutive`, default 10; see
 [NaN detection](../resilience/nan-detection.md)).
 The gradient norm is checked because a finite loss can come with
 non-finite gradients: a micro-batch whose labels are all `-100` has an exact

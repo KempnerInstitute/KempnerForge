@@ -115,6 +115,8 @@ Training-loop hyperparameters.
 | `fp32_cross_entropy` | `bool` | `False` | compute `cross_entropy` / `chunked_cross_entropy` and their gradient in fp32 from bf16 logits, without an fp32 copy of the logits; rejected for any other `loss_fn`; see [Losses § fp32 cross-entropy](../training/losses.md#fp32-cross-entropy) |
 | `shutdown_timeout_sec` | `float` | `600.0` | seconds a rank has, from the start of its shutdown (the signal, or for a rank the vote stops, the vote), to finish the step in flight, write and flush the emergency checkpoint and tear down, before a forced exit (`0` = disabled); under SLURM it fires first only if shorter than the signal lead |
 | `nccl_health_check_interval` | `int` | `0` | NCCL liveness all-reduce every N steps (`0` = disabled) |
+| `nan_action` | `"warn" \| "skip" \| "raise"` | `"warn"` | what the NaN detector does on a step whose loss or gradient norm is NaN / Inf on any rank: `"warn"` and `"skip"` log a warning and the loop skips the step (the two differ only in the warning), `"raise"` raises `RuntimeError` on every rank; see [NaN detection](../resilience/nan-detection.md#three-actions) |
+| `nan_max_consecutive` | `int` | `10` | NaN / Inf steps in a row after which the loop stops, without a checkpoint, for a manual rollback; must be positive; see [NaN detection § Rollback recommendation](../resilience/nan-detection.md#rollback-recommendation) |
 
 Computed properties: `param_dtype` (compute dtype), `master_dtype` (storage dtype: fp32 with
 `fp32_master_weights`, otherwise `param_dtype`), `is_fp8`.

@@ -10,7 +10,7 @@ diagnose each.
 
 | Tool | What it catches | Config | Enabled by default? |
 |------|------------------|:------:|:-------------------:|
-| [`NaNDetector`](../resilience/nan-detection.md) | NaN/Inf in loss | hardcoded in `kempnerforge/training/entry.py` | yes (warn mode) |
+| [`NaNDetector`](../resilience/nan-detection.md) | NaN/Inf in loss or gradient norm | `train.nan_action`, `train.nan_max_consecutive` | yes (warn mode) |
 | [`MetricsTracker`](../metrics-and-profiling/metrics-tracker.md) | loss, grad-norm, tok/s, MFU, memory | `[metrics]` | yes |
 | [`DeviceMemoryMonitor`](../metrics-and-profiling/memory-monitor.md) | per-interval peak memory, snapshot export | manual instantiation | no |
 | [`torch.profiler` wrapper](../metrics-and-profiling/profiler.md) | kernel traces, efficiency breakdown | `[profiling]` | no |
@@ -25,8 +25,9 @@ when default-on signals point at a specific failure mode.
 **Symptom:** one step shows `loss NaN`, the next might too, training
 keeps running.
 
-**What the codebase does:** `run_training` instantiates
-`NaNDetector(action="warn", max_consecutive=10)` at startup. Each
+**What the codebase does:** `run_training` builds a `NaNDetector` from
+`train.nan_action` (default `"warn"`) and `train.nan_max_consecutive`
+(default `10`) at startup. Each
 step's `avg_loss` flows through
 [`check_loss()`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/health.py),
 which all-reduces a NaN flag across ranks and returns `False` on NaN.
@@ -60,13 +61,13 @@ you from optimizing into garbage. The usual flow:
    `checkpoint.dir` holds a checkpoint (rank 0 logs a warning naming
    both paths).
 
-### Configuration caveat
+### Configuration
 
-`action` and `max_consecutive` are **hardcoded** in
-`kempnerforge/training/entry.py`; there's no TOML knob. If you need
-`action="raise"` (fail fast) or `action="skip"` without the warning,
-edit the source. See
-[Resilience § NaN detection § Limitations](../resilience/nan-detection.md#limitations).
+Both settings are in `[train]`. `nan_action = "raise"` fails the run
+on the first NaN / Inf step, on every rank, and `nan_max_consecutive`
+sets how many in a row stop it. `"skip"` acts like `"warn"` in the
+training loop: both skip the step, and only the warning differs. See
+[Resilience § NaN detection § Three actions](../resilience/nan-detection.md#three-actions).
 
 ### Related signals
 

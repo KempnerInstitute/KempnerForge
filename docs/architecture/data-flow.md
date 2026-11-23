@@ -51,9 +51,10 @@ initializes the collaborators:
   preemption.
 - **`NaNDetector`** from
   [`kempnerforge.resilience.health`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/health.py)
-  — tracks consecutive NaN steps; `action="warn"` by default. After
-  `max_consecutive=10` in a row it sets `rollback_recommended` and the loop
-  stops; rolling back is manual.
+  — tracks consecutive NaN steps, with the action `train.nan_action`
+  (`"warn"` by default). After `train.nan_max_consecutive` (default 10) in
+  a row it sets `rollback_recommended` and the loop stops; rolling back is
+  manual.
 - **Loss function** from the registry (`"cross_entropy"` or
   `"chunked_cross_entropy"`).
 - **Model** via `build_parallel_model` — applies the full parallelism

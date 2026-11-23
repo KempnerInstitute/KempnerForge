@@ -12,7 +12,9 @@ back to an earlier checkpoint.
 
 ```python
 # training/entry.py::run_training
-nan_detector = NaNDetector(action="warn", max_consecutive=10)
+nan_detector = NaNDetector(
+    action=config.train.nan_action, max_consecutive=config.train.nan_max_consecutive
+)
 ...
 # Inside the training loop, after backward:
 if not nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
@@ -30,12 +32,18 @@ if not nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
     continue
 ```
 
-Two things to note:
+Three things to note:
 
-- **`action="warn"` and `max_consecutive=10` are hardcoded in
-  `training/entry.py`** — not exposed as TOML config. If you want
-  `"skip"` or `"raise"` behavior, edit the script or construct the
-  detector yourself.
+- **The action and the threshold come from `[train]`.** `nan_action`
+  (default `"warn"`, see [Three actions](#three-actions)) and
+  `nan_max_consecutive` (default `10`, see
+  [Rollback recommendation](#rollback-recommendation)):
+
+  ```toml
+  [train]
+  nan_action          = "raise"   # fail fast on the first NaN / Inf step
+  nan_max_consecutive = 20        # or tolerate a longer run of them
+  ```
 - **The gradient norm is checked with the loss.** A finite loss can come with
   non-finite gradients: a micro-batch whose labels are all `-100` has an exact
   zero cross-entropy loss whatever its activations, and without the norm check
@@ -134,8 +142,10 @@ if action not in ("warn", "skip", "raise"):
 |--------|----------|-----------------|
 | `"warn"` | Log a warning, return `False`. Loop zeros grads and continues. | Default. NaN-tolerant training where a single bad step shouldn't kill the run. |
 | `"skip"` | Same as `"warn"` but logs `"— skipping optimizer step"` explicitly. | Same as warn; the two are nearly equivalent since the caller already skips the optimizer step on `False`. |
-| `"raise"` | Raise `RuntimeError` immediately. | Early development when you want the run to die loudly on first NaN. |
+| `"raise"` | Raise `RuntimeError` immediately, on every rank (the raise comes after the cross-rank reduction). | Early development when you want the run to die loudly on first NaN. |
 
+The training loop takes its action from `train.nan_action`, in the TOML
+`[train]` table or as `--train.nan_action=raise` on the command line.
 In the shipped training loop, `"warn"` and `"skip"` produce the same
 outcome (the caller already zeros grads and advances the step). The
 distinction exists for callers that only call `check_loss` and let the
@@ -187,8 +197,9 @@ class NaNState:
 ```
 
 `consecutive_nans` resets on any finite step. It's the one that drives
-rollback: when it reaches `max_consecutive` (default 5 in the class, 10
-in the shipped config), `rollback_recommended` flips to `True`.
+rollback: when it reaches `max_consecutive` (default 5 in the class;
+the training loop's detector takes `train.nan_max_consecutive`, default
+10), `rollback_recommended` flips to `True`.
 
 `nan_steps` is a diagnostic — a post-hoc "which steps actually failed"
 list. Capped at 100 entries to bound memory on pathological runs.
@@ -291,9 +302,6 @@ every rank must call it.
 
 ## Limitations
 
-- **NaN action isn't in config.** Fixed at `"warn"` / `max_consecutive=10`
-  in `run_training` (`kempnerforge/training/entry.py`). Change the source
-  if you need something different.
 - **No gradient scan in the hot path.** `check_gradients` exists but
   isn't wired in. Add it if you're hunting a specific gradient
   pathology, on every rank; expect a small per-step cost (one

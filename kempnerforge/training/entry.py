@@ -455,7 +455,9 @@ def run_training(
     finished = False
     try:
         shutdown_handler.register()
-        nan_detector = NaNDetector(action="warn", max_consecutive=10)
+        nan_detector = NaNDetector(
+            action=config.train.nan_action, max_consecutive=config.train.nan_max_consecutive
+        )
 
         loss_fn = build_loss_fn(config.train)
         use_dynamic_flex_shapes(config.is_vlm and config.data.pack_sequences)

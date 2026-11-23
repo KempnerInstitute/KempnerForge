@@ -20,7 +20,7 @@ Three failure modes the module addresses:
 | Component | Source | Wired into `train.py`? |
 |-----------|--------|-------------------------|
 | `ShutdownHandler` | `resilience/signal_handler.py` | always-on |
-| `NaNDetector` | `resilience/health.py` | hardcoded `action="warn"` |
+| `NaNDetector` | `resilience/health.py` | always-on; `train.nan_action`, `train.nan_max_consecutive` |
 | `check_nccl_health` | `resilience/health.py` | opt-in via `train.nccl_health_check_interval` |
 | `check_gpu_health` | `resilience/health.py` | no — manual utility |
 | `SLURMInfo` / `get_slurm_info` / `log_job_info` | `resilience/elastic.py` | `log_job_info()` at startup |
@@ -36,13 +36,13 @@ Everything in the first column is importable from
 shutdown_timeout_sec       = 600.0   # forced exit this long after a rank starts shutting down (0 = disabled);
                                      # fires before SLURM's SIGKILL only if below the signal lead
 nccl_health_check_interval = 0       # NCCL ping every N steps (0 = disabled)
+nan_action                 = "warn"  # on a NaN/Inf step: "warn" or "skip" (the loop skips it either way),
+                                     # or "raise" (every rank raises RuntimeError)
+nan_max_consecutive        = 10      # NaN/Inf steps in a row that stop the run for a manual rollback
 ```
 
-Two knobs. There is deliberately no `nan_detection` section — the
-action and max-consecutive count are hardcoded in
-`kempnerforge/training/entry.py` (`action="warn"`, `max_consecutive=10`).
-Edit the source if you need
-different behavior; see [NaN detection](nan-detection.md).
+Four knobs, all in `[train]`. The last two set the `NaNDetector` that
+the training loop checks every step; see [NaN detection](nan-detection.md).
 
 ## SLURM launch
 
@@ -80,4 +80,4 @@ elastic
   `shutdown_handler.should_shutdown()` and `nan_detector.check_loss()`
   are polled each step.
 - [Configuration § `[train]`](../configuration/config-sections.md) —
-  the two resilience-related config fields.
+  the resilience-related config fields.

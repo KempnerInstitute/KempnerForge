@@ -35,9 +35,14 @@ class NaNDetector:
     """Detects and tracks NaN/Inf values in loss and gradients.
 
     Supports three responses to NaN:
-      - ``"warn"``: Log a warning and continue.
-      - ``"skip"``: Skip the optimizer step (zero gradients).
+      - ``"warn"``: Log a warning and return False.
+      - ``"skip"``: The same, with a warning that the optimizer step is skipped.
       - ``"raise"``: Raise a ``RuntimeError``.
+
+    The training loop skips the optimizer step whenever a check returns False,
+    so there ``"warn"`` and ``"skip"`` behave the same; its action and
+    ``max_consecutive`` come from ``train.nan_action`` and
+    ``train.nan_max_consecutive``.
 
     Once the consecutive NaN count reaches ``max_consecutive``,
     :attr:`rollback_recommended` turns True. Nothing rolls back on its own: the

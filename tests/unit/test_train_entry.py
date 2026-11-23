@@ -1361,6 +1361,37 @@ class TestRunTraining:
         assert seen == [0, 1, 2]
         assert torch.equal(before, model.out.weight)
 
+    @pytest.mark.parametrize(
+        ("train_kwargs", "expected"),
+        [({}, ("warn", 10)), ({"nan_action": "skip", "nan_max_consecutive": 2}, ("skip", 2))],
+        ids=["defaults", "configured"],
+    )
+    def test_the_nan_detector_follows_the_train_config(self, monkeypatch, train_kwargs, expected):
+        """Every step is NaN, so the run stops after ``nan_max_consecutive`` of them."""
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        _stub_entry(monkeypatch, TinyTextModel())
+        seen: list[tuple[int, str, int]] = []
+
+        def nan_step(session, step):
+            seen.append((step, session.nan_detector.action, session.nan_detector.max_consecutive))
+            return StepResult(loss=float("nan"), grad_norm=0.5)
+
+        run_training(make_config(max_steps=20, **train_kwargs), step_fn=nan_step)
+        assert seen == [(step, *expected) for step in range(expected[1])]
+
+    def test_nan_action_raise_in_the_config_fails_the_run(self, monkeypatch):
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        _stub_entry(monkeypatch, TinyTextModel())
+        with pytest.raises(RuntimeError, match="NaN/Inf loss at step 0"):
+            run_training(
+                make_config(max_steps=20, nan_action="raise"),
+                step_fn=lambda _session, _step: StepResult(loss=float("nan"), grad_norm=0.5),
+            )
+
     def test_teardown_is_cooperative_only_on_the_clean_path(self, monkeypatch):
         import kempnerforge.training.entry as entry
         from kempnerforge.training.entry import run_training
