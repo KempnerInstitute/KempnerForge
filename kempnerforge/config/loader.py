@@ -158,7 +158,7 @@ def _coerce_number(field_type: type[int] | type[float], value: Any) -> int | flo
 
     Raises:
         ValueError: A bool, a string that is not such a number, a value of another type,
-            or, for an int, a number with a fraction.
+            for an int, a number with a fraction, or, for a float, an int too large for one.
     """
     article = "an" if field_type is int else "a"
     refusal = f"expected {article} {field_type.__name__}, got {value!r}"
@@ -169,7 +169,7 @@ def _coerce_number(field_type: type[int] | type[float], value: Any) -> int | flo
         raise ValueError(refusal)
     try:
         return field_type(value)
-    except ValueError:
+    except (ValueError, OverflowError):
         raise ValueError(refusal) from None
 
 

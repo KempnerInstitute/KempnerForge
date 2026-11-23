@@ -2095,8 +2095,9 @@ class TestScalarCoercion:
         lr = load_config(cli_args=[f"--optimizer.lr={raw}"]).optimizer.lr
         assert lr == expected and type(lr) is float
 
-    @pytest.mark.parametrize("raw", ["True", "'fast'"])
+    @pytest.mark.parametrize("raw", ["True", "'fast'", "1" + "0" * 400])
     def test_a_value_that_is_no_float_is_refused(self, raw):
+        """An int too large for a float is refused too, rather than raising OverflowError."""
         with pytest.raises(ValueError, match=r"OptimizerConfig\.lr: expected a float"):
             load_config(cli_args=[f"--optimizer.lr={raw}"])
 
