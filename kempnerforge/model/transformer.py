@@ -275,8 +275,19 @@ class Transformer(nn.Module):
 
         Called after ``model.to_empty(device=...)`` to fill in parameter values
         and compute RoPE frequency table. Safe to call on already-initialized models
-        (skips if freqs are already computed).
+        (skips if freqs are already computed). ``to_empty`` gives each module a
+        parameter of its own, so a tied output head is first tied to the token
+        embedding again; the shared weight is then initialized once, as in a build on
+        a real device.
         """
+        head, embedding = self.output_head, self.token_embedding
+        if (
+            self.config.tie_embeddings
+            and head is not None
+            and embedding is not None
+            and head.proj.weight is not embedding.embedding.weight
+        ):
+            head.tie_weights(embedding)
         if self._rope_cos is None:
             self._rope_cos, self._rope_sin = precompute_rope_frequencies(
                 head_dim=self.config.head_dim,

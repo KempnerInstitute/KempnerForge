@@ -14,7 +14,7 @@ from kempnerforge.config.model import FLEX_BLOCK_SIZE, ModelConfig
 from kempnerforge.config.optimizer import OptimizerConfig
 from kempnerforge.config.profiling import ProfilingConfig
 from kempnerforge.config.scheduler import SchedulerConfig
-from kempnerforge.config.training import TrainConfig
+from kempnerforge.config.training import FP8_DIM_MULTIPLE, TrainConfig
 from kempnerforge.config.video import VideoConfig
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import MoMaConfig, MoTConfig, VLMConfig
@@ -25,10 +25,11 @@ _HF_VISION_ENCODER_TYPES = frozenset({"siglip2", "clip"})
 def _arch_of(vlm: VLMConfig) -> str:
     """The arch of ``vlm``'s class, which is what the parallelism checks act on.
 
-    The instance's ``arch`` field can name another arch, for example after a
-    ``--vlm.arch`` override, which keeps the class the TOML section built.
+    The instance's ``arch`` field can name another arch after an assignment to
+    it, which ``__post_init__`` does not see; the loader rejects a ``--vlm.arch``
+    override that would need another class.
     """
-    return type(vlm).arch
+    return type(vlm).declared_arch()
 
 
 @dataclass
@@ -153,7 +154,7 @@ class JobConfig:
                     "data.pack_sequences on a VLM run does not support "
                     "train.mixed_precision='fp8': the packed head runs over the batch's text "
                     "tokens, whose count is the inner dimension of the head's FP8 "
-                    "weight-gradient GEMM and must be a multiple of 16"
+                    f"weight-gradient GEMM and must be a multiple of {FP8_DIM_MULTIPLE}"
                 )
 
         if self.optimizer.lr_multipliers:
@@ -296,6 +297,23 @@ class JobConfig:
                 "FP8 + Tensor Parallelism is not yet supported (torchao Float8Linear "
                 "does not compose with DTensor sharding). Use FP8 with FSDP only, "
                 "or TP without FP8."
+            )
+        if self.train.is_fp8 and self.model.dim % FP8_DIM_MULTIPLE:
+            raise ValueError(
+                f"train.mixed_precision='fp8' needs model.dim divisible by {FP8_DIM_MULTIPLE} "
+                f"(got {self.model.dim}): torch._scaled_mm needs both dimensions of an FP8 "
+                f"weight divisible by {FP8_DIM_MULTIPLE}, and every attention and MLP "
+                "projection and the output head has model.dim on one side, so no layer would "
+                f"run in FP8. Use a multiple of {FP8_DIM_MULTIPLE} or train in bf16."
+            )
+        tokens = self.train.batch_size * self.train.seq_len
+        if self.train.is_fp8 and self.vlm is None and tokens % FP8_DIM_MULTIPLE:
+            raise ValueError(
+                "train.mixed_precision='fp8' needs train.batch_size * train.seq_len divisible "
+                f"by {FP8_DIM_MULTIPLE} (got {self.train.batch_size} * {self.train.seq_len} = "
+                f"{tokens}): the FP8 weight gradient multiplies over the micro-batch's tokens, "
+                f"and torch._scaled_mm needs that dimension divisible by {FP8_DIM_MULTIPLE}, so "
+                "the first backward would fail. Change batch_size or seq_len, or train in bf16."
             )
 
         if self.model.is_moe and self.distributed.pp > 1:

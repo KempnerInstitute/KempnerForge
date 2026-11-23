@@ -18,10 +18,38 @@ Usage:
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable, Collection
 from typing import Any
 
 AdapterAccepts = Collection[str] | Callable[[Any], Collection[str]]
+
+_UNKNOWN_MODULE = "an unknown module"
+
+
+def _registering_module() -> str:
+    """Name of the module calling into the registry: the first frame outside this module."""
+    frame = inspect.currentframe()
+    while frame is not None and frame.f_globals.get("__name__") == __name__:
+        frame = frame.f_back
+    if frame is None:
+        return _UNKNOWN_MODULE
+    return frame.f_globals.get("__name__", _UNKNOWN_MODULE)
+
+
+def _registration_site(obj: Any) -> str:
+    """The registering module, plus where ``obj`` is defined when that is another module.
+
+    A shared helper or an ``__init_subclass__`` hook is the registering module for
+    every plugin that goes through it, so the module that defines a registered
+    function or class tells those plugins apart.
+    """
+    module = _registering_module()
+    if inspect.isfunction(obj) or inspect.isclass(obj):
+        defined_in = getattr(obj, "__module__", None)
+        if defined_in and defined_in != module:
+            return f"{module} (for {defined_in}.{obj.__qualname__})"
+    return module
 
 
 class Registry:
@@ -29,6 +57,7 @@ class Registry:
 
     def __init__(self) -> None:
         self._stores: dict[str, dict[str, Any]] = {}
+        self._owners: dict[str, dict[str, str]] = {}
 
     def _get_store(self, category: str) -> dict[str, Any]:
         if category not in self._stores:
@@ -36,11 +65,24 @@ class Registry:
         return self._stores[category]
 
     def register(self, category: str, name: str, obj: Any) -> Any:
-        """Register an object under category/name."""
+        """Register an object under category/name.
+
+        Records the registering module, the first caller outside this module, and
+        for a function or class defined in another module that module too, so
+        that registering the name again raises a ``ValueError`` naming both the
+        registration that owns it and the one trying again.
+        """
         store = self._get_store(category)
+        owners = self._owners.setdefault(category, {})
+        site = _registration_site(obj)
         if name in store:
-            raise ValueError(f"{category}/{name} is already registered")
+            owner = owners.get(name)
+            by = f" by {owner}" if owner is not None else ""
+            raise ValueError(
+                f"{category}/{name} is already registered{by}; {site} tried to register it again"
+            )
         store[name] = obj
+        owners[name] = site
         return obj
 
     def get(self, category: str, name: str) -> Any:
