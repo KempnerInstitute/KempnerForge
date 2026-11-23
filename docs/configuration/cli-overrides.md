@@ -86,7 +86,7 @@ the dataclass type hint and coerces:
 | Field type | Input | Result |
 |------------|-------|--------|
 | `int` | `"512"` or `3.0` | `int(…)`; a fraction such as `2.7`, a bool, another string or another type → `ValueError` |
-| `float` | `"3e-4"` or `1` | `float(…)`; a bool, a non-numeric string or another type → `ValueError` |
+| `float` | `"3e-4"` or `1` | `float(…)`; a bool, a non-numeric string, an int too large for a float or another type → `ValueError` |
 | `bool` | `"true"`, `"1"`, `"yes"` or `1` / `"false"`, `"0"`, `"no"` or `0` | `True` / `False`; anything else → `ValueError` |
 | `tuple[float, float]` | `[0.9, 0.95]` | `(0.9, 0.95)` |
 | `list[str]` | `"a"` | `["a"]` (wraps bare scalar) |
