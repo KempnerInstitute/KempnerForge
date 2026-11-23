@@ -830,8 +830,7 @@ class TestResumePathResolution:
         assert resolve_resume_path(str(tmp_path)) is None
 
     def test_latest_symlink(self, tmp_path):
-        step_dir = tmp_path / "step_100"
-        step_dir.mkdir()
+        step_dir = _durable_step_dir(tmp_path, 100)
         (step_dir / "metadata.json").write_text("{}")
 
         latest = tmp_path / "latest"
@@ -878,6 +877,38 @@ class TestResumePathResolution:
         result = resolve_resume_path(str(tmp_path))
         assert result is not None
         assert result.name == "step_50"
+
+    def test_latest_that_lost_its_shards_is_skipped(self, tmp_path, caplog, monkeypatch):
+        """``latest`` without DCP's ``.metadata`` falls back to the newest complete step."""
+        import logging
+
+        self._let_caplog_see_kempnerforge(monkeypatch)
+        _durable_step_dir(tmp_path, 10)
+        torn = _durable_step_dir(tmp_path, 20)
+        (torn / ".metadata").unlink()
+        (tmp_path / "latest").symlink_to("step_20")
+
+        with caplog.at_level(logging.WARNING):
+            result = resolve_resume_path(str(tmp_path))
+
+        assert result is not None
+        assert result.name == "step_10"
+        skipped = f"Auto-resume: skipping latest -> {torn.resolve()}"
+        assert any(skipped in r.getMessage() for r in caplog.records), caplog.text
+
+    @pytest.mark.parametrize("stage_dir", [True, False], ids=["no_metadata", "no_stage_dir"])
+    def test_latest_missing_a_stage_is_skipped(self, tmp_path, stage_dir):
+        """Under PP every stage of ``latest`` must be durable, as for a ``step_N``."""
+        _durable_step_dir(tmp_path, 10, pp_stages=2)
+        torn = _durable_step_dir(tmp_path, 20, pp_stages=2)
+        (torn / "pp1" / ".metadata").unlink()
+        if not stage_dir:
+            (torn / "pp1").rmdir()
+        (tmp_path / "latest").symlink_to("step_20")
+
+        result = resolve_resume_path(str(tmp_path), num_stages=2)
+        assert result is not None
+        assert result.name == "step_10"
 
     def test_single_step_dir(self, tmp_path):
         """Works with exactly one step directory."""
