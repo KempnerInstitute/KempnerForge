@@ -100,11 +100,19 @@ class FakeShutdownHandler:
     def __init__(self, after_steps: int | None = None) -> None:
         self.after_steps = after_steps
         self.checks = 0
+        self.reinstalls = 0
         self.registered = False
+        self.requested = False
         self.finished = False
 
     def register(self) -> None:
         self.registered = True
+
+    def request(self) -> None:
+        self.requested = True
+
+    def reinstall(self) -> None:
+        self.reinstalls += 1
 
     def should_shutdown(self) -> bool:
         self.checks += 1
@@ -713,7 +721,7 @@ class TestRunTrainingLoop:
         for old, new in zip(before, session.model.parameters(), strict=True):
             assert torch.equal(old, new)
 
-    def test_shutdown_writes_an_emergency_checkpoint_and_finishes(self):
+    def test_shutdown_writes_an_emergency_checkpoint_and_leaves_the_handler_armed(self):
         config = make_config(max_steps=10)
         config.checkpoint.interval = 100
         handler = FakeShutdownHandler(after_steps=2)
@@ -722,7 +730,7 @@ class TestRunTrainingLoop:
         ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
         assert step == 2
         assert ckpt.saved_steps == [2]
-        assert handler.finished is True
+        assert handler.finished is False
         assert ckpt.waits == 1
 
     def test_shutdown_on_a_scheduled_step_saves_it_once(self):
@@ -739,11 +747,11 @@ class TestRunTrainingLoop:
         assert step == 2
         assert ckpt.saved_steps == [2]
         assert hook.saves == [2]
-        assert handler.finished is True
+        assert handler.finished is False
         assert ckpt.waits == 2
 
-    def test_shutdown_on_a_scheduled_step_waits_for_it_before_finishing(self, monkeypatch):
-        """The scheduled save is flushed while the shutdown watchdog is still armed."""
+    def test_every_wait_runs_while_the_shutdown_watchdog_is_armed(self, monkeypatch):
+        """Neither the scheduled save's wait nor the final flush runs after ``finish()``."""
         config = make_config(max_steps=10)
         config.checkpoint.interval = 2
         ckpt = FakeCheckpointManager()
@@ -758,7 +766,8 @@ class TestRunTrainingLoop:
         monkeypatch.setattr(ckpt, "wait", wait)
         session = make_session(config, checkpointer=ckpt, shutdown_handler=handler)
         run_training_loop(session)
-        assert finished_at_wait == [False, True]
+        assert finished_at_wait == [False, False]
+        assert handler.finished is False
 
     def test_shutdown_after_a_scheduled_save_still_saves_its_own_step(self):
         """Step 2 is saved on the schedule; a shutdown at step 3 must still save step 3."""
@@ -770,7 +779,7 @@ class TestRunTrainingLoop:
         step, _ = run_training_loop(session)
         assert step == 3
         assert ckpt.saved_steps == [2, 3]
-        assert handler.finished is True
+        assert handler.finished is False
 
     @pytest.mark.parametrize(
         "after_steps,expected",
@@ -788,7 +797,7 @@ class TestRunTrainingLoop:
         step, _ = run_training_loop(session)
         assert step == after_steps
         assert ckpt.saved_steps == expected
-        assert handler.finished is True
+        assert handler.finished is False
 
     @pytest.mark.parametrize("mode", ["disabled", "async", "async_with_pinned_mem"])
     def test_shutdown_on_a_scheduled_step_commits_that_one_save(self, monkeypatch, tmp_path, mode):
@@ -816,6 +825,14 @@ class TestRunTrainingLoop:
         assert saved == [2]
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
         assert (tmp_path / "step_2" / ".metadata").is_file()
+
+    def test_the_signal_handlers_are_reinstalled_at_every_step(self):
+        """A compile can replace them below Python (#448); a skipped step reinstalls too."""
+        config = make_config(max_steps=4)
+        handler = FakeShutdownHandler()
+        session = make_session(config, shutdown_handler=handler, step_fn=_nan_on({1}))
+        run_training_loop(session)
+        assert handler.reinstalls == 4
 
     def test_hooks_fire_for_every_step_and_save(self):
         config = make_config(max_steps=4)
@@ -1032,7 +1049,7 @@ class TestNanSkippedStep:
         assert step == 1
         assert handler.checks == 1
         assert ckpt.saved_steps == [1]
-        assert handler.finished is True
+        assert handler.finished is False
         assert ckpt.waits == 1
 
     def test_shutdown_on_a_skipped_scheduled_step_saves_it_once(self, monkeypatch):
@@ -1057,7 +1074,7 @@ class TestNanSkippedStep:
         assert ckpt.saves == [(2, tokens_seen, {})]
         assert ckpt.waits == 1
         assert epochs == [2]
-        assert handler.finished is True
+        assert handler.finished is False
 
     def test_nan_stop_is_not_saved_even_with_a_shutdown_pending(self):
         """The NaN that trips the stop ends the run before the shutdown check: no save."""
@@ -1174,7 +1191,7 @@ class TestNanSkippedStep:
         with caplog.at_level(logging.ERROR, logger="kempnerforge"):
             step, handler = self._keep_last_one(tmp_path, _bad_update_on(2), mode)
         assert step == 4
-        assert handler.finished is True
+        assert handler.finished is False
         assert sorted(d.name for d in tmp_path.glob("step_*")) == ["step_2"]
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_2").resolve()
         errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
@@ -1192,7 +1209,7 @@ class TestNanSkippedStep:
         """A NaN loss alone leaves the weights finite, so skipped step 4 is saved as ``latest``."""
         step, handler = self._keep_last_one(tmp_path, _nan_on({3}))
         assert step == 4
-        assert handler.finished is True
+        assert handler.finished is False
         assert (tmp_path / "step_4" / ".metadata").is_file()
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_4").resolve()
 
@@ -1373,6 +1390,40 @@ class TestRunTraining:
         )
         assert destroys == [1]
         assert closes == [1, 1]
+
+    def test_finish_runs_after_the_emergency_flush_and_the_teardown(self, monkeypatch):
+        """The handler and its timer outlive the last ``wait()`` and the teardown (#313)."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+
+        events: list[str] = []
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        handler = FakeShutdownHandler(after_steps=2)
+        monkeypatch.setattr(handler, "finish", lambda: events.append("finish"))
+        monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: handler)
+        monkeypatch.setattr(ckpt, "wait", lambda: events.append("wait"))
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: events.append("destroy"))
+        config = make_config(max_steps=10)
+        config.checkpoint.interval = 100
+        run_training(config)
+        assert ckpt.saved_steps == [2]
+        assert events == ["wait", "destroy", "finish"]
+
+    def test_a_failed_run_does_not_finish_the_shutdown_handler(self, monkeypatch):
+        """On the exception path nothing calls ``finish()``; a real timer bounds the exit."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+
+        _stub_entry(monkeypatch, TinyTextModel())
+        handler = FakeShutdownHandler()
+        monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: handler)
+
+        def boom(_session, _step):
+            raise RuntimeError("step blew up")
+
+        with pytest.raises(RuntimeError, match="step blew up"):
+            run_training(make_config(max_steps=2), step_fn=boom)
+        assert handler.finished is False
 
     def test_checkpoint_manager_reads_the_trackers_live_runs(self, monkeypatch):
         import kempnerforge.training.entry as entry
@@ -2063,6 +2114,19 @@ class TestBuildModel:
         config.video = VideoConfig(max_frames=6, min_frames=1, frame_size=16)
         entry.build_model(config, _runtime(), lambda a, b: a)
         assert seen["frames_per_clip"] == 6
+
+    def test_non_pp_keeps_one_frame_per_clip_under_an_image_cap(self, monkeypatch):
+        """The cap sizes rows, not the clip the prefix route checks, so eval takes one image."""
+        import kempnerforge.training.entry as entry
+
+        seen: dict = {}
+        monkeypatch.setattr(
+            entry, "build_parallel_model", lambda *a, **k: seen.update(k) or "MODEL"
+        )
+        config = _vlm_config()
+        config.data = DataConfig(hf_max_images=3, num_workers=0)
+        entry.build_model(config, _runtime(), lambda a, b: a)
+        assert seen["frames_per_clip"] == 1
 
     def test_non_pp_sizes_the_model_for_the_tiled_views(self, monkeypatch):
         """A 2 × 2 grid without the whole image is four views per sample."""
@@ -3016,6 +3080,8 @@ class TestRestoreFromSavedCheckpoints:
 
 
 class FakeDataset:
+    has_text_only_rows = False
+
     def __init__(self, n=8, **kw) -> None:
         self.n = n
         self.kwargs = kw
@@ -3149,6 +3215,9 @@ class TestVlmSourceBuilders:
             vlmd, "HuggingFaceVLMDataset", lambda **k: FakeDataset(**seen.setdefault("dataset", k))
         )
         monkeypatch.setattr(vlmd, "VLMCollator", lambda **k: seen.setdefault("image_collator", k))
+        monkeypatch.setattr(
+            vlmd, "PackedVLMCollator", lambda **k: seen.setdefault("packed_collator", k)
+        )
         monkeypatch.setattr(vid, "build_video_dataset", lambda *a: FakeDataset())
         monkeypatch.setattr(vid, "VideoCollator", lambda **k: seen.setdefault("video_collator", k))
 
@@ -3159,7 +3228,70 @@ class TestVlmSourceBuilders:
         data = dp.build_data_pipeline(self._vlm_data_config(), _runtime())
         assert data.dataloader == "stateful_OBJ"
         assert seen["image_collator"]["pad_id"] == 7
+        assert seen["image_collator"]["frame_mask"] is False
         assert "video_collator" not in seen
+
+    def test_image_path_passes_the_image_cap_to_the_dataset(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.hf_max_images = 2
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=16)
+        assert seen["dataset"]["max_images"] == 2
+        assert seen["packed_collator"]["max_docs_per_row"] == 1 and "image_collator" not in seen
+
+    def test_a_dataset_with_text_only_rows_masks_every_batch(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        monkeypatch.setattr(FakeDataset, "has_text_only_rows", True)
+        dp.build_data_pipeline(self._vlm_data_config(), _runtime())
+        assert seen["image_collator"]["frame_mask"] is True
+
+    def test_an_image_cap_above_one_without_packing_uses_fixed_rows(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.hf_max_images = 3
+        config.train.seq_len = 128
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=16)
+        assert seen["packed_collator"] == {
+            "pad_id": 7,
+            "seq_len": config.train.seq_len,
+            "tokens_per_image": 16,
+            "max_docs_per_row": 1,
+        }
+        assert "image_collator" not in seen
+        with pytest.raises(ValueError, match="data.hf_max_images on a VLM run needs the built"):
+            dp.build_data_pipeline(config, _runtime())
+
+    @pytest.mark.parametrize("pack", [False, True])
+    def test_laid_out_rows_must_fit_the_image_cap_and_the_text(self, monkeypatch, pack):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.hf_max_images = 3
+        config.data.pack_sequences = pack
+        too_many = (config.train.seq_len - config.vlm.max_text_len) // 3 + 1
+        with pytest.raises(ValueError, match="cannot hold one document"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=too_many)
+        assert "dataset" not in seen
+
+    def test_text_only_rows_are_refused_with_flash_attention(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.model.sdpa_backend = "flash"
+        dp.build_data_pipeline(config, _runtime())
+        monkeypatch.setattr(FakeDataset, "has_text_only_rows", True)
+        with pytest.raises(ValueError, match="sdpa_backend='flash'"):
+            dp.build_data_pipeline(config, _runtime())
+        config.model.attention_backend = "flex"
+        dp.build_data_pipeline(config, _runtime())
 
     def test_packed_image_path_takes_the_model_token_count(self, monkeypatch):
         import kempnerforge.data.vlm_dataset as vlmd
@@ -3176,11 +3308,12 @@ class TestVlmSourceBuilders:
             "pad_id": 7,
             "seq_len": config.train.seq_len,
             "tokens_per_image": 12,
+            "max_docs_per_row": 0,
         }
         assert "image_collator" not in seen
         with pytest.raises(ValueError, match="built model's tokens per image"):
             dp.build_data_pipeline(config, _runtime())
-        with pytest.raises(ValueError, match="cannot hold one packed document"):
+        with pytest.raises(ValueError, match="cannot hold one document"):
             dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
 
     def test_packed_fit_check_runs_before_the_dataset_loads(self, monkeypatch):
@@ -3189,7 +3322,7 @@ class TestVlmSourceBuilders:
         self._stub_vlm_modules(monkeypatch, seen)
         config = self._vlm_data_config()
         config.data.pack_sequences = True
-        with pytest.raises(ValueError, match="cannot hold one packed document"):
+        with pytest.raises(ValueError, match="cannot hold one document"):
             dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
         with pytest.raises(ValueError, match="built model's tokens per image"):
             dp.build_data_pipeline(config, _runtime())
@@ -3213,6 +3346,20 @@ class TestVlmSourceBuilders:
         assert seen["dataset"]["tile_grid"] == 2
         assert seen["dataset"]["tile_global"] is False
 
+    def test_tiled_documents_with_several_images_count_every_view_of_every_image(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config(tile_grid=2, tile_global=False)
+        config.data.hf_max_images = 2
+        config.train.seq_len = 2 * 4 * 12 + config.vlm.max_text_len - 1
+        with pytest.raises(ValueError, match="96 image tokens"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        config.train.seq_len += 1
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        assert seen["packed_collator"]["max_docs_per_row"] == 1
+        assert seen["dataset"]["max_images"] == 2 and seen["dataset"]["tile_grid"] == 2
+
     def test_image_path_hands_the_tiling_to_the_dataset(self, monkeypatch):
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
@@ -3220,6 +3367,18 @@ class TestVlmSourceBuilders:
         dp.build_data_pipeline(self._vlm_data_config(tile_grid=2, tile_global=False), _runtime())
         assert seen["dataset"]["tile_grid"] == 2
         assert seen["dataset"]["tile_global"] is False
+
+    def test_packing_with_an_image_cap_packs_capped_documents(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        config.data.hf_max_images = 2
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=16)
+        assert seen["dataset"]["max_images"] == 2
+        assert seen["packed_collator"]["max_docs_per_row"] == 0
+        assert seen["packed_collator"]["tokens_per_image"] == 16
 
     def test_video_path_uses_the_video_collator(self, monkeypatch):
         seen: dict = {}
@@ -4012,17 +4171,20 @@ class TestPerDatasetMetrics:
 
 
 class TestLoopPeriodicWork:
-    def test_nccl_failure_stops_the_run_without_a_final_save(self, monkeypatch):
+    def test_nccl_failure_fails_the_run_without_a_final_save(self, monkeypatch):
+        """The pending save is drained, then the run raises so the job does not end as done."""
         import kempnerforge.training.loop as loop
 
         monkeypatch.setattr(loop, "check_nccl_health", lambda: False)
         config = make_config(max_steps=6)
         config.train.nccl_health_check_interval = 1
         session = make_session(config)
-        step, _ = run_training_loop(session)
-        ckpt: FakeCheckpointManager = session.checkpointer  # type: ignore[assignment]
-        assert step == 1
+        with pytest.raises(RuntimeError, match="NCCL health check failed at step 1"):
+            run_training_loop(session)
+        ckpt = session.checkpointer
+        assert isinstance(ckpt, FakeCheckpointManager)
         assert ckpt.saves == []
+        assert ckpt.waits == 1
 
     def test_healthy_nccl_does_not_stop_the_run(self, monkeypatch):
         import kempnerforge.training.loop as loop
@@ -4058,6 +4220,43 @@ class TestLoopPeriodicWork:
         config = make_config(max_steps=2)
         config.eval = EvalConfig(enabled=True, interval=1, steps=1, dataset_path="/x")
         run_training_loop(make_session(config, eval_dataloader=None))
+
+    def test_eval_runs_at_the_optimizers_evaluation_point(self, monkeypatch):
+        """A schedule-free run evaluates its averaged weights x and trains on at y, bit for bit."""
+        import kempnerforge.training.loop as loop
+        from kempnerforge.config.eval import EvalConfig
+        from kempnerforge.training.optimizer import ScheduleFreeAdamW
+
+        def build():
+            torch.manual_seed(0)
+            model = TinyTextModel()
+            return model, ScheduleFreeAdamW(model.parameters(), lr=0.05)
+
+        seen: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
+
+        def recording_eval(model, *args, **kwargs):
+            params = list(model.parameters())
+            x = [optimizer.state[p]["x"] for p in params]
+            seen.append(([p.detach().clone() for p in params], [t.clone() for t in x]))
+            return {}
+
+        monkeypatch.setattr(loop, "run_eval", recording_eval)
+        config = make_config(max_steps=4)
+        config.eval = EvalConfig(enabled=True, interval=2, steps=1, dataset_path="/x")
+        model, optimizer = build()
+        run_training_loop(
+            make_session(config, model=model, optimizer=optimizer, eval_dataloader=["BATCH"])
+        )
+        assert len(seen) == 2
+        for at_eval, x in seen:
+            assert all(torch.equal(a, b) for a, b in zip(at_eval, x, strict=True))
+
+        plain, plain_opt = build()
+        run_training_loop(
+            make_session(config, model=plain, optimizer=plain_opt, eval_dataloader=None)
+        )
+        for a, b in zip(model.parameters(), plain.parameters(), strict=True):
+            assert torch.equal(a, b), "evaluating at x changed the training run"
 
     def test_profiler_is_started_stepped_and_stopped(self):
         class CountingProfiler:

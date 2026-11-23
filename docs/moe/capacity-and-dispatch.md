@@ -40,17 +40,16 @@ expert** — their routing weight is set to 0:
 
 ```python
 # kempnerforge/model/moe.py — _apply_capacity (trimmed)
-for k in range(top_k):
-    for e in range(num_experts):
-        assigned = (indices[:, k] == e).nonzero(as_tuple=True)[0]
-        if assigned.numel() <= capacity:
-            continue
-        drop = assigned[capacity:]
-        weights[drop, k] = 0.0
+for e in range(num_experts):
+    tokens, slots = (indices == e).nonzero(as_tuple=True)
+    if tokens.numel() > capacity:
+        weights[tokens[capacity:], slots[capacity:]] = 0.0
 ```
 
-"First `capacity` tokens wins" — tokens are kept in sequence order,
-later tokens get dropped. If a token's *only* chosen expert is
+"First `capacity` routes win": an expert keeps the first `capacity`
+routes to it across all top-`k` slots, in token order, so an earlier
+token's second choice is kept ahead of a later token's first choice.
+Later routes get dropped. If a token's *only* chosen expert is
 overloaded, the token contributes nothing to the MoE output — but
 the residual connection still carries it through unchanged:
 
@@ -124,16 +123,31 @@ tests exercise this exact dispatch.
 Fallback when grouped GEMM can't run:
 
 ```python
-# kempnerforge/model/moe.py — MoEMLP._local_forward (trimmed)
+# kempnerforge/model/moe.py: MoEMLP._local_forward (trimmed)
+idle = []
 for i in range(self.num_experts):
     mask = (indices == i).any(dim=-1)
     if not mask.any():
+        idle.extend(self.experts[i].parameters())
         continue
     expert_input   = x_flat[mask]
     expert_output  = self.experts[i](expert_input)
     weight_for_i   = (weights * (indices == i).float()).sum(dim=-1)
     output[mask]  += weight_for_i[mask].unsqueeze(-1) * expert_output
+output = self._keep_in_graph(output, idle)   # output + sum(p.sum() for p in idle) * 0
 ```
+
+An expert that gets no tokens still gets a gradient, zero, from that
+last term. FSDP2 reduce-scatters only the parameters that have a
+gradient, so an expert idle on one rank but used on another would
+otherwise make the ranks' reduce-scatters differ in size: a hang over
+NCCL, a size mismatch over gloo. Packed experts always get one, since
+any expert that runs uses the packed tensors. A layer that gets no
+tokens at all, on either path, returns an empty output that carries the
+same term for every expert weight and for the routing weights, so the
+router's weights get a gradient too. Expert parallelism keeps its own
+version; see
+[Unused-expert kludge](../distributed/expert-parallelism.md#unused-expert-kludge).
 
 One kernel launch per expert (or more, per matmul). Fine for
 `num_experts ≤ 8`, painful at 32+.

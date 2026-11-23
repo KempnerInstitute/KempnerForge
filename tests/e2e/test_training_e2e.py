@@ -18,12 +18,14 @@ Each test verifies:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -482,23 +484,23 @@ def _check_resume_determinism(tmp_path, nproc: int, overrides: tuple[str, ...] =
 
 
 _MUON_OVERRIDES = ("--optimizer.name=muon", "--optimizer.lr=0.02", "--model.vocab_size=4096")
-_RESUMABLE_OPTIMIZERS = [
-    pytest.param(
-        name, marks=pytest.mark.xfail(strict=True, reason="#236: schedule_free_adamw cannot resume")
-    )
-    if name == "schedule_free_adamw"
-    else name
-    for name in sorted(registry.list("optimizer"))
-]
+_SCHEDULE_FREE_OVERRIDES = ("--optimizer.name=schedule_free_adamw", "--scheduler.name=none")
 
 
 def _optimizer_overrides(name: str) -> tuple[str, ...]:
-    """Overrides that train with the registered optimizer ``name``."""
-    return _MUON_OVERRIDES if name == "muon" else (f"--optimizer.name={name}",)
+    """Overrides that train with the registered optimizer ``name``.
+
+    Schedule-free AdamW runs under the ``none`` scheduler, the pairing its docs require.
+    """
+    if name == "muon":
+        return _MUON_OVERRIDES
+    if name == "schedule_free_adamw":
+        return _SCHEDULE_FREE_OVERRIDES
+    return (f"--optimizer.name={name}",)
 
 
 @pytest.mark.e2e
-@pytest.mark.parametrize("name", _RESUMABLE_OPTIMIZERS)
+@pytest.mark.parametrize("name", sorted(registry.list("optimizer")))
 def test_resume_determinism_single_gpu(tmp_path, name):
     """Single GPU: resumed run must match the uninterrupted reference bit-for-bit."""
     _check_resume_determinism(tmp_path, nproc=1, overrides=_optimizer_overrides(name))
@@ -506,7 +508,7 @@ def test_resume_determinism_single_gpu(tmp_path, name):
 
 @pytest.mark.e2e
 @requires_gpus(2)
-@pytest.mark.parametrize("name", _RESUMABLE_OPTIMIZERS)
+@pytest.mark.parametrize("name", sorted(registry.list("optimizer")))
 def test_resume_determinism_2gpu_fsdp(tmp_path, name):
     """2 GPU FSDP: resumed run must match the uninterrupted reference bit-for-bit."""
     _check_resume_determinism(tmp_path, nproc=2, overrides=_optimizer_overrides(name))
@@ -653,6 +655,153 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
     assert "Checkpoint committed" in output, (
         f"Emergency checkpoint was not saved:\n{traceback_or_tail(output, 2000)}"
     )
+
+
+def _descendants(pid: int) -> list[int]:
+    """Every process below ``pid``, read from ``/proc``."""
+    found: list[int] = []
+    for task in Path(f"/proc/{pid}/task").glob("*"):
+        try:
+            children = (task / "children").read_text().split()
+        except OSError:
+            continue
+        for child in map(int, children):
+            found += [child, *_descendants(child)]
+    return found
+
+
+def _rank_pid(launcher: subprocess.Popen, local_rank: int) -> int:
+    """The PID of the training process ``torch.distributed.run`` started for ``local_rank``."""
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        for pid in _descendants(launcher.pid):
+            try:
+                environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if f"LOCAL_RANK={local_rank}".encode() in environ:
+                return pid
+        time.sleep(0.5)
+    raise AssertionError(f"no process with LOCAL_RANK={local_rank} below {launcher.pid}")
+
+
+def _wait_for_log(log: Path, text: str, proc: subprocess.Popen, timeout: float) -> None:
+    """Wait until ``text`` is in ``log``; fail if ``proc`` exits first or time runs out."""
+    deadline = time.monotonic() + timeout
+    while text not in log.read_text():
+        if proc.poll() is not None or time.monotonic() > deadline:
+            pytest.fail(
+                f"{text!r} not logged (exit code {proc.poll()}):\n"
+                f"{traceback_or_tail(log.read_text(), 2000)}"
+            )
+        time.sleep(1)
+
+
+def _signal_and_wait(
+    cmd: list[str],
+    log: Path,
+    pid_of: Callable[[subprocess.Popen], int],
+    sig: signal.Signals,
+    env: dict[str, str],
+) -> str:
+    """Start ``cmd``, send ``sig`` to ``pid_of(proc)`` after step 5, and return the log.
+
+    At the end the launcher and every process below it are killed: ``torchrun``
+    starts each rank in a session of its own, so killing the launcher's
+    process group would leave the ranks of a hung run on their GPUs.
+    """
+    with log.open("w") as out:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(PROJECT_ROOT),
+            start_new_session=True,
+        )
+    returncode: int | None = None
+    try:
+        _wait_for_log(log, "[step 5]", proc, timeout=900)
+        os.kill(pid_of(proc), sig)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            returncode = proc.wait(timeout=120)
+    finally:
+        for pid in [*_descendants(proc.pid), proc.pid]:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        proc.wait()
+    output = log.read_text()
+    excerpt = traceback_or_tail(output, 2000)
+    assert returncode is not None, f"training still running 120s after {sig.name}:\n{excerpt}"
+    assert returncode == 0, f"training failed (exit {returncode}):\n{excerpt}"
+    return output
+
+
+@pytest.mark.e2e
+@requires_gpus(2)
+def test_sigusr1_to_one_rank_stops_every_rank(tmp_path):
+    """Only local rank 1 gets SIGUSR1; both ranks stop at one step and save it (#307)."""
+    ckpt_dir = tmp_path / "ckpt"
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--local-addr=127.0.0.1",
+        "--nproc_per_node=2",
+        TRAIN_SCRIPT,
+        DEBUG_CONFIG,
+        "--train.max_steps=100000",
+        "--metrics.log_interval=1",
+        f"--checkpoint.dir={ckpt_dir}",
+        "--checkpoint.interval=100000",
+    ]
+    output = _signal_and_wait(
+        cmd,
+        tmp_path / "train.log",
+        lambda launcher: _rank_pid(launcher, local_rank=1),
+        signal.SIGUSR1,
+        os.environ.copy(),
+    )
+    excerpt = traceback_or_tail(output, 2000)
+    assert "Shutdown requested on another rank" in output, f"rank 0 did not stop:\n{excerpt}"
+    assert "Checkpoint committed" in output, f"no emergency checkpoint:\n{excerpt}"
+    shards = sorted(p.name for p in (ckpt_dir / "latest").resolve().glob("*.distcp"))
+    assert shards == ["__0_0.distcp", "__1_0.distcp"], shards
+
+
+@pytest.mark.e2e
+@requires_gpus(1)
+def test_sigusr1_after_a_compile_writes_the_emergency_checkpoint(tmp_path):
+    """An in-process Triton compile replaces the handlers below Python (#448).
+
+    Empty Triton and Inductor caches and one compile thread make the run compile
+    its kernels in its own process, where LLVM installs its handlers.
+    """
+    ckpt_dir = tmp_path / "ckpt"
+    env = os.environ.copy()
+    env.setdefault("WORLD_SIZE", "1")
+    env.setdefault("RANK", "0")
+    env.setdefault("LOCAL_RANK", "0")
+    env["TRITON_CACHE_DIR"] = str(tmp_path / "triton-cache")
+    env["TORCHINDUCTOR_CACHE_DIR"] = str(tmp_path / "inductor-cache")
+    env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+    cmd = [
+        sys.executable,
+        TRAIN_SCRIPT,
+        DEBUG_CONFIG,
+        "--train.max_steps=100000",
+        "--train.compile_model=true",
+        "--metrics.log_interval=1",
+        f"--checkpoint.dir={ckpt_dir}",
+        "--checkpoint.interval=100000",
+    ]
+    output = _signal_and_wait(
+        cmd, tmp_path / "train.log", lambda proc: proc.pid, signal.SIGUSR1, env
+    )
+    excerpt = traceback_or_tail(output, 2000)
+    assert "Received SIGUSR1" in output, f"SIGUSR1 never reached the handler:\n{excerpt}"
+    assert "Checkpoint committed" in output, f"no emergency checkpoint:\n{excerpt}"
 
 
 @pytest.mark.e2e
@@ -991,6 +1140,34 @@ def test_fp8_moe_fsdp_4gpu(tmp_path):
     _assert_training_complete(result, expected_steps=10)
     output = result.stdout + result.stderr
     assert "Float8" in output, "Float8 conversion was not applied"
+
+
+@pytest.mark.e2e
+@requires_gpus(1)
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        ["--model.dim=64", "--model.n_heads=8", "--model.n_kv_heads=1"],
+        ["--model.vocab_size=50257"],
+    ],
+    ids=["kv-8x64", "vocab-50257"],
+)
+def test_fp8_unaligned_linears_stay_bf16_single_gpu(tmp_path, geometry):
+    """A Linear with a dim not divisible by 16 stays bf16 instead of failing in _scaled_mm."""
+    result = _run_training(
+        [
+            DEBUG_CONFIG,
+            "--train.max_steps=3",
+            "--metrics.log_interval=1",
+            "--train.mixed_precision=fp8",
+            *geometry,
+            f"--checkpoint.dir={tmp_path}/ckpt",
+        ],
+        nproc=1,
+    )
+    _assert_training_complete(result, expected_steps=3)
+    output = result.stdout + result.stderr
+    assert "Float8 kept" in output, traceback_or_tail(output, 2000)
 
 
 @pytest.mark.e2e

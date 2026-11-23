@@ -254,7 +254,7 @@ def check_nccl_health(timeout_sec: float = 10.0) -> bool:
         tensor = torch.ones(1, device="cuda")
         work = dist.all_reduce(tensor, async_op=True)
         try:
-            done = work.wait(timeout=timedelta(seconds=timeout_sec))  # type: ignore[reportOptionalMemberAccess]
+            done = work.wait(timeout=timedelta(seconds=timeout_sec))
         except RuntimeError as e:
             logger.warning(f"NCCL health check timed out after {timeout_sec}s: {e}")
             return False

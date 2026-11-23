@@ -240,8 +240,9 @@ expert dispatch breaks `Shard(1)` DTensors).
 
 ### MoE + FP8: experts stay bf16
 
-FP8 conversion is applied to dense `Linear`s only. Three classes are
-excluded: routed experts, shared expert, router gate. See
+FP8 conversion is applied to dense `Linear`s only. Four classes are
+excluded: routed experts, shared expert, router gate, and any other
+Linear with a dimension not divisible by 16. See
 [MoE + FP8](../moe/moe-fp8.md) for the rationale. Practical consequence:
 FP8 throughput lift on an MoE model is smaller than on a dense model
 of the same active-parameter count, because expert-weight GEMMs run

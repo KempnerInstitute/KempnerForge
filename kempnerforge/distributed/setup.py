@@ -101,7 +101,7 @@ def _barrier_with_timeout(seconds: float, reason: str) -> None:
     """
     work = dist.barrier(async_op=True)
     try:
-        done = work.wait(timeout=timedelta(seconds=seconds))  # type: ignore[reportOptionalMemberAccess]
+        done = work.wait(timeout=timedelta(seconds=seconds))
     except RuntimeError as e:
         raise RuntimeError(
             f"Barrier timed out after {seconds}s during {reason}. "
@@ -131,8 +131,33 @@ def _set_seed(seed: int, rank: int, pp_rank: int = 0) -> None:
     _np.random.seed(effective_seed)
 
 
+def _timeout_options(timeout: timedelta) -> dist.ProcessGroupNCCL.Options:
+    """Options that carry ``timeout`` to the groups ``init_device_mesh`` creates for a dim.
+
+    ``init_device_mesh`` gives a dimension's groups the timeout of the options it is passed,
+    at creation, so each backend and the wrapper ``TORCH_DISTRIBUTED_DEBUG=DETAIL`` puts
+    around them start with it. NCCL's options suit Gloo too: NCCL takes only its own, and
+    Gloo ignores options.
+    """
+    options = dist.ProcessGroupNCCL.Options()
+    options._timeout = timeout
+    return options
+
+
 def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | None:
     """Initialize distributed training and build the DeviceMesh.
+
+    ``config.nccl_timeout_sec`` is the collective timeout of the default process group
+    this creates and of every group ``init_device_mesh`` creates for the mesh, which would
+    otherwise get PyTorch's default. ``init_device_mesh`` creates a group for each
+    dimension smaller than the world, and for one as wide as the world only with CUDA and
+    Gloo alone; otherwise that dimension uses the default group, which keeps the timeout
+    it was created with. The options name the default group's backend, so with the mixed
+    backend a group is made with ``new_group`` even when the default group is bound to a
+    device, where torch 2.12 and 2.13 would split it and leave Gloo at its default. A bound
+    default group of NCCL alone is split with these options. One of Gloo alone is split
+    too, and Gloo keeps its default timeout there: naming it otherwise sends it to
+    ``new_group``, which fails on the ranks a subgroup leaves out.
 
     Args:
         config: Distributed configuration with parallelism dimensions.
@@ -217,10 +242,19 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
     if is_rank_zero():
         logger.info(f"DeviceMesh: dims={mesh_dims}, sizes={mesh_sizes}, world_size={world_size}")
 
+    timeout = timedelta(seconds=config.nccl_timeout_sec)
+    default_backend = dist.get_backend()
+    world_dims_create = torch.cuda.is_available() and default_backend == "gloo"
     device_mesh = init_device_mesh(
         device_type="cuda",
         mesh_shape=tuple(mesh_sizes),
         mesh_dim_names=tuple(mesh_dims),
+        backend_override={
+            name: (default_backend, _timeout_options(timeout))
+            for name, size in zip(mesh_dims, mesh_sizes, strict=True)
+            if size < world_size or world_dims_create
+        }
+        or None,
     )
 
     _barrier_with_timeout(60.0, reason="DeviceMesh construction")
