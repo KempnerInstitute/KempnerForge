@@ -330,9 +330,12 @@ class StreamingDataLoader:
     0's copy instead, a ``checkpoint.load_path`` warm start or a resume that
     ``checkpoint.ignore_rank_state_mismatch`` lets onto another layout, is exact
     while every rank started its current pass on the same step, so in practice
-    until the first rank finishes a pass. Past that, each rank that took another
-    rank's position warns, with a record every rank's log shows, since rank 0
-    holds its own position and stays silent.
+    until the first rank finishes a pass. Past that, a rank whose part of the
+    pass is shorter than rank 0's count runs off its end in the replay and
+    starts the next pass over, reading data again, and a rank that takes
+    another rank's count in a later pass may skip or repeat data. Either one
+    warns, with a record every rank's log shows, since rank 0 holds its own
+    position and stays silent.
 
     Args:
         dataset: The streaming dataset.
@@ -411,8 +414,10 @@ class StreamingDataLoader:
                 next(self._iterator)
             except StopIteration:
                 logger.warning(
-                    f"The stream ended after {replayed - 1} of {total} replayed batches; "
-                    f"starting epoch {self._epoch + 1}"
+                    f"The stream ended after {replayed - 1} of {total} replayed batches of "
+                    f"epoch {self._epoch}, so the saved position does not fit this rank's "
+                    f"part of the stream; starting epoch {self._epoch + 1} at its first batch",
+                    extra={"every_rank": True},
                 )
                 self._epoch += 1
                 self._batches_yielded = 0

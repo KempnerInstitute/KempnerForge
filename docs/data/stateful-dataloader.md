@@ -240,8 +240,13 @@ same data-parallel size, is exact only while every rank started its
 current pass on the same step, which in practice means until the first
 rank finishes a pass. Past that, a rank that had fallen behind rank 0
 skips data and a rank that was ahead reads data again, up to the
-difference between their parts of the stream, and every rank that takes
-another rank's position past the first pass logs a warning.
+difference between their parts of the stream. Such a rank logs a
+warning: a rank whose part of the pass is shorter than rank 0's count
+runs off its end during the replay, says that the stream ended and
+starts the next pass at its first batch, and in a later pass every rank
+that takes another rank's position warns when it loads it. Both
+warnings show in every rank's log, past the training log's rank-0
+filter.
 
 ## Worker RNG
 

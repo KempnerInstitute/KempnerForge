@@ -1029,7 +1029,7 @@
           ]
         },
         "StreamingDataLoader": {
-          "purpose": "DataLoader over a StreamingHuggingFaceDataset that resumes by replaying the saved batch count, logging progress; refuses a stream whose source files, shard count or settings changed, and starts fresh workers when a pass restarts midway; each rank saves its own count with its data-parallel rank, and past the first pass a rank that takes another rank's count, or one with no recorded rank, warns in every rank's log",
+          "purpose": "DataLoader over a StreamingHuggingFaceDataset that resumes by replaying the saved batch count, logging progress; refuses a stream whose source files, shard count or settings changed, and starts fresh workers when a pass restarts midway; each rank saves its own count with its data-parallel rank; a replay that runs off the end of the rank's part of the pass, and a later pass on another rank's count or one with no recorded rank, warn in every rank's log",
           "methods": [
             "__iter__()",
             "_restart_workers()",
@@ -2048,8 +2048,8 @@
         "count": 22
       },
       "tests/unit/test_streaming_resume.py": {
-        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning on another rank's position, mid-pass restart with workers, replay progress",
-        "count": 13
+        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning on another rank's position, replay past a shorter part warning in every rank's log, mid-pass restart with workers, replay progress",
+        "count": 14
       }
     },
     "integration": {

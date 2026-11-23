@@ -358,11 +358,13 @@ def test_the_same_files_in_another_directory_are_accepted(corpus, tmp_path):
 def test_a_later_pass_on_another_ranks_position_warns(corpus, caplog, monkeypatch):
     """Past the first pass, another rank's count may not fit this rank; say so.
 
-    A rank's own count, which an auto-resume restores, fits in every pass, and any
-    count fits in the first pass. A count saved before the rank was recorded may be
-    another rank's. Rank 0 takes its own count, so the warning must pass the training
-    log's rank-0 filter on the other ranks. The ``kempnerforge`` logger stops
-    propagation once configured, so the test lets records reach ``caplog``.
+    A rank's own count, which an auto-resume restores, fits in every pass. In the
+    first pass rank 0's count fits every rank still in that pass, and a rank that
+    already finished it runs off the end of its part in the replay, which warns on
+    its own (next test). A count saved before the rank was recorded may be another
+    rank's. Rank 0 takes its own count, so the warning must pass the training log's
+    rank-0 filter on the other ranks. The ``kempnerforge`` logger stops propagation
+    once configured, so the test lets records reach ``caplog``.
     """
     monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
     state = _stream_loader(corpus, world_size=2).state_dict()
@@ -383,6 +385,31 @@ def test_a_later_pass_on_another_ranks_position_warns(corpus, caplog, monkeypatc
         unrecorded = {k: v for k, v in later.items() if k != "data_parallel_rank"}
         _stream_loader(corpus, world_size=2).load_state_dict(unrecorded)
     assert "from a position that predates the saved rank" in caplog.text
+
+
+def test_a_replay_past_this_ranks_part_warns_in_its_own_log(corpus, caplog, monkeypatch):
+    """Rank 0's count can outrun a shorter part of the first pass; that rank says so.
+
+    In a load that gives every rank rank 0's count, a rank whose part of the stream is
+    shorter may have finished the pass while rank 0 has not, so its replay runs off
+    the end and it reads the next pass from its start again. Rank 0 replays its own
+    count, so the warning must pass the training log's rank-0 filter on the other
+    ranks. The ``kempnerforge`` logger stops propagation once configured, so the test
+    lets records reach ``caplog``.
+    """
+    monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+    part = sum(1 for _ in _stream_loader(corpus, rank=1, world_size=2))
+    state = {**_stream_loader(corpus, world_size=2).state_dict(), "batches_yielded": part + 2}
+    resumed = _stream_loader(corpus, rank=1, world_size=2)
+    with caplog.at_level(logging.WARNING, logger="kempnerforge.data.dataloader"):
+        resumed.load_state_dict(state)
+        next(iter(resumed))
+    ended = [r for r in caplog.records if "The stream ended" in r.getMessage()]
+    assert len(ended) == 1
+    assert f"after {part} of {part + 2} replayed batches of epoch 0" in ended[0].getMessage()
+    monkeypatch.setenv("RANK", "1")
+    assert _RankFilter(rank=0).filter(ended[0]), "the training log would drop it on rank 1"
+    assert resumed.state_dict()["epoch"] == 1
 
 
 def test_restarting_a_pass_midway_with_workers_reads_the_same_epoch(corpus, tmp_path):
