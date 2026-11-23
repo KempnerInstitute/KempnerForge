@@ -121,20 +121,21 @@ Nearly all of the AdamW share is the embedding and the output head,
 so both are there.
 
 **LR coupling.** Muon's scheduler sees only the Muon param groups.
-Before every Muon `step()`, the internal AdamW LR is set to its base LR
-times `muon_current_lr / muon_peak_lr` so both groups follow the same
-warmup/decay curve. If you set `muon_adam_lr`, it's the peak LR for the
-AdamW fallback group, and `muon_peak_lr` is the peak the scheduler runs
-Muon from, so a resume or warm start that continues a schedule saved
-under another `optimizer.lr` keeps the fallback at `muon_adam_lr`.
-Unset, the fallback runs at Muon's LR.
+In every Muon `step()`, before the internal AdamW steps, its LR is set
+to its base LR times `muon_current_lr / muon_peak_lr` so both groups
+follow the same warmup/decay curve. If you set `muon_adam_lr`, it's the
+peak LR for the AdamW fallback group, times a module's multiplier under
+`optimizer.lr_multipliers`, and `muon_peak_lr` is the peak the scheduler
+runs Muon from, so a resume or warm start that continues a schedule
+saved under another `optimizer.lr` keeps the fallback at `muon_adam_lr`
+times the schedule's factor. Unset, the fallback runs at Muon's LR.
 
-**FSDP2 interaction.** Newton-Schulz runs on each rank's local shard
-of the weight matrix rather than the fully gathered matrix — an
-approximation documented in the
-[`Muon` docstring](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/optimizer.py).
-Works in practice at 16+ GPU scale; the reference Muon config has been
-validated there.
+**FSDP2 interaction.** Under the default `muon_orthogonalize = "local"`,
+Newton-Schulz runs on each rank's shard of a weight on its own, an
+approximation whose measured gap the
+[`Muon` docstring](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/optimizer.py)
+states; `muon_orthogonalize = "exact"` orthogonalizes the full matrix
+(see [Optimizers § muon](../training/optimizers.md#muon)).
 
 ## Schedule-Free AdamW
 
