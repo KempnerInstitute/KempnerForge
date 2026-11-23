@@ -648,7 +648,7 @@ class TestValidation:
         out = model(modality=modality, attention_group_ids=torch.zeros(1, 8, dtype=torch.long))
         assert out.shape == (1, 8, 64)
 
-    def test_rejects_kv_caches(self):
+    def test_rejects_filled_kv_caches(self):
         caches = [
             KVCache(
                 batch_size=1,
@@ -660,10 +660,12 @@ class TestValidation:
             )
         ]
         model = self._model()
+        with torch.no_grad():
+            model(torch.randint(0, 64, (1, 2)), kv_caches=caches)
         calls = self._spy_embedding(model)
         tokens = torch.randint(0, 64, (1, 8))
         groups = torch.zeros(1, 8, dtype=torch.long)
-        with pytest.raises(ValueError, match="attention_group_ids .* training-only"):
+        with pytest.raises(ValueError, match="attention_group_ids .* filled kv_caches"):
             model(tokens, kv_caches=caches, attention_group_ids=groups)
         with pytest.raises(ValueError, match="modality.attention_group_ids"):
             model(tokens, kv_caches=caches, modality=ModalityContext(attention_group_ids=groups))
