@@ -12,7 +12,7 @@ from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from kempnerforge.data.vlm_dataset import (
     DEFAULT_IMAGE_MEAN,
     DEFAULT_IMAGE_STD,
-    pil_to_tensor,
+    image_to_views,
     resolve_pad_id,
 )
 
@@ -48,45 +48,69 @@ Span = tuple[int, int]
 
 
 class ChatRenderer:
-    """Renders a single-image document with a chat template into one VLM training sample.
+    """Renders a document with a chat template into one VLM training sample.
 
-    The sample holds ``pixel_values``, ``input_ids`` padded to ``max_text_len``, and
+    The sample holds ``pixel_values``, ``input_ids`` padded to ``max_text_len``,
     next-token ``labels`` (``labels[i]`` is token ``i + 1``) that are ``-100`` on
-    padding and, when ``answer_only``, outside the replies and their turn ends. The
-    replies are located by character span in the templated text, each where the
-    template of the turns before it ends, so what the template writes before a reply
-    (an empty think block, for instance) is never trained and a user message that
-    quotes a reply is not mistaken for it.
-    Leading newlines of a reply are dropped, as the template drops them. A reply that
-    is blank, that carries template text (``turn_start``, ``turn_end`` or a think
-    tag) or that ``max_text_len`` cuts away entirely is refused with
-    ``UnrenderableDocumentError``. A document longer than ``max_text_len`` keeps its
-    head and ends with ``turn_end``, as the core dataset ends a cut sample with EOS,
-    so a cut reply still trains to stop.
+    padding and, when ``answer_only``, outside the replies and their turn ends, and
+    ``text_len``, the count of real tokens. ``max_text_len=None`` keeps the whole
+    text unpadded, for packing. ``pixel_values`` follows the core dataset's shapes:
+    an image is ``(3, H, W)``, or its ``V`` views ``(V, 3, H, W)`` with
+    ``tile_grid``, and a text-only document is empty, ``(0, 3, H, W)`` or
+    ``(0, V, 3, H, W)``; with ``max_images`` above 1, or ``None`` for no cap, a
+    document's images, or all their views, are concatenated to ``(N, 3, H, W)``.
+    A document with more than ``max_images`` images is refused with
+    ``UnrenderableDocumentError``. The replies are located by character span in the
+    templated text, each where the template of the turns before it ends, so a user
+    message that quotes a reply is not mistaken for it. What the template writes
+    between the assistant header and a reply (an empty think block, for instance)
+    is trained only with ``train_reply_prefix``. The first user message follows the
+    image placeholders after a space, and with ``lead_space`` starts with that space
+    even when there are no placeholders.
+    Leading newlines of a reply are dropped, as the template drops them. A document
+    whose replies are all blank, a reply that carries template text (``turn_start``,
+    ``turn_end`` or a think tag), or replies that ``max_text_len`` cuts away
+    entirely are refused with ``UnrenderableDocumentError``. A document longer than
+    ``max_text_len`` keeps its head and ends with ``turn_end``, as the core dataset
+    ends a cut sample with EOS, so a cut reply still trains to stop.
     """
 
     def __init__(
         self,
         tokenizer: Any,
         *,
-        max_text_len: int,
+        max_text_len: int | None,
         image_size: int,
         answer_only: bool,
+        max_images: int | None = 1,
+        tile_grid: int = 0,
+        tile_global: bool = True,
+        train_reply_prefix: bool = False,
         image_placeholder: str = "",
+        lead_space: bool = False,
         turn_start: str = "<|im_start|>",
         turn_end: str = "<|im_end|>",
         image_mean: tuple[float, float, float] = DEFAULT_IMAGE_MEAN,
         image_std: tuple[float, float, float] = DEFAULT_IMAGE_STD,
     ) -> None:
-        if max_text_len < 2:
-            raise ValueError(f"max_text_len must be at least 2, got {max_text_len}")
+        if max_text_len is not None and max_text_len < 2:
+            raise ValueError(f"max_text_len must be at least 2 or None, got {max_text_len}")
+        if max_images is not None and max_images < 1:
+            raise ValueError(f"max_images must be positive or None, got {max_images}")
+        if tile_grid < 0 or tile_grid == 1:
+            raise ValueError(f"tile_grid must be 0 or at least 2, got {tile_grid}")
         if not getattr(tokenizer, "is_fast", False):
             raise ValueError("ChatRenderer needs a fast tokenizer to map replies to tokens")
         self.tokenizer = tokenizer
         self.max_text_len = max_text_len
         self.image_size = image_size
         self.answer_only = answer_only
+        self.max_images = max_images
+        self.tile_grid = tile_grid
+        self.tile_global = tile_global
+        self.train_reply_prefix = train_reply_prefix
         self.image_placeholder = image_placeholder
+        self.lead_space = lead_space
         self.turn_end = turn_end
         self.image_mean = image_mean
         self.image_std = image_std
@@ -126,8 +150,8 @@ class ChatRenderer:
         if len(answers) != len(document.turns):
             raise ValueError(f"{len(document.turns)} turns but {len(answers)} answers")
         replies = [answer.lstrip("\n") for answer in answers]
-        if not all(reply.strip() for reply in replies):
-            raise UnrenderableDocumentError("an empty reply trains nothing")
+        if not any(reply.strip() for reply in replies):
+            raise UnrenderableDocumentError("a document whose replies are all empty trains nothing")
         if any(mark in reply for reply in replies for mark in self._marks):
             raise UnrenderableDocumentError("a reply carries template text")
         return replies
@@ -139,14 +163,17 @@ class ChatRenderer:
         answers = self._replies(document, answers)
         placeholders = self.image_placeholder * len(document.images)
         first_user = document.turns[0].user
-        if placeholders:
+        if placeholders or self.lead_space:
             first_user = f"{placeholders} {first_user}"
         if document.kind == "qa":
             prompt = self._template(
                 [{"role": "user", "content": first_user}], generation_prompt=True
             )
             reply = answers[0] + self.turn_end
-            return prompt + reply, [(len(prompt), len(prompt) + len(reply))]
+            start = len(prompt)
+            if self.train_reply_prefix and prompt.endswith(self._header + self._reply_prefix):
+                start -= len(self._reply_prefix)
+            return prompt + reply, [(start, len(prompt) + len(reply))]
         messages = []
         for i, (turn, answer) in enumerate(zip(document.turns, answers, strict=True)):
             user = first_user if i == 0 else turn.user
@@ -160,18 +187,24 @@ class ChatRenderer:
                 raise UnrenderableDocumentError(
                     f"the chat template does not render turn {i} after the turns before it"
                 )
-            start = self._reply_start(text, len(prefix), answer + self.turn_end)
-            spans.append((start, start + len(answer) + len(self.turn_end)))
+            opened, start = self._reply_start(text, len(prefix), answer + self.turn_end)
+            spans.append(
+                (
+                    opened if self.train_reply_prefix else start,
+                    start + len(answer) + len(self.turn_end),
+                )
+            )
         return text, spans
 
-    def _reply_start(self, text: str, at: int, reply: str) -> int:
-        """Where ``reply`` starts in the assistant turn ``text`` opens at ``at``."""
+    def _reply_start(self, text: str, at: int, reply: str) -> tuple[int, int]:
+        """Where the assistant turn at ``at`` ends its header, and where ``reply`` starts."""
         if text.startswith(self._header, at):
             at += len(self._header)
+            opened = at
             if text.startswith(self._reply_prefix, at):
                 at += len(self._reply_prefix)
             if text.startswith(reply, at):
-                return at
+                return opened, at
         raise UnrenderableDocumentError(
             f"the chat template did not render {reply!r} as an assistant turn"
         )
@@ -182,15 +215,17 @@ class ChatRenderer:
 
     def render(self, document: Document, answers: Sequence[str]) -> dict[str, torch.Tensor]:
         """The training sample for ``document`` with the given replies."""
-        if len(document.images) != 1:
-            raise ValueError(
-                f"only single-image documents render to a sample, got {len(document.images)} images"
+        if self.max_images is not None and len(document.images) > self.max_images:
+            raise UnrenderableDocumentError(
+                f"the document holds {len(document.images)} images, over "
+                f"max_images={self.max_images}"
             )
         text, spans = self.text_and_reply_spans(document, answers)
         encoded = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
         full = encoded["input_ids"]
-        cut = len(full) > self.max_text_len
-        kept = full[: self.max_text_len - 1] if cut else full
+        width = len(full) if self.max_text_len is None else self.max_text_len
+        cut = len(full) > width
+        kept = full[: width - 1] if cut else full
         ends_already = cut and kept[-1] == self._end_id
         ids = kept if ends_already or not cut else kept + [self._end_id]
         if self.answer_only:
@@ -208,15 +243,37 @@ class ChatRenderer:
                 f"max_text_len={self.max_text_len} ({len(full)} tokens in all)"
             )
         n = len(ids)
-        input_ids = torch.full((self.max_text_len,), self.pad_id, dtype=torch.long)
-        labels = torch.full((self.max_text_len,), -100, dtype=torch.long)
+        input_ids = torch.full((width,), self.pad_id, dtype=torch.long)
+        labels = torch.full((width,), -100, dtype=torch.long)
         ids_t = torch.tensor(ids, dtype=torch.long)
         input_ids[:n] = ids_t
         labels[: n - 1] = torch.where(torch.tensor(trained[1:]), ids_t[1:], -100)
-        pixel_values = pil_to_tensor(
-            document.images[0], self.image_size, self.image_mean, self.image_std
-        )
-        return {"pixel_values": pixel_values, "input_ids": input_ids, "labels": labels}
+        return {
+            "pixel_values": self._pixels(document),
+            "input_ids": input_ids,
+            "labels": labels,
+            "text_len": torch.tensor(n, dtype=torch.long),
+        }
+
+    def _pixels(self, document: Document) -> torch.Tensor:
+        if not document.images:
+            views = self.tile_grid**2 + int(self.tile_global) if self.tile_grid else 0
+            tiled = (views,) if views and self.max_images == 1 else ()
+            return torch.zeros(0, *tiled, 3, self.image_size, self.image_size)
+        views = [
+            image_to_views(
+                image,
+                self.image_size,
+                self.image_mean,
+                self.image_std,
+                tile_grid=self.tile_grid,
+                tile_global=self.tile_global,
+            )
+            for image in document.images
+        ]
+        if self.max_images == 1:
+            return views[0]
+        return torch.cat([v if v.dim() == 4 else v.unsqueeze(0) for v in views])
 
     def __call__(self, document: Document, rng: random.Random) -> dict[str, torch.Tensor]:
         """Render with each turn's reply drawn from its answers by ``rng``."""
