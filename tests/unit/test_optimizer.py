@@ -53,6 +53,26 @@ class _OutputShapes(TorchFunctionMode):
         return out
 
 
+def _spectrum_matrix(rows: int, cols: int, decades: int | None) -> torch.Tensor:
+    """A Gaussian matrix, or one whose singular values fall geometrically over ``decades``."""
+    generator = torch.Generator().manual_seed(0)
+    if decades is None:
+        return torch.randn(rows, cols, generator=generator)
+    rank = min(rows, cols)
+    left, _ = torch.linalg.qr(torch.randn(rows, rank, generator=generator))
+    right, _ = torch.linalg.qr(torch.randn(cols, rank, generator=generator))
+    return (left * torch.logspace(0, -decades, rank)) @ right.T
+
+
+def _first_update(*grads: torch.Tensor) -> torch.Tensor:
+    """Muon's first update of zero weights with these gradients, the weights stacked by rows."""
+    weights = [nn.Parameter(torch.zeros_like(grad)) for grad in grads]
+    for weight, grad in zip(weights, grads, strict=True):
+        weight.grad = grad.clone()
+    Muon([{"params": weights}], [{"params": []}], lr=1.0).step()
+    return -torch.cat([weight.data for weight in weights])
+
+
 class TestNewtonSchulz:
     def test_produces_orthogonal_matrix(self):
         """Newton-Schulz output should be approximately orthogonal."""
@@ -503,6 +523,28 @@ class TestMuon:
                 weight.grad = grad.clone()
                 optimizer.step()
         assert torch.equal(weights[0].data, weights[1].data)
+
+    @pytest.mark.parametrize(
+        ("decades", "cosine", "rms"),
+        [(None, (0.8, 0.97), (0.75, 1.1)), (3, (0.58, 0.95), (0.92, 1.26))],
+        ids=["gaussian", "three-decades"],
+    )
+    def test_local_shards_stay_within_the_measured_gap_of_the_full_update(
+        self, decades, cosine, rms
+    ):
+        """Split by rows into 2, 4 and 8 shards, as FSDP2 splits a weight, a matrix's local
+        update keeps its cosine similarity to the full-matrix update and the ratio of their RMS
+        within these bounds, around the values the ``Muon`` docstring states."""
+        for rows, cols in [(1024, 512), (512, 1024), (1024, 1024)]:
+            grad = _spectrum_matrix(rows, cols, decades)
+            full = _first_update(grad)
+            for shards in (2, 4, 8):
+                local = _first_update(*grad.chunk(shards))
+                similarity = nn.functional.cosine_similarity(local.flatten(), full.flatten(), dim=0)
+                ratio = local.norm() / full.norm()
+                where = (rows, cols, shards)
+                assert cosine[0] <= similarity.item() <= cosine[1], (where, similarity.item())
+                assert rms[0] <= ratio.item() <= rms[1], (where, ratio.item())
 
     def test_rejects_unknown_orthogonalize(self):
         with pytest.raises(ValueError, match="orthogonalize must be one of"):
