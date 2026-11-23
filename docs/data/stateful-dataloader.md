@@ -133,10 +133,12 @@ Two positions cannot carry over to another data-parallel size, and
   saved data-parallel size and batch size; the checkpoints saved after
   that carry over to any size.
 
-The saved state and the loader's settings are the same on every rank, so
-every rank raises together and none is left waiting on the others.
-A `checkpoint.load_path` warm start does not raise: it logs the reason and
-starts the data at its first sample (see
+`CheckpointManager.apply_dataloader_state` checks the position on every
+rank with `check_state`, which changes nothing, and the ranks share their
+verdicts before any rank applies it, so every rank raises together and none
+is left waiting on the others, even where one rank's view of the data
+differs. A `checkpoint.load_path` warm start does not raise: it logs the
+reason and every rank starts the data at its first sample (see
 [Auto-resume](../checkpointing/auto-resume.md#where-its-called)).
 An auto-resume onto another world size or data-parallel layout stops
 earlier, before any rank applies a position, unless
@@ -198,8 +200,11 @@ The check does not see a file rewritten at the same size, a new revision
 of a Hub dataset with the same shard count, or a new version of
 `datasets` or of the tokenizer files, and any of those can shift the
 replay. A map-style position meeting a stream, or the reverse, raises too.
+Each rank checks the stream as it sees it, the sizes of its data files
+included, and the ranks share their verdicts before any rank replays, so a
+rank whose copy of a file differs stops every rank, not only itself.
 A `checkpoint.load_path` warm start does not raise: it logs the reason and
-starts the stream at its first document (see
+every rank starts its stream at the first document (see
 [Auto-resume](../checkpointing/auto-resume.md#where-its-called)). A
 replay that runs off the end of the stream starts the next pass with a
 warning instead of failing on one rank.
@@ -233,12 +238,17 @@ count divides by the data-parallel size, and shards differ in size. So
 once the first rank finishes a pass, the ranks are in different passes
 or at different counts, which their own saved positions record.
 
-A load that gives every rank rank 0's position instead, a
-`checkpoint.load_path` warm start or an auto-resume that
-`checkpoint.ignore_rank_state_mismatch` lets onto another layout of the
-same data-parallel size, is exact only while every rank started its
-current pass on the same step, which in practice means until the first
-rank finishes a pass. Past that, a rank that had fallen behind rank 0
+An auto-resume that `checkpoint.ignore_rank_state_mismatch` lets onto
+another layout of the same data-parallel size gives each rank the position
+its own data-parallel rank saved, found by the `data_parallel_rank` saved
+with it, so it is exact in every pass too. On another data-parallel size
+the saved positions have no counterpart, and every rank starts its stream
+at the first document, with a warning.
+
+A `checkpoint.load_path` warm start gives every rank rank 0's position
+instead, which is exact only while every rank started its current pass on
+the same step, which in practice means until the first rank finishes a
+pass. Past that, a rank that had fallen behind rank 0
 skips data and a rank that was ahead reads data again, up to the
 difference between their parts of the stream. Such a rank logs a
 warning: a rank whose part of the pass is shorter than rank 0's count
@@ -278,8 +288,8 @@ eval_dataloader = TorchDataLoader(
 
 - [Sampler](sampler.md) — `set_epoch`, `set_skip`, and how the
   sampler actually carries out the resume-aware iteration.
-- [Checkpointing § Train state](../checkpointing/train-state.md) —
-  why `dataloader=` isn't wired by default and what you gain by
-  opting in.
+- [Checkpointing § Train state](../checkpointing/train-state.md#dataloader-state):
+  the position the training loop saves with every checkpoint, through
+  `dataloader=` at each save site, for both loaders.
 - [Checkpointing § Auto-resume](../checkpointing/auto-resume.md) —
   the symlink-based restart that triggers this load path.

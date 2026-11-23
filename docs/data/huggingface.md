@@ -120,8 +120,10 @@ is refused before the position is applied (see
 Hugging Face's own
 `IterableDataset.state_dict()` is not used: it drops the examples in the
 shuffle buffer on resume. On several ranks an auto-resume gives every
-rank its own count; a load that gives every rank rank 0's count is exact
-until the first rank finishes a pass. See
+rank its own count, as does one that `checkpoint.ignore_rank_state_mismatch`
+lets onto another layout of the same data-parallel size; a
+`checkpoint.load_path` warm start gives every rank rank 0's count, which
+is exact until the first rank finishes a pass. See
 [Stateful dataloader § Streaming loader](stateful-dataloader.md#streaming-loader)
 for the replay cost and for how the ranks' counts differ.
 

@@ -132,7 +132,11 @@ refusal:
   position the saved rank 0 reached, `per_rank["ranks"][0]["dataloader"]`.
   With a `DistributedSampler` that position counts the samples all
   data-parallel ranks consumed, so it means the same on every rank.
-  The loader applies it where it fits the new layout and otherwise
+  A stream's count is one data-parallel rank's, so on the saved
+  data-parallel size each rank keeps the entry whose stream state
+  records its own `data_parallel_rank`. Every rank's loader checks the
+  position and the ranks agree before any rank applies it: every rank
+  applies it where it fits the new layout, and otherwise every rank
   starts at its first sample with a warning (see
   [Stateful dataloader § Resuming on another data-parallel size](../data/stateful-dataloader.md#resuming-on-another-data-parallel-size)).
   Only `StatefulDataLoader` and `StreamingDataLoader` take it, since

@@ -137,8 +137,12 @@ continues at the same sample on any data-parallel size. Where it cannot,
 as with a mixture or a streamed dataset on another data-parallel size, a
 switch of `data.hf_streaming`, a changed stream, or a checkpoint saved
 before the loader recorded its batch size on another data-parallel size,
-the warm start logs a warning that names the reason and starts the data
-at its first sample. A resume from `checkpoint.dir` stops instead. A
+the warm start logs a warning that names the reason and every rank
+starts the data at its first sample. A resume from `checkpoint.dir`
+stops instead, on every rank. Every rank checks the position before any
+rank applies it and the ranks agree, so one rank whose view of the data
+differs, such as a stream's data file at another size, cannot leave the
+others resuming without it. A
 checkpoint with per-rank state refuses a resume onto another world size
 or data-parallel layout with a `RankStateMismatchError`, before any data
 position is applied; on the topology that saved it, a position that
@@ -149,7 +153,9 @@ state was recorded applies rank 0's position on every rank and raises
 `checkpoint.ignore_rank_state_mismatch` set, a resume onto another world
 size or layout, and any resume of a checkpoint saved before per-rank
 state was recorded, even on the topology that saved it, treats the data
-position as a warm start does and restarts the RNG streams. Per-rank
+position as a warm start does, except that a stream on the saved
+data-parallel size resumes each data-parallel rank from the position it
+saved, and restarts the RNG streams. Per-rank
 state that is unreadable or incomplete even on the topology that saved
 it is the exception: the flag keeps no data position from it, so the
 data starts at its first sample. The flag does not cover a position
