@@ -433,7 +433,10 @@ again. A record of another checkpoint does not count: after a rollback to a new
 `checkpoint.dir` with the same `--eval-output`, each step is evaluated again, with a
 warning naming both directories. So a run takes up the complete steps already on
 disk when it begins and evaluates what no run recorded, and within a run no step is
-started twice at once.
+started twice at once. Across runs one can be, since output directories are named
+by step: after a rollback, an evaluation the old run queued can still be running in
+`step_<N>` when the new run's evaluation of that step starts there, and the one that
+starts later removes the other's files. So give a rollback a fresh `--eval-output`.
 
 A command that cannot be started, or that exits non-zero, is a warning (naming
 `launch.log` for an exit status) and leaves no record. Its step is tried again at
