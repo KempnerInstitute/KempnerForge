@@ -11,17 +11,27 @@ than another branch inside the loop.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
-from kempnerforge.distributed.utils import any_rank, clip_grad_norm_, new_control_group
+from kempnerforge.distributed.utils import (
+    any_rank,
+    clip_grad_norm_,
+    data_parallel_groups,
+    dp_all_reduce_,
+    dp_mean,
+    new_control_group,
+)
 from kempnerforge.metrics.logger import get_logger
+from kempnerforge.metrics.mfu import vision_flops_per_image
 from kempnerforge.metrics.tracker import MetricsTracker
 from kempnerforge.model.vlm import inner_transformer
 from kempnerforge.profiling.profiler import print_profiler_summary
@@ -142,21 +152,33 @@ class BatchStream:
 class StepResult:
     """What one training step reports back to the loop.
 
-    The per-dataset fields stay empty for step bodies that don't produce
+    The per-dataset fields stay None for step bodies that don't produce
     them; ``text_tokens`` stays None, which a VLM run treats as an error
-    rather than logging a zero. ``tokens`` is what this rank ran when the
-    batch decides it (packed VLM rows), counted as row slots like the unpacked
-    ``batch_size × seq_len``, image slots and padding included; None means
-    the configured batch per micro-step.
+    rather than logging a zero. With a data mixture, on a step the tracker
+    will log, ``dataset_tokens`` holds the positions this rank drew from each
+    source, by source index, and ``dataset_losses`` each source's summed
+    cross-entropy (row 0) and labeled-token count (row 1). ``tokens`` is the
+    number of positions the model ran on this rank over every micro-step,
+    image positions and padding included, and ``seq_len`` the length of each
+    of those rows; with ``tokens`` None the loop counts
+    ``train.batch_size * train.seq_len`` per micro-step. A VLM step also
+    reports the ``documents`` it trained on, the ``image_tokens`` of their
+    real images, their ``document_text_tokens`` (prompt included, padding
+    excluded; None when the batch does not say) and the ``encoder_images``
+    the vision encoder ran, padding frames included.
     """
 
     loss: float
     grad_norm: float
     text_tokens: int | None = None
-    dataset_token_counts: dict[str, int] = field(default_factory=dict)
-    dataset_loss_sums: dict[str, float] = field(default_factory=dict)
-    dataset_loss_counts: dict[str, int] = field(default_factory=dict)
+    dataset_tokens: torch.Tensor | None = None
+    dataset_losses: torch.Tensor | None = None
     tokens: int | None = None
+    seq_len: int | None = None
+    documents: int | None = None
+    image_tokens: int | None = None
+    document_text_tokens: int | None = None
+    encoder_images: int | None = None
 
 
 StepFn = Callable[["TrainingSession", int], StepResult]
@@ -164,7 +186,11 @@ StepFn = Callable[["TrainingSession", int], StepResult]
 
 @dataclass
 class TrainingSession:
-    """Everything one training run needs after the build phase."""
+    """Everything one training run needs after the build phase.
+
+    ``documents_seen`` counts the documents a VLM run trained on over the data-parallel
+    ranks, from the checkpoint it resumed; it stays None while the step body reports none.
+    """
 
     config: JobConfig
     runtime: RuntimeContext
@@ -185,7 +211,9 @@ class TrainingSession:
     profiler: Any | None = None
     autocast_dtype: torch.dtype | None = None
     control_group: Any | None = field(default=None, repr=False)
+    documents_seen: int | None = None
     _batch_stream: BatchStream | None = field(default=None, init=False, repr=False)
+    _dp_groups: tuple | None = field(default=None, init=False, repr=False)
 
     @property
     def batches(self) -> BatchStream:
@@ -193,6 +221,17 @@ class TrainingSession:
         if self._batch_stream is None or self._batch_stream.pipeline is not self.data:
             self._batch_stream = BatchStream(self.data)
         return self._batch_stream
+
+    @property
+    def dp_groups(self) -> tuple:
+        """``data_parallel_groups`` of the runtime's mesh, taken from it once.
+
+        The logged losses and token counts are reduced over these groups, so every
+        rank logs and hands its hooks the same values for the whole job.
+        """
+        if self._dp_groups is None:
+            self._dp_groups = data_parallel_groups(self.runtime.device_mesh)
+        return self._dp_groups
 
     def autocast(self) -> contextlib.AbstractContextManager:
         """``torch.autocast`` to ``autocast_dtype``, or a no-op when it is None."""
@@ -307,7 +346,12 @@ def pipeline_step(session: TrainingSession, step: int) -> StepResult:
 
     loss_tensor = torch.tensor([avg_loss], device=device)
     dist.broadcast(loss_tensor, group_src=pipeline.size - 1, group=group)
-    return StepResult(loss=loss_tensor.item(), grad_norm=grad_norm_val)
+    return StepResult(
+        loss=loss_tensor.item(),
+        grad_norm=grad_norm_val,
+        tokens=full_input.numel(),
+        seq_len=full_input.shape[1],
+    )
 
 
 _PACKED_BATCH_KEYS = (
@@ -320,16 +364,21 @@ _PACKED_BATCH_KEYS = (
     "text_positions",
 )
 
+_SOURCE_CE_CHUNK = 1024
+"""Tokens the per-source cross-entropy runs at once, about 1 GB of fp32 at a 128k vocabulary."""
+
 
 def vlm_step(session: TrainingSession, step: int) -> StepResult:
     """VLM step (no PP): pixel_values + input_ids forward, with a text-token count.
 
+    Each row the decoder runs holds the model's ``num_image_tokens`` image
+    positions (zero when they do not enter the residual stream) and the text.
     A packed batch (one with ``image_rows``) also carries ``doc_ids``,
     ``position_ids``, the image placement (``image_starts``, ``image_tokens``)
     and the text positions, all passed through to the wrapper, with
-    ``attention_group_ids`` when a collator emits them. Its row count varies,
-    so the step reports the tokens it ran and marks the leading dims dynamic
-    for ``torch.compile``.
+    ``attention_group_ids`` when a collator emits them. Its rows hold their
+    image positions already, and its row count varies, so the leading dims are
+    marked dynamic for ``torch.compile``.
     """
     config = session.config
     tc, mc = config.train, config.model
@@ -339,7 +388,18 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
 
     total_loss = 0.0
     total_text_tokens = 0
-    packed_tokens: int | None = None
+    total_tokens = 0
+    seq_len = 0
+    inner = getattr(model, "_orig_mod", model)
+    image_positions = getattr(inner, "num_image_tokens", 0)
+    adapter, encoder = getattr(inner, "adapter", None), getattr(inner, "vision_encoder", None)
+    tokens_per_image = (
+        adapter.output_num_tokens(encoder.num_tokens)
+        if adapter is not None and encoder is not None
+        else None
+    )
+    documents = image_tokens = encoder_images = 0
+    document_text_tokens: int | None = 0
 
     for micro_step in range(tc.grad_accum_steps):
         if not batches.has_data:
@@ -358,9 +418,18 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
         if "image_tokens" in batch:
             extras["image_tokens"] = int(batch["image_tokens"])
         if "image_rows" in extras:
-            packed_tokens = (packed_tokens or 0) + input_ids.numel()
+            seq_len = input_ids.shape[1]
             if tc.compile_model:
                 _mark_rows_dynamic(pixel_values, input_ids, labels, *extras.values())
+        else:
+            seq_len = input_ids.shape[1] + image_positions
+        total_tokens += input_ids.shape[0] * seq_len
+        counts = _batch_counts(batch, image_positions, tokens_per_image)
+        documents += counts[0]
+        image_tokens += counts[1]
+        encoder_images += counts[3]
+        if document_text_tokens is not None:
+            document_text_tokens = None if counts[2] is None else document_text_tokens + counts[2]
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
@@ -383,9 +452,41 @@ def vlm_step(session: TrainingSession, step: int) -> StepResult:
     return StepResult(
         loss=total_loss / tc.grad_accum_steps,
         grad_norm=clip_grads(model, tc.grad_clip_norm),
+        tokens=total_tokens,
+        seq_len=seq_len,
         text_tokens=total_text_tokens,
-        tokens=packed_tokens,
+        documents=documents,
+        image_tokens=image_tokens,
+        document_text_tokens=document_text_tokens,
+        encoder_images=encoder_images,
     )
+
+
+def _source_cross_entropy(
+    logits: torch.Tensor, labels: torch.Tensor, sources: torch.Tensor, n_sources: int, chunk: int
+) -> torch.Tensor:
+    """Each source's summed cross-entropy and labeled-token count, as a ``(2, n_sources)`` tensor.
+
+    ``sources`` holds the source index of each row. The cross-entropy runs in fp32,
+    ``chunk`` tokens at a time, so it copies no source's logits and holds one chunk's
+    fp32 logits and log-softmax at most. A token labeled -100 counts in neither row.
+    """
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_labels = labels.reshape(-1)
+    token_sources = sources.repeat_interleave(labels.shape[-1])
+    out = torch.zeros(2, n_sources, dtype=torch.float64, device=logits.device)
+    for start in range(0, flat_labels.numel(), chunk):
+        chunk_labels = flat_labels[start : start + chunk]
+        losses = F.cross_entropy(
+            flat_logits[start : start + chunk].float(),
+            chunk_labels,
+            ignore_index=-100,
+            reduction="none",
+        )
+        chunk_sources = token_sources[start : start + chunk]
+        out[0].index_add_(0, chunk_sources, losses.double())
+        out[1].index_add_(0, chunk_sources, (chunk_labels != -100).double())
+    return out
 
 
 def _mark_rows_dynamic(*tensors: Any) -> None:
@@ -397,36 +498,109 @@ def _mark_rows_dynamic(*tensors: Any) -> None:
             maybe_mark_dynamic(tensor, 0)
 
 
-def _sum_over_data_ranks(session: TrainingSession, value: int) -> int:
-    """Sum a per-rank count over the data-parallel ranks; tp and pp peers hold the same batch."""
-    if not dist.is_initialized():
-        return value * session.data.dp_size
-    t = torch.tensor([value], device=session.runtime.device, dtype=torch.long)
-    dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    return int(t.item()) * session.data.dp_size // session.runtime.world_size
+def _batch_counts(
+    batch: dict[str, Any], image_positions: int, tokens_per_image: int | None = None
+) -> tuple[int, int, int | None, int]:
+    """A VLM batch's documents, real-image tokens, document text tokens and encoder images.
+
+    A packed batch (one with ``image_rows``) holds several documents per row: they are the
+    distinct row and document pairs at its text positions and image starts, its image tokens
+    are its images times ``image_tokens``, and its text tokens its ``text_positions``; with no
+    image, the encoder runs one blank image. A padded batch holds one document per row, and its
+    image tokens are ``tokens_per_image``, the adapter's output tokens, for each real image or
+    frame ``frame_mask`` marks (``image_positions`` split evenly over the frames when
+    ``tokens_per_image`` is None); its text tokens are what ``text_len`` gives. The text count
+    is None when the batch does not give it. The encoder runs every image or frame, blank or
+    padding ones included.
+    """
+    pixel_values = batch["pixel_values"]
+    if "image_rows" in batch:
+        empty = torch.zeros(0, dtype=torch.long)
+        text_positions = batch.get("text_positions")
+        rows = torch.cat([batch.get("text_rows", empty), batch["image_rows"]])
+        starts = torch.cat(
+            [empty if text_positions is None else text_positions, batch["image_starts"]]
+        )
+        doc_ids = batch["doc_ids"]
+        pairs = rows * (int(doc_ids.max()) + 1) + doc_ids[rows, starts]
+        n_images = int(pixel_values.shape[0])
+        return (
+            int(torch.unique(pairs).numel()),
+            n_images * int(batch["image_tokens"]),
+            None if text_positions is None else int(text_positions.numel()),
+            max(n_images, 1),
+        )
+    rows = int(batch["input_ids"].shape[0])
+    frames = int(pixel_values.shape[1]) if pixel_values.dim() == 5 else 1
+    frame_mask = batch.get("frame_mask")
+    real = int(frame_mask.sum()) if frame_mask is not None else rows * frames
+    per_image = image_positions // frames if tokens_per_image is None else tokens_per_image
+    text_len = batch.get("text_len")
+    text = int(text_len.sum()) if text_len is not None else None
+    return rows, real * per_image, text, rows * frames
 
 
-def _tokens_in_step(session: TrainingSession, result: StepResult) -> int:
-    """Tokens the step ran across the data-parallel ranks, from the step's count or the config."""
+def _dp_sum(session: TrainingSession, counts: list[int]) -> list[int]:
+    """``counts`` summed over the data-parallel ranks, in one reduction.
+
+    Without data-parallel groups, which a run of one data-parallel rank has, each count is
+    taken ``data.dp_size`` times, as if every rank had run the same batch.
+    """
+    if not session.dp_groups:
+        return [count * session.data.dp_size for count in counts]
+    tensor = torch.tensor(counts, device=session.runtime.device, dtype=torch.long)
+    return dp_all_reduce_(tensor, session.dp_groups).tolist()
+
+
+def _step_counts(
+    session: TrainingSession, result: StepResult
+) -> tuple[int, int | None, int | None]:
+    """Positions, documents and encoder images the step ran over the data-parallel ranks.
+
+    Every rank adds its counts in one reduction, whatever its step body reports, so ranks that
+    ran different batches count what each of them ran and every rank takes part. A rank that
+    reports no ``tokens`` adds the configured batch, and one that reports no documents or
+    encoder images adds zero; those come back None, on every rank, when no rank reported them.
+    """
     tc = session.config.train
-    if result.tokens is None:
-        return tc.batch_size * tc.seq_len * tc.grad_accum_steps * session.data.dp_size
-    return _sum_over_data_ranks(session, result.tokens)
+    tokens = result.tokens
+    if tokens is None:
+        tokens = tc.batch_size * tc.seq_len * tc.grad_accum_steps
+    counts = [
+        tokens,
+        result.documents or 0,
+        result.encoder_images or 0,
+        int(result.documents is not None),
+        int(result.encoder_images is not None),
+    ]
+    total, documents, images, with_documents, with_images = _dp_sum(session, counts)
+    return total, (documents if with_documents else None), (images if with_images else None)
 
 
 def text_step(session: TrainingSession, step: int) -> StepResult:
-    """Standard step (no PP, text-only), with optional per-dataset mixture metrics."""
+    """Standard step (no PP, text-only), with optional per-dataset mixture metrics.
+
+    Each source's tokens and loss are counted only on a step the tracker will log,
+    which is ``step + 1``: ``step`` counts the steps done before this one. The loss is
+    the plain cross-entropy of the source's labeled tokens, without the z-loss or MoE
+    terms the training loss may add.
+    """
     config = session.config
     tc, mc = config.train, config.model
     device = session.runtime.device
     model = session.model
     batches = session.batches
     mixture_dataset = session.data.mixture_dataset
+    n_sources = len(mixture_dataset.dataset_names) if mixture_dataset is not None else 0
 
     total_loss = 0.0
-    ds_token_counts: dict[str, int] = {}
-    ds_loss_sums: dict[str, float] = {}
-    ds_loss_counts: dict[str, int] = {}
+    total_tokens = 0
+    seq_len = 0
+    ds_tokens = ds_losses = None
+    if n_sources and session.tracker.is_log_step(step + 1):
+        ds_tokens = torch.zeros(n_sources, dtype=torch.long)
+        ds_losses = torch.zeros(2, n_sources, dtype=torch.float64, device=device)
+    ce_chunk = min(tc.ce_chunk_size, _SOURCE_CE_CHUNK) if tc.ce_chunk_size > 0 else _SOURCE_CE_CHUNK
 
     for micro_step in range(tc.grad_accum_steps):
         batch: dict[str, torch.Tensor] = {}
@@ -439,6 +613,8 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
             input_ids = torch.randint(0, mc.vocab_size, (tc.batch_size, tc.seq_len), device=device)
             labels = torch.randint(0, mc.vocab_size, (tc.batch_size, tc.seq_len), device=device)
             doc_ids = None
+        seq_len = input_ids.shape[1]
+        total_tokens += input_ids.numel()
 
         with maybe_no_sync(model, micro_step, tc.grad_accum_steps):
             if mc.is_moe:
@@ -447,23 +623,13 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
                 logits = model(input_ids, doc_ids=doc_ids)
                 loss = session.loss_fn(logits, labels)
 
-            if mixture_dataset is not None and "dataset_idx" in batch:
-                ds_idx = batch["dataset_idx"]
+            if ds_tokens is not None and ds_losses is not None and "dataset_idx" in batch:
+                sources = batch["dataset_idx"]
+                ds_tokens += torch.bincount(sources, minlength=n_sources) * seq_len
                 with torch.no_grad():
-                    for i, name in enumerate(mixture_dataset.dataset_names):
-                        mask = ds_idx == i
-                        count = int(mask.sum().item())
-                        if count > 0:
-                            ds_token_counts[name] = (
-                                ds_token_counts.get(name, 0) + count * tc.seq_len
-                            )
-                            ds_l = torch.nn.functional.cross_entropy(
-                                logits[mask].reshape(-1, logits.size(-1)),
-                                labels[mask].reshape(-1),
-                                ignore_index=-100,
-                            ).item()
-                            ds_loss_sums[name] = ds_loss_sums.get(name, 0) + ds_l
-                            ds_loss_counts[name] = ds_loss_counts.get(name, 0) + 1
+                    ds_losses += _source_cross_entropy(
+                        logits, labels, sources.to(device), n_sources, ce_chunk
+                    )
 
             if mc.is_moe:
                 loss = add_moe_losses(loss, model, mc)
@@ -475,9 +641,10 @@ def text_step(session: TrainingSession, step: int) -> StepResult:
     return StepResult(
         loss=total_loss / tc.grad_accum_steps,
         grad_norm=clip_grads(model, tc.grad_clip_norm),
-        dataset_token_counts=ds_token_counts,
-        dataset_loss_sums=ds_loss_sums,
-        dataset_loss_counts=ds_loss_counts,
+        tokens=total_tokens,
+        seq_len=seq_len,
+        dataset_tokens=ds_tokens,
+        dataset_losses=ds_losses,
     )
 
 
@@ -490,13 +657,18 @@ def select_step_fn(config: JobConfig) -> StepFn:
     return text_step
 
 
-def checkpoint_extra(config: JobConfig, step: int, phases: PhaseState) -> dict:
+def checkpoint_extra(
+    config: JobConfig, step: int, phases: PhaseState, documents_seen: int | None = None
+) -> dict:
     """Metadata saved alongside every checkpoint so a resume is exact.
 
     ``vlm_freeze`` reflects the post-transition state when a FreezeStage
-    has fired (see ``freeze_meta_at_step``).
+    has fired (see ``freeze_meta_at_step``). ``documents_seen``, when given,
+    is saved for the resumed run to count on from.
     """
     extra: dict = {"phase_idx": phases.next_idx} if phases.phases else {}
+    if documents_seen is not None:
+        extra["documents_seen"] = documents_seen
     if config.metrics.wandb_run_id:
         extra["wandb_run_id"] = config.metrics.wandb_run_id
     if config.metrics.mlflow_run_id:
@@ -507,16 +679,23 @@ def checkpoint_extra(config: JobConfig, step: int, phases: PhaseState) -> dict:
     return extra
 
 
+@contextlib.contextmanager
+def _logged_time(tracker: MetricsTracker, key: str, step: int) -> Iterator[None]:
+    """Log the time the block takes as the metric ``key`` of ``step``.
+
+    Nothing is logged when the block raises.
+    """
+    start = time.perf_counter()
+    yield
+    tracker.log_eval({key: time.perf_counter() - start}, step)
+
+
 def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: int) -> None:
-    """Per-module LR / MoE / VLM-text-token / per-dataset series, on the main metrics interval."""
+    """MoE / VLM-text-token / per-dataset series, on the main metrics interval."""
     config = session.config
     mc = config.model
     tracker = session.tracker
     model = session.model
-
-    module_lrs = module_learning_rates(session.optimizer)
-    if module_lrs:
-        tracker.log_eval(module_lrs, step)
 
     if mc.is_moe:
         inner = cast("Transformer", inner_transformer(model))
@@ -531,23 +710,58 @@ def _log_periodic_metrics(session: TrainingSession, result: StepResult, step: in
         tracker.log_eval(moe_metrics, step)
 
     if config.is_vlm:
-        if result.text_tokens is None:
+        if any_rank(result.text_tokens is None, session.control_group):
             raise RuntimeError(
-                "VLM run: the step body reported no text-token count, so "
+                "VLM run: a step body reported no text-token count, so "
                 "data/text_tokens_trained would be logged as zero"
             )
-        global_text_tokens = _sum_over_data_ranks(session, result.text_tokens)
-        tracker.log_eval({"data/text_tokens_trained": float(global_text_tokens)}, step)
+        assert result.text_tokens is not None
+        local = [
+            result.text_tokens,
+            result.image_tokens or 0,
+            result.document_text_tokens or 0,
+            int(result.image_tokens is not None),
+            int(result.document_text_tokens is not None),
+        ]
+        trained, image_tokens, text_tokens, with_images, with_text = _dp_sum(session, local)
+        data_metrics = {"data/text_tokens_trained": float(trained)}
+        if with_images:
+            data_metrics["data/image_tokens"] = float(image_tokens)
+        if with_text:
+            data_metrics["data/text_tokens"] = float(text_tokens)
+        if session.documents_seen is not None:
+            data_metrics["data/documents_seen"] = float(session.documents_seen)
+        tracker.log_eval(data_metrics, step)
 
-    if session.data.mixture_dataset is not None and result.dataset_loss_sums:
-        ds_metrics: dict[str, float] = {}
-        for name in result.dataset_loss_sums:
-            ds_metrics[f"loss/{name}"] = (
-                result.dataset_loss_sums[name] / result.dataset_loss_counts[name]
-            )
-        for name, count in result.dataset_token_counts.items():
-            ds_metrics[f"data/{name}/tokens"] = float(count)
-        tracker.log_eval(ds_metrics, step)
+    mixture = session.data.mixture_dataset
+    if mixture is not None:
+        _log_dataset_metrics(session, result, mixture.dataset_names, step)
+
+
+def _log_dataset_metrics(
+    session: TrainingSession, result: StepResult, names: list[str], step: int
+) -> None:
+    """``loss/<name>`` and ``data/<name>/tokens`` for each source, over every DP rank.
+
+    The loss is the cross-entropy of the source's labeled tokens, weighted by token, and
+    the tokens are the positions drawn from the source in this step. A source no rank
+    drew from in this step is left out. Every rank takes part in the reduction, adding
+    nothing when its step body reports no per-source counts.
+    """
+    stats = torch.zeros(3, len(names), dtype=torch.float64, device=session.runtime.device)
+    if result.dataset_tokens is not None:
+        stats[0] = result.dataset_tokens.to(stats.device)
+    if result.dataset_losses is not None:
+        stats[1:] = result.dataset_losses
+    totals = dp_all_reduce_(stats, session.dp_groups).tolist()
+    ds_metrics: dict[str, float] = {}
+    for name, tokens, loss_sum, labeled in zip(names, *totals, strict=True):
+        if labeled > 0:
+            ds_metrics[f"loss/{name}"] = loss_sum / labeled
+        if tokens > 0:
+            ds_metrics[f"data/{name}/tokens"] = tokens
+    if ds_metrics:
+        session.tracker.log_eval(ds_metrics, step)
 
 
 def _advance_lr_schedule(session: TrainingSession) -> None:
@@ -582,7 +796,12 @@ def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     pending_stages = [s for s in vlm_cfg.freeze_schedule if s.start_step == step]
     if not pending_stages:
         return
-    session.checkpointer.flush_pending_save()
+    ckpt_mgr = session.checkpointer
+    if ckpt_mgr.has_pending_save:
+        with _logged_time(session.tracker, "checkpoint/wait_sec", step):
+            ckpt_mgr.flush_pending_save()
+    else:
+        ckpt_mgr.flush_pending_save()
     for stage in pending_stages:
         flipped = apply_freeze_specs(session.model, stage.specs, vlm_cfg.module_patterns)
         logger.info(f"FreezeStage at step={step}: applied {flipped}")
@@ -644,7 +863,11 @@ def _shutdown_if_requested(
             f"Shutdown requested at step {step}; "
             "its scheduled checkpoint is the emergency checkpoint"
         )
-        ckpt_mgr.wait()
+        if ckpt_mgr.has_pending_save:
+            with _logged_time(session.tracker, "checkpoint/wait_sec", step):
+                ckpt_mgr.wait()
+        else:
+            ckpt_mgr.wait()
     elif nan_skipped and not params_are_finite(session.model, session.runtime.device):
         logger.error(
             f"Shutdown requested at step {step}, skipped for a NaN/Inf loss, but the "
@@ -653,13 +876,16 @@ def _shutdown_if_requested(
         )
     else:
         logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
-        ckpt_mgr.save(
-            step=step,
-            tokens_seen=tokens_seen,
-            scheduler=session.scheduler,
-            dataloader=session.data.dataloader,
-            extra=checkpoint_extra(session.config, step, session.phases),
-        )
+        with _logged_time(session.tracker, "checkpoint/save_sec", step):
+            ckpt_mgr.save(
+                step=step,
+                tokens_seen=tokens_seen,
+                scheduler=session.scheduler,
+                dataloader=session.data.dataloader,
+                extra=checkpoint_extra(
+                    session.config, step, session.phases, session.documents_seen
+                ),
+            )
     return True
 
 
@@ -712,13 +938,14 @@ def run_training_loop(
         prof.start()
 
     if step == 0 and config.checkpoint.is_dynamic_milestone(0):
-        ckpt_mgr.save(
-            step=0,
-            tokens_seen=0,
-            scheduler=scheduler,
-            dataloader=data.dataloader,
-            extra=checkpoint_extra(config, 0, phases),
-        )
+        with _logged_time(tracker, "checkpoint/save_sec", 0):
+            ckpt_mgr.save(
+                step=0,
+                tokens_seen=0,
+                scheduler=scheduler,
+                dataloader=data.dataloader,
+                extra=checkpoint_extra(config, 0, phases, session.documents_seen),
+            )
         hooks.on_checkpoint_save(0, config.checkpoint.dir)
 
     completed_normally = False
@@ -734,7 +961,12 @@ def run_training_loop(
 
             tracker.start_step()
             result = session.step_fn(session, step)
-            tokens_in_step = _tokens_in_step(session, result)
+            tokens_in_step, documents_in_step, images_in_step = _step_counts(session, result)
+            vision_flops = (
+                images_in_step * vision_flops_per_image(model)
+                if images_in_step is not None
+                else None
+            )
 
             if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
                 optimizer.zero_grad()
@@ -755,6 +987,8 @@ def run_training_loop(
                     break
                 continue
 
+            applied_lr = optimizer.param_groups[0]["lr"]
+            applied_module_lrs = module_learning_rates(optimizer)
             optimizer.step()
             _advance_lr_schedule(session)
 
@@ -762,24 +996,28 @@ def run_training_loop(
 
             step += 1
             tokens_seen += tokens_in_step
+            if documents_in_step is not None:
+                session.documents_seen = (session.documents_seen or 0) + documents_in_step
 
             _apply_step_transitions(session, step)
 
-            current_lr = optimizer.param_groups[0]["lr"]
+            loss = dp_mean(result.loss, session.dp_groups, runtime.device)
             step_metrics = tracker.end_step(
                 step=step,
-                loss=result.loss,
+                loss=loss,
                 grad_norm=result.grad_norm,
-                lr=current_lr,
+                lr=applied_lr,
                 tokens_in_step=tokens_in_step,
+                seq_len=result.seq_len,
+                vision_flops=vision_flops,
             )
 
             hooks.on_step_end(
                 StepContext(
                     step=step,
-                    loss=result.loss,
+                    loss=loss,
                     grad_norm=result.grad_norm,
-                    lr=current_lr,
+                    lr=applied_lr,
                     tokens_seen=tokens_seen,
                     model=model,
                     optimizer=optimizer,
@@ -787,6 +1025,8 @@ def run_training_loop(
             )
 
             if step_metrics is not None:
+                if applied_module_lrs:
+                    tracker.log_eval(applied_module_lrs, step)
                 _log_periodic_metrics(session, result, step)
 
             if (
@@ -816,6 +1056,7 @@ def run_training_loop(
                         pp_size=pipeline.size if pipeline is not None else None,
                         pp_group=pp_group(runtime) if pipeline is not None else None,
                         pp_n_microbatches=tc.grad_accum_steps if pipeline is not None else None,
+                        dp_groups=session.dp_groups,
                     )
                 tracker.log_eval(eval_metrics, step)
                 hooks.on_eval_end(eval_metrics, step)
@@ -823,16 +1064,17 @@ def run_training_loop(
             if prof is not None:
                 prof.step()
 
-            ckpt_extra = checkpoint_extra(config, step, phases)
+            ckpt_extra = checkpoint_extra(config, step, phases, session.documents_seen)
             saved_this_step = config.checkpoint.should_save(step)
             if saved_this_step:
-                ckpt_mgr.save(
-                    step=step,
-                    tokens_seen=tokens_seen,
-                    scheduler=scheduler,
-                    dataloader=data.dataloader,
-                    extra=ckpt_extra,
-                )
+                with _logged_time(tracker, "checkpoint/save_sec", step):
+                    ckpt_mgr.save(
+                        step=step,
+                        tokens_seen=tokens_seen,
+                        scheduler=scheduler,
+                        dataloader=data.dataloader,
+                        extra=ckpt_extra,
+                    )
                 hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
             if _shutdown_if_requested(session, step, tokens_seen, saved_this_step=saved_this_step):
@@ -852,16 +1094,21 @@ def run_training_loop(
             session.control_group = None
 
     if completed_normally and not config.checkpoint.should_save(step):
-        ckpt_mgr.save(
-            step=step,
-            tokens_seen=tokens_seen,
-            scheduler=scheduler,
-            dataloader=data.dataloader,
-            extra=ckpt_extra,
-        )
+        with _logged_time(tracker, "checkpoint/save_sec", step):
+            ckpt_mgr.save(
+                step=step,
+                tokens_seen=tokens_seen,
+                scheduler=scheduler,
+                dataloader=data.dataloader,
+                extra=ckpt_extra,
+            )
         hooks.on_checkpoint_save(step, config.checkpoint.dir)
 
-    ckpt_mgr.wait()
+    if ckpt_mgr.has_pending_save:
+        with _logged_time(tracker, "checkpoint/wait_sec", step):
+            ckpt_mgr.wait()
+    else:
+        ckpt_mgr.wait()
     if nccl_failed_at is not None:
         raise RuntimeError(
             f"NCCL health check failed at step {nccl_failed_at} on at least one rank; "

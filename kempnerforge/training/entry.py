@@ -514,6 +514,7 @@ def run_training(
             eval_dataloader=eval_dataloader,
             profiler=prof,
             autocast_dtype=amp_dtype,
+            documents_seen=ckpt_mgr.restored_extra.get("documents_seen"),
         )
 
         run_training_loop(session, step=step, tokens_seen=tokens_seen)
