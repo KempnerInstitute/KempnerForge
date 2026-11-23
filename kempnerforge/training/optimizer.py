@@ -568,7 +568,7 @@ class Muon(torch.optim.Optimizer):
                 buf_local.mul_(momentum).add_(g_local)
                 inputs.append(g_local.add(buf_local, alpha=momentum) if nesterov else buf_local)
 
-            matrices = [x.view(x.shape[0], -1) for x in inputs]
+            matrices = [x.flatten(1) for x in inputs]
             newton_schulz = functools.partial(_orthogonalize_matrix, steps=ns_steps)
             if orthogonalize == "exact":
                 orthos = orthogonalize_exact(params, matrices, newton_schulz)

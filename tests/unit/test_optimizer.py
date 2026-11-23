@@ -131,6 +131,24 @@ class TestMuon:
         expected = -0.1 * _muon_update_scale("original", 64, 12) * _newton_schulz(matrix)
         torch.testing.assert_close(weight.data.view(64, 12), expected)
 
+    @pytest.mark.parametrize("shape", [(0, 8), (0, 2, 4)])
+    @pytest.mark.parametrize("orthogonalize", ["local", "exact"])
+    def test_steps_a_shard_with_no_rows(self, orthogonalize, shape):
+        """A rank holds no rows of a weight with fewer rows than FSDP2 shards. It steps that
+        weight and the rest of its group, the rest as it would without that weight."""
+        torch.manual_seed(0)
+        empty = nn.Parameter(torch.zeros(shape))
+        weight = nn.Parameter(torch.zeros(4, 8))
+        empty.grad = torch.zeros(shape)
+        weight.grad = torch.randn(4, 8)
+        optimizer = Muon(
+            [{"params": [empty, weight]}], [{"params": []}], lr=0.1, orthogonalize=orthogonalize
+        )
+        optimizer.step()
+        assert empty.shape == shape
+        expected = -0.1 * _muon_update_scale("original", 4, 8) * _newton_schulz(weight.grad)
+        torch.testing.assert_close(weight.data, expected)
+
     def test_nesterov_orthogonalizes_the_lookahead(self):
         """With nesterov, Newton-Schulz sees grad + momentum * buffer."""
         torch.manual_seed(0)
