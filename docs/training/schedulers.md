@@ -17,7 +17,9 @@ the configured steps however many steps were skipped. A checkpoint
 whose scheduler had already fallen behind, saved by an earlier version
 that did not step it on skipped steps, keeps that lag after a resume. The Schedule-Free
 optimizer's own warmup (`optimizer.schedule_free_warmup_steps`) is
-different: it counts optimizer updates, so skipped steps delay it.
+different: it counts each parameter's own optimizer updates, so skipped
+steps delay it, and a parameter whose first gradient comes late starts
+its warmup then.
 
 ## Shared warmup
 

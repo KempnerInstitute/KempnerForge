@@ -56,8 +56,11 @@ class SoftmaxTopKRouter(nn.Module):
 
         p = probs.mean(dim=0)
 
-        self.aux_loss = self.num_experts * (f * p).sum()
-        self.z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
+        if num_tokens == 0:
+            self.aux_loss = self.z_loss = logits.sum() * 0
+        else:
+            self.aux_loss = self.num_experts * (f * p).sum()
+            self.z_loss = (torch.logsumexp(logits, dim=-1) ** 2).mean()
         self.expert_counts = tokens_per_expert.detach()
 
         return weights, indices
@@ -161,6 +164,10 @@ class SigmoidTopKRouter(nn.Module):
         one_hot = F.one_hot(indices, num_classes=self.num_experts).float()
         tokens_per_expert = one_hot.sum(dim=(0, 1))
         self.expert_counts = tokens_per_expert.detach()
+
+        if num_tokens == 0:
+            self.aux_loss = self.z_loss = scores.sum() * 0
+            return weights, indices
 
         if self.training:
             utilization = tokens_per_expert / (num_tokens * self.top_k + 1e-8)
