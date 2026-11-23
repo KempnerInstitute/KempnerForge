@@ -703,6 +703,31 @@ class TestRunTrainingLoop:
         assert ckpt.saves == []
         assert ckpt.waits == 1
 
+    def test_nan_stop_says_the_rollback_is_manual(self, monkeypatch, caplog):
+        """The stop's error gives the manual rollback, and the loop reads the new name."""
+        import logging
+        import warnings
+
+        config = make_config(max_steps=10)
+        session = make_session(
+            config,
+            loss_fn=lambda logits, labels: logits.sum() * float("nan"),
+            nan_detector=NaNDetector(action="warn", max_consecutive=3),
+        )
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        with (
+            caplog.at_level(logging.ERROR, logger="kempnerforge"),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            run_training_loop(session)
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "Too many consecutive NaNs at step 2" in errors[0]
+        assert "Nothing rolls back on its own" in errors[0]
+        assert "checkpoint.load_path" in errors[0]
+        assert not [w for w in caught if "should_rollback" in str(w.message)]
+
     def test_a_finite_loss_with_nan_gradients_skips_the_step(self):
         """NaN gradients under a finite loss never reach the optimizer."""
 

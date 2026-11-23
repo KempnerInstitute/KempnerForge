@@ -17,8 +17,8 @@ nan_detector = NaNDetector(action="warn", max_consecutive=10)
 # Inside the training loop, after backward:
 if not nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
     optimizer.zero_grad()
-    if nan_detector.should_rollback:
-        logger.error("Too many consecutive NaNs — stopping")
+    if nan_detector.rollback_recommended:    # stops without a checkpoint; no rollback
+        logger.error(f"Too many consecutive NaNs at step {step}: stopping ...")
         break
     _advance_lr_schedule(session)            # scheduler.step(), then the phase lr_scale
     step += 1
@@ -83,7 +83,7 @@ the uninterrupted run would have, with two exceptions:
 
 Two edge cases:
 
-- **The NaN that trips the stop.** `should_rollback` is checked first,
+- **The NaN that trips the stop.** `rollback_recommended` is checked first,
   so that step ends the run without a checkpoint, even with a shutdown
   pending (see [Rollback recommendation](#rollback-recommendation)).
 - **A fresh run whose first step is skipped.** PyTorch warns
@@ -188,7 +188,7 @@ class NaNState:
 
 `consecutive_nans` resets on any finite step. It's the one that drives
 rollback: when it reaches `max_consecutive` (default 5 in the class, 10
-in the shipped config), `should_rollback` flips to `True`.
+in the shipped config), `rollback_recommended` flips to `True`.
 
 `nan_steps` is a diagnostic — a post-hoc "which steps actually failed"
 list. Capped at 100 entries to bound memory on pathological runs.
@@ -197,17 +197,27 @@ list. Capped at 100 entries to bound memory on pathological runs.
 
 ```python
 @property
-def should_rollback(self) -> bool:
+def rollback_recommended(self) -> bool:
     return self.state.consecutive_nans >= self.max_consecutive
 ```
+
+The property recommends a rollback and does none. It used to be named
+`should_rollback`, which reads as if the detector rolled back;
+`should_rollback` still works as a deprecated alias that emits a
+`DeprecationWarning`.
 
 When this trips, the training loop *stops* — it doesn't roll back
 automatically:
 
 ```python
 # training/loop.py::run_training_loop
-if nan_detector.should_rollback:
-    logger.error("Too many consecutive NaNs — stopping")
+if nan_detector.rollback_recommended:
+    logger.error(
+        f"Too many consecutive NaNs at step {step}: stopping without a "
+        "checkpoint. Nothing rolls back on its own; to roll back, resubmit "
+        "with a new, empty checkpoint.dir and checkpoint.load_path set to "
+        "an earlier step_N"
+    )
     break
 ```
 
@@ -242,7 +252,7 @@ the *source* of the NaN determines what's safe:
 - **FP8 overflow** — reduce `distributed.fp8_interval` or disable FP8
   for sensitive layers, restart.
 
-A rule-of-thumb: if you hit `should_rollback`, don't resume from the
+A rule-of-thumb: if you hit `rollback_recommended`, don't resume from the
 most recent checkpoint. It holds the weights from just before the NaN
 storm, so whatever state caused the explosion is baked in. That also
 holds for an emergency checkpoint a shutdown wrote during the storm:

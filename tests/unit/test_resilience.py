@@ -401,13 +401,21 @@ class TestNaNDetector:
         assert det.state.consecutive_nans == 0
         assert det.state.total_nans == 2
 
-    def test_should_rollback(self):
+    def test_rollback_recommended(self):
         det = NaNDetector(action="warn", max_consecutive=3)
         det.check_loss(float("nan"), step=1)
         det.check_loss(float("nan"), step=2)
-        assert not det.should_rollback
+        assert not det.rollback_recommended
         det.check_loss(float("nan"), step=3)
-        assert det.should_rollback
+        assert det.rollback_recommended
+
+    def test_should_rollback_is_a_deprecated_alias(self):
+        det = NaNDetector(action="warn", max_consecutive=1)
+        with pytest.warns(DeprecationWarning, match="use rollback_recommended"):
+            assert det.should_rollback is False
+        det.check_loss(float("nan"), step=1)
+        with pytest.warns(DeprecationWarning, match="use rollback_recommended"):
+            assert det.should_rollback is True
 
     def test_raise_action(self):
         det = NaNDetector(action="raise")
@@ -457,7 +465,7 @@ class TestNaNDetector:
         det = NaNDetector(action="warn", max_consecutive=2)
         det.check_loss(1.0, step=1, grad_norm=float("nan"))
         det.check_loss(1.0, step=2, grad_norm=float("nan"))
-        assert det.should_rollback
+        assert det.rollback_recommended
 
     def test_bad_grad_norm_raises_with_action_raise(self):
         det = NaNDetector(action="raise")

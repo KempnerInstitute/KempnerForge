@@ -9,6 +9,7 @@ Provides utilities for detecting common failures during training:
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -38,8 +39,9 @@ class NaNDetector:
       - ``"skip"``: Skip the optimizer step (zero gradients).
       - ``"raise"``: Raise a ``RuntimeError``.
 
-    Once the consecutive NaN count reaches ``max_consecutive``, the detector
-    signals that a checkpoint rollback is recommended.
+    Once the consecutive NaN count reaches ``max_consecutive``,
+    :attr:`rollback_recommended` turns True. Nothing rolls back on its own: the
+    training loop stops on it, and a rollback to an earlier checkpoint is manual.
 
     Args:
         action: What to do when NaN is detected.
@@ -169,9 +171,26 @@ class NaNDetector:
         return False
 
     @property
-    def should_rollback(self) -> bool:
-        """Whether consecutive NaN count suggests a checkpoint rollback."""
+    def rollback_recommended(self) -> bool:
+        """Whether the consecutive NaN count has reached ``max_consecutive``.
+
+        It recommends a rollback and does none: the training loop stops on it
+        without a checkpoint, and the rollback to an earlier one is manual.
+        """
         return self.state.consecutive_nans >= self.max_consecutive
+
+    @property
+    def should_rollback(self) -> bool:
+        """Deprecated alias of :attr:`rollback_recommended`.
+
+        Reading it emits a ``DeprecationWarning``.
+        """
+        warnings.warn(
+            "NaNDetector.should_rollback is deprecated; use rollback_recommended",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.rollback_recommended
 
     def reset(self) -> None:
         """Reset NaN tracking state (e.g., after a rollback)."""

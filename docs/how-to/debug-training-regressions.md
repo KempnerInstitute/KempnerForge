@@ -35,9 +35,10 @@ The training loop reacts:
 - Logs a warning on every NaN/Inf (from `check_loss`)
 - Zeros gradients and skips the optimizer step (in the loop, right
   after `check_loss` returns False, preserving last-good weights)
-- When `nan_detector.should_rollback` becomes true (consecutive count
-  ≥ `max_consecutive`), rank 0 logs `"Too many consecutive NaNs — stopping"`
-  and breaks the loop
+- When `nan_detector.rollback_recommended` becomes true (consecutive count
+  ≥ `max_consecutive`), rank 0 logs `"Too many consecutive NaNs at step N:
+  stopping without a checkpoint"`, followed by the manual rollback, and
+  breaks the loop
 
 You still need to act: the detector doesn't roll back, it just keeps
 you from optimizing into garbage. The usual flow:

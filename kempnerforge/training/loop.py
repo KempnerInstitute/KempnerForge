@@ -679,7 +679,9 @@ def run_training_loop(
     ``shutdown_handler.finish()``; the handler's owner does, once teardown is
     done. After an NCCL-health stop it saves nothing, drains any pending async
     save and raises ``RuntimeError`` on every rank, so the job fails rather
-    than ending as if it completed.
+    than ending as if it completed. The NaN stop, once
+    ``nan_detector.rollback_recommended``, saves nothing either and returns:
+    nothing rolls back, and the rollback to an earlier checkpoint is manual.
     """
     config = session.config
     tc = config.train
@@ -736,8 +738,13 @@ def run_training_loop(
 
             if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
                 optimizer.zero_grad()
-                if session.nan_detector.should_rollback:
-                    logger.error("Too many consecutive NaNs — stopping")
+                if session.nan_detector.rollback_recommended:
+                    logger.error(
+                        f"Too many consecutive NaNs at step {step}: stopping without a "
+                        "checkpoint. Nothing rolls back on its own; to roll back, resubmit "
+                        "with a new, empty checkpoint.dir and checkpoint.load_path set to "
+                        "an earlier step_N"
+                    )
                     break
                 _advance_lr_schedule(session)
                 step += 1
