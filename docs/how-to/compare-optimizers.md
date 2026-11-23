@@ -121,10 +121,13 @@ Nearly all of the AdamW share is the embedding and the output head,
 so both are there.
 
 **LR coupling.** Muon's scheduler sees only the Muon param groups.
-Before every Muon `step()`, the internal AdamW LR is rescaled by
-`muon_current_lr / muon_initial_lr` so both groups follow the same
-warmup/decay curve. If you set `muon_adam_lr`, it's the *initial* LR
-for the AdamW fallback group, then tracks the Muon schedule shape.
+Before every Muon `step()`, the internal AdamW LR is set to its base LR
+times `muon_current_lr / muon_peak_lr` so both groups follow the same
+warmup/decay curve. If you set `muon_adam_lr`, it's the peak LR for the
+AdamW fallback group, and `muon_peak_lr` is the peak the scheduler runs
+Muon from, so a resume or warm start that continues a schedule saved
+under another `optimizer.lr` keeps the fallback at `muon_adam_lr`.
+Unset, the fallback runs at Muon's LR.
 
 **FSDP2 interaction.** Newton-Schulz runs on each rank's local shard
 of the weight matrix rather than the fully gathered matrix — an

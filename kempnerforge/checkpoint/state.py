@@ -459,6 +459,26 @@ def _module_peaks(scheduler: Any) -> dict[str | None, Any]:
     return peaks
 
 
+def _match_initial_lrs(scheduler: Any) -> None:
+    """Set each param group's ``initial_lr`` to the base rate the restored schedule runs it from.
+
+    Building an ``LRScheduler`` makes the two equal, but loading its state restores
+    ``base_lrs`` alone, so a group would keep the rate it was built at. Muon's AdamW fallback
+    takes its schedule's factor from that ``initial_lr``. A state with another number of base
+    rates than the optimizer has groups, which a scheduler other than ``LambdaLR`` loads as
+    saved, leaves them as they are.
+    """
+    base_lrs = getattr(scheduler, "base_lrs", None)
+    if not isinstance(scheduler, torch.optim.lr_scheduler.LRScheduler) or not isinstance(
+        base_lrs, list
+    ):
+        return
+    groups = scheduler.optimizer.param_groups
+    if len(base_lrs) == len(groups):
+        for group, base_lr in zip(groups, base_lrs, strict=True):
+            group["initial_lr"] = base_lr
+
+
 def build_train_state(
     step: int,
     tokens_seen: int,
@@ -523,7 +543,8 @@ def restore_train_state(
     Args:
         state: Training state dict (from build_train_state).
         scheduler: LR scheduler to restore. The saved schedule carries on in every param
-            group, peak included, whatever the rates the optimizer was built with. Its state is
+            group, peak included, whatever the rates the optimizer was built with, and each
+            group's ``initial_lr`` is set to the base rate it now runs from. Its state is
             laid out by module for groups other than those it was saved with (see
             ``build_train_state``): each group of a module the checkpoint holds resumes at that
             module's rates, and any other at the saved peak times its multiplier. Nothing is
@@ -563,6 +584,7 @@ def restore_train_state(
     if scheduler is not None and scheduler_state is not None:
         built = _module_peaks(scheduler)
         scheduler.load_state_dict(scheduler_state)
+        _match_initial_lrs(scheduler)
         peaks = _module_peaks(scheduler)
         if peaks:
             logger.info(
