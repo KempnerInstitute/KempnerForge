@@ -313,7 +313,9 @@ class TestHuggingFaceDataset:
         mock_tokenizer.eos_token_id = 0
         mock_tokenizer.encode = lambda text, **kwargs: [ord(c) for c in text]
 
-        mock_raw_dataset = documents
+        from datasets import Dataset as HFDataset
+
+        mock_raw_dataset = HFDataset.from_list(documents)
 
         with (
             patch("datasets.load_dataset", return_value=mock_raw_dataset),
@@ -376,6 +378,84 @@ class TestHuggingFaceDataset:
         assert ds2._sample_idx == 5
 
 
+def _texts_with_images(tmp_path):
+    """A parquet file of two texts whose image column holds an image and a blank entry,
+    which load_dataset keeps as it is and the Image feature cannot decode."""
+    import io
+
+    import pyarrow as pa
+    from datasets import Dataset as HFDataset
+    from datasets import Features, Image, Value
+    from PIL import Image as PILImage
+
+    buf = io.BytesIO()
+    PILImage.new("RGB", (8, 8)).save(buf, format="PNG")
+    struct = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
+    images = pa.array(
+        [{"bytes": buf.getvalue(), "path": None}, {"bytes": None, "path": None}], struct
+    )
+    table = pa.table({"text": ["a first document", "a second document"], "image": images})
+    path = str(tmp_path / "train.parquet")
+    features = Features({"text": Value("string"), "image": Image()})
+    HFDataset(table).cast(features).to_parquet(path)
+    return path
+
+
+_PACKED_CHUNKS = (len("a first document") + 1 + len("a second document") + 1) // 5
+
+
+def _no_image_decoding(monkeypatch):
+    from datasets import Image
+
+    def refuse(self, value, token_per_repo_id=None):
+        raise AssertionError("an image was decoded")
+
+    monkeypatch.setattr(Image, "decode_example", refuse)
+
+
+class TestTextReadersReadOnlyTheText:
+    """Both readers read only the text column, so an image column, a blank entry included,
+    is never decoded."""
+
+    def test_the_eager_reader(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import datasets
+        import transformers
+
+        from kempnerforge.data.dataset import HuggingFaceDataset
+
+        hub = datasets.load_dataset(
+            "parquet", data_files=_texts_with_images(tmp_path), split="train"
+        )
+        tokenizer = MagicMock(eos_token_id=0)
+        tokenizer.encode = lambda text, **kwargs: [ord(c) for c in text]
+        monkeypatch.setattr(datasets, "load_dataset", lambda *args, **kwargs: hub)
+        monkeypatch.setattr(
+            transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: tokenizer
+        )
+        _no_image_decoding(monkeypatch)
+        ds = HuggingFaceDataset("mock/dataset", "train", "text", seq_len=4, tokenizer_path="mock")
+        assert len(ds) == _PACKED_CHUNKS
+
+    def test_the_streaming_reader(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import datasets
+
+        from kempnerforge.data.dataset import StreamingHuggingFaceDataset
+
+        path = _texts_with_images(tmp_path)
+        stream = datasets.load_dataset("parquet", data_files=path, split="train", streaming=True)
+        monkeypatch.setattr(datasets, "load_dataset", lambda *args, **kwargs: stream)
+        _no_image_decoding(monkeypatch)
+        ds = StreamingHuggingFaceDataset("mock/dataset", "train", "text", 4, "mock")
+        ds._tokenizer = MagicMock(eos_token_id=0)
+        ds._tokenizer.encode = lambda text, **kwargs: [ord(c) for c in text]
+        ds._eos_id = 0
+        assert len(list(ds)) == _PACKED_CHUNKS
+
+
 class TestStreamingHuggingFaceDataset:
     """Tests using a mock streaming dataset to avoid network dependencies."""
 
@@ -424,10 +504,17 @@ class TestStreamingHuggingFaceDataset:
         import datasets
 
         calls = {}
+        order = []
 
         class RecordingStream:
+            def select_columns(self, columns):
+                calls["columns"] = columns
+                order.append("select_columns")
+                return self
+
             def shuffle(self, seed, buffer_size):
                 calls["shuffle"] = (seed, buffer_size)
+                order.append("shuffle")
                 return self
 
         def fake_load_dataset(name, config, split, streaming):
@@ -442,7 +529,9 @@ class TestStreamingHuggingFaceDataset:
 
         assert isinstance(stream, RecordingStream)
         assert calls["load"] == ("mock/dataset", None, "train", True)
+        assert calls["columns"] == ["text"]
         assert calls["shuffle"] == (9, ds.shuffle_buffer_size)
+        assert order == ["select_columns", "shuffle"]
 
     def test_basic_iteration(self):
         ds = self._make_mock_dataset(seq_len=4)
