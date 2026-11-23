@@ -33,6 +33,11 @@ _VIDEO_INSTEAD_OF_DATA_HF_FIELDS = {
 }
 
 
+def _set_away_from_default(value: object, default: object) -> bool:
+    """Whether ``value`` departs from ``default``; ``""`` is unset where the default is ``None``."""
+    return bool(value) if default is None else value != default
+
+
 def _arch_of(vlm: VLMConfig) -> str:
     """The arch of ``vlm``'s class, which is what the parallelism checks act on.
 
@@ -397,7 +402,7 @@ class JobConfig:
                 unread = [
                     name
                     for name in _VIDEO_INSTEAD_OF_DATA_HF_FIELDS
-                    if getattr(self.data, name) != defaults[name]
+                    if _set_away_from_default(getattr(self.data, name), defaults[name])
                 ]
                 if unread:
                     settings = "; ".join(

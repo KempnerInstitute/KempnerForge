@@ -455,8 +455,9 @@ instead where there is one, and the defaults to put back:
 | `hf_dataset_config`, `hf_dataset_text_field`, `hf_dataset_image_field`, `hf_streaming` | no counterpart |
 
 The fields are compared with their defaults, so `hf_dataset_split = "train"`
-or `hf_image_size = 224` passes. `data.hf_max_images` is refused with
-`[video]` when `JobConfig` is built.
+or `hf_image_size = 224` passes, and an empty `hf_dataset_name` or
+`hf_dataset_config` counts as unset like their default `None`.
+`data.hf_max_images` is refused with `[video]` when `JobConfig` is built.
 
 ### MoE + torch.compile — warning, not error
 

@@ -156,6 +156,11 @@ class TestJobConfigVideoWiring:
             hf_image_size=224,
         ).validate(world_size=1)
 
+    def test_an_empty_dataset_name_or_config_is_unset(self):
+        """Both default to None; an empty string, as a TOML template or
+        ``--data.hf_dataset_name=`` writes it, leaves them unset too."""
+        self._video_job(hf_dataset_name="", hf_dataset_config="").validate(world_size=1)
+
     def test_an_image_run_keeps_them(self):
         JobConfig(
             train=TrainConfig(seq_len=64),
