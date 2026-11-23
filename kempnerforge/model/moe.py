@@ -128,8 +128,8 @@ def _apply_capacity(
     """Zero routing weights for tokens that exceed per-expert capacity.
 
     Capacity = ceil(num_tokens * top_k / num_experts * capacity_factor).
-    For each expert, only the first ``capacity`` tokens (in sequence order)
-    are kept; the rest get weight=0 and are effectively dropped.
+    For each expert, only the first ``capacity`` routes (in token order across
+    all top-k slots) are kept; the rest get weight=0 and are effectively dropped.
 
     Args:
         weights: (num_tokens, top_k) routing weights.
@@ -138,8 +138,8 @@ def _apply_capacity(
         capacity_factor: Multiplier for capacity (1.0 = exact average, 1.25 = 25% headroom).
 
     Returns:
-        (weights, indices) with overflow entries zeroed out. Tensors are cloned
-        to avoid mutating the router's output.
+        (weights, indices) with overflow weights zeroed out. Weights are cloned
+        to avoid mutating the router's output; indices are returned unchanged.
     """
     import math
 
@@ -147,13 +147,10 @@ def _apply_capacity(
     capacity = max(1, math.ceil(num_tokens * top_k / num_experts * capacity_factor))
 
     weights = weights.clone()
-    for k in range(top_k):
-        for e in range(num_experts):
-            assigned = (indices[:, k] == e).nonzero(as_tuple=True)[0]
-            if assigned.numel() <= capacity:
-                continue
-            drop = assigned[capacity:]
-            weights[drop, k] = 0.0
+    for e in range(num_experts):
+        tokens, slots = (indices == e).nonzero(as_tuple=True)
+        if tokens.numel() > capacity:
+            weights[tokens[capacity:], slots[capacity:]] = 0.0
 
     return weights, indices
 
@@ -222,6 +219,24 @@ class MoEMLP(nn.Module):
             hidden = self._packed_activation(up)  # type: ignore[reportCallIssue]
         return hidden @ self.down_w[i]
 
+    def _expert_params(self) -> list[nn.Parameter]:
+        """Every expert weight: the packed tensors, or each expert's parameters."""
+        if self.packed_experts:
+            return [self.up_w, self.down_w] + ([self.gate_w] if self._is_swiglu else [])
+        return list(self.experts.parameters())
+
+    def _keep_in_graph(self, output: torch.Tensor, params: Sequence[torch.Tensor]) -> torch.Tensor:
+        """``output`` plus a zero-valued term of ``params``, so each gets a gradient this step.
+
+        FSDP2 reduce-scatters only the parameters that have a gradient, so an expert or router
+        weight left out on one rank while another rank uses it would make the ranks'
+        collectives differ in size. The expert-parallel dispatch adds the same term for its
+        idle experts.
+        """
+        if not params:
+            return output
+        return output + sum(p.sum() for p in params) * 0
+
     def _local_forward(
         self,
         x_flat: torch.Tensor,
@@ -231,10 +246,15 @@ class MoEMLP(nn.Module):
         """Dispatch tokens to local experts and weighted-combine results.
 
         Uses grouped GEMM when available (torch._grouped_mm) for batched expert
-        computation. Falls back to sequential loop otherwise.
+        computation. Falls back to sequential loop otherwise. Every expert weight gets a
+        gradient, zero for an expert that got no tokens, on both paths. A layer that gets no
+        tokens at all returns an empty output that keeps every expert weight, and through
+        ``weights`` every router weight, in the graph.
         """
         num_tokens, dim = x_flat.shape
         top_k = indices.shape[1]
+        if num_tokens == 0:
+            return self._keep_in_graph(torch.zeros_like(x_flat), [weights, *self._expert_params()])
 
         use_grouped = _HAS_GROUPED_MM and x_flat.dtype in _GROUPED_MM_DTYPES
         if use_grouped:
@@ -281,9 +301,12 @@ class MoEMLP(nn.Module):
             output = torch.zeros_like(x_flat)
             if self.gradient_scale and self.training:
                 avg_tokens = num_tokens * top_k / max(self.num_experts, 1)
+            idle: list[nn.Parameter] = []
             for i in range(self.num_experts):
                 mask = (indices == i).any(dim=-1)
                 if not mask.any():
+                    if not self.packed_experts:
+                        idle.extend(self.experts[i].parameters())
                     continue
                 expert_input = x_flat[mask]
                 expert_output = (
@@ -297,6 +320,7 @@ class MoEMLP(nn.Module):
                     expert_output = expert_output * scale
                 weight_for_i = (weights * (indices == i).float()).sum(dim=-1)
                 output[mask] += weight_for_i[mask].unsqueeze(-1) * expert_output
+            output = self._keep_in_graph(output, idle)
 
         return output
 

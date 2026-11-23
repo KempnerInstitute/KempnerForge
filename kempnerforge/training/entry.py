@@ -191,7 +191,7 @@ def build_checkpoint_manager(
         from kempnerforge.distributed.pipeline_parallel import build_stage_group
 
         ckpt_pp_rank = pipeline.rank
-        ckpt_pg = build_stage_group(device_mesh)
+        ckpt_pg = build_stage_group(device_mesh, config.distributed.nccl_timeout_sec)
     return CheckpointManager(
         config.checkpoint,
         model,
@@ -202,6 +202,7 @@ def build_checkpoint_manager(
         weight_decay_scope=config.optimizer.weight_decay_scope,
         lr_multipliers=config.optimizer.lr_multipliers,
         module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
+        group_timeout_sec=config.distributed.nccl_timeout_sec,
     )
 
 
@@ -463,9 +464,8 @@ def run_training(
 
         prof = build_profiler(config.profiling, rank=runtime.rank)
 
-        tokens_per_image = (
-            packed_tokens_per_image(model) if config.is_vlm and config.data.pack_sequences else None
-        )
+        laid_out = config.data.pack_sequences or config.data.hf_max_images != 1
+        tokens_per_image = packed_tokens_per_image(model) if config.is_vlm and laid_out else None
         data = build_data_pipeline(config, runtime, tokens_per_image=tokens_per_image)
         if data.dataloader is not None:
             ckpt_mgr.apply_dataloader_state(data.dataloader)

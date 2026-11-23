@@ -419,6 +419,31 @@ class TestStreamingHuggingFaceDataset:
 
         ds._load_stream = lambda: MockStream(documents)
 
+    def test_load_stream_streams_and_shuffles_by_epoch(self, monkeypatch):
+        """The stream is loaded in streaming mode and shuffled with seed + epoch."""
+        import datasets
+
+        calls = {}
+
+        class RecordingStream:
+            def shuffle(self, seed, buffer_size):
+                calls["shuffle"] = (seed, buffer_size)
+                return self
+
+        def fake_load_dataset(name, config, split, streaming):
+            calls["load"] = (name, config, split, streaming)
+            return RecordingStream()
+
+        monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+        ds = self._make_mock_dataset(seq_len=4, seed=7)
+        ds._epoch = 2
+
+        stream = ds._load_stream()
+
+        assert isinstance(stream, RecordingStream)
+        assert calls["load"] == ("mock/dataset", None, "train", True)
+        assert calls["shuffle"] == (9, ds.shuffle_buffer_size)
+
     def test_basic_iteration(self):
         ds = self._make_mock_dataset(seq_len=4)
         docs = [{"text": "abcdefghij"}]

@@ -2115,6 +2115,19 @@ class TestBuildModel:
         entry.build_model(config, _runtime(), lambda a, b: a)
         assert seen["frames_per_clip"] == 6
 
+    def test_non_pp_keeps_one_frame_per_clip_under_an_image_cap(self, monkeypatch):
+        """The cap sizes rows, not the clip the prefix route checks, so eval takes one image."""
+        import kempnerforge.training.entry as entry
+
+        seen: dict = {}
+        monkeypatch.setattr(
+            entry, "build_parallel_model", lambda *a, **k: seen.update(k) or "MODEL"
+        )
+        config = _vlm_config()
+        config.data = DataConfig(hf_max_images=3, num_workers=0)
+        entry.build_model(config, _runtime(), lambda a, b: a)
+        assert seen["frames_per_clip"] == 1
+
     def test_non_pp_sizes_the_model_for_the_tiled_views(self, monkeypatch):
         """A 2 × 2 grid without the whole image is four views per sample."""
         import kempnerforge.training.entry as entry
@@ -3067,6 +3080,8 @@ class TestRestoreFromSavedCheckpoints:
 
 
 class FakeDataset:
+    has_text_only_rows = False
+
     def __init__(self, n=8, **kw) -> None:
         self.n = n
         self.kwargs = kw
@@ -3203,6 +3218,9 @@ class TestVlmSourceBuilders:
             vlmd, "HuggingFaceVLMDataset", lambda **k: FakeDataset(**seen.setdefault("dataset", k))
         )
         monkeypatch.setattr(vlmd, "VLMCollator", lambda **k: seen.setdefault("image_collator", k))
+        monkeypatch.setattr(
+            vlmd, "PackedVLMCollator", lambda **k: seen.setdefault("packed_collator", k)
+        )
         monkeypatch.setattr(vid, "build_video_dataset", lambda *a: FakeDataset())
         monkeypatch.setattr(vid, "VideoCollator", lambda **k: seen.setdefault("video_collator", k))
 
@@ -3213,7 +3231,70 @@ class TestVlmSourceBuilders:
         data = dp.build_data_pipeline(self._vlm_data_config(), _runtime())
         assert data.dataloader == "stateful_OBJ"
         assert seen["image_collator"]["pad_id"] == 7
+        assert seen["image_collator"]["frame_mask"] is False
         assert "video_collator" not in seen
+
+    def test_image_path_passes_the_image_cap_to_the_dataset(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.hf_max_images = 2
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=16)
+        assert seen["dataset"]["max_images"] == 2
+        assert seen["packed_collator"]["max_docs_per_row"] == 1 and "image_collator" not in seen
+
+    def test_a_dataset_with_text_only_rows_masks_every_batch(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        monkeypatch.setattr(FakeDataset, "has_text_only_rows", True)
+        dp.build_data_pipeline(self._vlm_data_config(), _runtime())
+        assert seen["image_collator"]["frame_mask"] is True
+
+    def test_an_image_cap_above_one_without_packing_uses_fixed_rows(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.hf_max_images = 3
+        config.train.seq_len = 128
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=16)
+        assert seen["packed_collator"] == {
+            "pad_id": 7,
+            "seq_len": config.train.seq_len,
+            "tokens_per_image": 16,
+            "max_docs_per_row": 1,
+        }
+        assert "image_collator" not in seen
+        with pytest.raises(ValueError, match="data.hf_max_images on a VLM run needs the built"):
+            dp.build_data_pipeline(config, _runtime())
+
+    @pytest.mark.parametrize("pack", [False, True])
+    def test_laid_out_rows_must_fit_the_image_cap_and_the_text(self, monkeypatch, pack):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.hf_max_images = 3
+        config.data.pack_sequences = pack
+        too_many = (config.train.seq_len - config.vlm.max_text_len) // 3 + 1
+        with pytest.raises(ValueError, match="cannot hold one document"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=too_many)
+        assert "dataset" not in seen
+
+    def test_text_only_rows_are_refused_with_flash_attention(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.model.sdpa_backend = "flash"
+        dp.build_data_pipeline(config, _runtime())
+        monkeypatch.setattr(FakeDataset, "has_text_only_rows", True)
+        with pytest.raises(ValueError, match="sdpa_backend='flash'"):
+            dp.build_data_pipeline(config, _runtime())
+        config.model.attention_backend = "flex"
+        dp.build_data_pipeline(config, _runtime())
 
     def test_packed_image_path_takes_the_model_token_count(self, monkeypatch):
         import kempnerforge.data.vlm_dataset as vlmd
@@ -3230,11 +3311,12 @@ class TestVlmSourceBuilders:
             "pad_id": 7,
             "seq_len": config.train.seq_len,
             "tokens_per_image": 12,
+            "max_docs_per_row": 0,
         }
         assert "image_collator" not in seen
         with pytest.raises(ValueError, match="built model's tokens per image"):
             dp.build_data_pipeline(config, _runtime())
-        with pytest.raises(ValueError, match="cannot hold one packed document"):
+        with pytest.raises(ValueError, match="cannot hold one document"):
             dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
 
     def test_packed_fit_check_runs_before_the_dataset_loads(self, monkeypatch):
@@ -3243,7 +3325,7 @@ class TestVlmSourceBuilders:
         self._stub_vlm_modules(monkeypatch, seen)
         config = self._vlm_data_config()
         config.data.pack_sequences = True
-        with pytest.raises(ValueError, match="cannot hold one packed document"):
+        with pytest.raises(ValueError, match="cannot hold one document"):
             dp.build_data_pipeline(config, _runtime(), tokens_per_image=config.train.seq_len)
         with pytest.raises(ValueError, match="built model's tokens per image"):
             dp.build_data_pipeline(config, _runtime())
@@ -3267,6 +3349,20 @@ class TestVlmSourceBuilders:
         assert seen["dataset"]["tile_grid"] == 2
         assert seen["dataset"]["tile_global"] is False
 
+    def test_tiled_documents_with_several_images_count_every_view_of_every_image(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config(tile_grid=2, tile_global=False)
+        config.data.hf_max_images = 2
+        config.train.seq_len = 2 * 4 * 12 + config.vlm.max_text_len - 1
+        with pytest.raises(ValueError, match="96 image tokens"):
+            dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        config.train.seq_len += 1
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=12)
+        assert seen["packed_collator"]["max_docs_per_row"] == 1
+        assert seen["dataset"]["max_images"] == 2 and seen["dataset"]["tile_grid"] == 2
+
     def test_image_path_hands_the_tiling_to_the_dataset(self, monkeypatch):
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
@@ -3274,6 +3370,18 @@ class TestVlmSourceBuilders:
         dp.build_data_pipeline(self._vlm_data_config(tile_grid=2, tile_global=False), _runtime())
         assert seen["dataset"]["tile_grid"] == 2
         assert seen["dataset"]["tile_global"] is False
+
+    def test_packing_with_an_image_cap_packs_capped_documents(self, monkeypatch):
+        seen: dict = {}
+        dp = _stub_loaders(monkeypatch, seen)
+        self._stub_vlm_modules(monkeypatch, seen)
+        config = self._vlm_data_config()
+        config.data.pack_sequences = True
+        config.data.hf_max_images = 2
+        dp.build_data_pipeline(config, _runtime(), tokens_per_image=16)
+        assert seen["dataset"]["max_images"] == 2
+        assert seen["packed_collator"]["max_docs_per_row"] == 0
+        assert seen["packed_collator"]["tokens_per_image"] == 16
 
     def test_video_path_uses_the_video_collator(self, monkeypatch):
         seen: dict = {}
@@ -4115,6 +4223,43 @@ class TestLoopPeriodicWork:
         config = make_config(max_steps=2)
         config.eval = EvalConfig(enabled=True, interval=1, steps=1, dataset_path="/x")
         run_training_loop(make_session(config, eval_dataloader=None))
+
+    def test_eval_runs_at_the_optimizers_evaluation_point(self, monkeypatch):
+        """A schedule-free run evaluates its averaged weights x and trains on at y, bit for bit."""
+        import kempnerforge.training.loop as loop
+        from kempnerforge.config.eval import EvalConfig
+        from kempnerforge.training.optimizer import ScheduleFreeAdamW
+
+        def build():
+            torch.manual_seed(0)
+            model = TinyTextModel()
+            return model, ScheduleFreeAdamW(model.parameters(), lr=0.05)
+
+        seen: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
+
+        def recording_eval(model, *args, **kwargs):
+            params = list(model.parameters())
+            x = [optimizer.state[p]["x"] for p in params]
+            seen.append(([p.detach().clone() for p in params], [t.clone() for t in x]))
+            return {}
+
+        monkeypatch.setattr(loop, "run_eval", recording_eval)
+        config = make_config(max_steps=4)
+        config.eval = EvalConfig(enabled=True, interval=2, steps=1, dataset_path="/x")
+        model, optimizer = build()
+        run_training_loop(
+            make_session(config, model=model, optimizer=optimizer, eval_dataloader=["BATCH"])
+        )
+        assert len(seen) == 2
+        for at_eval, x in seen:
+            assert all(torch.equal(a, b) for a, b in zip(at_eval, x, strict=True))
+
+        plain, plain_opt = build()
+        run_training_loop(
+            make_session(config, model=plain, optimizer=plain_opt, eval_dataloader=None)
+        )
+        for a, b in zip(model.parameters(), plain.parameters(), strict=True):
+            assert torch.equal(a, b), "evaluating at x changed the training run"
 
     def test_profiler_is_started_stepped_and_stopped(self):
         class CountingProfiler:

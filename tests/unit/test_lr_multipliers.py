@@ -32,7 +32,6 @@ from kempnerforge.training.optimizer import Muon, build_optimizer, module_learni
 from kempnerforge.training.scheduler import build_scheduler
 
 REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
-RESUMABLE_OPTIMIZERS = [name for name in REGISTERED_OPTIMIZERS if name != "schedule_free_adamw"]
 
 VLM_PATTERNS = {
     "transformer": ["transformer", "transformer.*"],
@@ -754,7 +753,7 @@ class TestResume:
         step_dir = self._save(tmp_path, {})
         assert "lr_multipliers" not in json.loads((step_dir / "metadata.json").read_text())
 
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_the_same_multipliers_resume_exactly(self, tmp_path, name):
         multipliers = {"layer0": 0.5, "head": 2.0}
         model, optimizer, scheduler = self._build(name, multipliers, seed=0)
@@ -957,9 +956,8 @@ class TestResume:
             (b'{"step": 3, "lr_module_patterns": {"head": "x"}}', "lists of patterns"),
             (b'{"step": 3, "lr_group_modules": "head"}', "a module name or null per"),
             (b'{"step": 3, "lr_group_modules": [null, 2]}', "a module name or null per"),
-            (b"[" * 100_000 + b"]" * 100_000, "RecursionError"),
         ],
-        ids=["bad-json", "list", "negative", "patterns", "group-modules", "group-module", "deep"],
+        ids=["bad-json", "list", "negative", "patterns", "group-modules", "group-module"],
     )
     @pytest.mark.parametrize("exclude", [[], ["optimizer"]], ids=["resume", "warm-start"])
     def test_an_invalid_record_is_refused(self, tmp_path, content, match, exclude):
@@ -967,6 +965,24 @@ class TestResume:
         (self._save(tmp_path, {"head": 2.0}) / "metadata.json").write_bytes(content)
         _, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
         with pytest.raises(ValueError, match=f"Cannot check the lr_multipliers.*{match}"):
+            manager.load(scheduler=scheduler, exclude_keys=exclude)
+        assert scheduler.last_epoch == 0
+
+    @pytest.mark.parametrize("exclude", [[], ["optimizer"]], ids=["resume", "warm-start"])
+    def test_a_read_that_fails_with_any_error_is_refused(self, tmp_path, monkeypatch, exclude):
+        """A read that fails with an error other than a ``ValueError`` still refuses the load,
+        and the refusal names the error's type."""
+        record = (self._save(tmp_path, {"head": 2.0}) / "metadata.json").read_text()
+        _, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
+        loads = json.loads
+
+        def fail_on_the_record(text, *args, **kwargs):
+            if text == record:
+                raise RecursionError("maximum recursion depth exceeded")
+            return loads(text, *args, **kwargs)
+
+        monkeypatch.setattr(json, "loads", fail_on_the_record)
+        with pytest.raises(ValueError, match="Cannot check the lr_multipliers.*RecursionError"):
             manager.load(scheduler=scheduler, exclude_keys=exclude)
         assert scheduler.last_epoch == 0
 
@@ -1274,7 +1290,7 @@ class TestLayoutChange:
             )
 
     @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_a_warm_start_resumes_each_group_at_its_module_rate(self, tmp_path, name, scenario):
         saved, resumed = self.SCENARIOS[scenario]
         model, optimizer, scheduler = self._build(name, *saved)
@@ -1291,7 +1307,7 @@ class TestLayoutChange:
         self._train(model, optimizer, scheduler, 1)
         self._assert_module_rates(optimizer, scheduler)
 
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_groups_of_no_module_that_change_in_number_resume_at_their_rate(self, tmp_path, name):
         """With every listed module frozen no group names a module, and the scope sets how
         many groups hold the rest."""
@@ -1318,7 +1334,7 @@ class TestLayoutChange:
     }
 
     @pytest.mark.parametrize("change", sorted(LR_CHANGES))
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_a_warm_start_with_another_lr_keeps_the_saved_peak_in_every_group(
         self, tmp_path, name, change
     ):

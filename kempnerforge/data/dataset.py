@@ -361,7 +361,7 @@ class HuggingFaceDataset(Dataset):
         self._packed_sequences = self._pack_sequences(raw_dataset)
         logger.info(
             f"HuggingFaceDataset: {len(self._packed_sequences)} packed sequences "
-            f"(seq_len={seq_len}) from {len(raw_dataset)} documents"  # type: ignore[reportArgumentType]
+            f"(seq_len={seq_len}) from {len(raw_dataset)} documents"
         )
 
         self._epoch = 0
@@ -575,7 +575,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             split=self.split,
             streaming=True,
         )
-        ds = ds.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer_size)  # type: ignore[reportCallIssue]
+        ds = ds.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer_size)
         if self.world_size > 1:
             ds = split_dataset_by_node(ds, rank=self.rank, world_size=self.world_size)
         return ds
