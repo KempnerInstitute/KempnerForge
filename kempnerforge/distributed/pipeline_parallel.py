@@ -23,6 +23,7 @@ Note on FSDP reshard policy:
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import cast
 
 import torch
@@ -67,7 +68,9 @@ def get_pp_size(device_mesh: DeviceMesh) -> int:
     return pp_mesh.size()
 
 
-def build_stage_group(device_mesh: DeviceMesh) -> dist.ProcessGroup:
+def build_stage_group(
+    device_mesh: DeviceMesh, timeout_sec: float | None = None
+) -> dist.ProcessGroup:
     """Create one process group per pipeline stage and return the one holding this rank.
 
     A stage's group holds every rank at the same ``pp`` coordinate of ``device_mesh``,
@@ -76,6 +79,11 @@ def build_stage_group(device_mesh: DeviceMesh) -> dist.ProcessGroup:
     ``torch.distributed.new_group``, which is collective over the default process group:
     every rank must call this at the same point.
 
+    Args:
+        device_mesh: The mesh, with a ``pp`` dimension.
+        timeout_sec: Collective timeout of the stage groups, ``distributed.nccl_timeout_sec``
+            in training. None leaves PyTorch's default.
+
     Raises:
         ValueError: ``device_mesh`` has no ``pp`` dimension.
     """
@@ -83,7 +91,10 @@ def build_stage_group(device_mesh: DeviceMesh) -> dist.ProcessGroup:
     if "pp" not in dim_names:
         raise ValueError(f"build_stage_group needs a 'pp' mesh dimension, got dims {dim_names}")
     stages = device_mesh.mesh.unbind(dim_names.index("pp"))
-    group, _ = dist.new_subgroups_by_enumeration([stage.flatten().tolist() for stage in stages])
+    group, _ = dist.new_subgroups_by_enumeration(
+        [stage.flatten().tolist() for stage in stages],
+        timeout=None if timeout_sec is None else timedelta(seconds=timeout_sec),
+    )
     return cast("dist.ProcessGroup", group)
 
 
