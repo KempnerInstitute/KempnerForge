@@ -105,6 +105,8 @@ class _HFVisionEncoder(VisionEncoder):
     ``has_cls_token`` flag tells the encoder which architecture it wraps so
     ``num_tokens`` reflects the actual forward output shape, and the
     ``strip_cls`` flag controls whether to drop position 0 before returning.
+    ``drop_pooling_head`` removes the tower's attention-pooling head (SigLIP's
+    ``head``), which HF runs for a pooled output this encoder discards.
     """
 
     def __init__(
@@ -112,6 +114,7 @@ class _HFVisionEncoder(VisionEncoder):
         path: str,
         strip_cls: bool = False,
         has_cls_token: bool = True,
+        drop_pooling_head: bool = False,
     ) -> None:
         super().__init__()
         if strip_cls and not has_cls_token:
@@ -130,6 +133,11 @@ class _HFVisionEncoder(VisionEncoder):
             raise ValueError("vlm.vision_encoder_path must be set for HF-backed vision encoders")
         model = AutoModel.from_pretrained(path)
         vision_tower = getattr(model, "vision_model", model)
+        if drop_pooling_head:
+            if not getattr(vision_tower, "use_head", False):
+                raise ValueError(f"{path} has no pooling head to drop")
+            vision_tower.use_head = False
+            del vision_tower.head
         self.vision_tower = vision_tower
         self._strip_cls = strip_cls
         self._has_cls_token = has_cls_token
@@ -158,10 +166,13 @@ def _build_siglip2(
     path: str,
     num_tokens: int | None = None,
     feature_dim: int | None = None,
+    drop_pooling_head: bool = False,
     **_: Any,
 ) -> VisionEncoder:
     """Builder for a SigLIP2 vision tower. SigLIP2 has no CLS token."""
-    enc = _HFVisionEncoder(path, strip_cls=False, has_cls_token=False)
+    enc = _HFVisionEncoder(
+        path, strip_cls=False, has_cls_token=False, drop_pooling_head=drop_pooling_head
+    )
     if num_tokens is not None:
         enc.num_tokens = num_tokens
     if feature_dim is not None:
@@ -174,13 +185,16 @@ def _build_clip(
     path: str,
     num_tokens: int | None = None,
     feature_dim: int | None = None,
+    drop_pooling_head: bool = False,
     **_: Any,
 ) -> VisionEncoder:
     """Builder for a CLIP ViT vision tower. CLIP output includes a CLS
     token; we strip it so ``num_tokens`` matches the number of image
     patches.
     """
-    enc = _HFVisionEncoder(path, strip_cls=True, has_cls_token=True)
+    enc = _HFVisionEncoder(
+        path, strip_cls=True, has_cls_token=True, drop_pooling_head=drop_pooling_head
+    )
     if num_tokens is not None:
         enc.num_tokens = num_tokens
     if feature_dim is not None:
