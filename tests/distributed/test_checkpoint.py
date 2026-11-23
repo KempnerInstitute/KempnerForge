@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -489,6 +490,33 @@ class TestCheckpointLoadDivergentExistence:
         )
 
 
+class TestCheckpointLoadUnreadableTrainState:
+    """Every rank raises at once when rank 0 cannot read ``train_state.pt`` (#546)."""
+
+    def test_a_torn_train_state_fails_every_rank_at_once(self, distributed_env, shared_tmp_dir):
+        mesh = distributed_env
+        rank = dist.get_rank()
+        model = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(model, mesh)
+        from kempnerforge.config.schema import OptimizerConfig
+
+        opt = build_optimizer(model, OptimizerConfig(lr=1e-3, fused=False))
+        mgr = CheckpointManager(CheckpointConfig(dir=shared_tmp_dir), model, opt)
+        mgr.save(step=1, tokens_seen=100)
+        dist.barrier()
+        path = Path(shared_tmp_dir) / "step_1" / "train_state.pt"
+        if rank == 0:
+            path.write_bytes(path.read_bytes()[:100])
+        dist.barrier()
+        reason = "PytorchStreamReader"
+        if rank != 0:
+            reason = f"Rank 0 could not read {path}: RuntimeError: {reason}"
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match=re.escape(reason)):
+            mgr.load()
+        assert time.monotonic() - start < 60
+
+
 class TestAsyncCheckpointLatestSafety:
     """Real 2-rank FSDP coverage for the async `latest`-before-flush bug.
 
@@ -538,7 +566,7 @@ class TestAsyncCheckpointLatestSafety:
 
     def test_resume_falls_back_when_latest_incomplete(self, distributed_env, shared_tmp_dir):
         """Defense in depth: if `latest` points at an interrupted async
-        flush (no DCP `.metadata`), resume falls back to the newest
+        flush (no DCP `.metadata`), an exact resume falls back to the newest
         complete checkpoint instead of hard-failing in dcp.load."""
         mesh = distributed_env
         ckpt_dir = shared_tmp_dir
@@ -567,9 +595,59 @@ class TestAsyncCheckpointLatestSafety:
             tmp.rename(link)
         dist.barrier()
 
-        step, tokens_seen, _ = mgr.load()
+        step, tokens_seen, _ = mgr.load(exact_resume=True)
         assert step == 1, f"rank {rank}: expected fallback to step 1, got {step}"
         assert tokens_seen == 64
+
+
+class TestTornStageResume:
+    """Two pipeline stages of two ranks each: a step one stage cannot load is resumed by none."""
+
+    @pytest.mark.parametrize("torn", [0, 1], ids=["stage_0_torn", "stage_1_torn"])
+    def test_every_stage_resumes_the_same_step(self, distributed_env, shared_tmp_dir, torn):
+        """Each stage saves through its own group; stage ``torn`` loses its step-20 shards."""
+        if dist.get_world_size() != 4:
+            pytest.skip("needs 4 ranks, two stages of two")
+        rank = dist.get_rank()
+        stage = rank // 2
+        groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
+
+        def manager() -> tuple[torch.nn.Module, CheckpointManager]:
+            torch.manual_seed(stage)
+            model = torch.nn.Linear(16, 16).cuda()
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            config = CheckpointConfig(dir=shared_tmp_dir, keep_last_n=3)
+            return model, CheckpointManager(
+                config,
+                model,
+                optimizer,
+                process_group=groups[stage],
+                pp_rank=stage,
+                dp_info=(rank % 2, 2),
+            )
+
+        model, saver = manager()
+        model(torch.ones(2, 16, device="cuda")).sum().backward()
+        saver.optimizer.step()
+        saver.save(step=10, tokens_seen=100)
+        at_10 = model.weight.detach().clone()
+        with torch.no_grad():
+            model.weight.add_(1.0)
+        saver.save(step=20, tokens_seen=200)
+        dist.barrier()
+        if rank == 2 * torn:
+            (Path(shared_tmp_dir) / "step_20" / f"pp{torn}" / ".metadata").unlink()
+        dist.barrier()
+
+        model, loader = manager()
+        with torch.no_grad():
+            model.weight.zero_()
+        step, tokens_seen, _ = loader.load(
+            path=str(Path(shared_tmp_dir) / "step_20"), exact_resume=True
+        )
+        outcomes: list = [None] * 4
+        dist.all_gather_object(outcomes, (step, tokens_seen, torch.equal(model.weight, at_10)))
+        assert outcomes == [(10, 100, True)] * 4, f"(step, tokens, step 10's weights): {outcomes}"
 
 
 class TestAsyncSaveBarrierNoDeadlock:
@@ -1080,3 +1158,54 @@ class TestWeightDecayScopeAcrossStages:
             pytest.raises(expected, match=reason),
         ):
             resumed.load()
+
+
+class TestPinnedSnapshot:
+    def test_a_pinned_save_snapshots_dtensors_when_it_returns(
+        self, distributed_env, shared_tmp_dir, monkeypatch
+    ):
+        """A sharded weight and a 0-dim replicated DTensor changed right after an
+        async_with_pinned_mem save returns load back as they were at save time. The
+        background write is held until they have changed."""
+        import threading
+
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.filesystem import FileSystemWriter
+        from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+
+        from kempnerforge.checkpoint.async_save import AsyncCheckpointer
+
+        mesh = distributed_env["dp_shard"]
+
+        def state(weight: float, scale: float) -> dict:
+            return {
+                "weight": distribute_tensor(
+                    torch.full((64, 32), weight, device="cuda"), mesh, [Shard(0)]
+                ),
+                "scale": distribute_tensor(torch.tensor(scale, device="cuda"), mesh, [Replicate()]),
+            }
+
+        release = threading.Event()
+        real_write = FileSystemWriter.write_data
+
+        def held_write(writer, plan, planner):
+            assert release.wait(timeout=60)
+            return real_write(writer, plan, planner)
+
+        monkeypatch.setattr(FileSystemWriter, "write_data", held_write)
+        live = state(1.0, 1.0)
+        checkpoint_id = os.path.join(shared_tmp_dir, "pinned")
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_pinned)
+        try:
+            ckpt.save(live, checkpoint_id=checkpoint_id)
+            with torch.no_grad():
+                for tensor in live.values():
+                    tensor.mul_(11.0)
+        finally:
+            release.set()
+        ckpt.wait()
+        dist.barrier()
+        loaded = state(0.0, 0.0)
+        dcp.load(loaded, checkpoint_id=checkpoint_id)
+        assert torch.equal(loaded["weight"].full_tensor(), torch.ones(64, 32, device="cuda"))
+        assert loaded["scale"].full_tensor().item() == 1.0

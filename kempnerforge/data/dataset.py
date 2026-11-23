@@ -326,6 +326,8 @@ class HuggingFaceDataset(Dataset):
 
     Loads a HuggingFace dataset, tokenizes text on the fly, and packs
     multiple documents into fixed-length sequences (separated by EOS tokens).
+    Only the text column is read, so the dataset's other columns, images
+    included, are not decoded.
 
     Args:
         dataset_name: HuggingFace dataset name (e.g., "allenai/c4").
@@ -357,7 +359,9 @@ class HuggingFaceDataset(Dataset):
         self._eos_id = self._tokenizer.eos_token_id or 0
 
         logger.info(f"Loading HuggingFace dataset: {dataset_name} ({split})")
-        raw_dataset = load_dataset(dataset_name, dataset_config, split=split)
+        raw_dataset = load_dataset(dataset_name, dataset_config, split=split).select_columns(
+            [text_field]
+        )
         self._packed_sequences = self._pack_sequences(raw_dataset)
         logger.info(
             f"HuggingFaceDataset: {len(self._packed_sequences)} packed sequences "
@@ -425,7 +429,9 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
     """Streaming HuggingFace dataset with on-the-fly tokenization and packing.
 
     For very large datasets that don't fit in memory. Streams documents,
-    tokenizes on the fly, and packs into fixed-length sequences.
+    tokenizes on the fly, and packs into fixed-length sequences. Only the
+    text column is read, so the other columns, images included, are not
+    decoded.
 
     Handles distributed training by splitting the shuffled stream across
     data-parallel ranks with ``datasets.distributed.split_dataset_by_node``:
@@ -565,7 +571,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
         return self._source_identity
 
     def _load_stream(self):
-        """Load this rank's part of the shuffled HuggingFace stream.
+        """Load the text column of this rank's part of the shuffled HuggingFace stream.
 
         Every rank shuffles with the same seed before the split, so the ranks
         divide one shared order between them.
@@ -579,6 +585,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             split=self.split,
             streaming=True,
         )
+        ds = ds.select_columns([self.text_field])
         ds = ds.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer_size)
         if self.world_size > 1:
             ds = split_dataset_by_node(ds, rank=self.rank, world_size=self.world_size)

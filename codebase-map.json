@@ -1293,11 +1293,13 @@
             "_resume_without_rank_state(train_state) -> (view, carried) (with ignore_rank_state_mismatch, a checkpoint with no per-rank state resumes as if the topology changed: rank 0's data position kept, its RNG dropped)",
             "_read_saved_keys(dcp_dir) -> (keys, restored_on_any_rank) (this rank's DCP keys; with a scope or multipliers an all-reduce on the gloo group tells every rank whether any rank's index holds optimizer state)",
             "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope, multipliers and group-layout checks all decide from it)",
+            "_broadcast_train_state(path) -> dict (rank 0 reads train_state.pt and broadcasts the state or why it could not; rank 0 re-raises its error, every other rank raises a RuntimeError naming it)",
             "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
             "_check_lr_multipliers(metadata, ckpt_dir) -> saved group modules | None (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
             "_present_experts(dcp_state, load_from, saved_keys) (EP experts placed among all of them before DCP; a load refuses a checkpoint of fewer experts than the model; the ranks agree before DCP)",
             "apply_dataloader_state(dataloader) (a position that cannot carry over raises DataPositionError on a resume and starts the data fresh with a warning on a warm start or a carried position; a carried position goes only to a StatefulDataLoader or StreamingDataLoader)",
             "_resolve_load_path(path)",
+            "_agreed_resume_dir(path) -> Path | None (exact resume: rank 0 resolves the checkpoint, takes the newest step_N beside it that every stage saved when that one is not, and broadcasts its choice or its error)",
             "_cleanup()"
           ]
         }
@@ -1691,9 +1693,11 @@
           "TestPeekSavedStep(5)",
           "TestFlushPendingSave(1)",
           "TestSaveVLMFreezeMetadata(3)",
-          "TestLoadVLMFreezeCompare(9)"
+          "TestLoadVLMFreezeCompare(9)",
+          "TestUnreadableTrainStateAcrossRanks(1)",
+          "TestTornStageAcrossRanks(1)"
         ],
-        "count": 51
+        "count": 53
       },
       "tests/unit/test_checkpoint_per_rank.py": {
         "classes": [
