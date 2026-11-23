@@ -186,8 +186,8 @@ def _install_fake_load_world(
             return
         if obj_list[0] is False:
             obj_list[0] = ts_path.exists()
-        elif obj_list[0] is None:
-            obj_list[0] = torch.load(ts_path, weights_only=False)
+        elif obj_list[0] == (None, None):
+            obj_list[0] = (torch.load(ts_path, weights_only=False), None)
 
     def fake_all_gather(obj_list, obj, group=None):
         gathers.append((obj, group))

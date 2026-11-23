@@ -7,7 +7,6 @@ import json
 import os
 import random
 import re
-import shutil
 import stat
 import threading
 from concurrent.futures import Future
@@ -381,6 +380,26 @@ class TestCheckpointRetention:
         assert len(warnings) == 1 and "step_10" in warnings[0], warnings
 
 
+_PINNED_WITHOUT_GPU_CHILD = """
+import sys
+
+import torch
+import torch.distributed.checkpoint as dcp
+
+from kempnerforge.checkpoint.async_save import AsyncCheckpointer
+from kempnerforge.config.schema import AsyncCheckpointMode
+
+state = {"weight": torch.arange(12.0).reshape(3, 4), "bias": torch.full((5,), 0.25)}
+ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_pinned)
+ckpt.save(state, checkpoint_id=sys.argv[1])
+ckpt.wait()
+loaded = {"weight": torch.zeros(3, 4), "bias": torch.zeros(5)}
+dcp.load(loaded, checkpoint_id=sys.argv[1])
+equal = all(torch.equal(loaded[name], state[name]) for name in state)
+print(f"cuda={torch.cuda.is_available()} equal={equal}")
+"""
+
+
 class TestAsyncCheckpointer:
     def test_default_mode_is_disabled(self):
         ckpt = AsyncCheckpointer()
@@ -440,6 +459,233 @@ class TestAsyncCheckpointer:
         ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
         ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_2"))
         mock_future1.result.assert_called_once()
+
+    @staticmethod
+    def _recording_stager(monkeypatch) -> list:
+        """Replace DefaultStager in async_save with a fake that records its options."""
+        made: list = []
+
+        class _FakeStager:
+            def __init__(self, options):
+                self.options = options
+                self.closed = 0
+                made.append(self)
+
+            def close(self):
+                self.closed += 1
+
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.DefaultStager", _FakeStager)
+        return made
+
+    def test_pinned_mode_reuses_one_pinned_stager_where_cuda_is_available(
+        self, monkeypatch, tmp_path
+    ):
+        """With a CUDA device, the pinned mode hands DCP one stager, built to copy into
+        pinned memory synchronously, and reuses it for every save."""
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.torch.cuda.is_available", lambda: True
+        )
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save._reuses_stager", lambda: True)
+        made = self._recording_stager(monkeypatch)
+        mock_async = MagicMock(return_value=MagicMock())
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", mock_async)
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_pinned)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_2"))
+        assert len(made) == 1
+        assert [call.kwargs["async_stager"] for call in mock_async.call_args_list] == made * 2
+        options = made[0].options
+        assert options.use_pinned_memory is True
+        assert options.use_shared_memory is False
+        assert options.use_async_staging is False
+        assert options.use_non_blocking_copy is True
+
+    def test_pinned_mode_builds_a_stager_per_save_before_torch_2_13(self, monkeypatch, tmp_path):
+        """Torch 2.12's stager fails when used again, so each save gets a new one, and
+        close() closes the last."""
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.torch.cuda.is_available", lambda: True
+        )
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save._reuses_stager", lambda: False)
+        made = self._recording_stager(monkeypatch)
+        mock_async = MagicMock(return_value=MagicMock())
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", mock_async)
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_pinned)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_2"))
+        assert len(made) == 2
+        assert [call.kwargs["async_stager"] for call in mock_async.call_args_list] == made
+        ckpt.close()
+        assert made[1].closed == 1
+
+    def test_close_waits_then_releases_the_stager(self, monkeypatch, tmp_path):
+        """close() waits for the pending save and closes the stager once; a later save
+        builds a new one."""
+        import gc
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.torch.cuda.is_available", lambda: True
+        )
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save._reuses_stager", lambda: True)
+        made = self._recording_stager(monkeypatch)
+        future = MagicMock()
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.dcp.async_save", MagicMock(return_value=future)
+        )
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_pinned)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        ckpt.close()
+        future.result.assert_called_once()
+        assert [stager.closed for stager in made] == [1]
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_2"))
+        assert len(made) == 2
+        ckpt.close()
+        del ckpt
+        gc.collect()
+        assert [stager.closed for stager in made] == [1, 1]
+
+    def test_close_after_a_failed_save_still_releases_the_stager(self, monkeypatch, tmp_path):
+        """A failed save's error reaches close(), which still releases the stager and
+        drops the save, so the next save starts clean."""
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.torch.cuda.is_available", lambda: True
+        )
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save._reuses_stager", lambda: True)
+        made = self._recording_stager(monkeypatch)
+        failed = MagicMock()
+        failed.result.side_effect = OSError("disk full")
+        mock_async = MagicMock(side_effect=[failed, MagicMock()])
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", mock_async)
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_pinned)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        with pytest.raises(OSError, match="disk full"):
+            ckpt.close()
+        assert [stager.closed for stager in made] == [1]
+        assert not ckpt.is_pending
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_2"))
+        assert len(made) == 2
+
+    @pytest.mark.parametrize(
+        ("version", "reuses"),
+        [("2.12.1", False), ("2.13.0a0", False), ("2.13.0", True), ("2.14.1+cu130", True)],
+    )
+    def test_the_stager_is_reused_from_torch_2_13(self, monkeypatch, version, reuses):
+        """Torch 2.13 is the first release whose stager serves more than one save; a 2.13
+        pre-release still gets a stager per save."""
+        from torch.torch_version import TorchVersion
+
+        from kempnerforge.checkpoint import async_save
+
+        monkeypatch.setattr(async_save.torch, "__version__", TorchVersion(version))
+        assert async_save._reuses_stager() is reuses
+
+    @pytest.mark.parametrize("mode", [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_])
+    def test_close_without_a_stager_only_waits(self, monkeypatch, tmp_path, mode):
+        """A checkpointer that never staged into pinned memory has nothing to release."""
+        from unittest.mock import MagicMock
+
+        future = MagicMock()
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.dcp.async_save", MagicMock(return_value=future)
+        )
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.save", MagicMock())
+        ckpt = AsyncCheckpointer(mode=mode)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        ckpt.close()
+        assert future.result.call_count == (mode == AsyncCheckpointMode.async_)
+        assert not ckpt.is_pending
+
+    def test_a_collected_checkpointer_closes_its_reused_stager(self, monkeypatch, tmp_path):
+        """Dropping the checkpointer releases the pinned copies without an explicit close."""
+        import gc
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.torch.cuda.is_available", lambda: True
+        )
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save._reuses_stager", lambda: True)
+        made = self._recording_stager(monkeypatch)
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.dcp.async_save", MagicMock(return_value=None)
+        )
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_pinned)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        assert made[0].closed == 0
+        del ckpt
+        gc.collect()
+        assert made[0].closed == 1
+
+    def test_pinned_mode_saves_as_async_without_cuda_and_warns_once(self, monkeypatch, tmp_path):
+        """Without a CUDA device, pinning would raise, so the pinned mode saves as async
+        and says so once."""
+        import logging
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.torch.cuda.is_available", lambda: False
+        )
+        mock_async = MagicMock(return_value=MagicMock())
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", mock_async)
+        records: list[logging.LogRecord] = []
+
+        class _CaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        target = logging.getLogger("kempnerforge.checkpoint.async_save")
+        capture = _CaptureHandler(level=logging.WARNING)
+        target.addHandler(capture)
+        try:
+            ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_pinned)
+            ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+            ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_2"))
+        finally:
+            target.removeHandler(capture)
+        assert mock_async.call_count == 2
+        assert all("async_stager" not in call.kwargs for call in mock_async.call_args_list)
+        assert [r.getMessage() for r in records] == [
+            "async_with_pinned_mem needs a CUDA device to pin memory; saving as async"
+        ]
+
+    def test_async_mode_passes_no_stager(self, monkeypatch, tmp_path):
+        """Plain async keeps DCP's default staging even where a CUDA device is available."""
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.torch.cuda.is_available", lambda: True
+        )
+        mock_async = MagicMock(return_value=MagicMock())
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.async_save", mock_async)
+        ckpt = AsyncCheckpointer(mode=AsyncCheckpointMode.async_)
+        ckpt.save({"model": {}}, checkpoint_id=str(tmp_path / "step_1"))
+        assert "async_stager" not in mock_async.call_args.kwargs
+
+    def test_pinned_mode_without_a_gpu_writes_a_checkpoint_that_loads(self, tmp_path):
+        """A real save in the pinned mode, in a process that sees no GPU, stages nonempty
+        tensors and writes a checkpoint that loads back exactly; pinning them would raise
+        there. The save runs in a child that sees no GPU, so this holds on GPU hosts too,
+        within the CI per-test timeout."""
+        import subprocess
+        import sys
+
+        child = tmp_path / "pinned_child.py"
+        child.write_text(_PINNED_WITHOUT_GPU_CHILD)
+        result = subprocess.run(
+            [sys.executable, str(child), str(tmp_path / "step_1")],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": ""},
+            timeout=50,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert result.stdout.split() == ["cuda=False", "equal=True"]
 
 
 def _mock_dcp_load(monkeypatch):
@@ -1534,6 +1780,10 @@ class TestSaveCheckpointRegistration:
     def test_record_skips_quietly_when_the_checkpoint_or_its_record_is_gone(
         self, tmp_path, monkeypatch
     ):
+        """step_1 is removed as the manager prunes, with _remove_tree's retries, since NFS
+        can keep a directory written a moment ago non-empty for a moment."""
+        from kempnerforge.checkpoint.manager import _remove_tree
+
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         live: list = [self.MLFLOW]
         registrar = _Registrar()
@@ -1545,7 +1795,7 @@ class TestSaveCheckpointRegistration:
         live.clear()
         mgr.save(step=3)
         texts = {step: (tmp_path / f"step_{step}" / "metadata.json").read_text() for step in (2, 3)}
-        shutil.rmtree(tmp_path / "step_1")
+        _remove_tree(tmp_path / "step_1", threading.Lock(), iter([0.05] * 40))
         warnings = self._log(monkeypatch, "warning")
         notes = self._log(monkeypatch, "debug")
         for record in registrar.records:
@@ -2825,16 +3075,13 @@ class TestResumeWithUnsteppedParameters:
         self._assert_same_run(model, optimizer, model2, optimizer2, stepped=("used.", "unused."))
 
     def test_a_stepped_parameter_missing_part_of_its_state_still_fails(self, tmp_path):
-        from torch.distributed.checkpoint.api import CheckpointException
-
         model, optimizer, manager = self._build(0, tmp_path)
         self._step(model, optimizer, 1)
         del optimizer.state[model.used.weight]["exp_avg_sq"]
         manager.save(step=1)
 
         _, _, manager2 = self._build(1, tmp_path)
-        missing = r"Missing key in checkpoint state_dict: optimizer\.state\.used\.weight\."
-        with pytest.raises(CheckpointException, match=missing + "exp_avg_sq"):
+        with pytest.raises(RuntimeError, match=r"used\.weight was saved without \['exp_avg_sq'\]"):
             manager2.load()
 
     @pytest.mark.parametrize(
@@ -3393,17 +3640,6 @@ class TestMuonResume:
 
 
 REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
-RESUMABLE_OPTIMIZERS = [
-    pytest.param(
-        name,
-        marks=pytest.mark.xfail(
-            raises=ZeroDivisionError, strict=True, reason="#236: schedule_free_adamw cannot resume"
-        ),
-    )
-    if name == "schedule_free_adamw"
-    else name
-    for name in REGISTERED_OPTIMIZERS
-]
 
 
 class TestSaveBeforeFirstStep:
@@ -3740,6 +3976,88 @@ class TestResumeWithoutTrainStateAcrossRanks:
         mp.spawn(_load_with_a_stale_view, args=(2, _free_port(), str(tmp_path), stale), nprocs=2)
 
 
+class _Unprintable(Exception):
+    """An error whose message cannot be formatted."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("no message")
+
+
+def _load_an_unreadable_train_state(
+    rank: int, world: int, port: int, ckpt_dir: str, how: str
+) -> None:
+    """Save on every rank, then load while rank 0 cannot read ``train_state.pt``."""
+    import time
+    from contextlib import nullcontext
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from kempnerforge.checkpoint import manager as mgr_mod
+    from kempnerforge.checkpoint.manager import CheckpointManager
+
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"tcp://127.0.0.1:{port}",
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        torch.manual_seed(0)
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        model(torch.ones(2, 4)).sum().backward()
+        optimizer.step()
+        manager = CheckpointManager(CheckpointConfig(dir=ckpt_dir), model, optimizer)
+        manager.save(step=3, tokens_seen=30)
+        dist.barrier()
+        path = Path(ckpt_dir) / "step_3" / "train_state.pt"
+        if rank == 0 and how == "torn":
+            path.write_bytes(path.read_bytes()[:100])
+        dist.barrier()
+        error, reason = {
+            "torn": (RuntimeError, "PytorchStreamReader"),
+            "foreign": (PermissionError, "Refusing to load"),
+            "unprintable": (_Unprintable, ""),
+        }[how]
+        if rank != 0:
+            if how == "unprintable":
+                reason = "<unprintable _Unprintable>"
+            reason = f"Rank 0 could not read {path}: {error.__name__}: {reason}"
+            error = RuntimeError
+        uid = os.getuid() + (1 if rank == 0 and how == "foreign" else 0)
+        raising = (
+            patch.object(mgr_mod, "_load_train_state", side_effect=_Unprintable())
+            if rank == 0 and how == "unprintable"
+            else nullcontext()
+        )
+        start = time.monotonic()
+        with (
+            patch("os.getuid", return_value=uid),
+            raising,
+            pytest.raises(error, match=re.escape(reason) if reason else None),
+        ):
+            manager.load()
+        assert time.monotonic() - start < 20
+    finally:
+        dist.destroy_process_group()
+
+
+class TestUnreadableTrainStateAcrossRanks:
+    """A ``train_state.pt`` rank 0 cannot read fails every rank at once (#546)."""
+
+    @pytest.mark.parametrize("how", ["torn", "foreign", "unprintable"])
+    def test_every_rank_raises_rank_zeros_error(self, tmp_path, how):
+        """Rank 0 raises its own error; rank 1 names it, instead of waiting for the timeout."""
+        import torch.multiprocessing as mp
+
+        mp.spawn(
+            _load_an_unreadable_train_state, args=(2, _free_port(), str(tmp_path), how), nprocs=2
+        )
+
+
 def _refuse_on_one_stage(
     rank: int, world: int, port: int, ckpt_dir: str, refusing: int, scope: str | None
 ) -> None:
@@ -4047,7 +4365,7 @@ class TestCheckpointEveryOptimizer:
         for (n, ref), p in zip(reference.named_parameters(), model.parameters(), strict=True):
             assert torch.equal(ref, p), f"{n} differs from the run that never saved"
 
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_resume_restores_the_optimizer_exactly(self, tmp_path, name):
         """A resume restores the saved optimizer state bit for bit and continues the run exactly."""
         from kempnerforge.checkpoint.manager import CheckpointManager
@@ -4068,6 +4386,122 @@ class TestCheckpointEveryOptimizer:
         _assert_same_state_dict(ref_opt.state_dict(), opt2.state_dict())
         for (n, ref), p in zip(reference.named_parameters(), model2.parameters(), strict=True):
             assert torch.equal(ref, p), f"{n} differs from the uninterrupted run"
+
+
+class TestScheduleFreeCheckpoint:
+    """What a schedule-free checkpoint holds, and what a resume from one restores."""
+
+    MODEL_CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=2, vocab_size=256, max_seq_len=64)
+
+    def _build(self, seed):
+        torch.manual_seed(seed)
+        model = Transformer(self.MODEL_CONFIG)
+        config = OptimizerConfig(name="schedule_free_adamw", lr=1e-2, fused=False)
+        return model, build_optimizer(model, config)
+
+    @staticmethod
+    def _train(model, opt, steps):
+        g = torch.Generator().manual_seed(1)
+        for _ in range(steps):
+            tokens = torch.randint(0, 256, (2, 32), generator=g)
+            logits = model(tokens)
+            torch.nn.functional.cross_entropy(logits.flatten(0, 1), tokens.flatten()).backward()
+            opt.step()
+            opt.zero_grad()
+
+    @staticmethod
+    def _points(model, opt):
+        y = [p.detach().clone() for p in model.parameters()]
+        x = [opt.state[p]["x"].clone() for p in model.parameters()]
+        assert not all(torch.equal(a, b) for a, b in zip(x, y, strict=True)), "fixture: x == y"
+        return x, y
+
+    @pytest.mark.parametrize("mode", [AsyncCheckpointMode.disabled, AsyncCheckpointMode.async_])
+    def test_the_model_entry_is_x_and_the_run_stays_at_y(self, tmp_path, mode):
+        """``save`` writes x as the model and returns with the parameters at y, bit for bit."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 4)
+        x, y = self._points(model, opt)
+        config = CheckpointConfig(dir=str(tmp_path), async_mode=mode)
+        manager = CheckpointManager(config, model, opt)
+        manager.save(step=4)
+        assert all(torch.equal(a, p) for a, p in zip(y, model.parameters(), strict=True))
+        manager.wait()
+
+        torch.manual_seed(5)
+        fresh = Transformer(self.MODEL_CONFIG)
+        dummy = torch.optim.SGD(fresh.parameters(), lr=0.0)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), fresh, dummy).load(
+            exclude_keys=["optimizer"]
+        )
+        assert all(torch.equal(a, p) for a, p in zip(x, fresh.parameters(), strict=True))
+
+    def test_a_resume_puts_the_parameters_back_at_y(self, tmp_path):
+        """Loading the optimizer rebuilds y from z and x, the exact point the run trained at."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 4)
+        _, y = self._points(model, opt)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=4)
+
+        model2, opt2 = self._build(1)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
+        assert all(torch.equal(a, p) for a, p in zip(y, model2.parameters(), strict=True))
+
+    def test_a_save_that_fails_inside_the_swap_leaves_the_run_at_y(self, tmp_path, monkeypatch):
+        """An error while the parameters hold x still puts every one back at y."""
+        from kempnerforge.checkpoint import manager as mgr_mod
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 4)
+        _, y = self._points(model, opt)
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("state dict failed")
+
+        monkeypatch.setattr(mgr_mod, "get_optimizer_state_dict", fail)
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt)
+        with pytest.raises(RuntimeError, match="state dict failed"):
+            manager.save(step=4)
+        assert all(torch.equal(a, p) for a, p in zip(y, model.parameters(), strict=True))
+
+    def test_a_save_whose_swap_in_fails_partway_leaves_the_run_at_y(self, tmp_path):
+        """A swap to x that raises after moving some parameters leaves every one at y."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 4)
+        _, y = self._points(model, opt)
+        params = list(model.parameters())
+
+        def swap_half_then_fail():
+            for p in params[: len(params) // 2]:
+                p.data.copy_(opt.state[p]["x"])
+            raise RuntimeError("swap failed")
+
+        opt.eval_params = swap_half_then_fail
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt)
+        with pytest.raises(RuntimeError, match="swap failed"):
+            manager.save(step=4)
+        assert all(torch.equal(a, p) for a, p in zip(y, params, strict=True))
+
+    def test_a_checkpoint_from_before_the_per_parameter_step_is_refused(self, tmp_path):
+        """A checkpoint saved without each parameter's ``step`` cannot continue the run."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(0)
+        self._train(model, opt, 2)
+        for state in opt.state.values():
+            del state["step"]
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=2)
+
+        model2, opt2 = self._build(1)
+        with pytest.raises(RuntimeError, match=r"saved without \['step'\]"):
+            CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load()
 
 
 class TestComponentSwapOnResume:
@@ -4181,7 +4615,7 @@ class TestWeightDecayScopeOnResume:
         assert not any(o.state for o in manager.checkpointed_optimizers)
 
     @pytest.mark.parametrize("scope", [DEFAULT_SCOPE, ALL_SCOPE])
-    @pytest.mark.parametrize("name", RESUMABLE_OPTIMIZERS)
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
     def test_the_same_scope_resumes_exactly(self, tmp_path, name, scope):
         """A resume under the saved scope restores all optimizer state and continues exactly."""
         model, opt = self._build(name, scope, seed=0)

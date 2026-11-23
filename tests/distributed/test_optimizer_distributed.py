@@ -201,37 +201,37 @@ class TestScheduleFreeDistributed:
         )
 
     def test_schedule_free_checkpoint_roundtrip(self, distributed_env, shared_tmp_dir):
-        """Schedule-Free AdamW state (_k, _warmup_steps) survives checkpoint."""
+        """A fresh FSDP2 run resumes Schedule-Free AdamW's step counts and training point."""
+        from torch.distributed.tensor import DTensor
+
         mesh = distributed_env
-        ckpt_dir = shared_tmp_dir
-
-        torch.manual_seed(42)
-        model = Transformer(SMALL_CONFIG).cuda()
-        apply_fsdp2(model, mesh)
-
         opt_config = OptimizerConfig(
             name="schedule_free_adamw", lr=0.025, fused=False, schedule_free_warmup_steps=10
         )
-        optimizer = build_optimizer(model, opt_config)
 
+        def build(seed):
+            torch.manual_seed(seed)
+            model = Transformer(SMALL_CONFIG).cuda()
+            apply_fsdp2(model, mesh)
+            return model, build_optimizer(model, opt_config)
+
+        def local(t):
+            return t.to_local() if isinstance(t, DTensor) else t
+
+        model, optimizer = build(42)
         _train_steps(model, optimizer, n_steps=5)
-
         tokens = torch.randint(0, SMALL_CONFIG.vocab_size, (2, 32), device="cuda")
         with torch.no_grad():
             ref_out = model(tokens).clone()
+        CheckpointManager(CheckpointConfig(dir=shared_tmp_dir), model, optimizer).save(step=5)
 
-        config = CheckpointConfig(dir=ckpt_dir, keep_last_n=2)
-        mgr = CheckpointManager(config, model, optimizer)
-        mgr.save(step=5, tokens_seen=320)
-
+        model2, optimizer2 = build(7)
+        CheckpointManager(CheckpointConfig(dir=shared_tmp_dir), model2, optimizer2).load()
+        assert {state["step"].item() for state in optimizer2.state.values()} == {5.0}
+        for a, b in zip(model.parameters(), model2.parameters(), strict=True):
+            assert torch.equal(local(a), local(b)), "the resume is not at the training point"
         with torch.no_grad():
-            for p in model.parameters():
-                p.add_(torch.randn_like(p) * 0.1)
-
-        mgr.load()
-
-        with torch.no_grad():
-            restored_out = model(tokens)
+            restored_out = model2(tokens)
         assert torch.allclose(ref_out, restored_out, atol=1e-5), (
             f"Restored output differs: max diff={(ref_out - restored_out).abs().max().item()}"
         )

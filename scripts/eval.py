@@ -109,7 +109,12 @@ def main() -> None:
     )
 
     dummy_optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
-    ckpt_mgr = CheckpointManager(config.checkpoint, model, dummy_optimizer)
+    ckpt_mgr = CheckpointManager(
+        config.checkpoint,
+        model,
+        dummy_optimizer,
+        group_timeout_sec=config.distributed.nccl_timeout_sec,
+    )
 
     load_path = config.checkpoint.load_path or _newest_save(config.checkpoint.dir)
 
