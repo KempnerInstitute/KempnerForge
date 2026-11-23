@@ -5,10 +5,13 @@ fine-tuned for extractive question answering takes to answer a question. By
 default the model is ``google/bigbird-base-trivia-itc`` at a pinned revision,
 downloaded to the Hugging Face cache on first use and loaded on the extractor's
 first call. The span is chosen as the transformers question-answering pipeline
-of transformers 4 chose its single answer, which transformers 5 no longer has:
-windows of the model's length over the context, a softmax over each window's
-context tokens, the best spans of up to ``MAX_ANSWER_TOKENS`` tokens widened to
-whole words, and the texts of equal spans, ignoring case, adding up their scores.
+of transformers 4 chose its single answer, which transformers 5 no longer has,
+called as the recipe calls it: windows over the context as long as the model
+reads (the recipe sets the pipeline's ``max_seq_len`` to the tokenizer's 4,096
+in place of its default 384) with the pipeline's stride, a softmax over each
+window's context tokens, the best spans of up to ``MAX_ANSWER_TOKENS`` tokens
+widened to whole words, and the texts of equal spans, ignoring case, adding up
+their scores.
 """
 
 from __future__ import annotations

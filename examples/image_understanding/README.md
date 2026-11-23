@@ -653,7 +653,10 @@ the scorers of their answers.
     failed extraction stops the evaluation instead of giving no answer, and the
     answers are compared as text. The model (about 530 MB, at a pinned revision)
     is downloaded to the Hugging Face cache the first time a row needs it; each
-    rank loads its own copy, as each rank scores its own rows. transformers 5 has
+    rank loads its own copy, as each rank scores its own rows, and the others
+    wait for it at the end of the task, so on a slow network fetch it before a
+    run of several ranks (`extraction.py`'s `EXTRACTOR_MODEL`,
+    `EXTRACTOR_REVISION` and `EXTRACTOR_FILES`). transformers 5 has
     no question-answering pipeline, so `extraction.py` reads the span as the
     transformers 4 pipeline the recipe calls does, with the same tokenizer, built
     from the model's SentencePiece file with `protobuf` (the `sentencepiece`
