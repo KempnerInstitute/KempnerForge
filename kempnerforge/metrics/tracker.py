@@ -41,6 +41,7 @@ class StepMetrics:
     reserved_gb: float = 0.0
     total_gb: float = 0.0
     mem_utilization: float = 0.0
+    mfu_vlm: float | None = None
 
 
 class MetricsTracker:
@@ -102,6 +103,10 @@ class MetricsTracker:
         """Mark the beginning of a training step."""
         self._step_start = time.perf_counter()
 
+    def is_log_step(self, step: int) -> bool:
+        """Whether ``end_step`` logs ``step``: step 1 and every ``log_interval`` steps."""
+        return step % self.metrics_config.log_interval == 0 or step == 1
+
     def end_step(
         self,
         step: int,
@@ -109,6 +114,8 @@ class MetricsTracker:
         grad_norm: float,
         lr: float,
         tokens_in_step: int,
+        seq_len: int | None = None,
+        vision_flops: float | None = None,
     ) -> StepMetrics | None:
         """Mark the end of a training step and optionally log metrics.
 
@@ -123,6 +130,11 @@ class MetricsTracker:
                 returns); under pipeline parallelism, the whole model's norm.
             lr: Current learning rate.
             tokens_in_step: Total tokens processed in this step (across all GPUs).
+            seq_len: Length of the sequences the step ran, for the MFU attention term;
+                None uses ``train.seq_len``.
+            vision_flops: FLOPs the step's vision encoder and adapter ran over the
+                data-parallel ranks; given, ``mfu_vlm`` adds them to the language model's
+                in ``mfu``.
 
         Returns:
             StepMetrics if this step was a logging step, None otherwise.
@@ -135,15 +147,20 @@ class MetricsTracker:
             tokens_per_sec=tokens_per_sec,
             num_gpus=self.num_gpus,
             gpu_peak_tflops=self.gpu_peak_tflops,
-            seq_len=self.seq_len,
+            seq_len=self.seq_len if seq_len is None else seq_len,
         )
+
+        mfu_vlm = None
+        if vision_flops is not None:
+            peak = self.gpu_peak_tflops * 1e12 * self.num_gpus * step_time
+            mfu_vlm = mfu + (vision_flops / peak if peak > 0 else 0.0)
 
         self._update_smoothed("loss", loss)
         self._update_smoothed("tokens_per_sec", tokens_per_sec)
         self._update_smoothed("mfu", mfu)
         self._update_smoothed("step_time", step_time)
 
-        if step % self.metrics_config.log_interval != 0 and step != 1:
+        if not self.is_log_step(step):
             return None
 
         mem_stats = get_memory_stats()
@@ -160,6 +177,7 @@ class MetricsTracker:
             reserved_gb=mem_stats["reserved_gb"],
             total_gb=total_gb,
             mem_utilization=peak_gb / total_gb if total_gb else 0.0,
+            mfu_vlm=mfu_vlm,
         )
         self._log_step(step, metrics)
         return metrics
@@ -183,6 +201,8 @@ class MetricsTracker:
             "mem": (f"{metrics.peak_gb:.1f}/{metrics.total_gb:.0f}GB"),
             "step_time": f"{metrics.step_time_sec:.2f}s",
         }
+        if metrics.mfu_vlm is not None:
+            log_dict["mfu_vlm"] = f"{metrics.mfu_vlm:.1%}"
         logger.info(format_metrics(step, log_dict))
 
         backend_dict = {
@@ -197,6 +217,8 @@ class MetricsTracker:
             "gpu/reserved_gb": metrics.reserved_gb,
             "gpu/mem_utilization": metrics.mem_utilization,
         }
+        if metrics.mfu_vlm is not None:
+            backend_dict["train/mfu_vlm"] = metrics.mfu_vlm
 
         for key, val in self._smoothed.items():
             backend_dict[f"smoothed/{key}"] = val

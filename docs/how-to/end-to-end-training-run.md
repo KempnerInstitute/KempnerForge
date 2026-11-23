@@ -64,8 +64,8 @@ Expected output: after the startup messages, a metrics line for step 1
 and then one every 10 steps (`metrics.log_interval`), such as:
 
 ```
-2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=10.4200 | lr=6.00e-05 | grad_norm=1.842 | tok/s=8,420 | mfu=0.3% | mem=9.6/80GB | step_time=1.95s
-2026-11-04 14:03:31.630 [rank 0] INFO     [step 20] loss=9.8400 | lr=1.20e-04 | grad_norm=1.103 | tok/s=8,510 | mfu=0.3% | mem=9.6/80GB | step_time=1.93s
+2026-11-04 14:03:12.345 [rank 0] INFO     [step 10] loss=10.4200 | lr=5.40e-05 | grad_norm=1.842 | tok/s=8,420 | mfu=0.3% | mem=9.6/80GB | step_time=1.95s
+2026-11-04 14:03:31.630 [rank 0] INFO     [step 20] loss=9.8400 | lr=1.14e-04 | grad_norm=1.103 | tok/s=8,510 | mfu=0.3% | mem=9.6/80GB | step_time=1.93s
 ...
 ```
 
@@ -90,8 +90,8 @@ uv run torchrun --nproc_per_node=4 scripts/train.py configs/train/hf_wikitext.to
 tokens/sec (assumes 4× H100, bf16, Wikitext streaming fast enough to
 not bottleneck).
 
-Watch the log: only rank 0 prints, so the metrics lines are rank 0's,
-and their `tok/s` counts the tokens of all 4 GPUs. Every rank writes its
+Watch the log: only rank 0 prints the metrics lines; their loss is the
+mean over the 4 ranks and their `tok/s` counts the tokens of all 4 GPUs. Every rank writes its
 own shard of each checkpoint, and rank 0 also writes `train_state.pt`
 and `metadata.json`. By default, data appears in `checkpoints/hf_wikitext/`
 under the current working directory.

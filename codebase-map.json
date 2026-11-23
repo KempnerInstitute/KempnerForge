@@ -67,6 +67,7 @@
             "tp_sequence_parallel",
             "head_dim",
             "computed_ffn_hidden_dim",
+            "mlp_matrices",
             "num_params_estimate"
           ]
         }
@@ -795,10 +796,11 @@
     },
     "kempnerforge/training/eval.py": {
       "functions": [
-        "run_eval(model, eval_dataloader, loss_fn, device, eval_steps, *, pp_schedule, pp_rank, pp_size, pp_group) -> dict"
+        "run_eval(model, eval_dataloader, loss_fn, device, eval_steps, *, pp_schedule, pp_rank, pp_size, pp_group, pp_n_microbatches, dp_groups) -> dict"
       ],
       "tested_by": [
-        "tests/unit/test_eval.py::TestRunEval"
+        "tests/unit/test_eval.py::TestRunEval",
+        "tests/unit/test_eval.py::TestRunEvalOverDataParallel"
       ]
     },
     "kempnerforge/training/freeze.py": {
@@ -906,10 +908,10 @@
           "purpose": "Dataloader + live iterator with epoch restart"
         },
         "StepResult": {
-          "purpose": "Loss, grad norm, text-token and per-dataset counters from one step"
+          "purpose": "Loss, grad norm, positions run, text-token count, per-source token and loss tensors, and a VLM step's documents, image and text tokens and encoder images from one step"
         },
         "TrainingSession": {
-          "purpose": "Collaborators the step loop needs after the build phase"
+          "purpose": "Collaborators the step loop needs after the build phase, and a VLM run's documents_seen"
         }
       },
       "functions": [
@@ -918,7 +920,9 @@
         "text_step(session, step) -> StepResult",
         "vlm_step(session, step) -> StepResult",
         "pipeline_step(session, step) -> StepResult",
-        "checkpoint_extra(config, step, phases) -> dict"
+        "checkpoint_extra(config, step, phases, documents_seen) -> dict",
+        "_batch_counts(batch, image_positions) -> (documents, image_tokens, text_tokens, encoder_images)",
+        "_step_counts(session, result) -> (tokens, documents, encoder_images) over the DP ranks"
       ],
       "tested_by": [
         "tests/unit/test_train_entry.py::TestLoopPeriodicWork",
@@ -927,6 +931,12 @@
         "tests/unit/test_train_entry.py::TestMoEMetrics",
         "tests/unit/test_train_entry.py::TestSelectStepFn",
         "tests/unit/test_train_entry.py::TestCheckpointExtra",
+        "tests/unit/test_train_entry.py::TestTokensCountTheBatch",
+        "tests/unit/test_train_entry.py::TestVlmDataMetrics",
+        "tests/unit/test_train_entry.py::TestCheckpointTiming",
+        "tests/unit/test_train_entry.py::TestPerDatasetMetrics",
+        "tests/unit/test_train_entry.py::TestModuleLearningRateMetrics",
+        "tests/unit/test_dp_info.py::TestLoggedMetricsOverDataParallel",
         "tests/e2e/test_training_e2e.py",
         "tests/unit/test_shutdown_agreement.py::TestLoopStopsOnEveryRank"
       ]
@@ -1212,12 +1222,16 @@
     "kempnerforge/distributed/utils.py": {
       "functions": [
         "get_dp_info(device_mesh) -> (dp_rank, dp_size)",
+        "data_parallel_groups(device_mesh) -> tuple[ProcessGroup, ...]",
+        "dp_all_reduce_(tensor, groups) -> Tensor",
+        "dp_mean(value, groups, device) -> float",
         "clip_grad_norm_(model, max_norm, foreach, pp_group) -> Tensor",
         "new_control_group(timeout_sec) -> ProcessGroup | None",
         "any_rank(flag, group) -> bool"
       ],
       "tested_by": [
         "tests/unit/test_distributed.py::TestClipGradNorm",
+        "tests/unit/test_dp_info.py::TestDataParallelReduction",
         "tests/unit/test_shutdown_agreement.py::TestAnyRank",
         "tests/unit/test_ep_gradients.py::TestClipUnderExpertParallelism"
       ]
@@ -1245,6 +1259,7 @@
           "purpose": "DCP-based distributed checkpoint save/load/cleanup manager. Cross-arch VLM freeze-metadata validation, rank-0-authoritative train_state existence broadcast (NFS/Lustre stat() race), ownership-gated train_state.pt load",
           "methods": [
             "save(step, tokens_seen, scheduler, dataloader, extra)",
+            "has_pending_save (property: an async save to drain or a latest commit to make)",
             "wait()",
             "flush_pending_save()",
             "peek_saved_step(path)",
@@ -1256,6 +1271,7 @@
             "_check_lr_multipliers(metadata, ckpt_dir) -> saved group modules | None (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
             "_present_experts(dcp_state, load_from, saved_keys) (EP experts placed among all of them before DCP; a load refuses a checkpoint of fewer experts than the model; the ranks agree before DCP)",
             "apply_dataloader_state(dataloader)",
+            "restored_extra (property: the extra keys the last load restored)",
             "_resolve_load_path(path)",
             "_agreed_load_dir(path, fall_back) -> Path | None (every load: rank 0 resolves the checkpoint, on an exact resume that reads shards takes the newest step_N beside it that every stage saved when that one is not, and broadcasts its choice or its error)",
             "_cleanup()"
@@ -1278,6 +1294,7 @@
         "tests/unit/test_lr_multipliers.py::TestLayoutChange",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
+        "tests/unit/test_checkpoint.py::TestHasPendingSave",
         "tests/unit/test_checkpoint.py::TestPeekSavedStep",
         "tests/unit/test_checkpoint.py::TestSaveVLMFreezeMetadata",
         "tests/unit/test_checkpoint.py::TestLoadVLMFreezeCompare",
@@ -1338,7 +1355,8 @@
           "purpose": "Collect, smooth (EMA), and dispatch metrics to backends",
           "methods": [
             "start_step()",
-            "end_step(step, loss, grad_norm, lr, ...)",
+            "is_log_step(step) -> bool",
+            "end_step(step, loss, grad_norm, lr, tokens_in_step, seq_len)",
             "log_step(metrics, step)"
           ]
         }
@@ -1383,10 +1401,13 @@
       "functions": [
         "get_gpu_peak_tflops(device) -> float",
         "estimate_model_flops_per_token(config, seq_len) -> int",
-        "compute_mfu(tokens_per_sec, config, seq_len, gpu_peak_tflops) -> float"
+        "compute_mfu(tokens_per_sec, config, seq_len, gpu_peak_tflops) -> float",
+        "vision_flops_per_image(model) -> float (vision encoder and adapter, for train/mfu_vlm)"
       ],
       "tested_by": [
-        "tests/unit/test_performance.py::TestMFU"
+        "tests/unit/test_performance.py::TestMFU",
+        "tests/unit/test_performance.py::TestEstimatesCountTheBuiltMLP",
+        "tests/unit/test_performance.py::TestVisionFlops"
       ]
     },
     "kempnerforge/profiling/profiler.py": {
@@ -1650,10 +1671,11 @@
           "TestFlushPendingSave(1)",
           "TestSaveVLMFreezeMetadata(3)",
           "TestLoadVLMFreezeCompare(9)",
+          "TestRestoredExtra(2)",
           "TestUnreadableTrainStateAcrossRanks(1)",
           "TestTornStageAcrossRanks(1)"
         ],
-        "count": 52
+        "count": 54
       },
       "tests/unit/test_observability.py": {
         "classes": [
@@ -1670,11 +1692,12 @@
       "tests/unit/test_performance.py": {
         "classes": [
           "TestMFU(11)",
+          "TestVisionFlops(5)",
           "TestMemory(4)",
           "TestProfiler(7)",
           "TestCompile(1)"
         ],
-        "count": 23
+        "count": 28
       },
       "tests/unit/test_pipeline_parallel.py": {
         "classes": [

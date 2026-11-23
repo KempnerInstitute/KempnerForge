@@ -212,16 +212,23 @@ so the resume logic matches what was live at save time — see
 
 ## Per-source metrics
 
-Each `MixtureDataset` sample has a `dataset_idx` field. The training
-loop breaks the loss down per source so you can see which dataset is
-contributing what:
+Each `MixtureDataset` sample has a `dataset_idx` field. On each logged
+step the training loop breaks the loss down per source so you can see
+which dataset is contributing what; the overall loss stays `train/loss`:
 
 ```
-loss/total  = 2.41
-loss/web    = 2.18    (0.5 of samples)
-loss/code   = 3.02    (0.3 of samples)
-loss/books  = 2.22    (0.2 of samples)
+loss/web          = 2.18
+loss/code         = 3.02
+loss/books        = 2.22
+data/web/tokens   = 65536
+data/code/tokens  = 40960
+data/books/tokens = 24576
 ```
+
+`loss/{name}` is the token-weighted cross-entropy of that source's
+labeled tokens and `data/{name}/tokens` the positions drawn from it in
+that step, both over every data-parallel rank (see
+[Data mixing how-to § Per-dataset metrics](../how-to/data-mixing-annealing.md#per-dataset-metrics)).
 
 Exposed names come from `DatasetSource.name` (auto-derived from
 `path` / `hf_name` if left blank).
