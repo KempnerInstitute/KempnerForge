@@ -235,15 +235,6 @@ def _check_dp_reduction(rank: int, world: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-class _AllFinite:
-    """Stands in for NaNDetector, whose agreement all-reduce allocates on CUDA."""
-
-    should_rollback = False
-
-    def check_loss(self, loss: float, step: int, grad_norm: float | None = None) -> bool:
-        return True
-
-
 def _check_loop_reduces_losses(rank: int, world: int, port: int) -> None:
     """Each rank trains and evaluates on its own data; every rank logs the DP mean."""
     from kempnerforge.training.hooks import HookRunner, TrainingHook
@@ -303,7 +294,6 @@ def _check_loop_reduces_losses(rank: int, world: int, port: int) -> None:
             data=DataPipeline(dataloader=[train_batch], dp_rank=rank, dp_size=world),
             step_fn=step_fn,
             hooks=HookRunner([hook]),
-            nan_detector=_AllFinite(),
             eval_dataloader=eval_batches,
         )
         session.tracker.metrics_config.log_interval = 1
@@ -363,7 +353,6 @@ def _check_source_metrics(rank: int, world: int, port: int, names: tuple, sizes:
             ),
             data=data,
             phases=PhaseState(),
-            nan_detector=_AllFinite(),
         )
         with torch.no_grad():
             logits = session.model(batch["input_ids"])
@@ -588,7 +577,7 @@ def _check_vlm_partial_loop(rank: int, world: int, port: int) -> None:
                 )
             return StepResult(loss=1.0, grad_norm=0.5, text_tokens=4)
 
-        session = make_session(config, runtime=runtime, step_fn=step_fn, nan_detector=_AllFinite())
+        session = make_session(config, runtime=runtime, step_fn=step_fn)
         logged: dict = {}
         session.tracker.log_eval = lambda m, s: logged.update(m)
         flops: list = []
