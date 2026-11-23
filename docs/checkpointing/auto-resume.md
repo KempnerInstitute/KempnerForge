@@ -264,6 +264,14 @@ committed and the save still succeeds on every rank.
   the checkpoint rank 0 picked, whatever its own view of the filesystem,
   so no stage resumes a different step than another. A checkpoint named
   by `load_path` is loaded as named.
+- **A rank that cannot see the checkpoint**: every load, a `load_path`
+  warm start or an evaluation as well as a resume, takes the directory
+  rank 0 resolves (the path passed to it, `load_path`, or `latest`,
+  links followed), broadcast to the other ranks with any error rank 0
+  hit. A rank whose view of a shared filesystem lags neither fails alone
+  at that point nor starts from scratch while the others load. The
+  agreement covers which directory to load, not reading it: a rank that
+  cannot read the files still fails when it reads them.
 - **Corrupted `step_N` directory**: `resolve_resume_path` checks
   only that a save completed (DCP's `.metadata`, and `train_state.pt`
   when the shards hold optimizer state), not the contents. If DCP

@@ -129,6 +129,16 @@ class VisionAdapter(nn.Module):
         """
         return num_input_tokens
 
+    def forward_flops(self, num_input_tokens: int) -> float:
+        """Matmul FLOPs of one image's forward: ``2 * params`` per output token by default.
+
+        A projection adapter applies every parameter to each of its tokens, and one that pools
+        first applies them to the tokens it puts out; an adapter that projects before it pools
+        overrides this.
+        """
+        params = sum(p.numel() for p in self.parameters())
+        return 2.0 * params * self.output_num_tokens(num_input_tokens)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
         raise NotImplementedError
 
@@ -342,6 +352,21 @@ class AttentionalPoolAdapter(VisionAdapter):
 
     def output_num_tokens(self, num_input_tokens: int) -> int:
         return pooled_token_count(num_input_tokens, self.pool_window)
+
+    def forward_flops(self, num_input_tokens: int) -> float:
+        """Matmul FLOPs of one image's forward: the key and value projections over every
+        padded window input, the query, output and final projections once per window."""
+        windows = self.output_num_tokens(num_input_tokens)
+        inputs = windows * self.pool_window**2
+        per_input = sum(
+            p.numel() for layer in (self.k_proj, self.v_proj) for p in layer.parameters()
+        )
+        per_window = sum(
+            p.numel()
+            for layer in (self.q_proj, self.o_proj, self.out_proj)
+            for p in layer.parameters()
+        )
+        return 2.0 * (per_input * inputs + per_window * windows)
 
     def forward(self, x: torch.Tensor, pool_window: int | None = None) -> torch.Tensor:
         w = pool_window if pool_window is not None else self.pool_window
