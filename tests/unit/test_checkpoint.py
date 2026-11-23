@@ -2019,6 +2019,7 @@ class TestAsyncLatestSymlinkSafety:
     def test_resume_falls_back_to_newest_complete(self, tmp_path, monkeypatch):
         import logging
 
+        self._build_ckpt(tmp_path, 5, complete=True)
         self._build_ckpt(tmp_path, 10, complete=True)
         incomplete = self._build_ckpt(tmp_path, 20, complete=False)
         latest = Path(tmp_path) / "latest"
@@ -2039,22 +2040,22 @@ class TestAsyncLatestSymlinkSafety:
         mgr_logger.setLevel(logging.WARNING)
         mgr_logger.addHandler(handler)
         try:
-            step, tokens, _ = mgr.load()
+            step, tokens, _ = mgr.load(exact_resume=True)
         finally:
             mgr_logger.removeHandler(handler)
             mgr_logger.setLevel(prior_level)
 
         assert step == 10, "did not fall back to the newest COMPLETE checkpoint"
         assert tokens == 1000
-        assert any("interrupted async flush" in r.getMessage() for r in records)
+        switch = f"Resuming from {(tmp_path / 'step_10').resolve()} instead"
+        assert any(switch in r.getMessage() for r in records), [r.getMessage() for r in records]
 
     def test_auto_resume_falls_back_when_given_the_resolved_path(self, tmp_path, monkeypatch):
         """Auto-resume passes the path it resolved, and must still fall back.
 
         This is the shape production takes: ``training/entry.py`` calls
-        ``resolve_resume_path()`` and hands the result to ``load(path=...)``.
-        Treating a passed path as "the user asked for this" made every
-        production call explicit and left the fallback unreachable.
+        ``resolve_resume_path()`` and hands the result to
+        ``load(path=..., exact_resume=True)``.
         """
 
         self._build_ckpt(tmp_path, 10, complete=True)
@@ -2063,7 +2064,7 @@ class TestAsyncLatestSymlinkSafety:
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
         _mock_dcp_load(monkeypatch)
 
-        step, tokens, _ = mgr.load(path=str(incomplete))
+        step, tokens, _ = mgr.load(path=str(incomplete), exact_resume=True)
 
         assert step == 10, "auto-resume did not fall back to the newest COMPLETE checkpoint"
         assert tokens == 1000
@@ -2087,6 +2088,53 @@ class TestAsyncLatestSymlinkSafety:
 
         assert step == 20, "explicit load_path was not honored as-is"
         assert tokens == 2000
+
+    def test_a_requeued_warm_start_falls_back_like_any_resume(self, tmp_path, monkeypatch):
+        """A run started from ``load_path`` resumes its own checkpoints, and falls back off them.
+
+        Requeued, it auto-resumes from ``checkpoint.dir`` with ``load_path`` still set.
+        """
+        warm_start = self._build_ckpt(tmp_path / "pretrained", 5, complete=True)
+        run = tmp_path / "run"
+        self._build_ckpt(run, 10, complete=True)
+        incomplete = self._build_ckpt(run, 20, complete=False)
+
+        mgr = self._mgr(run, AsyncCheckpointMode.async_pinned)
+        mgr.config.load_path = str(warm_start)
+        _mock_dcp_load(monkeypatch)
+
+        step, tokens, _ = mgr.load(path=str(incomplete), exact_resume=True)
+
+        assert (step, tokens) == (10, 1000), "the requeued warm start did not fall back"
+
+    def test_a_named_checkpoint_elsewhere_is_loaded_as_named(self, tmp_path, monkeypatch):
+        """A load that names a checkpoint outside ``checkpoint.dir`` never gets one from it."""
+        run = tmp_path / "run"
+        self._build_ckpt(run, 200, complete=True)
+        self._build_ckpt(tmp_path / "other", 5, complete=True)
+        requested = self._build_ckpt(tmp_path / "other", 999, complete=False)
+
+        mgr = self._mgr(run, AsyncCheckpointMode.async_pinned)
+        _mock_dcp_load(monkeypatch)
+
+        step, tokens, _ = mgr.load(path=str(requested))
+
+        assert (step, tokens) == (999, 99900), "the named checkpoint was swapped for another"
+
+    def test_an_exact_resume_falls_back_only_beside_its_checkpoint(self, tmp_path, monkeypatch):
+        """The fallback is the newest complete step next to the one requested, not in ``dir``."""
+        run = tmp_path / "run"
+        self._build_ckpt(run, 300, complete=True)
+        other = tmp_path / "other"
+        self._build_ckpt(other, 10, complete=True)
+        incomplete = self._build_ckpt(other, 20, complete=False)
+
+        mgr = self._mgr(run, AsyncCheckpointMode.async_pinned)
+        _mock_dcp_load(monkeypatch)
+
+        step, tokens, _ = mgr.load(path=str(incomplete), exact_resume=True)
+
+        assert (step, tokens) == (10, 1000), "the fallback came from another directory"
 
     def test_missing_load_path_raises(self, tmp_path):
         """A typo'd or moved ``load_path`` must not silently train from scratch."""
@@ -2235,20 +2283,60 @@ class TestAsyncLatestSymlinkSafety:
         mgr.flush_pending_save()
         assert len(agreements) == 2
 
-    def test_newest_complete_none_when_base_dir_missing(self, tmp_path):
-        mgr = self._mgr(tmp_path / "does_not_exist", AsyncCheckpointMode.async_pinned)
-        assert mgr._newest_complete_checkpoint() is None
+    def test_a_checkpoint_every_stage_saved_is_kept(self, tmp_path):
+        from kempnerforge.checkpoint.manager import CheckpointManager
 
-    def test_newest_complete_none_when_no_durable_checkpoint(self, tmp_path):
-        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        self._build_ckpt(tmp_path, 9, complete=True)
+        kept = self._build_ckpt(tmp_path, 5, complete=True)
+        assert CheckpointManager._newest_saved_beside(kept) == kept
+
+    def test_a_torn_checkpoint_with_nothing_complete_beside_it_is_kept(self, tmp_path):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
         self._build_ckpt(tmp_path, 1, complete=False)
-        self._build_ckpt(tmp_path, 2, complete=False)
-        assert mgr._newest_complete_checkpoint() is None
+        incomplete = self._build_ckpt(tmp_path, 2, complete=False)
+        assert CheckpointManager._newest_saved_beside(incomplete) == incomplete
 
-    def test_resolve_dcp_load_dir_returns_resolved_when_no_fallback(self, tmp_path):
+    def test_the_newest_step_every_stage_saved_replaces_a_torn_one(self, tmp_path):
+        """Other names, files and a step one stage did not save are passed over."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        self._build_ckpt(tmp_path, 3, complete=True)
+        self._build_ckpt(tmp_path, 12, complete=True)
+        torn = self._build_ckpt(tmp_path, 40, complete=False)
+        one_stage = self._build_ckpt(tmp_path, 30, complete=False)
+        for stage in ("pp0", "pp1"):
+            (one_stage / stage).mkdir()
+        (one_stage / "pp0" / ".metadata").write_text("ok")
+        for name in ("step_abc", "other"):
+            (tmp_path / name).mkdir()
+            (tmp_path / name / ".metadata").write_text("ok")
+        (tmp_path / "step_50").write_text("not a directory")
+        assert CheckpointManager._newest_saved_beside(torn) == tmp_path / "step_12"
+
+    def test_an_exact_resume_without_shards_takes_its_checkpoint(self, tmp_path, monkeypatch):
+        """A resume that reads only the train state needs no shards, so it does not fall back."""
+        self._build_ckpt(tmp_path, 10, complete=True)
+        incomplete = self._build_ckpt(tmp_path, 20, complete=False)
+
         mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
-        incomplete = self._build_ckpt(tmp_path, 5, complete=False)
-        assert mgr._resolve_dcp_load_dir(incomplete, None) == incomplete
+        _mock_dcp_load(monkeypatch)
+
+        loaded = mgr.load(
+            path=str(incomplete), exclude_keys=["model", "optimizer"], exact_resume=True
+        )
+        assert loaded[:2] == (20, 2000)
+
+    def test_a_load_that_is_not_a_resume_takes_latest_as_is(self, tmp_path, monkeypatch):
+        """Without ``exact_resume`` the checkpoint ``latest`` names loads, torn or not."""
+        self._build_ckpt(tmp_path, 10, complete=True)
+        incomplete = self._build_ckpt(tmp_path, 20, complete=False)
+        (Path(tmp_path) / "latest").symlink_to(incomplete.name)
+
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        _mock_dcp_load(monkeypatch)
+
+        assert mgr.load()[:2] == (20, 2000)
 
 
 def _no_space(*args: object, **kwargs: object) -> None:
@@ -3684,6 +3772,120 @@ def _refuse_on_one_stage(
         assert torch.equal(model.weight, before), "a refused load changed the model"
     finally:
         dist.destroy_process_group()
+
+
+def _resume_with_a_torn_stage(rank: int, world: int, port: int, ckpt_dir: str, case: str) -> None:
+    """Save steps 10 and 20 one stage per rank, then resume step 20 in ``case``.
+
+    ``stage_0_torn`` and ``stage_1_torn`` drop that stage's step-20 shards, so every rank must
+    resume step 10; with ``rank_1_skewed`` nothing is dropped but rank 1 cannot see stage 1's
+    step-20 ``.metadata``, so every rank must resume step 20, as rank 0 sees it; with
+    ``rank_1_cannot_see_dir`` rank 1 cannot see step 20 at all, and every rank resumes it. With
+    ``rank_0_cannot_list`` stage 1's shards are dropped and rank 0 cannot list the checkpoint
+    directory, so rank 0 raises its error and rank 1 an error naming it. ``dcp_excluded`` drops
+    stage 1's shards, hides step 20 from rank 1 and loads the train state alone, so every rank
+    resumes step 20's train state with its weights untouched.
+    """
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from kempnerforge.checkpoint.manager import CheckpointManager
+
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"tcp://127.0.0.1:{port}",
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        stages = [dist.new_group([r]) for r in range(world)]
+
+        def manager() -> tuple[torch.nn.Module, CheckpointManager]:
+            torch.manual_seed(rank)
+            model = torch.nn.Linear(4, 4)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            config = CheckpointConfig(dir=ckpt_dir)
+            return model, CheckpointManager(
+                config, model, optimizer, process_group=stages[rank], pp_rank=rank
+            )
+
+        model, saver = manager()
+        saver.save(step=10, tokens_seen=100)
+        at_10 = model.weight.detach().clone()
+        with torch.no_grad():
+            model.weight.add_(1.0)
+        saver.save(step=20, tokens_seen=200)
+        at_20 = model.weight.detach().clone()
+        hidden = Path(ckpt_dir) / "step_20" / "pp1" / ".metadata"
+        dist.barrier()
+        torn = {"stage_0_torn": 0, "stage_1_torn": 1, "rank_0_cannot_list": 1, "dcp_excluded": 1}
+        torn = torn.get(case)
+        if rank == torn:
+            (Path(ckpt_dir) / "step_20" / f"pp{rank}" / ".metadata").unlink()
+        dist.barrier()
+
+        model, loader = manager()
+        with torch.no_grad():
+            model.weight.zero_()
+        exists, iterdir = Path.exists, Path.iterdir
+        skewed = case == "rank_1_skewed" and rank == 1
+        blind = case in ("rank_1_cannot_see_dir", "dcp_excluded") and rank == 1
+        unlisted = case == "rank_0_cannot_list" and rank == 0
+        step_20 = Path(ckpt_dir) / "step_20"
+
+        def view(path: Path) -> bool:
+            if (skewed and path == hidden) or (blind and path == step_20):
+                return False
+            return exists(path)
+
+        def listing(path: Path):
+            if unlisted and path == Path(ckpt_dir):
+                raise PermissionError(13, "Permission denied", str(path))
+            return iterdir(path)
+
+        resume = str(step_20)
+        exclude = ["model", "optimizer"] if case == "dcp_excluded" else None
+        with patch.object(Path, "exists", view), patch.object(Path, "iterdir", listing):
+            if case == "rank_0_cannot_list":
+                expected_error = PermissionError if rank == 0 else RuntimeError
+                reason = "Permission denied" if rank == 0 else "Rank 0 could not pick"
+                with pytest.raises(expected_error, match=reason):
+                    loader.load(path=resume, exact_resume=True)
+                return
+            step, tokens, _ = loader.load(path=resume, exclude_keys=exclude, exact_resume=True)
+        expected = {
+            "rank_1_skewed": (20, 200, at_20),
+            "rank_1_cannot_see_dir": (20, 200, at_20),
+            "dcp_excluded": (20, 200, torch.zeros_like(at_20)),
+        }.get(case, (10, 100, at_10))
+        assert (step, tokens) == expected[:2], f"rank {rank} resumed step {step}"
+        assert torch.equal(model.weight, expected[2]), f"rank {rank} loaded another step's weights"
+    finally:
+        dist.destroy_process_group()
+
+
+class TestTornStageAcrossRanks:
+    """Rank 0 picks the step an exact resume loads, so every stage resumes the same one."""
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "stage_0_torn",
+            "stage_1_torn",
+            "rank_1_skewed",
+            "rank_1_cannot_see_dir",
+            "rank_0_cannot_list",
+            "dcp_excluded",
+        ],
+    )
+    def test_every_stage_resumes_the_same_step(self, tmp_path, case):
+        """No stage loads a step another stage does not, whatever its own view."""
+        import torch.multiprocessing as mp
+
+        mp.spawn(_resume_with_a_torn_stage, args=(2, _free_port(), str(tmp_path), case), nprocs=2)
 
 
 class TestOptimizerChecksAcrossStages:

@@ -2943,13 +2943,42 @@ class TestRestoreCheckpoint:
         monkeypatch.setattr(
             entry.dist,
             "broadcast_object_list",
-            lambda lst, src=0: lst.__setitem__(0, str(chosen)),
+            lambda lst, src=0: lst.__setitem__(0, {"path": str(chosen), "error": None}),
         )
 
         mgr = FakeResumeManager(step=7, tokens=1234)
         assert entry.restore_checkpoint(make_config(), TinyTextModel(), None, mgr) == (7, 1234)
         assert mgr.load_kwargs["path"] == str(chosen)
         assert len(looked) == (1 if rank == 0 else 0), "non-zero ranks must not stat the tree"
+
+    def test_rank_zero_shares_an_error_it_hits_while_resolving(self, monkeypatch):
+        """Rank 0 broadcasts its error before raising it, and another rank raises one naming it."""
+        import kempnerforge.training.entry as entry
+
+        def resolve(_d, _n=None):
+            raise PermissionError(13, "Permission denied", "/runs/a")
+
+        sent: list = []
+        rank = 0
+        monkeypatch.setattr(entry, "resolve_resume_path", resolve)
+        monkeypatch.setattr(entry.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(entry.dist, "get_rank", lambda: rank)
+
+        def broadcast(objects, src=0):
+            if rank == 0:
+                sent.append(dict(objects[0]))
+            else:
+                objects[0] = sent[0]
+
+        monkeypatch.setattr(entry.dist, "broadcast_object_list", broadcast)
+        with pytest.raises(PermissionError, match="Permission denied"):
+            entry.restore_checkpoint(make_config(), TinyTextModel(), None, FakeResumeManager())
+        assert sent == [
+            {"path": None, "error": "PermissionError: [Errno 13] Permission denied: '/runs/a'"}
+        ]
+        rank = 1
+        with pytest.raises(RuntimeError, match="Rank 0 could not find the checkpoint to resume"):
+            entry.restore_checkpoint(make_config(), TinyTextModel(), None, FakeResumeManager())
 
     def test_warm_start_exclude_leaves_the_vlm_freeze_probe_alone(self, monkeypatch):
         """Excluding state keys does not skip the freeze-metadata check; a
@@ -3108,7 +3137,7 @@ class TestRestoreCheckpoint:
         monkeypatch.setattr(
             entry.dist,
             "broadcast_object_list",
-            lambda lst, src=0: lst.__setitem__(0, str(chosen)),
+            lambda lst, src=0: lst.__setitem__(0, {"path": str(chosen), "error": None}),
         )
         config = make_config()
         config.checkpoint.load_path = "/somewhere/step_3"
@@ -3345,6 +3374,25 @@ class TestRestoreFromSavedCheckpoints:
             restore_checkpoint(config, model, None, mgr)
         assert self._same(initial, model), "the refused load changed the weights"
         assert not optimizer.state, "the refused load filled the optimizer"
+
+    @pytest.mark.parametrize("warm_start", [False, True], ids=["no_load_path", "load_path"])
+    def test_a_latest_that_lost_its_shards_resumes_the_save_before_it(self, tmp_path, warm_start):
+        """A requeued run resumes its last complete save, ``load_path`` set or not."""
+        from kempnerforge.training.entry import restore_checkpoint
+
+        load_path = None
+        if warm_start:
+            self._saved(tmp_path / "pretrained", seed=2, step=100)
+            load_path = str(tmp_path / "pretrained" / "step_100")
+        run = tmp_path / "run"
+        complete = self._saved(run, seed=0, step=4)
+        self._saved(run, seed=3, step=8)
+        (run / "step_8" / ".metadata").unlink()
+
+        config, model, _, mgr = self._run(run, seed=1, load_path=load_path)
+
+        assert restore_checkpoint(config, model, None, mgr) == (4, 40)
+        assert self._same(complete, model), "the run did not resume its last complete save"
 
     def test_load_path_into_a_dir_with_a_checkpoint_resumes_it_and_warns(self, tmp_path):
         """The newest checkpoint in ``dir`` wins over ``load_path``, and the log names both."""

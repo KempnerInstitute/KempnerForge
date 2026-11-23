@@ -339,13 +339,24 @@ def _decode_image(feature: Any, value: Any) -> Any:
     return value
 
 
-def _images_of(value: Any) -> list[Any]:
-    """The images an image field holds: none for ``None``, a list's present entries, else it."""
+def _is_image(value: Any) -> bool:
+    """Whether an image field's entry holds an image, as ``_images_per_row`` counts one.
+
+    ``None`` holds none, and neither does a blank entry, a stored struct such as
+    ``{"bytes": None, "path": None}`` whose every field is null, which the ``Image``
+    feature cannot decode.
+    """
     if value is None:
-        return []
+        return False
+    return not (isinstance(value, dict) and value and all(v is None for v in value.values()))
+
+
+def _images_of(value: Any) -> list[Any]:
+    """The images an image field holds: a list's entries that hold one, else the value if it
+    holds one."""
     if isinstance(value, list | tuple):
-        return [image for image in value if image is not None]
-    return [value]
+        return [image for image in value if _is_image(image)]
+    return [value] if _is_image(value) else []
 
 
 def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
