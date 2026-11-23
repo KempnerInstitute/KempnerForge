@@ -59,6 +59,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
       - run: uv sync --group video
       # Example tests are outside the root `testpaths`, so they are named here by path.
       # The eval integration tier needs the real, undeclared lmms-eval and must not
@@ -72,5 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
       - run: uv sync
       - run: uv run pytest examples/image_understanding/tests -v --timeout=60

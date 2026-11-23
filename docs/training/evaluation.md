@@ -100,10 +100,10 @@ could not take. The sampler splits the eval set evenly across data-parallel
 ranks and drops the remainder, so each rank needs at least one full batch;
 with none, building the eval dataloader raises `ValueError` before training
 starts. When `eval_steps` asks for more batches than the loader holds, eval
-starts the loader over. The schedule's gradient reduction still runs after
-each `eval()` call, which with FSDP2 reshards the stage; `run_eval` turns the
-schedule's gradient scaling off for those calls, so gradients left on the
-stage keep their values.
+starts the loader over. The schedule's metadata pass and gradient reduction
+still run in each `eval()` call and, with FSDP2, can rescale or drop the
+stage's gradients; `run_eval` sets the gradients left on the stage aside for
+those calls and puts them back after, so they keep their values.
 
 ## In-loop evaluation
 
@@ -120,6 +120,16 @@ if eval_config.enabled and eval_dataloader is not None \
     tracker.log_eval(eval_metrics, step)
     hook_runner.on_eval_end(eval_metrics, step)
 ```
+
+The call runs inside `evaluation_point(optimizer, model)` from
+`kempnerforge.training.optimizer`. An optimizer that evaluates at
+another point than it trains at, as `schedule_free_adamw` does, has
+`eval_params()` and `train_params()`: eval then sees its averaged
+weights `x`, and training continues from the training point `y`, bit
+for bit. Every FSDP2 unit of the model is resharded before the swap and
+after it, so a unit that stays gathered after the eval forward
+(`reshard_after_forward` false) does not hand `x` to the next training
+step. Every other optimizer evaluates the live weights.
 
 Cadence tuning:
 
@@ -143,7 +153,9 @@ Cadence tuning:
 4. Creates a dummy `torch.optim.SGD(lr=0.0)` — unused, but required by
    `CheckpointManager.load()`'s signature.
 5. Loads the checkpoint with `exclude_keys=["optimizer"]` so the
-   dummy SGD state isn't overwritten.
+   dummy SGD state isn't overwritten. A `schedule_free_adamw`
+   checkpoint's model entry holds the averaged weights `x`, so this
+   evaluates `x`; one written before checkpoints held `x` has `y`.
 6. Builds the eval dataloader (pre-tokenized or HF-streaming).
 7. Calls `run_eval` and prints the results + a JSON line for
    programmatic consumption.

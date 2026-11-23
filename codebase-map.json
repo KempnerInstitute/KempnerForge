@@ -188,7 +188,8 @@
         "tests/unit/test_mixing.py::TestDatasetSource",
         "tests/unit/test_mixing.py::TestDataConfigMixing",
         "tests/unit/test_annealing.py::TestTrainingPhase",
-        "tests/unit/test_annealing.py::TestDataConfigPhases"
+        "tests/unit/test_annealing.py::TestDataConfigPhases",
+        "tests/unit/test_fp8.py::TestFP8Config"
       ]
     },
     "kempnerforge/config/vlm.py": {
@@ -205,6 +206,7 @@
           "methods": [
             "__post_init__()",
             "residual_stream_image_tokens() -> int",
+            "declared_arch() -> str",
             "for_arch(arch, **kwargs) -> VLMConfig"
           ]
         },
@@ -229,8 +231,7 @@
         }
       },
       "globals": [
-        "DEFAULT_MODULE_PATTERNS",
-        "_RESERVED_ARCHS"
+        "DEFAULT_MODULE_PATTERNS"
       ],
       "registry": [
         "@registry.register_vlm_config('joint_decoder')",
@@ -275,7 +276,7 @@
           "purpose": "Full decoder-only transformer (embed -> blocks -> norm -> head). Branches on isinstance(config.vlm, MoTConfig) to build MoTBlocks + per-modality mot_norms + per-modality forward path; on isinstance(config.vlm, CrossAttentionConfig) to interleave CrossAttentionBlocks at cadence; otherwise the JD / text-only path. Forward accepts a `modality: ModalityContext` kwarg with cross-arg invariants vs kv_caches",
           "methods": [
             "forward(tokens, *, modality, kv_caches, doc_ids, position_ids, attention_group_ids)",
-            "init_weights_and_freqs()",
+            "init_weights_and_freqs() (ties a tied output head to the embedding again after to_empty, then initializes)",
             "get_moe_aux_loss()",
             "get_moe_router_z_loss()",
             "get_expert_counts()",
@@ -590,7 +591,9 @@
           ],
           "methods": [
             "forward(x)",
-            "_local_forward(x_flat, weights, indices)"
+            "_local_forward(x_flat, weights, indices)",
+            "_expert_params() -> list[Parameter]",
+            "_keep_in_graph(output, params) -> Tensor (adds a zero-valued term of params so each gets a gradient under FSDP2)"
           ]
         }
       },
@@ -697,7 +700,7 @@
       "functions": [
         "cross_entropy_loss(logits, labels) -> Tensor",
         "chunked_cross_entropy_loss(logits, labels, chunk_size) -> Tensor",
-        "z_loss(logits, weight) -> Tensor",
+        "z_loss(logits, weight, chunk_size=None) -> Tensor",
         "build_loss_fn(config) -> Callable"
       ],
       "registry": [
@@ -721,11 +724,10 @@
           ]
         },
         "ScheduleFreeAdamW": {
-          "purpose": "Schedule-Free AdamW (Defazio & Mishchenko 2024), eliminates LR schedule via iterate averaging",
+          "purpose": "Schedule-Free AdamW (Defazio & Mishchenko 2024), eliminates LR schedule via iterate averaging; each parameter's step count lives in its optimizer state",
           "methods": [
             "step(closure)",
-            "state_dict()",
-            "load_state_dict(state_dict)",
+            "load_state_dict(state_dict) (maps a legacy optimizer-wide _k onto each parameter's step)",
             "eval_params()",
             "train_params()"
           ]
@@ -741,6 +743,7 @@
       },
       "functions": [
         "build_optimizer(model, config, module_patterns=None) -> Optimizer",
+        "evaluation_point(optimizer, model=None) -> context manager (eval_params() inside, train_params() after; reshards the model's FSDP2 units around the swap)",
         "module_learning_rates(optimizer) -> dict[str, float] (keyed lr/<module>, lr_adamw/<module>)",
         "_split_by_module(model, param_groups, config, module_patterns) -> list[dict]",
         "_module_owners(model, modules, module_patterns) -> (owners, enclosing) (over every parameter name; a parameter several listed modules match goes to the one whose matches the others strictly contain; identical or partly overlapping matches are refused)",
@@ -918,12 +921,14 @@
         "checkpoint_extra(config, step, phases) -> dict"
       ],
       "tested_by": [
+        "tests/unit/test_train_entry.py::TestLoopPeriodicWork",
         "tests/unit/test_train_entry.py::TestRunTrainingLoop",
         "tests/unit/test_train_entry.py::TestBatchStream",
         "tests/unit/test_train_entry.py::TestMoEMetrics",
         "tests/unit/test_train_entry.py::TestSelectStepFn",
         "tests/unit/test_train_entry.py::TestCheckpointExtra",
-        "tests/e2e/test_training_e2e.py"
+        "tests/e2e/test_training_e2e.py",
+        "tests/unit/test_shutdown_agreement.py::TestLoopStopsOnEveryRank"
       ]
     },
     "kempnerforge/training/entry.py": {
@@ -1094,13 +1099,16 @@
         "destroy_distributed()",
         "_detect_ib_interface() -> str | None",
         "_set_nccl_env()",
-        "_set_seed(seed, rank, pp_rank)"
+        "_set_seed(seed, rank, pp_rank)",
+        "_timeout_options(timeout) -> ProcessGroupNCCL.Options"
       ],
       "tested_by": [
         "tests/unit/test_distributed.py::TestDetectIBInterface",
         "tests/unit/test_distributed.py::TestSetNcclEnv",
         "tests/unit/test_distributed.py::TestGetWorldInfo",
-        "tests/distributed/test_fsdp.py::TestInitDistributed"
+        "tests/unit/test_collective_timeouts.py::TestGroupTimeouts",
+        "tests/distributed/test_fsdp.py::TestInitDistributed",
+        "tests/distributed/test_group_timeouts.py::TestGroupTimeouts"
       ]
     },
     "kempnerforge/distributed/parallel.py": {
@@ -1111,6 +1119,7 @@
         "_ac_blocks(model) -> list[tuple[nn.ModuleDict, str]]",
         "_is_checkpointed(module) -> bool",
         "apply_float8(model, enable_fsdp_float8_all_gather)",
+        "_keep_tied_head(model, filter_fn) -> filter (keeps an output head tied to the token embedding out of Float8 conversion)",
         "apply_fsdp2(model, device_mesh, mp_policy, reshard_after_forward) (text-only path; shares _fsdp_wrap_transformer_blocks with VLM)",
         "_apply_fsdp_vlm(wrapper, device_mesh, mp_policy, reshard_after_forward) (VLM-aware FSDP: inner Transformer per-block + adapter + optional encoder wrap based on freeze)",
         "_fsdp_wrap_transformer_blocks(transformer, dp_mesh, policy, reshard_after_forward) (EP-MoE-aware per-block FSDP wrap; iterates transformer.layers and transformer.cross_attention_layers)",
@@ -1124,6 +1133,7 @@
         "tests/distributed/test_fsdp.py::TestActivationCheckpointing",
         "tests/distributed/test_fsdp.py::TestGetDpMesh",
         "tests/unit/test_fp8.py::TestApplyFloat8",
+        "tests/unit/test_fp8.py::TestFloat8Alignment",
         "tests/unit/test_distributed.py::TestDefaultMpPolicy",
         "tests/unit/test_distributed.py::TestApplyFsdpVLMGuards",
         "tests/unit/test_distributed.py::TestBuildParallelModelVLM",
@@ -1202,10 +1212,13 @@
     "kempnerforge/distributed/utils.py": {
       "functions": [
         "get_dp_info(device_mesh) -> (dp_rank, dp_size)",
-        "clip_grad_norm_(model, max_norm, foreach, pp_group) -> Tensor"
+        "clip_grad_norm_(model, max_norm, foreach, pp_group) -> Tensor",
+        "new_control_group(timeout_sec) -> ProcessGroup | None",
+        "any_rank(flag, group) -> bool"
       ],
       "tested_by": [
         "tests/unit/test_distributed.py::TestClipGradNorm",
+        "tests/unit/test_shutdown_agreement.py::TestAnyRank",
         "tests/unit/test_ep_gradients.py::TestClipUnderExpertParallelism"
       ]
     },
@@ -1271,6 +1284,8 @@
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
         "tests/unit/test_ep_checkpoint.py",
         "tests/unit/test_checkpoint.py::TestCheckpointManagerLoad",
+        "tests/unit/test_checkpoint.py::TestScheduleFreeCheckpoint",
+        "tests/unit/test_schedule_free_fsdp.py::TestScheduleFreeUnderFsdp2",
         "tests/distributed/test_checkpoint.py"
       ]
     },
@@ -1436,8 +1451,11 @@
           ],
           "methods": [
             "register()",
+            "reinstall()",
             "unregister()",
+            "cancel_watchdog()",
             "should_shutdown()",
+            "request()",
             "finish()"
           ]
         }
@@ -1519,6 +1537,14 @@
   },
   "tests": {
     "unit": {
+      "tests/unit/test_tied_embeddings.py": {
+        "classes": [
+          "TestMetaBuild(2)",
+          "TestTensorParallelBuild(1)",
+          "TestFloat8(2)"
+        ],
+        "count": 5
+      },
       "tests/unit/test_model.py": {
         "classes": [
           "TestRMSNorm(3)",
@@ -1594,13 +1620,20 @@
       },
       "tests/unit/test_resilience.py": {
         "classes": [
-          "TestShutdownHandler(8)",
+          "TestShutdownHandler(16)",
           "TestNaNDetector(17)",
           "TestGPUHealth(2)",
           "TestSLURM(13)",
           "TestResumePathResolution(9)"
         ],
-        "count": 49
+        "count": 57
+      },
+      "tests/unit/test_shutdown_agreement.py": {
+        "classes": [
+          "TestAnyRank(4)",
+          "TestLoopStopsOnEveryRank(6)"
+        ],
+        "count": 10
       },
       "tests/unit/test_checkpoint.py": {
         "classes": [
@@ -1652,10 +1685,12 @@
         "classes": [
           "TestCrossEntropy(2)",
           "TestChunkedCrossEntropy(6)",
-          "TestZLoss(5)",
-          "TestBuildLossFn(5)"
+          "TestFp32CrossEntropy(8)",
+          "TestZLoss(11)",
+          "TestBuildLossFn(12)",
+          "TestAllMaskedBatch(3)"
         ],
-        "count": 18
+        "count": 42
       },
       "tests/unit/test_moe.py": {
         "classes": [
@@ -1672,17 +1707,19 @@
           "TestGradientScaling(6)",
           "TestSetMoeStep(3)",
           "TestMoESigmoidConfigValidation(6)",
-          "TestPackedExperts(17)"
+          "TestPackedExperts(17)",
+          "TestIdleExperts(6)"
         ],
-        "count": 91
+        "count": 119
       },
       "tests/unit/test_router.py": {
         "classes": [
           "TestSoftmaxTopKRouter(8)",
           "TestSigmoidSequenceAuxLoss(5)",
-          "TestSigmoidBiasSchedule(6)"
+          "TestSigmoidBiasSchedule(6)",
+          "TestEmptyInput(3)"
         ],
-        "count": 19
+        "count": 22
       },
       "tests/unit/test_optimizer.py": {
         "classes": [
@@ -1749,10 +1786,11 @@
       },
       "tests/unit/test_fp8.py": {
         "classes": [
-          "TestFP8Config(7)",
-          "TestApplyFloat8(4)"
+          "TestFP8Config(10)",
+          "TestApplyFloat8(5)",
+          "TestFloat8Alignment(4)"
         ],
-        "count": 11
+        "count": 19
       },
       "tests/unit/test_packing.py": {
         "classes": [
@@ -1803,11 +1841,11 @@
       "tests/unit/test_additional_optimizers.py": {
         "classes": [
           "TestLion(10)",
-          "TestScheduleFreeAdamW(9)",
+          "TestScheduleFreeAdamW(21)",
           "TestNoneScheduler(3)",
           "TestOptimizerConfig(3)"
         ],
-        "count": 25
+        "count": 37
       },
       "tests/unit/test_scheduler_extensions.py": {
         "classes": [
@@ -1933,9 +1971,10 @@
         "classes": [
           "TestNcclAsyncErrorHandlingEnvGuard(3)",
           "TestCheckNcclHealthTimeout(4)",
-          "TestBarrierWithTimeout(3)"
+          "TestBarrierWithTimeout(3)",
+          "TestGroupTimeouts(5)"
         ],
-        "count": 10
+        "count": 15
       },
       "tests/unit/test_dataset_mmap_cleanup.py": {
         "note": "Module-level pytest functions (no Test* classes): mmap close on partial-open failure, idempotent close, mmap retention on success, .bin variant",
@@ -2022,6 +2061,11 @@
         "classes": [
           "TestNCCLHealth(2)",
           "TestNaNDetectorDistributed(3)"
+        ]
+      },
+      "tests/distributed/test_group_timeouts.py": {
+        "classes": [
+          "TestGroupTimeouts(4)"
         ]
       },
       "tests/distributed/test_tp.py": {

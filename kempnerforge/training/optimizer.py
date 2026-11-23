@@ -19,13 +19,15 @@ All optimizers:
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import functools
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any, ClassVar
 
 import torch
+from torch.distributed._composable.fsdp import FSDPModule
 
 from kempnerforge.config.optimizer import MUON_ADJUST_LR_MODES, MUON_ORTHOGONALIZE_MODES
 from kempnerforge.config.registry import registry
@@ -138,6 +140,11 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
     and a running average ``x``.  Parameters are set to the interpolated
     point ``y = (1 - beta1) * z + beta1 * x`` for gradient computation.
 
+    Each parameter's ``step`` counts the steps it had a gradient in, and its warmup,
+    second-moment bias correction and average all run on that count, so a parameter
+    whose first gradient comes late starts as a fresh one does. The count is optimizer
+    state, which ``get_optimizer_state_dict`` keeps, so a checkpoint resumes it.
+
     Use with ``scheduler.name = "none"`` — no LR schedule is needed.
 
     Args:
@@ -161,18 +168,21 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.warmup_steps = warmup_steps
-        self._k = 0
-
-    def state_dict(self) -> dict:
-        sd = super().state_dict()
-        sd["_k"] = self._k
-        sd["_warmup_steps"] = self.warmup_steps
-        return sd
 
     def load_state_dict(self, state_dict: dict) -> None:
-        self._k = state_dict.pop("_k", 0)
+        """Load ``state_dict``, also one saved before each parameter kept its own ``step``.
+
+        Such a state carries one optimizer-wide count as ``_k``, which every parameter with
+        state resumes from, and its warmup as ``_warmup_steps``.
+        """
+        state_dict = dict(state_dict)
+        legacy_k = state_dict.pop("_k", None)
         self.warmup_steps = state_dict.pop("_warmup_steps", self.warmup_steps)
         super().load_state_dict(state_dict)
+        if legacy_k is not None:
+            for state in self.state.values():
+                if state and "step" not in state:
+                    state["step"] = torch.tensor(float(legacy_k), dtype=torch.float32)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -181,18 +191,10 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        self._k += 1
-        k = self._k
-
-        warmup = min(1.0, k / max(self.warmup_steps, 1)) if self.warmup_steps > 0 else 1.0
-
         for group in self.param_groups:
-            lr = group["lr"] * warmup
             beta1, beta2 = group["betas"]
             eps = group["eps"]
             wd = group["weight_decay"]
-
-            weight = lr * (1 - beta1)
 
             for p in group["params"]:
                 if p.grad is None:
@@ -202,9 +204,16 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
                 state = self.state[p]
 
                 if len(state) == 0:
+                    state["step"] = torch.tensor(0.0, dtype=torch.float32)
                     state["z"] = p.data.clone()
                     state["v"] = torch.zeros_like(p.data)
                     state["weight_sum"] = 0.0
+
+                state["step"] += 1
+                k = state["step"].item()
+                warmup = min(1.0, k / self.warmup_steps) if self.warmup_steps > 0 else 1.0
+                lr = group["lr"] * warmup
+                weight = lr * (1 - beta1)
 
                 z = state["z"]
                 v = state["v"]
@@ -220,7 +229,7 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
                     z.mul_(1 - lr * wd)
 
                 state["weight_sum"] += weight
-                ck = weight / state["weight_sum"]
+                ck = weight / state["weight_sum"] if state["weight_sum"] > 0 else 0.0
 
                 if "x" not in state:
                     state["x"] = z.clone()
@@ -239,20 +248,64 @@ class ScheduleFreeAdamW(torch.optim.Optimizer):
         """
         for group in self.param_groups:
             for p in group["params"]:
-                if p in self.state and "x" in self.state[p]:
-                    p.data.copy_(self.state[p]["x"])
+                state = self.state.get(p)
+                if state and "x" in state:
+                    p.data.copy_(state["x"])
 
     def train_params(self) -> None:
-        """Restore parameters to the training point (interpolated y).
+        """Restore parameters to the training point (interpolated y), bit for bit.
 
-        Call after :meth:`eval_params` to resume training.
+        Call after :meth:`eval_params` to resume training. A parameter without state
+        stays as it is, and no state is created for it.
         """
         for group in self.param_groups:
             beta1 = group["betas"][0]
             for p in group["params"]:
-                state = self.state[p]
-                if "z" in state and "x" in state:
+                state = self.state.get(p)
+                if state and "z" in state and "x" in state:
                     p.data.copy_(state["z"]).lerp_(state["x"], beta1)
+
+
+def _reshard(model: torch.nn.Module | None) -> None:
+    """Reshard every FSDP2 unit in ``model``, so its next forward gathers the shards anew."""
+    if model is None:
+        return
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.reshard()
+
+
+@contextlib.contextmanager
+def evaluation_point(
+    optimizer: torch.optim.Optimizer, model: torch.nn.Module | None = None
+) -> Iterator[None]:
+    """Hold the parameters at ``optimizer``'s evaluation point inside the block.
+
+    An optimizer that evaluates at another point than it trains at, as
+    :class:`ScheduleFreeAdamW` does, has ``eval_params`` and ``train_params``: the block
+    runs between them, and the parameters leave it at the training point again, bit for
+    bit, also when the swap or the block raises. Any other optimizer leaves them as they
+    are.
+
+    The swap writes the sharded parameters. An FSDP2 unit that does not reshard after its
+    forward (``reshard_after_forward`` False or an int, or the root under the default
+    None) stays gathered after a forward in the block, holding ``x``, and the next
+    training forward would reuse it. So pass ``model`` whenever the block runs a forward:
+    every FSDP2 unit in it is resharded before the swap in and after the swap back, and
+    each forward gathers the point it should see. Resharding a resharded unit does nothing.
+    """
+    to_eval = getattr(optimizer, "eval_params", None)
+    to_train = getattr(optimizer, "train_params", None)
+    if to_eval is None or to_train is None:
+        yield
+        return
+    _reshard(model)
+    try:
+        to_eval()
+        yield
+    finally:
+        to_train()
+        _reshard(model)
 
 
 @registry.register_optimizer("schedule_free_adamw")

@@ -13,24 +13,42 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
       - run: uv sync --group video
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pyright kempnerforge/
 
-  unit-tests:
+  unit-tests-python:
+    name: unit-tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
     needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
       - run: uv sync --group video
+      - run: uv run python --version
       - run: uv run pytest tests/unit/ -v --timeout=60 --cov --cov-branch --cov-report=xml
       - name: Upload coverage reports to Codecov
+        if: matrix.python-version == '3.12'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: KempnerInstitute/KempnerForge
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: unit-tests-python
+    if: always()
+    steps:
+      - run: test "${{ needs.unit-tests-python.result }}" = "success"
 
   gpu-tests:
     runs-on: ubuntu-latest
@@ -38,5 +56,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
       - run: uv sync
       - run: uv run pytest tests/integration/ -v --timeout=120 -m "not slow"

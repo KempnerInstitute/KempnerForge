@@ -833,6 +833,59 @@ class TestJobConfig:
         with pytest.raises(ValueError, match="train.seq_len.*insufficient for VLM"):
             config.validate(world_size=1)
 
+    def test_several_images_per_document_rules(self):
+        kwargs = dict(
+            model=ModelConfig(max_seq_len=1024),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+        )
+        JobConfig(vlm=VLMConfig(max_text_len=64), data=DataConfig(hf_max_images=2), **kwargs)
+        JobConfig(
+            vlm=VLMConfig(max_text_len=64),
+            data=DataConfig(hf_max_images=3, pack_sequences=True),
+            **kwargs,
+        )
+        with pytest.raises(ValueError, match="not text runs or"):
+            JobConfig(data=DataConfig(hf_max_images=2))
+        with pytest.raises(ValueError, match="requires vlm.arch='joint_decoder'"):
+            JobConfig(
+                vlm=VLMConfig.for_arch("cross_attention", max_text_len=64),
+                data=DataConfig(hf_max_images=2),
+                **kwargs,
+            )
+        with pytest.raises(ValueError, match="requires vlm.arch='joint_decoder'"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=64),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig.for_arch("mot", max_text_len=64),
+                data=DataConfig(hf_max_images=4),
+            )
+        for cap in (0, -1):
+            with pytest.raises(ValueError, match="hf_max_images must be >= 1"):
+                DataConfig(hf_max_images=cap)
+
+    def test_the_image_cap_counts_against_the_context(self):
+        """Three images of 16 tokens plus 64 text tokens is 112, over a context of 100."""
+        kwargs = dict(
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig(max_text_len=64),
+        )
+        JobConfig(model=ModelConfig(max_seq_len=100), data=DataConfig(hf_max_images=2), **kwargs)
+        with pytest.raises(ValueError, match="max_seq_len.*insufficient for VLM"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=100), data=DataConfig(hf_max_images=3), **kwargs
+            )
+        config = JobConfig(
+            model=ModelConfig(max_seq_len=128),
+            data=DataConfig(hf_max_images=3),
+            train=TrainConfig(seq_len=100),
+            **kwargs,
+        )
+        with pytest.raises(ValueError, match="train.seq_len.*insufficient for VLM"):
+            config.validate(world_size=1)
+
     def test_vlm_packing_requires_joint_decoder_and_no_video(self):
         kwargs = dict(
             model=ModelConfig(max_seq_len=1024),
@@ -867,6 +920,36 @@ class TestJobConfig:
                 vlm=VLMConfig(max_text_len=64),
                 data=DataConfig(pack_sequences=True),
             )
+
+    @pytest.mark.parametrize("pack", [False, True])
+    def test_several_images_per_document_are_refused_with_fp8(self, pack):
+        with pytest.raises(ValueError, match="hf_max_images != 1 is not supported with train"):
+            JobConfig(
+                model=ModelConfig(max_seq_len=1024),
+                train=TrainConfig(seq_len=512, mixed_precision="fp8"),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64),
+                data=DataConfig(hf_max_images=2, pack_sequences=pack),
+            )
+
+    @pytest.mark.parametrize("pack", [False, True])
+    def test_several_images_per_document_are_refused_with_flash_attention(self, pack):
+        def config(attention_backend: str) -> JobConfig:
+            return JobConfig(
+                model=ModelConfig(
+                    max_seq_len=1024, sdpa_backend="flash", attention_backend=attention_backend
+                ),
+                train=TrainConfig(seq_len=512),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig(max_text_len=64),
+                data=DataConfig(hf_max_images=2, pack_sequences=pack),
+            )
+
+        with pytest.raises(ValueError, match="hf_max_images != 1 is not supported with model"):
+            config("sdpa")
+        config("flex")
 
     def test_vlm_packing_inherits_the_sequence_parallel_refusal(self):
         """Packed rows are indexed as plain tensors, which sequence parallelism cannot carry."""
@@ -1101,7 +1184,7 @@ class TestVLMParallelismSupport:
 
     def test_errors_name_the_arch_of_the_config_class(self):
         """The checks act on the config's class, and the arch field can name another arch
-        after a ``--vlm.arch`` override, so the error names the class's arch."""
+        after an assignment to it, so the error names the class's arch."""
         job = _vlm_job("moma", ep=2)
         assert job.vlm is not None
         job.vlm.arch = "joint_decoder"
@@ -1400,33 +1483,6 @@ freeze_schedule = [
         assert sched[0].specs[0].module == "adapter"
         assert sched[0].specs[0].frozen is True
         assert sched[1].specs[0].frozen is False
-
-    def test_vlm_reserved_arch_in_toml_raises(self, tmp_path):
-        """A TOML aiming at a reserved arch should surface
-        ``NotImplementedError`` from the loader's arch resolver, not the
-        generic ``Unknown vlm.arch`` message. Reads ``_RESERVED_ARCHS``
-        dynamically so the test stays portable across branches where
-        the reserved set differs."""
-        from kempnerforge.config.vlm import _RESERVED_ARCHS
-
-        if not _RESERVED_ARCHS:
-            pytest.skip("No reserved arches on this branch")
-
-        reserved_arch = _RESERVED_ARCHS[0]
-        toml = tmp_path / "vlm_reserved.toml"
-        toml.write_text(
-            f"""
-[vision_encoder]
-type = "random"
-num_tokens = 16
-
-[vlm]
-arch = "{reserved_arch}"
-max_text_len = 32
-"""
-        )
-        with pytest.raises(NotImplementedError, match="reserved"):
-            load_config(str(toml), cli_args=[])
 
     def test_vlm_unknown_arch_in_toml_raises_value_error(self, tmp_path):
         toml = tmp_path / "vlm_unknown.toml"
