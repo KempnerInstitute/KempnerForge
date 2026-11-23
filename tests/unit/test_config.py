@@ -32,6 +32,7 @@ from kempnerforge.config.schema import (
     VisionEncoderConfig,
     VLMConfig,
 )
+from kempnerforge.config.video import VideoConfig
 
 
 class TestModelConfig:
@@ -935,6 +936,99 @@ class TestJobConfig:
         with pytest.raises(ValueError, match="hf_max_images != 1 is not supported with model"):
             config("sdpa")
         config("flex")
+
+    @pytest.mark.parametrize("attention_backend", ["sdpa", "flex"])
+    def test_packed_sequences_are_refused_with_flash_attention_under_sdpa(self, attention_backend):
+        """Packed rows mask their documents; flex expresses that as a block mask, not SDPA's."""
+
+        def config(sdpa_backend: str, **data) -> JobConfig:
+            return JobConfig(
+                model=ModelConfig(
+                    max_seq_len=1024, sdpa_backend=sdpa_backend, attention_backend=attention_backend
+                ),
+                train=TrainConfig(seq_len=512),
+                data=DataConfig(pack_sequences=True, **data),
+            )
+
+        refused = config("flash", dataset_path="/some/data")
+        if attention_backend == "sdpa":
+            match = "sdpa_backend='flash' is not supported with data.pack_sequences"
+            with pytest.raises(ValueError, match=match):
+                refused.check_flash_attention_masks()
+        else:
+            refused.check_flash_attention_masks()
+        config("flash").check_flash_attention_masks()
+        config("auto", dataset_path="/some/data").check_flash_attention_masks()
+
+    def test_a_cli_override_lifts_the_flash_refusal(self, tmp_path):
+        """The check runs on the merged config, so the command line can correct the TOML."""
+        path = tmp_path / "c.toml"
+        path.write_text(
+            '[model]\nsdpa_backend = "flash"\n[data]\npack_sequences = true\n'
+            'dataset_path = "/some/data"\n'
+        )
+        with pytest.raises(ValueError, match="sdpa_backend='flash'"):
+            load_config(str(path), cli_args=[]).check_flash_attention_masks()
+        for override in ("--model.sdpa_backend=auto", "--data.pack_sequences=false"):
+            load_config(str(path), cli_args=[override]).check_flash_attention_masks()
+
+    @pytest.mark.parametrize("attention_backend", ["sdpa", "flex"])
+    @pytest.mark.parametrize("arch", ["joint_decoder", "moma", "mot", "cross_attention"])
+    def test_video_is_refused_with_flash_attention_where_frames_are_masked(
+        self, arch, attention_backend
+    ):
+        """Joint-Decoder and MoMa mask padded frames in self-attention, under flex as well."""
+
+        def config(sdpa_backend: str) -> JobConfig:
+            return JobConfig(
+                model=ModelConfig(
+                    max_seq_len=1024, sdpa_backend=sdpa_backend, attention_backend=attention_backend
+                ),
+                train=TrainConfig(seq_len=512),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig.for_arch(arch, max_text_len=64),
+                video=VideoConfig(data_root="/some/root"),
+            )
+
+        if arch in ("joint_decoder", "moma"):
+            with pytest.raises(ValueError, match=rf"\[video\] on vlm.arch='{arch}'"):
+                config("flash").check_flash_attention_masks()
+        else:
+            config("flash").check_flash_attention_masks()
+        config("auto").check_flash_attention_masks()
+
+    @pytest.mark.parametrize(
+        ("built", "named", "refused"),
+        [
+            ("moma", "mot", True),
+            ("mot", "moma", False),
+            ("cross_attention", "joint_decoder", True),
+            ("joint_decoder", "cross_attention", False),
+        ],
+    )
+    def test_the_video_rule_follows_the_strategy_and_the_attention_built(
+        self, built, named, refused
+    ):
+        """The arch field picks the strategy that masks frames; the class, the attention."""
+        config = JobConfig(
+            model=ModelConfig(max_seq_len=1024, sdpa_backend="flash"),
+            train=TrainConfig(seq_len=512),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig.for_arch(built, max_text_len=64),
+            video=VideoConfig(data_root="/some/root"),
+        )
+        assert config.vlm is not None
+        config.vlm.arch = named
+        if refused:
+            with pytest.raises(ValueError, match=rf"\[video\] on vlm.arch='{named}'"):
+                config.check_flash_attention_masks()
+        else:
+            config.check_flash_attention_masks()
+
+    def test_a_run_without_a_vlm_masks_no_frames(self):
+        assert not JobConfig().masks_frames_in_backend_attention()
 
     def test_vlm_packing_inherits_the_sequence_parallel_refusal(self):
         """Packed rows are indexed as plain tensors, which sequence parallelism cannot carry."""

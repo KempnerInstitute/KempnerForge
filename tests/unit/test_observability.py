@@ -76,6 +76,31 @@ class TestMetricsTracker:
         result = tracker.end_step(step=1, loss=2.5, grad_norm=1.0, lr=3e-4, tokens_in_step=1024)
         assert result is not None
 
+    def test_vision_flops_give_a_vlm_mfu_above_the_language_models(self, monkeypatch):
+        import kempnerforge.metrics.tracker as tracker_mod
+
+        tracker = self._make_tracker()
+        tracker.gpu_peak_tflops = 100.0
+        logged: list[dict] = []
+        tracker._backends = [type("B", (), {"log": lambda _s, d, step: logged.append(d)})()]
+        tracker._step_start = 10.0
+        monkeypatch.setattr(tracker_mod.time, "perf_counter", lambda: 12.0)
+        result = tracker.end_step(
+            step=1, loss=1.0, grad_norm=1.0, lr=1e-4, tokens_in_step=1024, vision_flops=5e13
+        )
+        assert result is not None
+        assert result.mfu_vlm == pytest.approx(result.mfu + 5e13 / (100e12 * 2.0))
+        assert logged[-1]["train/mfu_vlm"] == result.mfu_vlm
+
+    def test_without_vision_flops_there_is_no_vlm_mfu(self):
+        tracker = self._make_tracker()
+        logged: list[dict] = []
+        tracker._backends = [type("B", (), {"log": lambda _s, d, step: logged.append(d)})()]
+        tracker.start_step()
+        result = tracker.end_step(step=1, loss=1.0, grad_norm=1.0, lr=1e-4, tokens_in_step=8)
+        assert result is not None and result.mfu_vlm is None
+        assert "train/mfu_vlm" not in logged[-1]
+
     def test_metrics_fields(self):
         tracker = self._make_tracker()
         tracker.start_step()
@@ -112,6 +137,30 @@ class TestMetricsTracker:
             tracker.end_step(step=step, loss=loss, grad_norm=1.0, lr=3e-4, tokens_in_step=1024)
         logged = [(step, m["smoothed/loss"]) for m, step in backend.log_calls]
         assert logged == [(1, 1.0), (2, pytest.approx(1.1)), (4, pytest.approx(1.561))]
+
+    def test_is_log_step_matches_the_steps_end_step_logs(self):
+        tracker = self._make_tracker(log_interval=3)
+        logged = []
+        for step in range(1, 8):
+            tracker.start_step()
+            if tracker.end_step(step=step, loss=2.0, grad_norm=1.0, lr=3e-4, tokens_in_step=8):
+                logged.append(step)
+        assert logged == [1, 3, 6]
+        assert [step for step in range(1, 8) if tracker.is_log_step(step)] == logged
+
+    def test_mfu_attention_term_uses_the_step_seq_len(self, monkeypatch):
+        """``seq_len`` from the step feeds the MFU attention term; without it, ``train.seq_len``."""
+        seen: list = []
+        monkeypatch.setattr(
+            tracker_mod, "compute_mfu", lambda *a, **k: seen.append(k["seq_len"]) or 0.0
+        )
+        tracker = self._make_tracker()
+        for step, seq_len in ((1, 12), (2, None)):
+            tracker.start_step()
+            tracker.end_step(
+                step=step, loss=2.0, grad_norm=1.0, lr=3e-4, tokens_in_step=8, seq_len=seq_len
+            )
+        assert seen == [12, tracker.seq_len]
 
     def test_end_step_reads_memory_once_per_logged_step(self, monkeypatch):
         """A logged step reads each counter once, from the current device; other steps read none."""

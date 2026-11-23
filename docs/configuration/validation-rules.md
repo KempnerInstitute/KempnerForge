@@ -414,6 +414,43 @@ Routing produces data-dependent shapes that break `torch.compile`'s
 graph, so the loop logs a warning but still runs. Set
 `train.compile_model=false` for MoE runs.
 
+### Flash attention and masked runs
+
+```
+model.sdpa_backend == "flash" && (
+    data.pack_sequences && model.attention_backend == "sdpa" && a data source
+    || video && vlm.arch in {"joint_decoder", "mot", "moma"}
+             && the vlm section's class is not MoT
+)  →  ValueError
+```
+
+Checked by the training setup on CUDA, after the CLI overrides and
+before the process group starts
+(`JobConfig.check_flash_attention_masks`). Evaluation and generation
+are not checked at setup; on CUDA, a forward there that passes a dense
+mask to `Attention`, such as video evaluation's frame mask under
+Joint-Decoder or MoMa, raises the `ValueError` from
+`Attention.forward`. PyTorch's CUDA FlashAttention
+kernel takes no attention mask, and these runs build one: packed rows
+read from a dataset mask their documents from each other, and the padded
+frames of a video run are masked in self-attention, under
+`attention_backend = "flex"` too, which turns only document and group
+masks into a block mask. The modality strategy, which `vlm.arch` picks,
+masks frames in self-attention under Joint-Decoder, MoT and MoMa, while
+Cross-Attention masks them in its cross-attention layers only, and the
+attention the model builds, which the section's class picks, runs under
+the configured backend except under MoT, so a run counts only when both
+apply (`JobConfig.masks_frames_in_backend_attention`), as after a
+`--vlm.arch` override. Image runs whose documents can hold several
+images (`data.hf_max_images != 1`) are refused under `"sdpa"` when the
+config is built, and on CUDA a dataset with text-only rows on the
+single-image route (`data.pack_sequences = false` and
+`data.hf_max_images = 1`) is refused by the same test when the data
+pipeline is built, since only the dataset knows it has such rows. A
+forward that passes a dense mask to SDPA some other way on CUDA, such as
+attention groups from a collator of your own, raises a `ValueError` that
+names the setting instead of PyTorch's `No available kernel`.
+
 ## Example: a failing config and its error
 
 ```toml

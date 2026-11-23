@@ -90,6 +90,7 @@ def estimate_model_flops_per_token(config: ModelConfig, seq_len: int | None = No
     The 12*L*D*S attention term does not discount GQA — FlashAttention expands
     GQA internally, so the hardware performs full attention compute.
     Router FLOPS (dim × num_experts) are intentionally omitted — negligible.
+    Each MLP, dense or expert, counts ``config.mlp_matrices`` weight matrices.
 
     Args:
         config: Model configuration.
@@ -113,7 +114,7 @@ def _dense_flops_per_token(config: ModelConfig, seq_len: int) -> int:
         + 2 * config.dim * (config.n_kv_heads * head_dim)  # type: ignore[reportOptionalOperand]
         + attn_dim * config.dim
     )
-    mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim
+    mlp_params = config.mlp_matrices * config.dim * config.computed_ffn_hidden_dim
     per_layer = attn_params + mlp_params
     output_params = config.vocab_size * config.dim
     active_params = config.n_layers * per_layer + output_params
@@ -128,8 +129,8 @@ def _moe_flops_per_token(config: ModelConfig, seq_len: int) -> int:
         + 2 * config.dim * (config.n_kv_heads * head_dim)  # type: ignore[reportOptionalOperand]
         + attn_dim * config.dim
     )
-    mlp_params = 3 * config.dim * config.computed_ffn_hidden_dim
-    expert_mlp_params = 3 * config.dim * config.computed_expert_ffn_hidden_dim
+    mlp_params = config.mlp_matrices * config.dim * config.computed_ffn_hidden_dim
+    expert_mlp_params = config.mlp_matrices * config.dim * config.computed_expert_ffn_hidden_dim
 
     n_moe_layers = sum(1 for i in range(config.n_layers) if (i + 1) % config.moe_frequency == 0)
     n_dense_layers = config.n_layers - n_moe_layers
@@ -142,6 +143,40 @@ def _moe_flops_per_token(config: ModelConfig, seq_len: int) -> int:
     output_params = config.vocab_size * config.dim
     active_params = dense_active + moe_active + output_params
     return 6 * active_params + 12 * config.n_layers * attn_dim * seq_len
+
+
+def vision_flops_per_image(model: torch.nn.Module) -> float:
+    """FLOPs one image costs a VLM's vision encoder and adapter in a training step.
+
+    The encoder runs ``2 * N`` FLOPs per token forward for its ``N`` parameters over the
+    ``num_tokens`` it processes, plus ``4 * layers * tokens**2 * hidden`` for attention when
+    its tower's config gives the layers and width. The adapter runs its ``forward_flops``,
+    which counts each projection over the tokens it sees, or ``2 * N`` per encoder token
+    without one. A module with a trainable parameter also runs the backward, twice the
+    forward. Zero for a model without a vision encoder.
+    """
+    inner = getattr(model, "_orig_mod", model)
+    encoder = getattr(inner, "vision_encoder", None)
+    if encoder is None:
+        return 0.0
+    tokens = int(getattr(encoder, "num_tokens", 0))
+    config = getattr(getattr(encoder, "vision_tower", None), "config", None)
+    attention = 4.0 * getattr(config, "num_hidden_layers", 0) * tokens**2
+    attention *= getattr(config, "hidden_size", 0)
+    params = list(encoder.parameters())
+    forward = 2.0 * sum(p.numel() for p in params) * tokens + attention
+    total = forward * (3 if any(p.requires_grad for p in params) else 1)
+    adapter = getattr(inner, "adapter", None)
+    if adapter is not None:
+        params = list(adapter.parameters())
+        forward_flops = getattr(adapter, "forward_flops", None)
+        forward = (
+            forward_flops(tokens)
+            if forward_flops is not None
+            else 2.0 * sum(p.numel() for p in params) * tokens
+        )
+        total += forward * (3 if any(p.requires_grad for p in params) else 1)
+    return total
 
 
 def compute_mfu(

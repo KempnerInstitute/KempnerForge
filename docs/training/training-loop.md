@@ -37,8 +37,12 @@ Key mechanics:
   disables FSDP2's reduce-scatter on all but the last microbatch. One
   collective fires per optimizer step instead of `grad_accum_steps`.
 - **Per-dataset metrics** — if the dataloader is a `MixtureDataset`,
-  per-dataset loss is computed inside the `no_sync` block while logits
-  are still alive, and returned on the `StepResult`.
+  a step that will be logged counts the positions drawn from each source
+  and sums each source's cross-entropy over its labeled tokens inside
+  the `no_sync` block while logits are still alive, in fp32, at most
+  1024 tokens at a time (`ce_chunk_size` when it is smaller). Both
+  return on the `StepResult` by source index and are summed over the
+  data-parallel ranks when logged.
 - **Loss scaling** — `loss / grad_accum_steps` keeps the effective
   learning rate invariant to the accumulation factor.
 
@@ -164,14 +168,29 @@ batches from the old weights for one more step.
 Metrics fire first, hooks second:
 
 ```python
-step_metrics = tracker.end_step(step=step, loss=avg_loss,
-                                grad_norm=grad_norm_val, lr=current_lr,
-                                tokens_in_step=tokens_in_step)
+applied_lr = optimizer.param_groups[0]["lr"]   # read before optimizer.step()
+...
+loss = dp_mean(result.loss, session.dp_groups, runtime.device)
+step_metrics = tracker.end_step(step=step, loss=loss,
+                                grad_norm=result.grad_norm, lr=applied_lr,
+                                tokens_in_step=tokens_in_step,
+                                seq_len=result.seq_len)
 hook_runner.on_step_end(StepContext(
-    step=step, loss=avg_loss, grad_norm=grad_norm_val, lr=current_lr,
+    step=step, loss=loss, grad_norm=result.grad_norm, lr=applied_lr,
     tokens_seen=tokens_seen, model=model, optimizer=optimizer,
 ))
 ```
+
+`loss` is the mean of the step's loss over the data-parallel ranks, the
+loss whose gradient the update applied, on every rank. `lr` is the LR
+the update used (for `schedule_free_adamw`, the rate before the warmup
+the optimizer applies inside `step()`). The per-module `lr/<module>` and
+`lr_adamw/<module>` metrics are read at the same point, so they describe
+the same update. `tokens_in_step` sums the positions each
+data-parallel rank ran, `result.tokens` (the configured batch for a step
+body that reports none), in one reduction with the step's documents and
+encoder images; a VLM step counts the image positions in the residual
+stream as well as the text.
 
 `StepContext` freezes the full step state for hooks that need to read
 gradients or parameter values before the next iteration. See
@@ -190,8 +209,8 @@ After the step body, before advancing:
 | NCCL health | `step % tc.nccl_health_check_interval == 0` | Small all-reduce; if it failed on any rank, every rank stops without saving and the loop raises `RuntimeError` |
 | Eval | `step % eval_config.interval == 0` | [`run_eval`](evaluation.md), `on_eval_end` hook |
 | Profiler | every step | `prof.step()` advances the schedule |
-| Checkpoint | `checkpoint.should_save(step)`: `dyn_ckpt_window` milestones inside the window, every `checkpoint.interval` steps outside it | `ckpt_mgr.save(step)`, `on_checkpoint_save` hook |
-| Shutdown | SIGTERM / SIGUSR1 pending on any rank | `ckpt_mgr.save(step)`, or `ckpt_mgr.wait()` when the checkpoint tick just saved this step; then break |
+| Checkpoint | `checkpoint.should_save(step)`: `dyn_ckpt_window` milestones inside the window, every `checkpoint.interval` steps outside it | `ckpt_mgr.save(step)`, logged as `checkpoint/save_sec`, then the `on_checkpoint_save` hook |
+| Shutdown | SIGTERM / SIGUSR1 pending on any rank | `ckpt_mgr.save(step)` (`checkpoint/save_sec`), or `ckpt_mgr.wait()` when the checkpoint tick just saved this step (`checkpoint/wait_sec` if that save is still pending); then break |
 
 The two stop rows are votes. Each row all-reduces the ranks' own
 verdicts, a failed probe or a pending signal, over
@@ -215,6 +234,15 @@ nothing (see
 `nccl_health_check_interval = 0` disables the all-reduce probe — it is
 off in every shipped config but worth enabling for long multi-node
 runs. See [Resilience § NCCL health](../resilience/index.md).
+
+None of this periodic work is inside the step's `step_time`, so `tok/s`
+and MFU leave it out. Each checkpoint save (startup, scheduled,
+emergency or final) logs the time the loop waited for it as
+`checkpoint/save_sec`, and each drain that finds an async save pending
+(the final `wait()`, the wait when a shutdown finds its step already
+saved, a freeze stage's flush) logs `checkpoint/wait_sec`; a drain with
+nothing pending logs nothing. A freeze stage's flush runs inside its
+step, so it is also in that step's `step_time`.
 
 ## Entry-point setup
 
