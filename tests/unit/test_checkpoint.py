@@ -1942,14 +1942,40 @@ class TestPluginsRecord:
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         assert mgr.load(path=str(path), plugins_expected=current)[0] == 1
 
-    def test_a_checkpoint_without_a_record_loads_with_a_warning(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        ("record", "reason"),
+        [
+            (None, "records no plugins list"),
+            ("pkg.a", "records plugins = 'pkg.a'"),
+            ("unreadable", "cannot read"),
+        ],
+        ids=["none", "invalid", "unreadable"],
+    )
+    def test_a_checkpoint_without_a_valid_record_loads_with_one_warning(
+        self, tmp_path, monkeypatch, record, reason
+    ):
+        """A missing, invalid or unreadable record is not compared, and rank 0 alone warns,
+        once."""
         path = self._saved(tmp_path, monkeypatch, None)
+        meta_path = path / "metadata.json"
+        if record == "unreadable":
+            meta_path.write_text("{")
+        elif record is not None:
+            meta_path.write_text(
+                json.dumps({**json.loads(meta_path.read_text()), "plugins": record})
+            )
         mgr = _make_mock_mgr(tmp_path, monkeypatch)
         (step, _, _), warnings = _manager_warnings(
             lambda: mgr.load(path=str(path), plugins_expected=["pkg.a"])
         )
         assert step == 1
-        assert any("records no plugins list" in w for w in warnings)
+        skipped = [w for w in warnings if "is not compared" in w]
+        assert len(skipped) == 1 and reason in skipped[0]
+        mgr._rank = 1
+        _, quiet = _manager_warnings(
+            lambda: mgr._check_plugins(mgr._broadcast_metadata(path), path, ["pkg.a"])
+        )
+        assert quiet == []
 
     def test_ignore_plugins_mismatch_loads_with_a_warning(self, tmp_path, monkeypatch):
         path = self._saved(tmp_path, monkeypatch, ["pkg.big"])

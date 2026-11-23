@@ -840,6 +840,47 @@ class TestResume:
         assert step == 3
         assert any(not torch.equal(b, p) for b, p in zip(before, model.parameters(), strict=True))
 
+    @staticmethod
+    def _record_plugins(step_dir):
+        """Record an empty plugins list in ``step_dir``'s metadata, as a training save does."""
+        meta = json.loads((step_dir / "metadata.json").read_text())
+        (step_dir / "metadata.json").write_text(json.dumps({**meta, "plugins": []}))
+
+    @pytest.mark.parametrize(
+        ("steps", "exclude"),
+        [(3, None), (3, ["optimizer"]), (0, None)],
+        ids=["resume", "no-optimizer", "unstepped"],
+    )
+    def test_the_plugins_check_leaves_the_multipliers_guard_on(self, tmp_path, steps, exclude):
+        """The plugins check reads metadata.json first, and other multipliers are still refused
+        before the scheduler is restored, also when no optimizer state is loaded."""
+        self._record_plugins(self._save(tmp_path, {"head": 2.0}, steps=steps))
+        _, scheduler, manager = self._resume(tmp_path, {})
+        with pytest.raises(ValueError, match="but this run uses"):
+            manager.load(scheduler=scheduler, exclude_keys=exclude, plugins_expected=[])
+        assert scheduler.last_epoch == 0
+
+    @pytest.mark.parametrize(
+        ("steps", "exclude"),
+        [(3, None), (3, ["optimizer"]), (0, None)],
+        ids=["resume", "no-optimizer", "unstepped"],
+    )
+    def test_the_plugins_and_multipliers_checks_share_one_metadata_read(
+        self, tmp_path, monkeypatch, steps, exclude
+    ):
+        self._record_plugins(self._save(tmp_path, {"head": 2.0}, steps=steps))
+        _, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
+        reads, checks = [], []
+        read, check = manager._broadcast_metadata, manager._check_lr_multipliers
+        monkeypatch.setattr(manager, "_broadcast_metadata", lambda *a: reads.append(a) or read(*a))
+        monkeypatch.setattr(
+            manager, "_check_lr_multipliers", lambda *a: checks.append(a) or check(*a)
+        )
+        assert (
+            manager.load(scheduler=scheduler, exclude_keys=exclude, plugins_expected=[])[0] == steps
+        )
+        assert len(reads) == 1 and len(checks) == 1
+
     WEIGHTS_ONLY = ["optimizer", "train_state"]
 
     @pytest.mark.parametrize("record", ["other", "unreadable"])
