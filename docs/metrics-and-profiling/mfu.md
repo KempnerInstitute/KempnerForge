@@ -29,11 +29,18 @@ attn_params = (
     + 2 * dim * (n_kv_heads * head_dim) # K + V
     + (n_heads * head_dim) * dim       # O
 )
-mlp_params = 3 * dim * computed_ffn_hidden_dim   # SwiGLU (up, gate, down)
+mlp_params = mlp_matrices * dim * computed_ffn_hidden_dim
 per_layer = attn_params + mlp_params
 output_params = vocab_size * dim
 active_params = n_layers * per_layer + output_params
 ```
+
+`mlp_matrices` is `ModelConfig.mlp_matrices`: 3 for `activation = "silu"`,
+which builds SwiGLU (gate, up and down projections), and 2 for `"gelu"` and
+`"relu"`, which build the standard MLP (up and down). An MLP a plugin
+registers under another name is counted as gated, 3 matrices, whatever it
+builds, so the estimate is exact for the built-in activations only.
+`num_params_estimate` counts MLPs the same way.
 
 Three things this does and doesn't count:
 
@@ -59,8 +66,8 @@ FLOPs. So `12*L*D*S` stays correct.
 
 ```python
 # kempnerforge/metrics/mfu.py — _moe_flops_per_token
-mlp_params        = 3 * dim * computed_ffn_hidden_dim
-expert_mlp_params = 3 * dim * computed_expert_ffn_hidden_dim
+mlp_params        = mlp_matrices * dim * computed_ffn_hidden_dim
+expert_mlp_params = mlp_matrices * dim * computed_expert_ffn_hidden_dim
 
 n_moe_layers = sum(1 for i in range(n_layers) if (i + 1) % moe_frequency == 0)
 n_dense_layers = n_layers - n_moe_layers
@@ -93,6 +100,32 @@ Key moves:
 
 The attention term (`12 * n_layers * dim * seq_len`) uses the full
 `n_layers` regardless of MoE vs dense — attention runs in every layer.
+
+## VLM runs: `train/mfu_vlm`
+
+`train/mfu` counts the language model alone, also in a VLM run. A VLM step
+body reports the images its vision encoder ran (every image, or every frame
+of a video, padding frames and the blank image of a packed batch without
+images included, since they run), and the loop adds their FLOPs to the
+language model's as `train/mfu_vlm`:
+
+```
+vision_flops = images_in_step * flops_per_image
+flops_per_image = f_enc * (2 * enc_params * enc_tokens + 4 * layers * enc_tokens**2 * hidden)
+                + f_adapter * adapter.forward_flops(enc_tokens)
+```
+
+`f` is 3 for a module with a trainable parameter (forward and backward) and
+1 for a frozen one, which runs forward only, as the step left them: a freeze
+stage that fires after the step changes the next step's count. `enc_tokens`
+is the encoder's `num_tokens`; the attention term needs the layers and width
+of the encoder's `vision_tower` config, which the Hugging Face encoders
+have, and is zero without them. `VisionAdapter.forward_flops` counts each
+projection over the tokens it sees, `2 * params` per output token by
+default (a pooling adapter projects after it pools), and the attentional
+pool's key and value projections over every padded window input. The images are summed
+over the data-parallel ranks, in the same reduction as the step's tokens
+(`vision_flops_per_image` in `kempnerforge/metrics/mfu.py`).
 
 ## FP8 caveat
 

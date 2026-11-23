@@ -215,13 +215,19 @@ LR that `scheduler.step()` just computed.
 ### 8 · Step accounting
 
 ```python
+tokens_in_step, documents_in_step, images_in_step = _step_counts(session, result)
+# each data-parallel rank adds result.tokens (the configured batch when a
+# step body counts none) in one reduction, with its documents and images
 step += 1
-tokens_in_step = tc.batch_size * tc.seq_len * tc.grad_accum_steps * dp_size
-tokens_seen   += tokens_in_step
+tokens_seen += tokens_in_step
 ```
 
-`tokens_in_step` times all ranks in the data-parallel dimension, not the
-full `world_size` — TP, PP, and EP don't multiply unique tokens.
+`result.tokens` counts every micro-step's positions, padding included; a
+VLM step also counts the image positions in the residual stream.
+
+`tokens_in_step` sums over the ranks of the data-parallel dimensions, not
+the full `world_size`: TP, PP and EP peers hold the same batch and count it
+once.
 
 ### 9 · Phase transitions
 
@@ -232,11 +238,20 @@ so the new weights take effect immediately.
 ### 10 · Metrics and hooks
 
 ```python
-step_metrics = tracker.end_step(step=step, loss=avg_loss,
-                                grad_norm=grad_norm_val, lr=current_lr,
-                                tokens_in_step=tokens_in_step)
+applied_lr = optimizer.param_groups[0]["lr"]   # read before optimizer.step()
+...
+loss = dp_mean(result.loss, session.dp_groups, runtime.device)
+step_metrics = tracker.end_step(step=step, loss=loss,
+                                grad_norm=result.grad_norm, lr=applied_lr,
+                                tokens_in_step=tokens_in_step,
+                                seq_len=result.seq_len)
 hook_runner.on_step_end(StepContext(...))
 ```
+
+`loss` is the step's loss averaged over the data-parallel ranks, the same
+on every rank, and `lr` is the rate the step's update used (for
+`schedule_free_adamw`, the rate before the warmup the optimizer applies
+inside `step()`).
 
 `tracker.end_step` dispatches to WandB / TensorBoard at
 `metrics.log_interval`. `HookRunner` (from

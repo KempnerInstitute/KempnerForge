@@ -104,9 +104,19 @@ def _row_tokens_per_image(tokens_per_image: int | None, setting: str) -> int:
 
 
 def _build_vlm_pipeline(
-    config: JobConfig, dp_rank: int, dp_size: int, tokens_per_image: int | None
+    config: JobConfig,
+    dp_rank: int,
+    dp_size: int,
+    tokens_per_image: int | None,
+    on_cuda: bool = False,
 ) -> DataPipeline:
-    """Image (Joint-Decoder) or video VLM loader, selected by ``config.is_video``."""
+    """Image (Joint-Decoder) or video VLM loader, selected by ``config.is_video``.
+
+    On CUDA, a dataset with text-only rows on the single-image route, unpacked with
+    ``data.hf_max_images = 1``, is refused under ``sdpa_backend="flash"`` where its frame
+    mask reaches attention under that backend (see
+    ``JobConfig.masks_frames_in_backend_attention``).
+    """
     tc = config.train
     vlm_cfg = config.vlm
     assert vlm_cfg is not None
@@ -177,9 +187,9 @@ def _build_vlm_pipeline(
             )
         else:
             flash = (
-                config.model.sdpa_backend == "flash"
-                and config.model.attention_backend == "sdpa"
-                and vlm_cfg.arch in ("joint_decoder", "moma")
+                on_cuda
+                and config.model.sdpa_backend == "flash"
+                and config.masks_frames_in_backend_attention()
             )
             if dataset.has_text_only_rows and flash:
                 raise ValueError(
@@ -380,7 +390,8 @@ def build_data_pipeline(
     dp_rank, dp_size = get_dp_info(runtime.device_mesh)
 
     if config.is_vlm:
-        return _build_vlm_pipeline(config, dp_rank, dp_size, tokens_per_image)
+        on_cuda = runtime.device.type == "cuda"
+        return _build_vlm_pipeline(config, dp_rank, dp_size, tokens_per_image, on_cuda)
     if config.data.datasets:
         return _build_mixture_pipeline(config, dp_rank, dp_size, eos_token_id)
     if config.data.dataset_path:
