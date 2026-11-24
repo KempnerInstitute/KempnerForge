@@ -340,18 +340,36 @@ prompt starts with a space (`lead_space`), and each view's tokens attend to each
 other in both directions (`view_groups`).
 
 The run starts from a stage-1 checkpoint saved as one `.pt` state dict, written
-as a DCP for this config first:
+as a DCP for this config first. On the cluster that checkpoint is
+`/n/holystore01/LABS/kempner_project_d/Lab/checkpoints/cross-modal/init/dcpacked-s1-50k-p16-512-k2mlp.pt`,
+step 50,000 of a stage-1 run with this preset's encoder (SigLIP2 so400m/16 at
+512 px) and connector (2 × 2 pooling into the RMS-normed GELU MLP). The converter
+reads either name of the connector's tensors (`adapter.norm` and
+`adapter.proj.{0,2}`, or `adapter.model.ln_q` and `adapter.model.mlp.{0,2}`); a
+checkpoint of another encoder, such as SigLIP so400m/14 at 224 px, is refused on
+its shapes.
 
 ```bash
 uv run python examples/image_understanding/scripts/convert_pt_checkpoint.py \
-    --checkpoint path-to-stage-1.pt \
+    --checkpoint /n/holystore01/LABS/kempner_project_d/Lab/checkpoints/cross-modal/init/dcpacked-s1-50k-p16-512-k2mlp.pt \
     --config examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml \
     --out /your/init/checkpoint
-uv run torchrun --nnodes=4 --nproc_per_node=4 examples/image_understanding/train.py \
+```
+
+The run takes 4 nodes of 4 GPUs. Launch it the way `scripts/slurm/multinode.sh`
+does, with one task per GPU and that script's `MASTER_ADDR`, `MASTER_PORT` and
+NCCL settings, running the example's entry point:
+
+```bash
+srun --kill-on-bad-exit=1 uv run python examples/image_understanding/train.py \
     examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml \
     --mixture=examples/image_understanding/mixtures/stage2_testbed_finevision_pixmo_text.toml \
     --checkpoint.load_path=/your/init/checkpoint --checkpoint.dir=/your/run/dir
 ```
+
+The mixture file and the run's settings for it (`[vlm]`, `data.pack_sequences`,
+`train.batch_size = 1`) are checked before training starts. The run saves every
+1000 steps and keeps the last three checkpoints.
 
 ## Evaluation tasks and scorers
 
