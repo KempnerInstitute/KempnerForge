@@ -146,8 +146,10 @@ def realworldqa(dataset_dir: str | Path) -> RealWorldQARows:
     ``dataset_dir`` holds the shards as the Hub lays them out,
     ``data/test-<i>-of-<n>.parquet`` with ``i`` from 0 to ``n - 1``, as
     ``hf download xai-org/RealworldQA --repo-type dataset --local-dir <dataset_dir>``
-    writes them, and they are read in shard order. A directory without a shard
-    raises ``FileNotFoundError``; shards that disagree on ``n``, or that leave
-    one of the ``n`` out, raise ``ValueError``.
+    writes them with ``--revision 17e7f75e092e47169732462ea3cdfebe911105dd``, the
+    revision of the 765 rows (the card says the set will grow), and they are read
+    in shard order. A directory without a shard raises ``FileNotFoundError``;
+    shards that disagree on ``n``, or that leave one of the ``n`` out, raise
+    ``ValueError``.
     """
     return RealWorldQARows(_test_shards(Path(dataset_dir)))
