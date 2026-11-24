@@ -92,6 +92,13 @@ class TestUnpackedNames:
         assert set(state["optimizer"]["state"]) == expected
         assert set(state["optimizer_never_stepped"]) == {_names([3])[0]}
 
+    def test_global_names_follow_the_order_given(self):
+        """Rank 1's local experts take their global index; other names pass through."""
+        layout = ExpertLayout([(LAYER, _rank_one_of_two())])
+        gate = f"{LAYER}.router.gate.weight"
+        names = [*_names([1]), gate, *_names([0])]
+        assert layout.global_names(names) == [*_names([3]), gate, *_names([2])]
+
     def test_tensors_are_the_rank_own(self):
         """Each global name holds the tensor of the local expert it names."""
         moe = _rank_one_of_two()

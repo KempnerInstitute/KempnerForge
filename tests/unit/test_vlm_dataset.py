@@ -7,6 +7,7 @@ import logging
 import random
 import re
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -634,6 +635,97 @@ class TestPromptColumnRoom:
 
     def test_an_empty_dataset_is_not_rejected(self, tmp_path, monkeypatch):
         assert len(_prompted_dataset(tmp_path, monkeypatch, [])) == 0
+
+
+class TestCaptionColumn:
+    """Building the dataset rejects a caption column that misses a kept row's caption or
+    holds another type, so every rank fails there, instead of the rank that reads the row
+    failing mid-run while the others wait in a collective."""
+
+    _LOAD = dict(split="train", image_field="image", text_field="caption", tokenizer_path="gpt2")
+
+    @staticmethod
+    def _saved(tmp_path, images, captions) -> str:
+        from datasets import Dataset
+
+        path = str(tmp_path / "captions")
+        Dataset.from_dict({"image": images, "caption": captions}).save_to_disk(path)
+        return path
+
+    def test_a_missing_caption_names_its_row_before_the_tokenizer_is_built(
+        self, tmp_path, monkeypatch
+    ):
+        """Row 1 is skipped for its two images, so the kept rows are an index mapping; the
+        first missing caption is reported at its index in the dataset as loaded."""
+        one, two = [_make_image(8)], [_make_image(8)] * 2
+        path = self._saved(tmp_path, [one, two, one, one], ["a b", "a b", None, None])
+
+        def no_tokenizer(path):
+            raise AssertionError("the tokenizer was built before the captions were checked")
+
+        monkeypatch.setattr(vlm_dataset, "build_tokenizer", no_tokenizer)
+        with pytest.raises(ValueError, match=r"'caption' has no value in row 2 and 1 more$"):
+            HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
+
+    def test_a_missing_caption_is_found_across_chunks(self):
+        """The column spans two Arrow chunks: the kept rows are looked up across both, and a
+        missing caption in a row the dataset skips does not count."""
+        from datasets import Dataset, concatenate_datasets
+
+        first, second = {"caption": ["a", "b", None]}, {"caption": ["d", None]}
+        rows = concatenate_datasets([Dataset.from_dict(first), Dataset.from_dict(second)])
+        assert rows.data.column("caption").num_chunks == 2
+        with pytest.raises(ValueError, match=r"'caption' has no value in row 2 and 1 more$"):
+            vlm_dataset._check_text_column(rows, "caption", np.arange(5))
+        with pytest.raises(ValueError, match=r"'caption' has no value in row 4$"):
+            vlm_dataset._check_text_column(rows, "caption", np.array([0, 1, 3, 4]))
+
+    def test_the_check_reads_no_row(self, monkeypatch):
+        """The check reads the column's validity, not rows, so a dataset with a missing
+        caption somewhere costs no row gather, whichever rows are kept."""
+        from datasets import Dataset
+
+        rows = Dataset.from_dict({"caption": ["a", None, "c", None]})
+
+        def no_rows(self, key):
+            raise AssertionError("the caption check read rows")
+
+        monkeypatch.setattr(Dataset, "__getitem__", no_rows)
+        vlm_dataset._check_text_column(rows, "caption", np.array([0, 2]))
+        with pytest.raises(ValueError, match=r"'caption' has no value in row 1$"):
+            vlm_dataset._check_text_column(rows, "caption", np.array([0, 1, 2]))
+
+    def test_kept_rows_without_the_missing_caption_pass(self):
+        from datasets import Dataset
+
+        rows = Dataset.from_dict({"caption": ["a", None, "c"]})
+        vlm_dataset._check_text_column(rows, "caption", np.array([0, 2]))
+
+    def test_a_missing_caption_in_a_skipped_row_is_never_read(self, tmp_path):
+        path = self._saved(tmp_path, [[_make_image(8)] * 2, [_make_image(8)]], [None, "a b"])
+        assert len(HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)) == 1
+
+    def test_a_column_with_no_caption_is_rejected(self, tmp_path):
+        path = self._saved(tmp_path, [_make_image(8)], [None])
+        with pytest.raises(ValueError, match=r"'caption' has no value in row 0$"):
+            HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
+
+    @pytest.mark.parametrize("dtype", ["string", "large_string"])
+    def test_a_full_string_column_is_accepted(self, tmp_path, dtype):
+        from datasets import Dataset, Features, Value
+        from datasets import Image as ImageFeature
+
+        path = str(tmp_path / "captions")
+        features = Features({"image": ImageFeature(), "caption": Value(dtype)})
+        rows = {"image": [_make_image(8)] * 2, "caption": ["a b", "c d"]}
+        Dataset.from_dict(rows, features=features).save_to_disk(path)
+        assert len(HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)) == 2
+
+    @pytest.mark.parametrize("captions", [[1, 2], [["a"], ["b"]]], ids=["int", "list"])
+    def test_a_column_of_another_type_is_rejected(self, tmp_path, captions):
+        path = self._saved(tmp_path, [_make_image(8)] * 2, captions)
+        with pytest.raises(TypeError, match="'caption' must be a string column"):
+            HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
 
 
 class TestPromptColumnType:
