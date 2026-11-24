@@ -129,6 +129,18 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
             return value
         return [value]
 
+    if origin is dict:
+        args = get_args(field_type)
+        if not isinstance(value, dict) or len(args) != 2:
+            return value
+        coerced = {}
+        for key, item in value.items():
+            try:
+                coerced[key] = _coerce_value(args[1], item)
+            except ValueError as e:
+                raise ValueError(f"key {key!r}: {e}") from None
+        return coerced
+
     if field_type is bool:
         return _coerce_bool(value)
     if field_type is int or field_type is float:
@@ -280,7 +292,7 @@ def _instantiate_from_dict(dc_type: type, data: dict[str, Any]) -> Any:
             default = None
             if isinstance(raw, _DottedKeys):
                 default = f.default_factory() if callable(f.default_factory) else f.default
-            kwargs[f.name] = _coerce_value(hint, _dict_field_value(raw, default))
+            kwargs[f.name] = _coerce_field(dc_type, f.name, hint, _dict_field_value(raw, default))
         else:
             kwargs[f.name] = _coerce_field(dc_type, f.name, hint, raw)
     return dc_type(**kwargs)
@@ -346,20 +358,17 @@ def _apply_dict_to_dataclass(dc: Any, data: dict[str, Any]) -> Any:
         current_val = getattr(dc, f.name)
         if f.name in data:
             raw = data[f.name]
+            hint = type_hints[f.name]
+            inner = _dataclass_type_from_hint(hint)
             if is_dataclass(current_val) and isinstance(raw, dict):
                 kwargs[f.name] = _apply_dict_to_dataclass(current_val, raw)
-            elif isinstance(raw, dict) and _dataclass_type_from_hint(type_hints[f.name]) is None:
-                kwargs[f.name] = _coerce_value(
-                    type_hints[f.name], _dict_field_value(raw, current_val)
-                )
-            elif current_val is None and isinstance(raw, dict):
-                inner = _dataclass_type_from_hint(type_hints[f.name])
-                if inner is not None:
-                    kwargs[f.name] = _instantiate_from_dict(inner, raw)
-                else:
-                    kwargs[f.name] = _coerce_field(dc_type, f.name, type_hints[f.name], raw)
+            elif isinstance(raw, dict) and inner is not None and current_val is None:
+                kwargs[f.name] = _instantiate_from_dict(inner, raw)
+            elif isinstance(raw, dict) and inner is None:
+                table = _dict_field_value(raw, current_val)
+                kwargs[f.name] = _coerce_field(dc_type, f.name, hint, table)
             else:
-                kwargs[f.name] = _coerce_field(dc_type, f.name, type_hints[f.name], raw)
+                kwargs[f.name] = _coerce_field(dc_type, f.name, hint, raw)
         else:
             kwargs[f.name] = current_val
 

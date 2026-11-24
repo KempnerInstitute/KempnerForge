@@ -258,7 +258,7 @@
         "_apply_dict_to_dataclass(dc, data)",
         "_with_dotted_keys(table, keys) -> dict (a dotted override's keys set on a dict-valued field's table, the rest kept)",
         "_dict_field_value(raw, current) -> dict (a dotted override merges into current, a literal replaces it)",
-        "_coerce_value(field_type, value) (refuses a value that cannot stand for the type)",
+        "_coerce_value(field_type, value) (refuses a value that cannot stand for the type; a dict's values take its value type)",
         "_coerce_bool(value) -> bool (a bool, 0 or 1, or a true/false spelling; else ValueError)",
         "_coerce_number(field_type, value) (an int or float from a number or numeric string; refuses bools and fractional ints)",
         "_coerce_field(dc_type, name, hint, raw) (_coerce_value whose errors name dc_type.name)",
@@ -1615,9 +1615,9 @@
           "TestCliParsing(6)",
           "TestRegistry(12)",
           "TestEvalConfig(7)",
-          "TestDottedDictOverrides(9)"
+          "TestDottedDictOverrides(13)"
         ],
-        "count": 134
+        "count": 138
       },
       "tests/unit/test_training.py": {
         "classes": [

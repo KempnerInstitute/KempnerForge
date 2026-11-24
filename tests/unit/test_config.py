@@ -2189,6 +2189,7 @@ class TestDottedDictOverrides:
             nested: dict[str, dict[str, int]] = field(
                 default_factory=lambda: {"a": {"x": 1, "y": 2}, "b": {"z": 3}}
             )
+            tree: dict[str, typing.Any] = field(default_factory=dict)
 
         return loader._apply_dict_to_dataclass(Tables(), _parse_cli_overrides(args))
 
@@ -2262,10 +2263,54 @@ class TestDottedDictOverrides:
             assert loader._instantiate_from_dict(Raising, {"table": raw}).table == {"k": "v"}
 
     def test_dotted_keys_inside_an_earlier_literal_give_plain_dicts(self):
-        args = ["--nested={'a': {}}", "--nested.a.p.q=1", "--nested.c.d=2"]
+        args = ["--tree={'a': {}}", "--tree.a.p.q=1", "--tree.c.d=2"]
         tables = self._tables_with(args)
-        assert tables.nested == {"a": {"p": {"q": 1}}, "c": {"d": 2}}
-        assert type(tables.nested["a"]["p"]) is dict and type(tables.nested["c"]) is dict
+        assert tables.tree == {"a": {"p": {"q": 1}}, "c": {"d": 2}}
+        assert type(tables.tree["a"]["p"]) is dict and type(tables.tree["c"]) is dict
+
+    def test_a_dotted_key_takes_the_value_type_of_the_table(self, tmp_path):
+        path = self._toml(tmp_path, self._VLM + '\n[vlm]\narch = "joint_decoder"\n')
+        override = "--vlm.module_patterns.vision_encoder=vision_encoder.*"
+        vlm = load_config(path, cli_args=[override]).vlm
+        assert vlm is not None
+        assert vlm.module_patterns["vision_encoder"] == ["vision_encoder.*"]
+        weights = load_config(path, cli_args=["--data.anneal_weights.c=1"]).data.anneal_weights
+        assert weights == {"c": 1.0} and type(weights["c"]) is float
+
+    def test_a_table_built_from_a_dict_takes_the_value_type(self):
+        from dataclasses import dataclass, field
+
+        @dataclass
+        class Tables:
+            patterns: dict[str, list[str]] = field(default_factory=dict)
+            weights: dict[str, float] = field(default_factory=dict)
+
+        for raw in ({"k": "v.*"}, _parse_cli_overrides(["--patterns.k=v.*"])["patterns"]):
+            built = loader._instantiate_from_dict(Tables, {"patterns": raw})
+            assert built.patterns == {"k": ["v.*"]}
+        with pytest.raises(ValueError, match=r"^Tables\.weights: key 'a': expected a float"):
+            loader._instantiate_from_dict(Tables, {"weights": {"a": "x"}})
+
+    @pytest.mark.parametrize(
+        ("toml", "args", "got"),
+        [
+            ('[data.anneal_weights]\nc4 = "x"\n', [], "'x'"),
+            ("", ["--data.anneal_weights.c4.en=0.9"], "{'en': 0.9}"),
+        ],
+    )
+    def test_a_value_the_value_type_refuses_names_the_field_and_key(
+        self, tmp_path, toml, args, got
+    ):
+        path = self._toml(tmp_path, toml)
+        refusal = rf"^DataConfig\.anneal_weights: key 'c4': expected a float, got {re.escape(got)}$"
+        with pytest.raises(ValueError, match=refusal):
+            load_config(path, cli_args=args)
+
+    def test_values_of_nested_tables_are_coerced(self):
+        tables = self._tables_with(["--nested.a.x=2.0"])
+        assert tables.nested["a"] == {"x": 2, "y": 2} and type(tables.nested["a"]["x"]) is int
+        with pytest.raises(ValueError, match=r"^Tables\.nested: key 'a': key 'x': expected an int"):
+            self._tables_with(["--nested.a.x=2.5"])
 
 
 class TestEvalConfig:
