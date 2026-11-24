@@ -280,7 +280,7 @@ if nccl_failed_at is not None:
     raise RuntimeError(...)            # an NCCL stop fails the run
 hook_runner.on_train_end(step, tokens_seen)
 tracker.close()
-ckpt_mgr.release_dir()                 # mark <checkpoint.dir>/.owner released
+ckpt_mgr.release_dir()
 destroy_distributed()
 shutdown_handler.finish()              # restore the handlers, cancel the timer
 ```

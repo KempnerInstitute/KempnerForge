@@ -6,12 +6,14 @@ import json
 import logging
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +120,39 @@ def _exited_pid() -> int:
     return child.pid
 
 
+def _in_forked_child(work: Callable[[], str], timeout: float = 60.0) -> tuple[int, str]:
+    """Run ``work`` in a forked child; return its exit code (-1 if killed) and its text.
+
+    The child exits whatever ``work`` does, and one still running after ``timeout``
+    seconds, or when the parent is interrupted, is killed and reaped.
+    """
+    read, write = os.pipe()
+    child = os.fork()
+    if child == 0:
+        code = 1
+        try:
+            os.write(write, work().encode())
+            code = 0
+        finally:
+            os._exit(code)
+    os.close(write)
+    pipe = os.fdopen(read)
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            done, status = os.waitpid(child, os.WNOHANG)
+            if done:
+                child = 0
+                return os.waitstatus_to_exitcode(status), pipe.read()
+            time.sleep(0.05)
+        return -1, ""
+    finally:
+        if child:
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+        pipe.close()
+
+
 class TestThisRun:
     def test_a_run_outside_slurm(self) -> None:
         record = this_run()
@@ -156,15 +191,8 @@ class TestThisRun:
     def test_a_process_keeps_its_id_and_a_forked_child_gets_its_own(self) -> None:
         mine = this_run()["process"]
         assert re.fullmatch(r"[0-9a-f]{32}", mine) and this_run()["process"] == mine
-        read, write = os.pipe()
-        child = os.fork()
-        if child == 0:
-            os.write(write, this_run()["process"].encode())
-            os._exit(0)
-        os.close(write)
-        os.waitpid(child, 0)
-        with os.fdopen(read) as pipe:
-            assert pipe.read() not in ("", mine)
+        code, child = _in_forked_child(lambda: this_run()["process"])
+        assert code == 0 and child not in ("", mine)
 
 
 class TestClaim:
@@ -731,6 +759,27 @@ class TestOneProcess:
         release.join(10)
         claim.join(10)
         assert _owner(tmp_path / OWNER_FILE)["claim"] == claims[0] != first
+
+    def test_a_child_forked_while_a_thread_claims_gets_a_free_lock(self, tmp_path: Path) -> None:
+        """The parent's thread that holds the lock when the process forks does not run in
+        the child, so the child claims with a lock of its own."""
+        held, done = threading.Event(), threading.Event()
+
+        def hold_the_lock() -> None:
+            with ownership._LOCK:
+                held.set()
+                done.wait(60)
+
+        holder = threading.Thread(target=hold_the_lock)
+        holder.start()
+        try:
+            assert held.wait(10)
+            directory = tmp_path / "child"
+            code, claim = _in_forked_child(lambda: claim_checkpoint_dir(directory), timeout=30)
+        finally:
+            done.set()
+            holder.join(10)
+        assert code == 0 and _owner(directory / OWNER_FILE)["claim"] == claim
 
 
 class TestClaimersInProcesses:

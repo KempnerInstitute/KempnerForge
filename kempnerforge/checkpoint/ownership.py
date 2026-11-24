@@ -49,14 +49,19 @@ class CheckpointDirInUseError(RuntimeError):
     """Another run that is alive, or not known to have ended, owns the checkpoint directory."""
 
 
-def _new_process_id() -> None:
-    """Give this process, or a child forked from it, a random id of its own."""
-    global _process_id
+def _after_fork_in_child() -> None:
+    """Give a child forked from this process a random id of its own and a free lock.
+
+    A thread of the parent may hold the lock when the process forks, and that thread does
+    not run in the child, which would keep the lock held.
+    """
+    global _process_id, _LOCK
     _process_id = uuid.uuid4().hex
+    _LOCK = threading.Lock()
 
 
 _process_id = uuid.uuid4().hex
-os.register_at_fork(after_in_child=_new_process_id)
+os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def _pid_namespace() -> int | None:

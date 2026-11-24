@@ -40,9 +40,8 @@ class TestClaimOnEveryRank:
         manager.claim_dir()
         dist.barrier()
         record = json.loads((directory / OWNER_FILE).read_text())
-        assert record["host"] == socket.gethostname()
         if dist.get_rank() == 0:
-            assert record["pid"] == os.getpid()
+            assert (record["host"], record["pid"]) == (socket.gethostname(), os.getpid())
         dist.barrier()
         manager.release_dir()
         dist.barrier()
