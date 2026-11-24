@@ -136,7 +136,7 @@ def main() -> None:
     print(f"Model: {config.model.num_params_estimate / 1e6:.0f}M params on {device} ({dtype})")
 
     if args.interactive:
-        print("Interactive mode — type a prompt and press Enter. Ctrl+C to exit.\n")
+        print("Interactive mode: type a prompt and press Enter. Ctrl+C to exit.\n")
         while True:
             try:
                 prompt = input(">>> ")

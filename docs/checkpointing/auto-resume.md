@@ -174,21 +174,28 @@ Inside `CheckpointManager.save` (rank 0 only):
 ```python
 # manager.py
 latest = self._latest_link()                # <dir>/latest
-tmp_link = latest.with_suffix(".tmp")       # <dir>/latest.tmp
-tmp_link.unlink(missing_ok=True)
+tag = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex}"
+tmp_link = latest.with_name(f"{latest.name}.{tag}.tmp")
 tmp_link.symlink_to(ckpt_dir.name)          # relative link: "step_1000"
-tmp_link.rename(latest)                     # atomic rename
+try:
+    tmp_link.rename(latest)                 # atomic rename
+except BaseException:
+    tmp_link.unlink(missing_ok=True)
+    raise
 ```
 
-Two details that matter:
+Three details that matter:
 
-- **Relative target** — the symlink points at `step_1000`, not
+- **Relative target**: the symlink points at `step_1000`, not
   `/abs/path/checkpoints/step_1000`. Checkpoint directories stay
   portable when moved or bind-mounted.
-- **Atomic rename** — `tmp_link.rename(latest)` is a single atomic
+- **Atomic rename**: `tmp_link.rename(latest)` is a single atomic
   syscall (`rename(2)` on POSIX). Either the old symlink is still
-  there or the new one is — never a half-written state. Safe against
+  there or the new one is, never a half-written state. Safe against
   crashes mid-save.
+- **A temporary name of its own**: the new link is made under a name
+  of this host, process and call, so no other writer removes or
+  replaces it before the rename, and a rename that fails removes it.
 
 The symlink is updated **after** the DCP save completes (async save
 futures are resolved before the next save starts), so `latest` only
@@ -207,6 +214,77 @@ whose own part failed raises that error, and every other rank raises a
 for one that has already raised. Pruning runs only once `latest` has
 moved, so an error while pruning fails no rank (see
 [Retention cleanup](#retention-cleanup)).
+
+## One run per checkpoint directory
+
+Two live runs pointed at one `checkpoint.dir`, such as one config
+launched twice from the same working directory, would overwrite each
+other's checkpoints, prune each other's `step_*` directories and resume
+from each other's `latest`. So before a training run resumes or saves,
+rank 0 records it in `<checkpoint.dir>/.owner`, and every rank stops
+when that fails. The record holds a claim id of its own, a random id of
+the process, by which a process knows its own records, the host, pid,
+pid namespace and start time, and under SLURM the job (`SLURM_JOB_ID`, or
+`<SLURM_ARRAY_JOB_ID>_<SLURM_ARRAY_TASK_ID>` for a job array element),
+its cluster (`SLURM_CLUSTER_NAME`) and its requeue count
+(`SLURM_RESTART_COUNT`). A run finds one of these:
+
+- **No record**: the run claims the directory. The record is written to
+  a temporary file and linked into place, so it appears whole and only
+  one of two runs claiming at once creates it.
+- **A record this process wrote**: replaced, as when a run that raised
+  is followed by another in the same process, unless the process
+  released it; a released record goes through the token below.
+- **A record of a run that is still alive**: the run stops with an error
+  that names the owner.
+- **A released record**: replaced, as below but without a warning.
+- **A record of a run that has ended**: replaced, with a warning. Of two
+  runs that find it at once, only the one that creates
+  `.owner.<that record's claim id>.takeover` replaces it, and the other
+  then finds the new owner alive. The run renames a link of its own
+  temporary file, under a name only its claim uses, so a rename that NFS
+  replays finds nothing to move, and it reads the record back before it
+  counts the claim.
+- **A record of a run this process cannot check**: the run stops, and the
+  error names the file to remove if that run has ended.
+
+Whether the owner is alive depends on where it ran:
+
+- **An earlier attempt of this SLURM job**, the same job with another
+  requeue count, has ended: a requeued job goes back to pending before
+  it runs again.
+- **Another run in this SLURM job**, such as a second training in one
+  allocation, is alive while its pid runs. Only a process on its host
+  and in its pid namespace can check, since containers that share the
+  host name but not the pid namespace reuse pids, and a host where
+  `/proc` does not show the namespace cannot check at all.
+- **Another SLURM job** is alive until `squeue` lists it in a final
+  state, such as `COMPLETED`, `CANCELLED`, `FAILED` or `TIMEOUT`, or no
+  longer lists it. `squeue` runs without the `SQUEUE_*` and
+  `SLURM_CLUSTERS` settings that narrow what it lists, and a run outside
+  SLURM asks the owner's cluster by name. A job of another cluster than
+  the run's own, or one `squeue` cannot answer for, cannot be checked.
+- **A run outside SLURM** is alive while its pid runs. Only a process on
+  its host and in its pid namespace can check.
+
+A run that ends cleanly marks its record released, replacing it the
+same way with a released record; nothing removes `.owner`, so a removal
+NFS replays cannot remove a later run's record. An error marking it is
+logged, not raised. A run that crashes leaves its record, and the next
+run takes it over once the first has ended. A run that dies while it
+holds a `.takeover` file leaves that file, and the next run takes the
+file over the same way once that run has ended; while its run is alive,
+or cannot be checked, the next run stops with an error that names the
+file. Claims and releases in one process run one at a time. Scripts that
+only read checkpoints, such as `scripts/eval.py`, do not claim the
+directory.
+
+The protocol assumes that the filesystem applies each request once, and
+that a request from a process that has died is not applied after another
+process has taken the directory over. Local filesystems, NFSv4.1
+sessions and NFSv3 servers with a duplicate request cache give both; on
+a server that loses its reply cache, rare orderings could still admit
+two owners.
 
 ## Retention cleanup
 

@@ -496,7 +496,7 @@ def apply_fsdp2(
             int = rate-limit the number of concurrent all-gathers.
     """
     if not has_dp_mesh(device_mesh):
-        logger.info("No DP dimensions in mesh — skipping FSDP2")
+        logger.info("No DP dimensions in mesh; skipping FSDP2")
         return
 
     dp_mesh = get_dp_mesh(device_mesh)

@@ -69,6 +69,7 @@ class TinyTextModel(nn.Module):
 
 class FakeCheckpointManager:
     def __init__(self) -> None:
+        self.ownership: list[str] = []
         self.saves: list[tuple[int, int, dict]] = []
         self.waits = 0
         self.flushes = 0
@@ -97,6 +98,12 @@ class FakeCheckpointManager:
     @property
     def saved_steps(self) -> list[int]:
         return [s for s, _, _ in self.saves]
+
+    def claim_dir(self) -> None:
+        self.ownership.append("claim")
+
+    def release_dir(self) -> None:
+        self.ownership.append("release")
 
 
 class FakeShutdownHandler:
@@ -1476,6 +1483,60 @@ class TestRunTraining:
         )
         assert destroys == [1]
         assert closes == [1, 1]
+
+    def test_the_checkpoint_dir_is_claimed_before_resuming_and_released_at_a_clean_exit(
+        self, monkeypatch
+    ):
+        """A run owns checkpoint.dir from before it resumes until it ends cleanly; a run that
+        raises keeps the claim, which a later run takes over once this one has ended (#353)."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        events = ckpt.ownership
+        monkeypatch.setattr(
+            entry, "restore_checkpoint", lambda *_a, **_k: events.append("restore") or (0, 0)
+        )
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: events.append("destroy"))
+
+        def boom(_session, _step):
+            raise RuntimeError("step blew up")
+
+        with pytest.raises(RuntimeError, match="step blew up"):
+            run_training(make_config(max_steps=2), step_fn=boom)
+        assert events == ["claim", "restore"]
+        events.clear()
+        run_training(
+            make_config(max_steps=2),
+            step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5),
+        )
+        assert events == ["claim", "restore", "release", "destroy"]
+
+    def test_the_teardown_runs_when_releasing_the_checkpoint_dir_fails(self, monkeypatch):
+        """The process group is destroyed and the handler retired even so (#353)."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        handler = FakeShutdownHandler()
+        monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: handler)
+        events = ckpt.ownership
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: events.append("destroy"))
+
+        def release_fails():
+            events.append("release")
+            raise RuntimeError("release failed")
+
+        monkeypatch.setattr(ckpt, "release_dir", release_fails)
+        with pytest.raises(RuntimeError, match="release failed"):
+            run_training(
+                make_config(max_steps=2),
+                step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5),
+            )
+        assert events == ["claim", "release", "destroy"]
+        assert handler.finished
 
     def test_finish_runs_after_the_emergency_flush_and_the_teardown(self, monkeypatch):
         """The handler and its timer outlive the last ``wait()`` and the teardown (#313)."""

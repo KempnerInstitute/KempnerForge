@@ -18,7 +18,7 @@ nan_detector = NaNDetector(action="warn", max_consecutive=10)
 if not nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
     optimizer.zero_grad()
     if nan_detector.should_rollback:
-        logger.error("Too many consecutive NaNs — stopping")
+        logger.error("Too many consecutive NaNs; stopping")
         break
     _advance_lr_schedule(session)            # scheduler.step(), then the phase lr_scale
     step += 1
@@ -131,7 +131,7 @@ if action not in ("warn", "skip", "raise"):
 | Action | Behavior | When to pick it |
 |--------|----------|-----------------|
 | `"warn"` | Log a warning, return `False`. Loop zeros grads and continues. | Default. NaN-tolerant training where a single bad step shouldn't kill the run. |
-| `"skip"` | Same as `"warn"` but logs `"— skipping optimizer step"` explicitly. | Same as warn; the two are nearly equivalent since the caller already skips the optimizer step on `False`. |
+| `"skip"` | Same as `"warn"` but logs `"; skipping optimizer step"` explicitly. | Same as warn; the two are nearly equivalent since the caller already skips the optimizer step on `False`. |
 | `"raise"` | Raise `RuntimeError` immediately. | Early development when you want the run to die loudly on first NaN. |
 
 In the shipped training loop, `"warn"` and `"skip"` produce the same
@@ -200,7 +200,7 @@ automatically:
 ```python
 # training/loop.py::run_training_loop
 if nan_detector.should_rollback:
-    logger.error("Too many consecutive NaNs — stopping")
+    logger.error("Too many consecutive NaNs; stopping")
     break
 ```
 

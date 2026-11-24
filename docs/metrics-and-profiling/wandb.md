@@ -106,7 +106,7 @@ All scalars. No histograms, no images, no tables.
 
 ```python
 except ImportError:
-    logger.warning("wandb not installed — disabling WandB backend")
+    logger.warning("wandb not installed; disabling WandB backend")
     self._run = False
 except Exception as e:     # network, auth, quota, etc.
     logger.warning(f"WandB init failed: {e}")
