@@ -56,8 +56,8 @@ image_root = "path-to-chartqa-images"
 [[tasks]]
 name = "realworldqa"
 reader = "realworldqa"
-scorer = "trimmed_match"
-max_new_tokens = 10
+scorer = "realworldqa_accuracy"
+max_new_tokens = 16
 
 [tasks.reader_args]
 dataset_dir = "path-to-realworldqa"

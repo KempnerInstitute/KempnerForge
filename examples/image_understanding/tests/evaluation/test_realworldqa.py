@@ -14,7 +14,7 @@ import pyarrow.parquet as pq
 import pytest
 from evaluation.evaluator import UNREADABLE_ROW, evaluate_checkpoint
 from evaluation.realworldqa import RealWorldQARows, realworldqa
-from evaluation.scorers import trimmed_match
+from evaluation.scorers import REALWORLDQA_CHOICES, extract_mcq_answer, realworldqa_accuracy
 from evaluation.tasks import READERS, build_reader, load_tasks
 from image_text.skip import NoUsableRowError
 from PIL import Image
@@ -111,12 +111,12 @@ class TestPublishedLayout:
 
 
 class TestRows:
-    def test_the_question_is_the_prompt_as_written_and_the_answer_its_one_reference(
+    def test_the_stripped_question_is_the_prompt_and_the_answer_its_one_reference(
         self, tmp_path: Path
     ) -> None:
-        question = f" Which way is the car turning?\nA. Left\nB. Right\n{LETTER}\n"
+        question = f"Which way is the car turning?\nA. Left\nB. Right\n{LETTER}"
         image = _image(_encoded((10, 4), image_format="WEBP"))
-        document = realworldqa(_publish(tmp_path, [_row(question, " B\n", image)]))[0]
+        document = realworldqa(_publish(tmp_path, [_row(f" \n{question}\n ", " B\n", image)]))[0]
         assert document.kind == "qa"
         assert len(document.turns) == 1
         assert document.turns[0].user == question
@@ -232,10 +232,10 @@ class TestFiles:
         assert (document.turns[0].user, document.turns[0].answers) == ("Q", ("A",))
 
 
-def _task_file(path: Path, dataset_dir: Path | str | None, max_new_tokens: int = 10) -> Path:
+def _task_file(path: Path, dataset_dir: Path | str | None, max_new_tokens: int = 16) -> Path:
     text = (
-        '[[tasks]]\nname = "realworldqa"\nreader = "realworldqa"\nscorer = "trimmed_match"\n'
-        f"max_new_tokens = {max_new_tokens}\n"
+        '[[tasks]]\nname = "realworldqa"\nreader = "realworldqa"\n'
+        f'scorer = "realworldqa_accuracy"\nmax_new_tokens = {max_new_tokens}\n'
     )
     if dataset_dir is not None:
         text += f'\n[tasks.reader_args]\ndataset_dir = "{dataset_dir}"\n'
@@ -290,25 +290,43 @@ def _evaluate(
     return results["tasks"]["realworldqa"], [json.loads(line) for line in lines]
 
 
+def _matching_reference(prediction: str) -> str | None:
+    """A reference that ``prediction`` matches once the reader strips it, if there is one."""
+    letter = extract_mcq_answer(prediction, choices=list(REALWORLDQA_CHOICES))
+    if letter:
+        return f" {letter.lower()} "
+    text = prediction.lower().strip().rstrip(".")
+    if text and text == text.strip() and text.upper() not in REALWORLDQA_CHOICES:
+        return f" {text.upper()} "
+    return None
+
+
 class TestEvaluation:
-    def test_the_split_is_decoded_and_scored_with_the_trimmed_match(
+    def test_the_split_is_decoded_and_scored_as_lmms_eval_scores_it(
         self, run: tuple[JobConfig, Path], tmp_path: Path
     ) -> None:
         summary, records = _evaluate(run, tmp_path, "first", ["zebra"] * 5)
-        assert (summary["scorer"], summary["rows"], summary["samples"]) == ("trimmed_match", 5, 4)
+        assert (summary["scorer"], summary["rows"], summary["samples"]) == (
+            "realworldqa_accuracy",
+            5,
+            4,
+        )
         assert summary["skipped"] == {UNREADABLE_ROW: 1}
         assert records[2] == {"row": 2, "skipped": UNREADABLE_ROW}
         scored = [record for record in records if "skipped" not in record]
         assert [record["score"] for record in scored] == [
-            trimmed_match(record["prediction"], record["answers"]) for record in scored
+            realworldqa_accuracy(record["prediction"], record["answers"]) for record in scored
         ]
         predictions = {record["row"]: record["prediction"] for record in scored}
-        matched = [row for row, prediction in predictions.items() if prediction.strip(" ?.!")]
+        last = max(predictions)
+        references = {
+            row: _matching_reference(prediction)
+            for row, prediction in predictions.items()
+            if row != last
+        }
+        matched = [row for row, reference in references.items() if reference is not None]
         assert matched
-        answers = [
-            f" {predictions[row].upper()}. " if row in matched else "zebra crossing"
-            for row in range(5)
-        ]
+        answers = [references.get(row) or "zebra crossing" for row in range(5)]
         summary, records = _evaluate(run, tmp_path, "second", answers)
         assert {r["row"]: r["prediction"] for r in records if "skipped" not in r} == predictions
         assert {r["row"]: r["score"] for r in records if "skipped" not in r} == {

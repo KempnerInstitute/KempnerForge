@@ -526,13 +526,18 @@ the scorers of their answers.
     `"yes !"` becomes `"yes "`. A number is what `float` parses, and a trailing
     `%` makes hundredths, as in Pix2Struct's relaxed correctness: `45%` matches
     `0.45` and `45.1%` but not `45`. `1,000` is text, while `1_000` is 1000.
-  - `trimmed_match` (RealWorldQA): 1 for a prediction equal to a reference but
-    for case, surrounding whitespace and trailing `?`, `.` and `!`, the text rule
-    of `relaxed_accuracy`. Nothing else is normalized: `B. Left` and `(B)` do not
-    match `B`, and a number is text, so `3.0` does not match `3`.
+  - `realworldqa_accuracy` (RealWorldQA): lmms-eval 0.7.4's rule. A reference
+    that is a letter from A to D names an option, and the prediction matches it
+    when `extract_mcq_answer` picks that letter out of it: `B. Left`, `(B)`,
+    `**B**` and `The answer is B` all match `B`, while `A or B` matches
+    neither. Any other reference must equal the prediction lowercased, stripped
+    of surrounding whitespace and then of trailing periods, so `Downhill.`
+    matches `Downhill` and `Downhill!` does not. `extract_mcq_answer` is
+    adopted from lmms-eval under the Apache License 2.0, as the docstring of
+    `scorers.py` records.
 
 `configs/eval_tasks.toml` is a sample with six tasks and their caps (VQAv2 10,
-TextVQA 75, DocVQA 50, ChartQA human and machine 50, RealWorldQA 10); its paths
+TextVQA 75, DocVQA 50, ChartQA human and machine 50, RealWorldQA 16); its paths
 are placeholders:
 
 ```toml
@@ -560,13 +565,13 @@ hf download xai-org/RealworldQA --repo-type dataset \
 
 `evaluation/realworldqa.py` reads the shards, `data/test-<i>-of-<n>.parquet`, in
 order and refuses a directory where one is missing, so a partial download is
-never scored. The question is the prompt as written: it ends with its own answer
-instruction, a single word or number, or the letter of an option. As in the
-recipe, the answer is capped at 10 tokens and scored with `trimmed_match`.
-lmms-eval (0.7.4) scores RealWorldQA differently: it caps the answer at 16
-tokens, picks the option letter out of a longer reply when the reference is a
-letter, and otherwise removes only trailing periods from the prediction, so its
-scores and these are not comparable.
+never scored. The question, stripped of surrounding whitespace, is the prompt:
+it ends with its own answer instruction, a single word or number, or the letter
+of an option. As in lmms-eval 0.7.4, the answer is decoded greedily, capped at
+16 tokens and scored with `realworldqa_accuracy`. The score matches lmms-eval
+0.7.4's, and the one difference left is the data: lmms-eval reads
+`lmms-lab-encoder/RealWorldQA`, while this task reads `xai-org/RealworldQA` at
+the pinned revision.
 
 A reader is an entry of `READERS` and a scorer an entry of `SCORERS`, so a new
 one is added there. A scorer may report several named components per sample and

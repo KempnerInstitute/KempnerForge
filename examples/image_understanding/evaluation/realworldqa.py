@@ -70,12 +70,12 @@ class RealWorldQARows(Dataset):
     Every file needs the columns of ``COLUMNS``: ``image``, a struct whose
     ``bytes`` field holds the encoded image, and the ``question`` and ``answer``
     strings; a file without them raises ``ValueError``. Rows follow the order of
-    ``files``. The question is the user message as written, and the answer,
-    stripped of surrounding whitespace, its one reference; a row with a blank
-    question or answer is dropped. The encoded images are held in memory and
-    decoded upright as RGB when their row is read; a row whose image holds no
-    bytes or does not decode is passed over for the next one, up to
-    ``max_attempts`` in a row, and ``skipped`` counts them.
+    ``files``. The question, stripped of surrounding whitespace as lmms-eval
+    strips it, is the user message, and the answer, stripped too, its one
+    reference; a row with a blank question or answer is dropped. The encoded
+    images are held in memory and decoded upright as RGB when their row is
+    read; a row whose image holds no bytes or does not decode is passed over for
+    the next one, up to ``max_attempts`` in a row, and ``skipped`` counts them.
     """
 
     def __init__(self, files: Sequence[str | Path], max_attempts: int = MAX_ATTEMPTS) -> None:
@@ -89,7 +89,7 @@ class RealWorldQARows(Dataset):
             pairs = zip(table["question"].to_pylist(), table["answer"].to_pylist(), strict=True)
             for row, (question, answer) in enumerate(pairs):
                 if is_text(question) and is_text(answer):
-                    self._rows.append((number, row, question, answer.strip()))
+                    self._rows.append((number, row, question.strip(), answer.strip()))
 
     @property
     def skipped(self) -> int:

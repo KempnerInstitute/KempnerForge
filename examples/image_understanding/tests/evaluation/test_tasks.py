@@ -155,7 +155,7 @@ class TestSampleFile:
             ("docvqa", "docvqa", "anls", 50),
             ("chartqa-human", "chartqa", "relaxed_accuracy", 50),
             ("chartqa-machine", "chartqa", "relaxed_accuracy", 50),
-            ("realworldqa", "realworldqa", "trimmed_match", 10),
+            ("realworldqa", "realworldqa", "realworldqa_accuracy", 16),
         ]
 
     def test_its_paths_are_placeholders(self) -> None:
