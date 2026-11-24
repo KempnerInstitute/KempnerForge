@@ -118,9 +118,9 @@ def build_attention_mask(
     case except key validity; everything else returns the dense form.
 
     The returned mask is square over the residual stream, so it is valid only
-    for a forward whose keys are exactly its queries. Incremental decoding with
-    a ``KVCache`` grows the key axis every step, which is why
-    ``Transformer.forward`` refuses every mask input alongside ``kv_caches``.
+    for a forward whose keys are exactly its queries, such as the first forward
+    into an empty ``KVCache``. Appending to a filled cache takes
+    ``build_cached_attention_mask`` instead.
 
     Args:
         backend: ``ModelConfig.attention_backend``, ``"sdpa"`` or ``"flex"``.
@@ -164,6 +164,41 @@ def build_attention_mask(
         group_ids=group_ids,
         key_padding_mask=key_padding_mask,
     )
+
+
+def build_cached_attention_mask(*, seq_len: int, valid_keys: torch.Tensor) -> torch.Tensor:
+    """Dense mask for ``seq_len`` tokens appended to a filled ``KVCache``.
+
+    Each appended token sees every cached key and the appended keys up to its
+    own position, narrowed to the keys ``valid_keys`` marks, so a row of a
+    batch can skip cached padding. A query left with no key is unmasked, as in
+    ``build_dense_attention_mask``.
+
+    Args:
+        seq_len: Number of tokens appended by this forward.
+        valid_keys: Bool ``(batch, cached + seq_len)`` over the keys after the
+            append; ``True`` = attend.
+
+    Returns:
+        Bool tensor of shape ``(batch, 1, seq_len, cached + seq_len)``.
+
+    Raises:
+        ValueError: If ``valid_keys`` is not a 2-D bool tensor covering at least
+            ``seq_len`` keys.
+    """
+    if valid_keys.dtype != torch.bool or valid_keys.dim() != 2:
+        raise ValueError(
+            f"valid_keys must be a (batch, keys) bool tensor, got {valid_keys.dtype} "
+            f"of shape {tuple(valid_keys.shape)}"
+        )
+    keys = valid_keys.shape[1]
+    if keys < seq_len:
+        raise ValueError(f"valid_keys covers {keys} keys, fewer than the {seq_len} appended")
+    causal = torch.ones(seq_len, keys, dtype=torch.bool, device=valid_keys.device).tril(
+        diagonal=keys - seq_len
+    )
+    mask = causal.unsqueeze(0).unsqueeze(0) & valid_keys.unsqueeze(1).unsqueeze(1)
+    return mask | ~mask.any(dim=-1, keepdim=True)
 
 
 def same_group_mask(group_ids: torch.Tensor) -> torch.Tensor:

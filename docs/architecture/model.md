@@ -106,14 +106,18 @@ before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
    inputs): SDPA with `is_causal=True`.
 3. **Single-token decode** (`seq_len == 1` with a KV cache): no mask, so the
    query attends to all cached positions. `is_causal=True` here would
-   incorrectly restrict attention to only the first key. Mask inputs are
-   refused together with a KV cache, whether passed as arguments or carried
-   on the ``ModalityContext``.
+   incorrectly restrict attention to only the first key. A prefill into an
+   empty cache accepts attention groups (as an argument or on the
+   `ModalityContext`) and `valid_keys`, and builds its mask as path 1 does.
+   `doc_ids` and a key padding mask are still refused with a KV cache.
 4. **Several tokens appended to a filled cache** (`seq_len > 1` with cached
    keys): SDPA with `torch.nn.attention.bias.causal_lower_right`, so each new
    token attends to every cached key and to the new keys up to its own
    position. `is_causal=True` would align the triangle to the first key
-   instead.
+   instead. With `valid_keys`, a forward on a filled cache, of one token or
+   several, uses the dense mask from
+   `kempnerforge.model.masking.build_cached_attention_mask` instead: the same
+   end-aligned causal triangle, narrowed to each row's valid keys.
 
 A further, slower path fires only when `capture_attention_weights=True`:
 `_attention_with_weights` computes `softmax(Q·Kᵀ / √d)` manually so

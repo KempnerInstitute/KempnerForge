@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import create_block_mask
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
 from kempnerforge.config.schema import ModelConfig
 from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
@@ -202,6 +202,42 @@ class TestAttention:
         with pytest.raises(ValueError, match=match):
             attn(x, cos[:8], sin[:8], attn_mask=mask)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.parametrize("past", [0, 4])
+    def test_flash_refuses_a_cached_mask_on_cuda_before_writing_the_cache(self, past):
+        device = torch.device("cuda")
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2, sdpa_backend="flash")
+        attn = attn.to(device=device, dtype=torch.bfloat16)
+        cos, sin = precompute_rope_frequencies(16, 16, device=device)
+        cache = KVCache(
+            batch_size=1,
+            max_seq_len=16,
+            n_kv_heads=2,
+            head_dim=16,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        with torch.no_grad():
+            if past:
+                attn(
+                    torch.randn(1, past, 64, device=device, dtype=torch.bfloat16),
+                    cos[:past],
+                    sin[:past],
+                    kv_cache=cache,
+                )
+            before = (cache.k.clone(), cache.v.clone())
+            mask = torch.ones(1, 1, 3, past + 3, dtype=torch.bool, device=device)
+            with pytest.raises(ValueError, match="sdpa_backend='flash' cannot run"):
+                attn(
+                    torch.randn(1, 3, 64, device=device, dtype=torch.bfloat16),
+                    cos[past : past + 3],
+                    sin[past : past + 3],
+                    kv_cache=cache,
+                    attn_mask=mask,
+                )
+        assert cache.seq_len == past
+        assert torch.equal(cache.k, before[0]) and torch.equal(cache.v, before[1])
+
     def test_flash_runs_a_dense_mask_on_cpu(self):
         """PyTorch's CPU flash kernel takes the mask, so the refusal is for CUDA alone."""
         attn = Attention(dim=64, n_heads=4, n_kv_heads=2, sdpa_backend="flash")
@@ -211,7 +247,9 @@ class TestAttention:
 
     @pytest.mark.parametrize("capture", [False, True])
     @pytest.mark.parametrize("past", [0, 4])
-    def test_a_visibility_mask_is_refused_before_writing_the_cache(self, capture, past):
+    def test_a_mask_not_over_the_cached_keys_is_refused_before_writing_the_cache(
+        self, capture, past
+    ):
         attn = Attention(dim=64, n_heads=4, n_kv_heads=2)
         attn.capture_attention_weights = capture
         cos, sin = precompute_rope_frequencies(16, 16)
@@ -227,9 +265,15 @@ class TestAttention:
             if past:
                 attn(torch.randn(1, past, 64), cos[:past], sin[:past], kv_cache=cache)
             x = torch.randn(1, 3, 64)
-            square = torch.ones(1, 1, 3, 3, dtype=torch.bool)
-            whole = torch.ones(7, 7, dtype=torch.bool)
-            for wrong in (square, whole):
+            short = torch.ones(1, 1, 3, past + 2, dtype=torch.bool)
+            long = torch.ones(1, 1, 3, past + 4, dtype=torch.bool)
+            flat = torch.ones(3, past + 3, dtype=torch.bool)
+            wrongs: list[torch.Tensor | BlockMask] = [short, long, flat]
+            if past:
+                wrongs.append(
+                    create_block_mask(lambda b, h, q, kv: q >= kv, 1, 1, 3, 3, device="cpu")
+                )
+            for wrong in wrongs:
                 with pytest.raises(ValueError, match="cannot be combined with kv_cache"):
                     attn(
                         x,
@@ -239,10 +283,31 @@ class TestAttention:
                         attn_mask=wrong,
                     )
                 assert cache.seq_len == past
-            block = create_block_mask(lambda b, h, q, kv: q >= kv, 1, 1, 3, 3, device="cpu")
-            with pytest.raises(ValueError, match="cannot be combined with kv_cache"):
-                attn(x, cos[past : past + 3], sin[past : past + 3], kv_cache=cache, attn_mask=block)
-            assert cache.seq_len == past
+
+    @pytest.mark.parametrize("capture", [False, True])
+    def test_a_mask_over_the_cached_keys_matches_the_uncached_forward(self, capture):
+        """A prefill mask on an empty cache, then a rectangular one, give the full masked output."""
+        torch.manual_seed(0)
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2, sdpa_backend="math")
+        attn.capture_attention_weights = capture
+        cos, sin = precompute_rope_frequencies(16, 16)
+        x = torch.randn(2, 8, 64)
+        mask = torch.ones(8, 8, dtype=torch.bool).tril().expand(2, 1, 8, 8).clone()
+        mask[0, :, :, 2] = False
+        mask[1, :, 1:3, :3] = True
+        cache = KVCache(
+            batch_size=2,
+            max_seq_len=16,
+            n_kv_heads=2,
+            head_dim=16,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        with torch.no_grad():
+            full = attn(x, cos[:8], sin[:8], attn_mask=mask)
+            prefill = attn(x[:, :5], cos[:5], sin[:5], kv_cache=cache, attn_mask=mask[..., :5, :5])
+            rest = attn(x[:, 5:], cos[5:8], sin[5:8], kv_cache=cache, attn_mask=mask[..., 5:, :])
+        torch.testing.assert_close(torch.cat([prefill, rest], dim=1), full)
 
     @pytest.mark.parametrize("capture", [False, True])
     def test_a_layer_on_its_own_appends_tokens_under_a_pinned_kernel(self, capture):
@@ -1619,10 +1684,10 @@ class TestInlineEmbeds:
                 prefix_embeds=torch.randn(1, 2, 128),
             )
 
-    def test_inline_embeddings_reject_kv_caches(self) -> None:
+    def test_inline_embeddings_fill_kv_caches(self) -> None:
         from kempnerforge.model.attention import KVCache
 
-        model = Transformer(_KWARG_CONFIG).to(DEVICE)
+        model = Transformer(_KWARG_CONFIG).to(DEVICE).eval()
         caches = [
             KVCache(
                 batch_size=1,
@@ -1640,8 +1705,11 @@ class TestInlineEmbeds:
             inline_positions=torch.arange(2, device=DEVICE),
         )
         tokens = torch.randint(0, 256, (1, 4), device=DEVICE)
-        with pytest.raises(ValueError, match="modality.inline_embeds is training-only"):
-            model(tokens, modality=modality, kv_caches=caches)
+        with torch.no_grad():
+            full = model(tokens, modality=modality)
+            cached = model(tokens, modality=modality, kv_caches=caches)
+        torch.testing.assert_close(cached, full)
+        assert caches[0].seq_len == 4
 
     def test_inline_embeddings_require_a_matrix(self) -> None:
         with pytest.raises(ValueError, match=r"inline_embeds must be \(M, dim\)"):

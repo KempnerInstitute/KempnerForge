@@ -25,7 +25,7 @@ from kempnerforge.model.attention import Attention, KVCache
 from kempnerforge.model.cross_attention import CrossAttentionBlock
 from kempnerforge.model.embedding import OutputHead, TokenEmbedding
 from kempnerforge.model.init import init_weights
-from kempnerforge.model.masking import build_attention_mask
+from kempnerforge.model.masking import build_attention_mask, build_cached_attention_mask
 from kempnerforge.model.mlp import build_mlp
 from kempnerforge.model.modality import ModalityContext
 from kempnerforge.model.moe import MoEMLP, build_moe
@@ -476,6 +476,7 @@ class Transformer(nn.Module):
         doc_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_group_ids: torch.Tensor | None = None,
+        valid_keys: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -513,9 +514,16 @@ class Transformer(nn.Module):
                 Cross-arg invariant:
                 ``kv_caches`` forbids ``modality.prefix_embeds``,
                 ``modality.output_slice``, ``modality.image_features``,
-                ``modality.modality_ids``, ``modality.key_padding_mask``,
-                ``doc_ids`` and ``attention_group_ids``, by argument or as
-                ``modality.attention_group_ids`` (all training-only).
+                ``modality.modality_ids``, ``modality.key_padding_mask`` and
+                ``doc_ids`` (all training-only). ``attention_group_ids``, by
+                argument or as ``modality.attention_group_ids``, is accepted
+                while the caches are empty, so a prefill builds the same mask
+                as an uncached forward; appended tokens are in no group.
+            valid_keys: Optional per-key validity, bool ``(batch, cached +
+                seq_len)`` over the keys the caches hold after this forward,
+                ``True`` = attend. Only with ``kv_caches``: it lets rows of
+                one batch skip keys of their own, e.g. the right padding of a
+                prefill whose prompts differ in length.
             doc_ids: Optional per-token document IDs for packed sequences,
                 shape ``(batch, seq_len)`` over the residual stream. Enables
                 block-diagonal causal attention that isolates documents within
@@ -600,29 +608,34 @@ class Transformer(nn.Module):
                 raise ValueError(
                     "modality.modality_ids is training-only; cannot be combined with kv_caches"
                 )
-            if inline_embeds is not None:
-                raise ValueError(
-                    "modality.inline_embeds is training-only; cannot be combined with kv_caches"
-                )
-            if output_rows is not None:
-                raise ValueError(
-                    "modality.output_rows is training-only; cannot be combined with kv_caches"
-                )
             if key_padding_mask is not None:
                 raise ValueError(
                     "modality.key_padding_mask is training-only; cannot be combined with kv_caches"
                 )
             if doc_ids is not None:
                 raise ValueError("doc_ids is training-only; cannot be combined with kv_caches")
-            if attention_group_ids is not None:
+            if attention_group_ids is not None and kv_caches[0].seq_len > 0:
                 raise ValueError(
-                    "attention_group_ids (the argument or modality.attention_group_ids) is "
-                    "training-only; cannot be combined with kv_caches"
+                    "attention_group_ids (the argument or modality.attention_group_ids) "
+                    "cannot be combined with filled kv_caches; pass them at the prefill"
                 )
+        elif valid_keys is not None:
+            raise ValueError(
+                "valid_keys requires kv_caches; an uncached forward takes modality.key_padding_mask"
+            )
         text = tokens if tokens is not None else inputs_embeds
         assert text is not None
         batch = text.shape[0]
         seq_len = text.shape[1] + (prefix_embeds.shape[1] if prefix_embeds is not None else 0)
+        cached = kv_caches[0].seq_len if kv_caches is not None else 0
+        if valid_keys is not None and (
+            valid_keys.dtype != torch.bool or tuple(valid_keys.shape) != (batch, cached + seq_len)
+        ):
+            raise ValueError(
+                f"valid_keys must be bool of shape {(batch, cached + seq_len)}, the keys the "
+                f"caches hold after this forward; got {valid_keys.dtype} of shape "
+                f"{tuple(valid_keys.shape)}"
+            )
         if rope_cos is not None and position_ids is not None:
             raise ValueError("modality.rope_cos/rope_sin cannot be combined with position_ids")
         if position_ids is not None:
@@ -685,15 +698,22 @@ class Transformer(nn.Module):
                 "order, so a mask over the residual would not line up with it."
             )
         self._validate_modality_ids(modality_ids, (batch, seq_len))
-        attn_mask = build_attention_mask(
-            backend=self.config.attention_backend,
-            batch=batch,
-            seq_len=seq_len,
-            device=text.device,
-            doc_ids=doc_ids,
-            group_ids=attention_group_ids,
-            key_padding_mask=key_padding_mask,
-        )
+        if cached:
+            attn_mask = (
+                None
+                if valid_keys is None
+                else build_cached_attention_mask(seq_len=seq_len, valid_keys=valid_keys)
+            )
+        else:
+            attn_mask = build_attention_mask(
+                backend=self.config.attention_backend,
+                batch=batch,
+                seq_len=seq_len,
+                device=text.device,
+                doc_ids=doc_ids,
+                group_ids=attention_group_ids,
+                key_padding_mask=key_padding_mask if valid_keys is None else valid_keys,
+            )
 
         h = (
             self.token_embedding(tokens)  # type: ignore[reportOptionalCall]
@@ -711,7 +731,6 @@ class Transformer(nn.Module):
                 prefix_embeds = prefix_embeds.to(h.dtype)
             h = torch.cat([prefix_embeds, h], dim=1)
 
-        start_pos = kv_caches[0].seq_len if kv_caches is not None else 0
         if rope_cos is not None:
             assert rope_sin is not None
             cos, sin = rope_cos.to(h.device), rope_sin.to(h.device)
@@ -728,8 +747,8 @@ class Transformer(nn.Module):
                 cos = self._rope_cos[position_ids]
                 sin = self._rope_sin[position_ids]
             else:
-                cos = self._rope_cos[start_pos : start_pos + seq_len]
-                sin = self._rope_sin[start_pos : start_pos + seq_len]
+                cos = self._rope_cos[cached : cached + seq_len]
+                sin = self._rope_sin[cached : cached + seq_len]
 
         if self._moma_modalities:
             assert modality_ids is not None
