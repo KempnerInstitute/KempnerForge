@@ -49,7 +49,7 @@ Each flag must begin with `--`. Parsing splits once on `=`:
 | `--optimizer.betas=[0.9,0.95]` | `list → tuple(0.9, 0.95)` (coerced to tuple by field type) |
 | `--checkpoint.load_path=/scratch/ckpt` | `str("/scratch/ckpt")` (literal_eval fails, keep as string) |
 | `--adapter.pre_norm=` | `str("")` (literal_eval fails on an empty value, keep as string) |
-| `--data.anneal_weights={"c4":0.7,"books":0.3}` | `dict` (parsed into `DataConfig.anneal_weights`) |
+| `--data.anneal_weights='{"c4":0.7,"books":0.3}'` | `dict` (parsed into `DataConfig.anneal_weights`) |
 
 Quote any value the shell would otherwise eat:
 
@@ -74,6 +74,27 @@ path = "/scratch/books"
 weight = 0.3
 name = "books"
 ```
+
+## Dict-valued fields
+
+A dotted path below a dict-valued field sets that one key and keeps the
+rest of the table, whether the TOML or the field's default holds it.
+With `[metrics.mlflow_tags]` holding `team = "kf"` and `stage = "one"`,
+`--metrics.mlflow_tags.stage=two` gives `{"team": "kf", "stage": "two"}`,
+and `--vlm.module_patterns.adapter="['adapter.*']"` changes the adapter's
+patterns and keeps the other modules'. A dict literal replaces the
+whole table: `--data.anneal_weights='{"c4":0.7,"books":0.3}'` drops any
+other key the TOML set.
+
+Each value takes the value type of the table, so
+`--vlm.module_patterns.vision_encoder=vision_encoder.*` gives the list
+`["vision_encoder.*"]`. A key the table does not hold is added, so a
+misspelled key adds a new entry unless the field checks its keys, as
+`optimizer.lr_multipliers` does against `vlm.module_patterns`. Each dot
+starts a level below, so a dotted path cannot set a key that contains a dot:
+`--data.anneal_weights.c4.en=0.9` names the key `en` in a table `c4`,
+which a table of floats refuses. Set such a key in the TOML as a quoted
+key, such as `"c4.en" = 0.9`, or give the whole table as a dict literal.
 
 ## Boolean shorthand
 
@@ -104,6 +125,7 @@ the dataclass type hint and coerces:
 | `tuple[float, float]` | `[0.9, 0.95]` | `(0.9, 0.95)` |
 | `list[str]` | `"a"` | `["a"]` (wraps bare scalar) |
 | `list[DatasetSource]` | `[{"path": …}]` | `[DatasetSource(path=…)]` (recursive) |
+| `dict[str, list[str]]` | `{"vision_encoder": "vision_encoder.*"}` | `{"vision_encoder": ["vision_encoder.*"]}` (each value coerced to the value type) |
 | `Literal["bf16", "fp16", "fp32", "fp8"]` | anything else | `ValueError` |
 | `StrEnum` (`NormType`, `SchedulerType`, …) | `"rmsnorm"` | `NormType.rmsnorm` |
 | `SchedulerType`, `NormType`, `Activation` | a registered name | the name, as a `str` |
@@ -113,7 +135,9 @@ the dataclass type hint and coerces:
 `--train.mixed_precision=bfloat16` (should be `"bf16"`) fails before
 training starts. Every coercion refusal starts with the class and
 field it concerns, such as
-`TrainConfig.batch_size: expected an int, got 2.7`. `"fp16"` passes
+`TrainConfig.batch_size: expected an int, got 2.7`, and a refused
+value of a table also names its key, such as
+`DataConfig.anneal_weights: key 'c4': expected a float, got 'x'`. `"fp16"` passes
 this check on purpose and is then rejected by
 `TrainConfig.__post_init__`, whose error explains that fp16 would
 train with no loss scaling.

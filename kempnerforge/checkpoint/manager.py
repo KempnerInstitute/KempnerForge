@@ -1541,11 +1541,14 @@ class CheckpointManager:
         so every reader of the model entry alone gets them; the parameters are back at the
         training point when this returns, and ``load`` rebuilds that point. The swap back
         runs as soon as ``AsyncCheckpointer.save`` returns, which is safe only because the
-        state is staged by then: ``dcp.async_save`` without a stager uses torch's
-        ``DefaultStager(StagingOptions(False, False, False, False))``, which copies every
-        tensor into new CPU storage before it returns. An asynchronous stager would let
-        the write read the parameters after the swap back, so adding one means moving the
-        swap back after staging completes.
+        state is staged by then: both async modes stage synchronously, so every tensor is
+        copied to CPU memory before ``dcp.async_save`` returns. The ``async`` mode passes
+        no stager and gets torch's default,
+        ``DefaultStager(StagingOptions(False, False, False, False))``;
+        ``async_with_pinned_mem`` passes its pinned ``DefaultStager``, built with
+        ``use_async_staging=False``, whose ``stage`` waits for its copies to finish. An
+        asynchronous stager would let the write read the parameters after the swap back,
+        so adding one means moving the swap back after staging completes.
 
         Under expert parallelism each EP rank holds a copy of every weight outside the
         routed experts, and the copies can drift apart on GPU (#482). DCP writes each
