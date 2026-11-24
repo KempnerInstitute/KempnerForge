@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 from evaluation.checkpoint import (
     SUPPORTED_ARCHES,
     check_supported,
@@ -19,6 +20,7 @@ from evaluation.checkpoint import (
 
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.loader import load_config
+from kempnerforge.model.router import SigmoidTopKRouter
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 
 CPU = torch.device("cpu")
@@ -236,6 +238,33 @@ class TestLoadModel:
         model = load_model(config, save_checkpoint(config), CPU)
         assert model.vision_encoder.get_buffer("_anchor").dtype == torch.bfloat16
         assert next(model.transformer.parameters()).dtype == torch.float32
+
+    def test_a_sigmoid_checkpoint_without_the_masters_loads_them_derived(
+        self, load: Callable[..., JobConfig], tmp_path: Path
+    ) -> None:
+        """A checkpoint saved before the sigmoid router's FP32 masters loads, with the masters
+        derived from the loaded EMA and bias instead of failing on the keys it lacks."""
+        config = load("--model.num_experts=4", "--model.moe_router=sigmoid_topk")
+        torch.manual_seed(5)
+        saved = _fresh_model(config)
+        before = [m for m in saved.modules() if isinstance(m, SigmoidTopKRouter)]
+        assert before
+        with torch.no_grad():
+            for router in before:
+                router.expert_bias.add_(0.125)
+                router.expert_ema.copy_(torch.linspace(0.1, 0.4, router.expert_ema.numel()))
+                for name in SigmoidTopKRouter.derived_buffers:
+                    router._buffers.pop(name)
+        step_dir = tmp_path / "step_1"
+        dcp.save({"model": saved.state_dict()}, checkpoint_id=str(step_dir), no_dist=True)
+        model = load_model(config, step_dir, CPU)
+        after = [m for m in model.modules() if isinstance(m, SigmoidTopKRouter)]
+        for router, old in zip(after, before, strict=True):
+            ema, bias = router._masters()
+            assert torch.equal(router.expert_bias.detach(), old.expert_bias.detach())
+            assert torch.equal(bias, old.expert_bias.detach().float())
+            assert torch.equal(router.expert_ema, old.expert_ema)
+            assert torch.equal(ema, old.expert_ema.float())
 
     def test_a_checkpoint_of_another_model_is_refused(
         self, load: Callable[..., JobConfig], save_checkpoint: Callable[..., Path]

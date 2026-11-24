@@ -32,6 +32,7 @@ import torch
 import torch.distributed.checkpoint as dcp
 
 from kempnerforge.checkpoint.expert_layout import check_saved_experts
+from kempnerforge.checkpoint.manager import derived_buffer_owners, drop_derived_model_keys
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import Activation, ModelConfig, NormType
 from kempnerforge.model.transformer import Transformer
@@ -189,7 +190,9 @@ def dcp_to_hf(
     safetensors refuses tensors that share memory. A checkpoint saved with
     expert parallelism holds every expert, as one saved without it does; one
     that holds fewer experts than ``model_config`` asks for is refused (see
-    ``check_saved_experts``).
+    ``check_saved_experts``). Buffers a module derives from its other state, such as
+    the sigmoid router's FP32 masters, are not exported, and a checkpoint saved before
+    they existed converts too (see ``derived_buffer_owners``).
 
     Args:
         dcp_dir: Path to DCP checkpoint directory (e.g., checkpoints/step_10000).
@@ -218,12 +221,15 @@ def dcp_to_hf(
         saved = dcp.FileSystemReader(dcp_dir).read_metadata().state_dict_metadata
         check_saved_experts(model, saved, dcp_dir)
         state_dict = {"model": model.state_dict()}
+        drop_derived_model_keys(state_dict["model"], model, saved)
         dcp.load(state_dict, checkpoint_id=dcp_dir)
         model.load_state_dict(state_dict["model"])
 
+    derived = derived_buffer_owners(model)
     hf_state = {}
     seen_storage: set[int] = set()
-    for hf_key, tensor in _hf_tensors(model.state_dict()):
+    exported = {key: value for key, value in model.state_dict().items() if key not in derived}
+    for hf_key, tensor in _hf_tensors(exported):
         cast = tensor.to(dtype)
         ptr = cast.untyped_storage().data_ptr()
         hf_state[hf_key] = cast.clone() if ptr in seen_storage else cast
@@ -252,7 +258,9 @@ def hf_to_dcp(
 ) -> None:
     """Convert a HuggingFace checkpoint to DCP format.
 
-    Supports loading from a local directory or a HuggingFace model ID.
+    Supports loading from a local directory or a HuggingFace model ID. Buffers a module
+    derives from its other state, such as the sigmoid router's FP32 masters, which no
+    export holds, are derived from the loaded weights.
 
     Args:
         hf_dir: Path to HF model directory or HF model ID.
@@ -296,7 +304,8 @@ def hf_to_dcp(
             "the output head takes the token embedding"
         )
 
-    missing = set(kf_state.keys()) - set(converted.keys())
+    derived = derived_buffer_owners(model)
+    missing = kf_state.keys() - converted.keys() - derived.keys()
     if missing:
         logger.warning(f"Missing {len(missing)} keys (using random init): {list(missing)[:5]}...")
 

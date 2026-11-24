@@ -42,7 +42,7 @@ The two routers have different balance strategies — start with
 |------|--------|-----|
 | Mixtral reproduction | `softmax_topk` | Matches original recipe, aux-loss coefficient well-studied (0.01) |
 | First MoE run, any target | `softmax_topk` | Simpler: one knob (`moe_aux_loss_weight`) and balance is visible in the loss |
-| DeepSeek-V3 reproduction | `sigmoid_topk` | Bias-based balancer, matching paper |
+| DeepSeek-V3-style routing | `sigmoid_topk` | Bias-based balancer as in the paper, with the update rule and gate weights noted in [Aux loss and balancing](../moe/aux-loss-and-balancing.md#sigmoid-router--bias-based-balancing) |
 | Long runs where aux-loss coefficient is brittle | `sigmoid_topk` | Balance signal doesn't perturb the main loss gradient |
 
 See [Routers](../moe/routers.md) for the mechanics.
