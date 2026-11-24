@@ -211,13 +211,15 @@ def _characters(window: Encoding, first: int, last: int) -> tuple[int, int]:
 
 
 def _check_pair(tokenizer: Tokenizer, question: str, context: str) -> None:
-    """Refuses a pair that ``tokenizer`` cannot cut into windows, on which it would abort.
+    """Refuses a pair that ``tokenizer`` cannot cut into windows.
 
     A pair longer than a window is cut into windows that hold the question and
     overlap by the stride, which needs a question shorter than a window's length
     less the pair's special tokens and the stride; a pair that fits one window
-    is not cut. ``tokenizer`` aborts on the rest rather than raising an error.
-    The texts are counted with its truncation off, which is then restored.
+    is not cut. On the rest ``tokenizer`` aborts, rather than raising an error,
+    while the question leaves any context in a window, and raises its own
+    truncation error once it leaves none. The texts are counted with its
+    truncation off, which is then restored.
     """
     truncation: Any = tokenizer.truncation
     processor: Any = tokenizer.post_processor
@@ -271,8 +273,8 @@ class AnswerExtractor:
     or ``""`` when the context holds no token (only whitespace), where the
     pipeline finds no answer at all. A pair the tokenizer cannot cut into
     windows, a question over 3,964 tokens for BigBird with a context that does
-    not fit one window beside it, raises ``ValueError`` where the tokenizer would
-    abort.
+    not fit one window beside it, raises ``ValueError``, where the tokenizer
+    would abort or raise its own truncation error.
 
     Raises:
         ValueError: ``device`` is refused by ``check_extractor_device``.
