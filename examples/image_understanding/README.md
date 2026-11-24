@@ -362,15 +362,19 @@ once. Every batch holds the same rows whatever the number of ranks, so with one
 `--batch-size` the scores are the same on any number of GPUs of one kind. Causal
 attention keeps a row independent of its batch in exact arithmetic; across batch
 sizes the scores match up to floating-point (bf16) numerics, which can flip a
-close argmax.
+close argmax. On a GPU the decode runs SDPA's memory-efficient kernel whatever
+`model.sdpa_backend` says, so view-group masks do not land on different kernels
+from one run to the next, which would break near-ties differently.
 
 A row is scored as it is or counted under a reason, never changed to fit:
 
 - `unreadable_row`: the reader passed over the row because its image does not
   decode. The row it moved on to is not scored in its place.
 - `prompt_too_long`: the document and `max_new_tokens` do not fit what training
-  lays out: `train.seq_len` positions for the views and text of a packed run, and
-  `vlm.max_text_len` for the text of an unpacked one.
+  lays out: `train.seq_len` positions for the views and text of a packed run
+  (`model.max_seq_len` for an unpacked one), and `vlm.max_text_len` for the text,
+  which the core pipeline cuts to that length packed or not. A run trained on a
+  mixture (`--mixture`) rendered its documents uncut, so its text has no cap.
 - `unrenderable_row`: the chat template does not lay the row out as training
   does (a `conversation` document whose turn the template mangles), so training
   passes over it too. Its record holds the error text.
@@ -589,6 +593,14 @@ The mixture file and the run's settings for it (`[vlm]`, `data.pack_sequences`,
 `evaluation/` also holds what an evaluation run is made of: the tasks to run and
 the scorers of their answers.
 
+The board, below, is the set of nine evaluations this recipe's runs are reported
+on: A-OKVQA, DocVQA, TextVQA, ChartQA human and machine, PixMo pointing and
+counting, GSM8K and MMLU, each with a fixed prompt, answer cap and scorer.
+`configs/eval_tasks.toml` holds them. Where the board's scoring departs from a
+task's published metric, the scorers here follow the board, so their numbers
+compare with the recipe's reported ones; each such departure is noted with its
+scorer.
+
 - `tasks.py`: `load_tasks` reads a TOML task file into frozen `EvalTask`s. A task
   has a unique `name`, a `reader` (a `testbed.py` loader or one of
   `readers.py`) with that loader's arguments in `reader_args`, a `scorer`, and
@@ -642,7 +654,11 @@ the scorers of their answers.
 
   - `exact_vqa_accuracy` (A-OKVQA): `min(1, m / 3)` for the `m` direct answers
     the prediction equals exactly, nothing normalized; the reader keeps the
-    direct answers as written, blank ones included.
+    direct answers as written, blank ones included. As on the board, every val
+    question is scored, the 70 of 1145 marked `difficult_direct_answer` included,
+    which the official direct-answer evaluation leaves out (about 2 points lower
+    on the correct choices), and each row needs an `image` path, which the
+    released annotation files give as `image_id`.
   - `count_accuracy` (PixMo counting): the stated count is the `N` of "I count
     N", else the last integer outside point tags; `accuracy` is whether it is the
     reference count and `mae` how far off it is (the whole count without one). A
@@ -651,7 +667,11 @@ the scorers of their answers.
   - `points_in_masks` (PixMo pointing): the points of every `<point>`/`<points>`
     tag, in percent, land on the nearest mask pixel; `precision` is the share
     inside any object, `recall` the share of objects hit, `count_mae` the gap
-    between the counts of points and objects.
+    between the counts of points and objects. This is the board's rule, not the
+    published one (Molmo, Deitke et al. 2024, appendix D): points are not matched
+    one-to-one to objects, so several points on one object all count as inside,
+    and a row with no target, stored as one empty mask, counts as one object and
+    scores 0 even for a correct "not present" answer.
   - `final_number` (GSM8K): 1 when the last number, commas dropped, equals the
     reference.
   - `choice_letter` (MMLU): 1 when the first standalone capital `A` to `D` is the

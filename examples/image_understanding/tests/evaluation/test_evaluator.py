@@ -39,7 +39,12 @@ from evaluation.evaluator import (
     token_budgets,
 )
 from evaluation.generation import Generation, greedy_decode, stop_token_ids
-from evaluation.inputs import UnsupportedDocumentError, build_renderer, document_inputs
+from evaluation.inputs import (
+    RenderSettings,
+    UnsupportedDocumentError,
+    build_renderer,
+    document_inputs,
+)
 from evaluation.scorers import SCORERS, Scorer, anls
 from evaluation.tasks import READERS, EvalTask, build_reader, load_tasks
 from image_text.document import Document, Turn
@@ -304,8 +309,10 @@ class TestTokenBudgets:
             train=dataclasses.replace(config.train, seq_len=40),
         )
         assert config.model.max_seq_len == 48 and config.vlm is not None
-        assert token_budgets(packed) == Budgets(row_len=40)
-        assert token_budgets(config) == Budgets(row_len=48, text_len=config.vlm.max_text_len)
+        cap = config.vlm.max_text_len
+        assert token_budgets(packed, RenderSettings(mixture=True)) == Budgets(row_len=40)
+        assert token_budgets(packed) == Budgets(row_len=40, text_len=cap)
+        assert token_budgets(config) == Budgets(row_len=48, text_len=cap)
 
 
 class TestEvaluateBatch:
@@ -1190,6 +1197,8 @@ def _evaluate_on_rank(
     from datetime import timedelta
 
     import torch.distributed as dist
+
+    torch.cuda.is_available = lambda: False
 
     notes = Path(output).parent
 

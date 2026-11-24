@@ -150,7 +150,7 @@ def test_training_runs_without_hooks_when_periodic_evaluation_is_off(
     config_path = tmp_path / "run.toml"
     config_path.write_text(VLM_CONFIG)
     seen = _run_main(_load_entry_point(), monkeypatch, str(config_path), "--train.tf32")
-    assert set(seen) == {"config"}
+    assert set(seen) == {"config", "data_fn"} and seen["data_fn"] is None
     assert seen["config"].train.tf32 is True
 
 
@@ -315,4 +315,4 @@ def test_without_an_evaluation_flag_every_argument_list_reaches_the_loader_uncha
     monkeypatch.setattr(sys, "argv", ["train.py", "run.toml", *arguments])
     module.main()
     assert received == [("run.toml", arguments)]
-    assert calls == [((sentinel,), {})]
+    assert calls == [((sentinel,), {"data_fn": None})]

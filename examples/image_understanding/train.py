@@ -38,12 +38,13 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
 
 from mixture import check_run, mixture_data_fn
 
+from kempnerforge.config.job import JobConfig
 from kempnerforge.config.loader import load_config
 from kempnerforge.training import run_training
+from kempnerforge.training.data_pipeline import DataFn
 
 EVAL_FLAG_PREFIX = "--eval-"
 MIXTURE_FLAG = "--mixture="
@@ -80,12 +81,12 @@ def _parse_args(argv: list[str]) -> tuple[argparse.ArgumentParser, argparse.Name
     return parser, args, overrides
 
 
-def _mixture_options(config: Any, mixtures: list[str]) -> dict[str, Any]:
+def _mixture_data_fn(config: JobConfig, mixtures: list[str]) -> DataFn | None:
     """``run_training``'s ``data_fn`` for the mixture given, the file and the run checked first."""
     if not mixtures:
-        return {}
+        return None
     check_run(config)
-    return {"data_fn": mixture_data_fn(mixtures[0])}
+    return mixture_data_fn(mixtures[0])
 
 
 def main() -> None:
@@ -97,7 +98,7 @@ def main() -> None:
     arguments = args[1:]
     if not any(argument.startswith(EVAL_FLAG_PREFIX) for argument in arguments):
         config = load_config(args[0], cli_args=arguments)
-        run_training(config, **_mixture_options(config, mixtures))
+        run_training(config, data_fn=_mixture_data_fn(config, mixtures))
         return
 
     parser, parsed, overrides = _parse_args(arguments)
@@ -110,7 +111,7 @@ def main() -> None:
     absent = [flag for flag, value in flags.items() if value is None]
     if absent:
         parser.error(f"periodic evaluation also needs {' and '.join(absent)}")
-    options = _mixture_options(config, mixtures)
+    data_fn = _mixture_data_fn(config, mixtures)
 
     from evaluation.checkpoint import check_supported
     from evaluation.periodic import PeriodicEvaluation, PeriodicEvaluationHook
@@ -127,7 +128,7 @@ def main() -> None:
         )
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
-    run_training(config, hooks=PeriodicEvaluationHook(settings).runner(), **options)
+    run_training(config, hooks=PeriodicEvaluationHook(settings).runner(), data_fn=data_fn)
 
 
 if __name__ == "__main__":

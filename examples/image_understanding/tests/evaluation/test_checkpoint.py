@@ -11,6 +11,7 @@ import torch
 from evaluation.checkpoint import (
     SUPPORTED_ARCHES,
     check_supported,
+    decode_model_config,
     load_model,
     read_step,
     resolve_checkpoint,
@@ -211,6 +212,15 @@ class TestLoadModel:
         torch.manual_seed(6)
         loaded = load_model(config, step_dir, CPU).state_dict()
         assert all(torch.equal(loaded[name], value) for name, value in saved.state_dict().items())
+
+    @pytest.mark.parametrize("backend", ["auto", "flash", "cudnn"])
+    def test_a_gpu_decode_runs_on_one_kernel_that_takes_masks(
+        self, load: Callable[..., JobConfig], backend: str
+    ) -> None:
+        model = load(f"--model.sdpa_backend={backend}").model
+        on_gpu = decode_model_config(model, torch.device("cuda", 0))
+        assert (on_gpu.attention_backend, on_gpu.sdpa_backend) == ("sdpa", "efficient")
+        assert decode_model_config(model, CPU).sdpa_backend == "auto"
 
     def test_a_flex_attention_run_loads_to_decode_on_sdpa(
         self, load: Callable[..., JobConfig], save_checkpoint: Callable[..., Path]

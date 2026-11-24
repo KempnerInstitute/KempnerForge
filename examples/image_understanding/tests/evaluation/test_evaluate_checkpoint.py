@@ -121,7 +121,9 @@ def test_the_mixture_render_settings_reach_the_evaluation(
     argv = [str(config_path), "--checkpoint=runs/a", "--tasks", str(SAMPLE_TASKS)]
     seen = _handed_off(monkeypatch, *argv, "--output", "results/a", f"--mixture={mixture}")
     assert seen["settings"] == RenderSettings(
-        {"answer_only": True, "train_reply_prefix": True, "lead_space": True}, view_groups=True
+        {"answer_only": True, "train_reply_prefix": True, "lead_space": True},
+        view_groups=True,
+        mixture=True,
     )
     assert _handed_off(monkeypatch, *argv, "--output", "results/b")["settings"] == RenderSettings()
 

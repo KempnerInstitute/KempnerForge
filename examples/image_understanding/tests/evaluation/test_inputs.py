@@ -64,7 +64,7 @@ class TestBuildRenderer:
         assert renderer.tokenizer.eos_token == "<|im_end|>"
         assert renderer.turn_end == "<|im_end|>"
 
-    def test_a_packed_run_renders_uncut_with_its_tiling_and_mixture_options(
+    def test_a_mixture_run_renders_uncut_with_its_tiling_and_mixture_options(
         self, write_config: Callable[..., Path]
     ) -> None:
         config = load_config(
@@ -72,11 +72,18 @@ class TestBuildRenderer:
             cli_args=["--data.pack_sequences=true", "--vlm.tile_grid=2", "--model.max_seq_len=64"],
         )
         renderer = build_renderer(
-            config, RenderSettings({"lead_space": True, "train_reply_prefix": True})
+            config,
+            RenderSettings({"lead_space": True, "train_reply_prefix": True}, mixture=True),
         )
         assert renderer.max_text_len is None
         assert (renderer.tile_grid, renderer.tile_global, renderer.max_images) == (2, True, None)
         assert renderer.lead_space and renderer.train_reply_prefix and renderer.answer_only
+
+    def test_a_packed_run_from_its_data_section_keeps_its_text_cap(
+        self, write_config: Callable[..., Path]
+    ) -> None:
+        config = load_config(write_config(), cli_args=["--data.pack_sequences=true"])
+        assert build_renderer(config).max_text_len == 32
 
     def test_a_config_without_a_vlm_or_a_tokenizer_is_refused(
         self, write_config: Callable[..., Path]
@@ -97,7 +104,7 @@ class TestRenderSettings:
         )
         settings = RenderSettings.from_mixture(path)
         assert settings.render == {"answer_only": True, "lead_space": True}
-        assert settings.view_groups
+        assert settings.view_groups and settings.mixture
 
     def test_without_a_mixture_nothing_changes(self) -> None:
         assert RenderSettings.from_mixture(None) == RenderSettings()
@@ -195,7 +202,7 @@ class TestDocumentInputs:
             "<|im_start|> user what is shown ? <|im_end|> <|im_start|> assistant"
         )
         sample = renderer.render(_document(), ["cat"])
-        assert torch.equal(inputs.pixel_values, sample["pixel_values"][None])
+        assert torch.equal(inputs.pixel_values, sample["pixel_values"].reshape(-1, 3, 16, 16))
         assert inputs.pixel_values.shape == (1, 3, 16, 16)
 
     def test_pixels_follow_the_renderers_size_and_normalization(self, tokenizer: Any) -> None:
@@ -203,9 +210,8 @@ class TestDocumentInputs:
             tokenizer, image_size=8, image_mean=(0.1, 0.2, 0.3), image_std=(0.5, 0.25, 0.2)
         )
         inputs = document_inputs(renderer, _document())
-        assert torch.equal(
-            inputs.pixel_values, renderer.render(_document(), ["cat"])["pixel_values"][None]
-        )
+        pixels = renderer.render(_document(), ["cat"])["pixel_values"]
+        assert torch.equal(inputs.pixel_values, pixels.reshape(-1, 3, 8, 8))
         assert inputs.pixel_values.shape == (1, 3, 8, 8)
 
     @pytest.mark.parametrize(
