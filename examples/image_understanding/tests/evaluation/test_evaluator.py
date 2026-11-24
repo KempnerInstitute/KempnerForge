@@ -25,6 +25,7 @@ from evaluation.evaluator import (
     PROMPT_TOO_LONG,
     UNREADABLE_ROW,
     UNRENDERABLE_ROW,
+    Budgets,
     ClearedResults,
     Decoder,
     check_token_budgets,
@@ -37,7 +38,6 @@ from evaluation.evaluator import (
     summarize,
     token_budgets,
 )
-from evaluation.evaluator import Budgets
 from evaluation.generation import Generation, greedy_decode, stop_token_ids
 from evaluation.inputs import UnsupportedDocumentError, build_renderer, document_inputs
 from evaluation.scorers import SCORERS, Scorer, anls
