@@ -60,21 +60,27 @@ dimension.
 
 ## SLURM metadata (resilience)
 
-Read by `get_slurm_context()` and `running_under_slurm()` in
-[`kempnerforge/resilience/elastic.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py).
-Purely informational: used to populate logs and decide whether a job
-is a restart.
+Read by `get_slurm_info()`, `is_slurm_job()` and `is_slurm_requeue()` in
+[`kempnerforge/resilience/elastic.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py),
+to populate logs and decide whether a job is a restart, and by
+`this_run()` in
+[`kempnerforge/checkpoint/ownership.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/ownership.py),
+whose record in `<checkpoint.dir>/.owner` decides whether the run that
+owns a checkpoint directory has ended (see
+[Auto-resume § One run per checkpoint directory](../checkpointing/auto-resume.md#one-run-per-checkpoint-directory)).
 
 | Variable | Purpose |
 |----------|---------|
-| `SLURM_JOB_ID` | Job identifier; also used to derive `MASTER_PORT` |
+| `SLURM_JOB_ID` | Job identifier; also used to derive `MASTER_PORT`, and the owner record's job |
+| `SLURM_ARRAY_JOB_ID` | With `SLURM_ARRAY_TASK_ID`, names a job array element in the owner record as `<array job>_<task>` |
+| `SLURM_CLUSTER_NAME` | The owner record's cluster: a job is checked with `squeue` only on its own cluster |
 | `SLURM_JOB_NAME` | Job name (logged) |
 | `SLURM_JOB_NODELIST` | Nodelist; parsed by `scontrol show hostnames` to find `MASTER_ADDR` |
 | `SLURM_NNODES` | Node count (logged) |
 | `SLURM_NTASKS_PER_NODE` | Tasks per node (logged) |
-| `SLURM_RESTART_COUNT` | Non-zero means this is a requeue (used to detect restarts) |
+| `SLURM_RESTART_COUNT` | Non-zero means this is a requeue (used to detect restarts); in the owner record, an earlier attempt of this job has ended |
 | `SLURM_JOB_PARTITION` | Partition name (logged) |
-| `SLURM_ARRAY_TASK_ID` | Array index when applicable (logged) |
+| `SLURM_ARRAY_TASK_ID` | Array index when applicable (logged); part of the owner record's job |
 
 ## Logging
 

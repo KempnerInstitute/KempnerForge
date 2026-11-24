@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import socket
-
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
 from kempnerforge.training.optimizer import Muon, _newton_schulz
 from kempnerforge.training.orthogonalize import _row_chunks, orthogonalize_exact
+from tests.gloo_ranks import gloo_group, spawn
 
 
 def _ns(x: torch.Tensor) -> torch.Tensor:
@@ -28,19 +25,9 @@ def _matrices() -> list[torch.Tensor]:
     return [torch.randn(rows, cols, generator=generator) for rows, cols in shapes]
 
 
-def _free_port() -> int:
-    """An unused local TCP port for the gloo rendezvous."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _check_rank(rank: int, world: int, port: int, mesh_shape: tuple, placements: tuple) -> None:
     """Orthogonalize sharded matrices on one rank and compare with one process's result."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", mesh_shape)
         fulls = _matrices()
         params = [distribute_tensor(full, mesh, list(placements)) for full in fulls]
@@ -48,8 +35,6 @@ def _check_rank(rank: int, world: int, port: int, mesh_shape: tuple, placements:
         for full, result in zip(fulls, results, strict=True):
             expected = distribute_tensor(_ns(full), mesh, list(placements), src_data_rank=None)
             assert torch.equal(result, expected.to_local())
-    finally:
-        dist.destroy_process_group()
 
 
 def _own_rows(full: torch.Tensor, mesh: DeviceMesh) -> torch.Tensor:
@@ -60,10 +45,7 @@ def _own_rows(full: torch.Tensor, mesh: DeviceMesh) -> torch.Tensor:
 def _check_rowless_rank(rank: int, world: int, port: int, orthogonalize: str) -> None:
     """Step Muon on a weight with fewer rows than ranks beside a larger one and compare with
     unsharded Muon. The ranks past its rows hold none of it, and step with the others."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (world,))
         generator = torch.Generator().manual_seed(0)
         fulls = [torch.randn(rows, 8, generator=generator) for rows in (2 * world + 1, 1)]
@@ -90,16 +72,11 @@ def _check_rowless_rank(rank: int, world: int, port: int, orthogonalize: str) ->
         for param, reference in zip(sharded, references, strict=True):
             expected = _own_rows(reference.data, mesh) if exact else reference.data
             assert torch.equal(param.to_local(), expected)
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_muon_rank(rank: int, world: int, port: int, orthogonalize: str, options: dict) -> None:
     """Step Muon on a row-sharded weight and compare with unsharded Muon."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (world,))
         generator = torch.Generator().manual_seed(0)
         full = torch.randn(4 * world + 3, 8, generator=generator)
@@ -124,8 +101,6 @@ def _check_muon_rank(rank: int, world: int, port: int, orthogonalize: str, optio
             ref_optimizer.step()
         expected = _own_rows(reference.data, mesh) if exact else reference.data
         assert torch.equal(sharded.to_local(), expected)
-    finally:
-        dist.destroy_process_group()
 
 
 class TestRowChunks:
@@ -151,17 +126,17 @@ class TestOrthogonalizeExact:
         ],
     )
     def test_sharded_matrices_match_one_process(self, world, mesh_shape, placements):
-        mp.spawn(_check_rank, args=(world, _free_port(), mesh_shape, placements), nprocs=world)
+        spawn(_check_rank, world, mesh_shape, placements)
 
 
 class TestMuonOnRowShards:
     @pytest.mark.parametrize("orthogonalize", ["local", "exact"])
     def test_a_rank_without_rows_of_a_weight_steps_with_the_others(self, orthogonalize):
         """Every rank finishes the step, and exact still steps the rows of the full matrix."""
-        mp.spawn(_check_rowless_rank, args=(2, _free_port(), orthogonalize), nprocs=2)
+        spawn(_check_rowless_rank, 2, orthogonalize)
 
     @pytest.mark.parametrize("options", [{}, {"nesterov": True, "adjust_lr": "match_rms_adamw"}])
     @pytest.mark.parametrize("orthogonalize", ["local", "exact"])
     def test_step_matches_unsharded_muon(self, orthogonalize, options):
         """Exact steps a shard as rows of the full matrix; local steps it as its own matrix."""
-        mp.spawn(_check_muon_rank, args=(2, _free_port(), orthogonalize, options), nprocs=2)
+        spawn(_check_muon_rank, 2, orthogonalize, options)

@@ -20,15 +20,18 @@ Two levels:
 Both wraps share the same `MixedPrecisionPolicy` and
 `reshard_after_forward` setting.
 
-A VLM is wrapped component by component: the blocks, the transformer
-root, the adapter, and the vision encoder unless it is fully frozen.
+With a `dp_shard` or `dp_replicate` dimension, a VLM is wrapped
+component by component: the blocks, the transformer root, the adapter,
+and the vision encoder unless it is frozen for the whole run, with no
+`FreezeStage` unfreezing any of it. An encoder without parameters goes
+by `vlm.freeze` alone.
 The encoder's unit takes the language model's policy by default. With
 `[vision_encoder] mixed_precision = "bf16"` or `"fp32"` it gets
 `default_mp_policy` of that dtype instead, so the encoder computes in
 that dtype while its parameters, gradients and optimizer state keep the
-dtype it was loaded in. An encoder FSDP2 does not wrap (frozen, or a
-run without a `dp_shard` or `dp_replicate` dimension, such as one GPU)
-gets the same from a wrapper around its forward: each forward runs on
+dtype it was loaded in. An encoder FSDP2 does not wrap (frozen for the
+whole run, or a run without a `dp_shard` or `dp_replicate` dimension,
+such as one GPU) gets the same from a wrapper around its forward: each forward runs on
 copies of its parameters cast to that dtype, with its floating-point
 inputs cast too and autocast off, and autograd returns the gradients to
 the parameters in their own dtype. Under `torch.compile` the wrapper

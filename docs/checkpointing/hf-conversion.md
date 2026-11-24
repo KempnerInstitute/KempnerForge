@@ -143,12 +143,31 @@ uv run python scripts/convert_checkpoint.py hf-to-dcp \
 
 What happens:
 
-1. Load the HF state dict:
-   - Local dir: prefer `*.safetensors`, fall back to
-     `pytorch_model*.bin`.
-   - HF ID: download via
-     `transformers.AutoModelForCausalLM.from_pretrained`.
-2. Convert keys HF → KempnerForge naming.
+1. Load the HF state dict from the standard weight files at the top of
+   the model, in the order transformers loads them by default:
+   `model.safetensors`, else the shards
+   `model.safetensors.index.json` names, and otherwise the same for
+   `pytorch_model.bin`. An adapter or another variant beside them is
+   left out; there is no variant or subfolder choice, and a config's
+   `transformers_weights` is not read.
+   - Local dir: those files; a directory with none of these names gives
+     every `*.safetensors` file, or else every `pytorch_model*.bin`.
+   - HF ID: the same files, each downloaded with
+     `huggingface_hub.hf_hub_download` or taken from its cache, the
+     shards at the commit their index came from. None of the
+     repository's code runs and no Hugging Face model is built, and a
+     shard that cannot be had fails the import. A name whose lookup
+     fails without the Hub saying it has no such file, as offline, is
+     passed over like a missing one, and `hf_hub_download` takes each
+     name from the cache when it cannot reach the Hub, so a cached
+     model imports with `HF_HUB_OFFLINE=1`. With none of the names
+     had, the error names the first failed lookup and chains its error.
+2. Convert keys HF → KempnerForge naming. The names converted are the
+   ones stored in the files, as [Key mapping](#key-mapping) lists
+   them, Mixtral's included; any other name is skipped with a
+   warning. A checkpoint with tied embeddings may store no
+   `lm_head.weight`: the output head then takes the token embedding,
+   whether `tie_embeddings` is true or false.
 3. `model.load_state_dict(converted, strict=False)` — missing KF
    keys (e.g. learned RoPE frequencies) stay at their default init
    and are logged as warnings.
@@ -196,14 +215,22 @@ MoE-specific, in Mixtral's names:
 `hf-to-dcp` reads these names, and the ones exports used before them:
 `model.layers.{i}.mlp.gate.weight` for the router and
 `model.layers.{i}.mlp.experts.{j}.{gate,up,down}_proj.weight` for the
-experts. From a hub ID it reads a loaded model, whose experts transformers
-5 packs into `mlp.experts.gate_up_proj` and `mlp.experts.down_proj`, and
-splits them. For a model with packed experts it stacks each layer's experts
+experts. It also splits the experts a checkpoint holds packed, as
+`mlp.experts.gate_up_proj` and `mlp.experts.down_proj`, which transformers 5
+saves with `save_original_format=False` and by default saves under the names
+above. For a model with packed experts it stacks each layer's experts
 into `gate_w`, `up_w` and `down_w`. Mixtral has no expert bias or shared
 experts: `dcp-to-hf` refuses models with them unless given
 `--no-architecture-check` (see [MoE](#moe)), and then writes them as
 `model.layers.{i}.mlp.expert_bias` and `model.layers.{i}.mlp.shared_experts.*`,
 which `hf-to-dcp` reads back.
+
+The sigmoid router's `fp32_ema_bits` and `fp32_bias_bits`, FP32 masters
+of its balancing state held as int32 bit patterns, are not exported.
+`hf-to-dcp` derives them from the imported `expert_bias` and
+`expert_ema`, and `dcp-to-hf` converts a checkpoint saved before they
+existed (see
+[Aux loss and balancing](../moe/aux-loss-and-balancing.md#sigmoid-router--bias-based-balancing)).
 
 A checkpoint saved with expert parallelism holds every expert under its
 global index, as one saved without it does (see

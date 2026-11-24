@@ -32,6 +32,7 @@ import torch
 import torch.distributed.checkpoint as dcp
 
 from kempnerforge.checkpoint.expert_layout import check_saved_experts
+from kempnerforge.checkpoint.manager import derived_buffer_owners, drop_derived_model_keys
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import Activation, ModelConfig, NormType
 from kempnerforge.model.transformer import Transformer
@@ -125,10 +126,10 @@ def _hf_tensors(state_dict: dict[str, torch.Tensor]) -> Iterator[tuple[str, torc
 def _unpack_mixtral_experts(hf_state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Split the experts a transformers 5 Mixtral holds packed into Mixtral's per-expert names.
 
-    A loaded model's state dict, which a hub ID goes through, holds each layer's experts as
-    ``mlp.experts.gate_up_proj`` of shape ``(num_experts, 2 * width, dim)``, each expert's
-    gate rows then its up rows, and ``mlp.experts.down_proj`` of shape
-    ``(num_experts, dim, width)``. Other keys pass through.
+    A checkpoint transformers 5 saves with ``save_original_format=False`` holds, as its loaded
+    model does, each layer's experts as ``mlp.experts.gate_up_proj`` of shape
+    ``(num_experts, 2 * width, dim)``, each expert's gate rows then its up rows, and
+    ``mlp.experts.down_proj`` of shape ``(num_experts, dim, width)``. Other keys pass through.
     """
     unpacked = {}
     for key, tensor in hf_state.items():
@@ -189,7 +190,9 @@ def dcp_to_hf(
     safetensors refuses tensors that share memory. A checkpoint saved with
     expert parallelism holds every expert, as one saved without it does; one
     that holds fewer experts than ``model_config`` asks for is refused (see
-    ``check_saved_experts``).
+    ``check_saved_experts``). Buffers a module derives from its other state, such as
+    the sigmoid router's FP32 masters, are not exported, and a checkpoint saved before
+    they existed converts too (see ``derived_buffer_owners``).
 
     Args:
         dcp_dir: Path to DCP checkpoint directory (e.g., checkpoints/step_10000).
@@ -218,12 +221,15 @@ def dcp_to_hf(
         saved = dcp.FileSystemReader(dcp_dir).read_metadata().state_dict_metadata
         check_saved_experts(model, saved, dcp_dir)
         state_dict = {"model": model.state_dict()}
+        drop_derived_model_keys(state_dict["model"], model, saved)
         dcp.load(state_dict, checkpoint_id=dcp_dir)
         model.load_state_dict(state_dict["model"])
 
+    derived = derived_buffer_owners(model)
     hf_state = {}
     seen_storage: set[int] = set()
-    for hf_key, tensor in _hf_tensors(model.state_dict()):
+    exported = {key: value for key, value in model.state_dict().items() if key not in derived}
+    for hf_key, tensor in _hf_tensors(exported):
         cast = tensor.to(dtype)
         ptr = cast.untyped_storage().data_ptr()
         hf_state[hf_key] = cast.clone() if ptr in seen_storage else cast
@@ -252,7 +258,9 @@ def hf_to_dcp(
 ) -> None:
     """Convert a HuggingFace checkpoint to DCP format.
 
-    Supports loading from a local directory or a HuggingFace model ID.
+    Supports loading from a local directory or a HuggingFace model ID. Buffers a module
+    derives from its other state, such as the sigmoid router's FP32 masters, which no
+    export holds, are derived from the loaded weights.
 
     Args:
         hf_dir: Path to HF model directory or HF model ID.
@@ -288,7 +296,16 @@ def hf_to_dcp(
     if unmapped:
         logger.warning(f"Skipped {len(unmapped)} unmapped HF keys: {unmapped[:5]}...")
 
-    missing = set(kf_state.keys()) - set(converted.keys())
+    head, embedding = "output_head.proj.weight", "token_embedding.embedding.weight"
+    if head in kf_state and head not in converted and embedding in converted:
+        converted[head] = converted[embedding]
+        logger.info(
+            "The checkpoint holds no lm_head.weight, as one with tied embeddings may not: "
+            "the output head takes the token embedding"
+        )
+
+    derived = derived_buffer_owners(model)
+    missing = kf_state.keys() - converted.keys() - derived.keys()
     if missing:
         logger.warning(f"Missing {len(missing)} keys (using random init): {list(missing)[:5]}...")
 
@@ -300,38 +317,87 @@ def hf_to_dcp(
     logger.info(f"Saved DCP checkpoint: {dcp_path}")
 
 
-def _load_hf_local(path: Path) -> dict[str, torch.Tensor]:
-    """Load state dict from a local HuggingFace model directory."""
-    safetensor_files = list(path.glob("*.safetensors"))
-    if safetensor_files:
-        from safetensors.torch import load_file
+_WEIGHT_FILES = (
+    ("model.safetensors", "model.safetensors.index.json"),
+    ("pytorch_model.bin", "pytorch_model.bin.index.json"),
+)
 
-        state = {}
-        for f in sorted(safetensor_files):
+
+def _indexed_shards(index: Path) -> list[str]:
+    """The shard files a weights index names in its ``weight_map``."""
+    return sorted(set(json.loads(index.read_text())["weight_map"].values()))
+
+
+def _read_weight_files(files: list[Path]) -> dict[str, torch.Tensor]:
+    """Read safetensors files, or ``.bin`` files with ``weights_only=True``, into one dict."""
+    from safetensors.torch import load_file
+
+    state: dict[str, torch.Tensor] = {}
+    for f in files:
+        if f.suffix == ".safetensors":
             state.update(load_file(f))
-        return state
-
-    bin_files = list(path.glob("pytorch_model*.bin"))
-    if bin_files:
-        state = {}
-        for f in sorted(bin_files):
+        else:
             state.update(torch.load(f, map_location="cpu", weights_only=True))
-        return state
+    return state
 
-    raise FileNotFoundError(f"No model files found in {path}")
+
+def _load_hf_local(path: Path) -> dict[str, torch.Tensor]:
+    """Load the weights of a local HuggingFace model directory.
+
+    The files read are the ones transformers loads by default from those standard names in the
+    directory: ``model.safetensors``, else the shards its index names, and otherwise the same
+    for ``pytorch_model.bin``, so an adapter or another variant beside them is left out. A
+    directory with none of these names gives every ``*.safetensors`` file, or else every
+    ``pytorch_model*.bin``.
+    """
+    for single, index in _WEIGHT_FILES:
+        if (path / single).exists():
+            return _read_weight_files([path / single])
+        if (path / index).exists():
+            return _read_weight_files([path / name for name in _indexed_shards(path / index)])
+    files = sorted(path.glob("*.safetensors")) or sorted(path.glob("pytorch_model*.bin"))
+    if not files:
+        raise FileNotFoundError(f"No model files found in {path}")
+    return _read_weight_files(files)
 
 
 def _load_hf_hub(model_id: str) -> dict[str, torch.Tensor]:
-    """Load state dict from HuggingFace Hub."""
-    from transformers import AutoModelForCausalLM
+    """Download the weight files of a Hub model that ``_load_hf_local`` reads, and read them.
 
-    logger.info(f"Downloading model from HuggingFace Hub: {model_id}")
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    )
-    return hf_model.state_dict()
+    The first of the standard names the repository has is downloaded as ``hf_hub_download``
+    resolves the branch, which keeps the cache's record of that branch for offline loads. The
+    shards an index names are downloaded at the commit of the snapshot it came from, so a branch
+    that moves meanwhile mixes no files, and a shard that cannot be had fails the load. A name
+    whose lookup fails without an answer from the Hub that it has no such file, as in offline
+    mode, is passed over like a missing one, and with none of the names had, the error chains
+    the first such failure. None of the repository's code runs, no Hugging Face model is built,
+    and the weights keep the precision they are stored in.
+    """
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
+
+    logger.info(f"Downloading the weight files of {model_id} from the HuggingFace Hub")
+    failed: tuple[str, LocalEntryNotFoundError] | None = None
+    for single, index in _WEIGHT_FILES:
+        for name in (single, index):
+            try:
+                path = Path(hf_hub_download(model_id, name))
+            except LocalEntryNotFoundError as e:
+                failed = failed or (name, e)
+                continue
+            except EntryNotFoundError:
+                continue
+            if name == single:
+                return _read_weight_files([path])
+            commit = path.parent.name
+            shards = [hf_hub_download(model_id, f, revision=commit) for f in _indexed_shards(path)]
+            return _read_weight_files([Path(shard) for shard in shards])
+    names = ", ".join(name for pair in _WEIGHT_FILES for name in pair)
+    found_none = f"Found none of {names} for {model_id} on the Hub or in its cache"
+    if failed is None:
+        raise FileNotFoundError(found_none)
+    name, error = failed
+    raise FileNotFoundError(f"{found_none}; the lookup of {name} failed: {error}") from error
 
 
 def _architecture_problems(config: ModelConfig) -> list[str]:

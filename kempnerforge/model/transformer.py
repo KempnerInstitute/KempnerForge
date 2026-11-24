@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING, cast
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from kempnerforge.config.registry import registry
@@ -323,6 +324,49 @@ class Transformer(nn.Module):
         for _, _, mlp in self._moe_mlps():
             if isinstance(mlp.router, SigmoidTopKRouter):
                 mlp.router.set_step(step, max_steps)
+
+    def balance_routers(self) -> None:
+        """Apply every sigmoid router's balancing update after an optimizer step.
+
+        One all-reduce over the default process group sums the routers' pending expert
+        counts, packed in ``_moe_mlps`` order, so every rank must call this, a rank that
+        routed no tokens included. Reaches every sigmoid router, each MoT modality's too.
+        See ``SigmoidTopKRouter.balance``.
+        """
+        from kempnerforge.model.router import SigmoidTopKRouter
+
+        routers = [
+            mlp.router
+            for _, _, mlp in self._moe_mlps()
+            if isinstance(mlp.router, SigmoidTopKRouter)
+        ]
+        if not routers:
+            return
+        counts = torch.cat([router.pending_counts for router in routers])
+        if dist.is_initialized():
+            dist.all_reduce(counts)
+        sizes = [router.num_experts for router in routers]
+        for router, routed in zip(routers, counts.split(sizes), strict=True):
+            router.balance(routed)
+
+    def discard_router_counts(self) -> None:
+        """Clear every sigmoid router's pending expert counts, for a step that did not run."""
+        from kempnerforge.model.router import SigmoidTopKRouter
+
+        for _, _, mlp in self._moe_mlps():
+            if isinstance(mlp.router, SigmoidTopKRouter):
+                mlp.router.pending_counts.zero_()
+
+    def detach_router_losses(self) -> None:
+        """Detach every router's ``aux_loss`` and ``z_loss`` once the loss holds what it uses.
+
+        A term the loss leaves out, such as the z-loss at weight 0, would otherwise keep
+        its graph until the next forward, and with it, under activation checkpointing, the
+        inputs of every checkpointed block. The detached values still serve the metrics.
+        """
+        for _, _, mlp in self._moe_mlps():
+            mlp.router.aux_loss = mlp.aux_loss.detach()
+            mlp.router.z_loss = mlp.z_loss.detach()
 
     def get_moe_aux_loss(self) -> torch.Tensor:
         """Sum the auxiliary losses of every MoE router. Returns 0 if dense.

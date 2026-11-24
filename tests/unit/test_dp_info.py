@@ -9,12 +9,9 @@ dimension names and order ``init_distributed`` builds: ``pp``, ``dp_replicate``,
 
 from __future__ import annotations
 
-import socket
-
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -40,6 +37,7 @@ from kempnerforge.training.data_pipeline import (
     build_eval_dataloader,
 )
 from kempnerforge.training.runtime import RuntimeContext
+from tests.gloo_ranks import gloo_group, spawn
 
 HSDP_LAYOUTS = {
     "dp_replicate2_dp_shard2": (
@@ -80,28 +78,13 @@ OTHER_LAYOUTS = {
 }
 
 
-def _free_port() -> int:
-    """An unused local TCP port for the gloo rendezvous."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _init(rank: int, world: int, port: int) -> None:
-    """Join a ``world``-rank gloo group."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-
-
 def _check_layouts(rank: int, world: int, port: int, layouts: list) -> None:
     """Build each ``(names, sizes, expected)`` mesh and compare this rank's DP info.
 
     Every mesh is checked even after one fails, and the failure names each mesh
     whose DP info was wrong or whose ``get_dp_info`` raised.
     """
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         wrong = []
         for names, sizes, expected in layouts:
             mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
@@ -112,8 +95,6 @@ def _check_layouts(rank: int, world: int, port: int, layouts: list) -> None:
             if got != expected[rank]:
                 wrong.append(f"mesh {names} of {sizes}: {got}, expected {expected[rank]}")
         assert not wrong, f"rank {rank}:\n" + "\n".join(wrong)
-    finally:
-        dist.destroy_process_group()
 
 
 def _by_world(layouts: dict) -> dict[int, list]:
@@ -126,8 +107,7 @@ def _by_world(layouts: dict) -> dict[int, list]:
 
 def _check_data_partition(rank: int, world: int, port: int, data_dir: str) -> None:
     """Build the training and eval loaders on a 2 x 2 HSDP mesh; each rank reads its own part."""
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp_replicate", "dp_shard"))
         runtime = RuntimeContext(
             rank=rank,
@@ -156,8 +136,6 @@ def _check_data_partition(rank: int, world: int, port: int, data_dir: str) -> No
                 f"loader {loader}: {len(seen)} samples, {len(set(seen))} distinct, "
                 f"expected {world * len(samples)} disjoint"
             )
-    finally:
-        dist.destroy_process_group()
 
 
 def _loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -172,8 +150,7 @@ def _check_hsdp_step(rank: int, world: int, port: int) -> None:
     ``get_dp_info``, so a DP rank shared by two ranks repeats rows and drops others.
     """
     seq = 16
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp_replicate", "dp_shard"))
         config = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=128, max_seq_len=seq)
         torch.manual_seed(0)
@@ -202,8 +179,6 @@ def _check_hsdp_step(rank: int, world: int, port: int) -> None:
             torch.testing.assert_close(
                 grad, reference.get_parameter(name).grad, rtol=1e-5, atol=1e-7
             )
-    finally:
-        dist.destroy_process_group()
 
 
 DP_PEERS = [
@@ -218,8 +193,7 @@ DP_PEERS = [
 
 def _check_dp_reduction(rank: int, world: int, port: int) -> None:
     """Sum and average over each mesh's DP groups; only the rank's DP peers take part."""
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         wrong = []
         for names, sizes, peers in DP_PEERS:
             mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
@@ -231,8 +205,6 @@ def _check_dp_reduction(rank: int, world: int, port: int) -> None:
             if (total, mean) != expected:
                 wrong.append(f"mesh {names} of {sizes}: {(total, mean)}, expected {expected}")
         assert not wrong, f"rank {rank}:\n" + "\n".join(wrong)
-    finally:
-        dist.destroy_process_group()
 
 
 class _AllFinite:
@@ -250,8 +222,7 @@ def _check_loop_reduces_losses(rank: int, world: int, port: int) -> None:
     from kempnerforge.training.loop import run_training_loop, text_step
     from tests.unit.test_train_entry import VOCAB, make_config, make_session
 
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
         generator = torch.Generator().manual_seed(10 + rank)
 
@@ -319,8 +290,6 @@ def _check_loop_reduces_losses(rank: int, world: int, port: int) -> None:
         assert published == pytest.approx(train_means, rel=1e-12), (rank, published, everyone)
         assert hook.losses == pytest.approx(train_means, rel=1e-12), (rank, hook.losses)
         assert hook.evals == pytest.approx(eval_means, rel=1e-6), (rank, hook.evals, everyone)
-    finally:
-        dist.destroy_process_group()
 
 
 MESHES_OF_TWO = {
@@ -338,8 +307,7 @@ def _check_source_metrics(rank: int, world: int, port: int, names: tuple, sizes:
     from kempnerforge.training.loop import run_training_loop
     from tests.unit.test_train_entry import VOCAB, _mixture_pipeline, make_config, make_session
 
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         dp_rank, _ = get_dp_info(mesh)
         generator = torch.Generator().manual_seed(20 + dp_rank)
@@ -386,8 +354,6 @@ def _check_source_metrics(rank: int, world: int, port: int, names: tuple, sizes:
             rank,
             logged,
         )
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_text_tokens(rank: int, world: int, port: int, names: tuple, sizes: tuple) -> None:
@@ -397,8 +363,7 @@ def _check_text_tokens(rank: int, world: int, port: int, names: tuple, sizes: tu
     from kempnerforge.training.loop import StepResult, _log_periodic_metrics
     from tests.unit.test_train_entry import make_config, make_session
 
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         _, dp_size = get_dp_info(mesh)
         config = JobConfig(
@@ -421,8 +386,6 @@ def _check_text_tokens(rank: int, world: int, port: int, names: tuple, sizes: tu
         session.tracker.log_eval = lambda m, s: logged.update(m)
         _log_periodic_metrics(session, StepResult(loss=1.0, grad_norm=0.1, text_tokens=10), 1)
         assert logged["data/text_tokens_trained"] == 10.0 * dp_size, (rank, logged)
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_step_counts(rank: int, world: int, port: int, names: tuple, sizes: tuple) -> None:
@@ -431,8 +394,7 @@ def _check_step_counts(rank: int, world: int, port: int, names: tuple, sizes: tu
     from kempnerforge.training.loop import StepResult, _step_counts
     from tests.unit.test_train_entry import make_config, make_session
 
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         dp_rank, dp_size = get_dp_info(mesh)
         runtime = RuntimeContext(
@@ -449,8 +411,6 @@ def _check_step_counts(rank: int, world: int, port: int, names: tuple, sizes: tu
         )
         expected = sum(2 + 2 * r for r in range(dp_size))
         assert _step_counts(session, result) == (expected * 4, expected, expected), rank
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_mixed_reports(rank: int, world: int, port: int) -> None:
@@ -459,8 +419,7 @@ def _check_mixed_reports(rank: int, world: int, port: int) -> None:
     from kempnerforge.training.loop import StepResult, _step_counts
     from tests.unit.test_train_entry import make_config, make_session
 
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp_shard",))
         runtime = RuntimeContext(
             rank=rank,
@@ -477,8 +436,6 @@ def _check_mixed_reports(rank: int, world: int, port: int) -> None:
         else:
             result = StepResult(loss=1.0, grad_norm=0.1)
         assert _step_counts(session, result) == (8 + configured, 2, 2), rank
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_missing_text_tokens(
@@ -490,8 +447,7 @@ def _check_missing_text_tokens(
     from kempnerforge.training.loop import StepResult, _log_periodic_metrics
     from tests.unit.test_train_entry import make_config, make_session
 
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
         runtime = RuntimeContext(
             rank=rank,
@@ -512,8 +468,6 @@ def _check_missing_text_tokens(
         result = StepResult(loss=1.0, grad_norm=0.1, text_tokens=10 if rank == 0 else None)
         with pytest.raises(RuntimeError, match="reported no text-token count"):
             _log_periodic_metrics(session, result, 1)
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_partial_reports(rank: int, world: int, port: int) -> None:
@@ -522,8 +476,7 @@ def _check_partial_reports(rank: int, world: int, port: int) -> None:
     from kempnerforge.training.loop import StepResult, _log_periodic_metrics, _step_counts
     from tests.unit.test_train_entry import _mixture_pipeline, make_config, make_session
 
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp_shard",))
         runtime = RuntimeContext(
             rank=rank,
@@ -546,8 +499,6 @@ def _check_partial_reports(rank: int, world: int, port: int) -> None:
         session.tracker.log_eval = lambda m, s: logged.update(m)
         _log_periodic_metrics(session, result, 1)
         assert logged == {"data/a/tokens": 3.0}, (rank, logged)
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_vlm_partial_loop(rank: int, world: int, port: int) -> None:
@@ -559,8 +510,7 @@ def _check_vlm_partial_loop(rank: int, world: int, port: int) -> None:
     from kempnerforge.training.loop import StepResult, run_training_loop
     from tests.unit.test_train_entry import make_config, make_session
 
-    _init(rank, world, port)
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp_shard",))
         runtime = RuntimeContext(
             rank=rank,
@@ -602,8 +552,6 @@ def _check_vlm_partial_loop(rank: int, world: int, port: int) -> None:
         assert session.documents_seen == 3, rank
         assert session.checkpointer.saves[-1][2]["documents_seen"] == 3, rank
         assert flops == [3 * 10.0], (rank, flops)
-    finally:
-        dist.destroy_process_group()
 
 
 class TestGetDpInfoOnRealMeshes:
@@ -616,13 +564,13 @@ class TestGetDpInfoOnRealMeshes:
         ``tp`` or ``ep`` share it, and the DP size is dp_replicate x dp_shard.
         """
         layouts = _by_world(HSDP_LAYOUTS)[world]
-        mp.spawn(_check_layouts, args=(world, _free_port(), layouts), nprocs=world)
+        spawn(_check_layouts, world, layouts)
 
     @pytest.mark.parametrize("world", sorted(_by_world(OTHER_LAYOUTS)))
     def test_meshes_without_hsdp_keep_their_dp_ranks(self, world):
         """One DP dim, or none under pure PP, gives the same DP info as before HSDP."""
         layouts = _by_world(OTHER_LAYOUTS)[world]
-        mp.spawn(_check_layouts, args=(world, _free_port(), layouts), nprocs=world)
+        spawn(_check_layouts, world, layouts)
 
 
 class TestDataParallelReduction:
@@ -632,48 +580,48 @@ class TestDataParallelReduction:
         Ranks that differ only in ``pp``, ``ep`` or ``tp`` read the same data, so they
         are not summed, and with one DP rank nothing is.
         """
-        mp.spawn(_check_dp_reduction, args=(4, _free_port()), nprocs=4)
+        spawn(_check_dp_reduction, 4)
 
 
 class TestLoggedMetricsOverDataParallel:
     def test_train_and_eval_loss_are_dp_means_on_every_rank(self):
         """The tracker, the hooks and eval see the mean over the DP ranks, not each
         rank's own loss, so rank 0's backends log the whole job's loss."""
-        mp.spawn(_check_loop_reduces_losses, args=(2, _free_port()), nprocs=2)
+        spawn(_check_loop_reduces_losses, 2)
 
     @pytest.mark.parametrize("mesh", sorted(MESHES_OF_TWO))
     def test_per_source_metrics_cover_every_dp_rank(self, mesh):
         """``loss/<name>`` is token-weighted over every DP rank's rows of that source and
         ``data/<name>/tokens`` sums every DP rank's, on every rank, counting TP peers once."""
         names, sizes = MESHES_OF_TWO[mesh]
-        mp.spawn(_check_source_metrics, args=(2, _free_port(), names, sizes), nprocs=2)
+        spawn(_check_source_metrics, 2, names, sizes)
 
     @pytest.mark.parametrize("mesh", sorted(MESHES_OF_TWO))
     def test_step_counts_add_what_each_dp_rank_ran(self, mesh):
         """Tokens, documents and encoder images sum the DP ranks' own counts, TP peers once."""
         names, sizes = MESHES_OF_TWO[mesh]
-        mp.spawn(_check_step_counts, args=(2, _free_port(), names, sizes), nprocs=2)
+        spawn(_check_step_counts, 2, names, sizes)
 
     def test_a_rank_that_reports_no_counts_still_joins_the_reduction(self):
-        mp.spawn(_check_mixed_reports, args=(2, _free_port()), nprocs=2)
+        spawn(_check_mixed_reports, 2)
 
     def test_counts_one_rank_reports_reach_every_rank(self):
-        mp.spawn(_check_partial_reports, args=(2, _free_port()), nprocs=2)
+        spawn(_check_partial_reports, 2)
 
     @pytest.mark.parametrize("mesh", sorted(MESHES_OF_TWO))
     def test_a_missing_text_token_count_fails_every_rank(self, mesh):
         """Also between tensor-parallel peers of one DP rank, whom the DP groups leave out."""
         names, sizes = MESHES_OF_TWO[mesh]
-        mp.spawn(_check_missing_text_tokens, args=(2, _free_port(), names, sizes), nprocs=2)
+        spawn(_check_missing_text_tokens, 2, names, sizes)
 
     def test_a_vlm_loop_publishes_the_counts_one_rank_reports(self):
-        mp.spawn(_check_vlm_partial_loop, args=(2, _free_port()), nprocs=2)
+        spawn(_check_vlm_partial_loop, 2)
 
     @pytest.mark.parametrize("mesh", sorted(MESHES_OF_TWO))
     def test_vlm_text_tokens_count_each_dp_rank_once(self, mesh):
         """The text-token count is summed over the DP ranks, not every rank of the world."""
         names, sizes = MESHES_OF_TWO[mesh]
-        mp.spawn(_check_text_tokens, args=(2, _free_port(), names, sizes), nprocs=2)
+        spawn(_check_text_tokens, 2, names, sizes)
 
 
 class TestDataPipelineOnHsdp:
@@ -683,7 +631,7 @@ class TestDataPipelineOnHsdp:
         The loaders are built where training builds them, from ``get_dp_info``,
         so a rank that shared another's part would repeat its samples.
         """
-        mp.spawn(_check_data_partition, args=(4, _free_port(), mmap_data_dir), nprocs=4)
+        spawn(_check_data_partition, 4, mmap_data_dir)
 
 
 class TestHsdpTrainingStep:
@@ -693,4 +641,4 @@ class TestHsdpTrainingStep:
         Each rank trains on the rows its DP rank selects, and the clipped gradients,
         averaged over all four ranks, equal one process's on every row.
         """
-        mp.spawn(_check_hsdp_step, args=(4, _free_port()), nprocs=4)
+        spawn(_check_hsdp_step, 4)

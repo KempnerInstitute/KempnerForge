@@ -633,7 +633,7 @@ class TestMuonRouting:
         on_muon = bool(muon_router)
         assert (moe.router.gate.weight in muon) is on_muon
         assert (moe.router.gate.weight in adam) is not on_muon
-        assert moe.router.expert_bias in adam
+        assert moe.router.expert_bias not in adam | muon
         assert {expert.up_proj.weight for expert in moe.experts} <= muon
 
     @pytest.mark.parametrize("muon_router", [False, True])

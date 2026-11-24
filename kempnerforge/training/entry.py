@@ -387,6 +387,9 @@ def restore_checkpoint(
     each enabled tracking backend opens a run of its own unless ``metrics.mlflow_run_id`` or
     ``metrics.wandb_run_id`` names one, and with MLflow on, rank 0 tags the new run with the
     checkpoint and the MLflow run that saved it (``_tag_warm_start_run``).
+
+    A checkpoint saved with another ``plugins`` list is refused before any state is read
+    (see ``CheckpointManager.load``'s ``plugins_expected``).
     """
     num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
@@ -424,6 +427,7 @@ def restore_checkpoint(
             vlm_freeze_expected=vlm_freeze_expected,
             fresh_if_unheld=unfrozen_later,
             exact_resume=resume_path is not None,
+            plugins_expected=list(config.plugins),
         )
     if resume_path is not None:
         if ckpt_extra_loaded.get("wandb_run_id"):
@@ -466,6 +470,7 @@ def run_training(
     """
     runtime = setup_distributed(config)
     tracker: MetricsTracker | None = None
+    ckpt_mgr: CheckpointManager | None = None
     shutdown_handler = ShutdownHandler(timeout_sec=config.train.shutdown_timeout_sec)
     finished = False
     try:
@@ -491,6 +496,7 @@ def run_training(
         scheduler = build_scheduler(optimizer, config.scheduler, max_steps=config.train.max_steps)
 
         ckpt_mgr = build_checkpoint_manager(config, runtime, model, optimizer, pipeline)
+        ckpt_mgr.claim_dir()
         step, tokens_seen = restore_checkpoint(config, model, scheduler, ckpt_mgr)
 
         tracker = MetricsTracker(config, num_gpus=runtime.world_size)
@@ -538,5 +544,9 @@ def run_training(
         if tracker is not None:
             tracker.close()
         if finished:
-            destroy_distributed()
-            shutdown_handler.finish()
+            try:
+                if ckpt_mgr is not None:
+                    ckpt_mgr.release_dir()
+            finally:
+                destroy_distributed()
+                shutdown_handler.finish()
