@@ -18,6 +18,7 @@ attention_backend = "flex"
 [vision_encoder]
 type = "siglip2"
 path = "google/siglip2-so400m-patch16-512"
+drop_pooling_head = true
 mixed_precision = "bf16"
 
 [adapter]

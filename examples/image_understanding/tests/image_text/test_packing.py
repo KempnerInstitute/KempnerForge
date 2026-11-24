@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import itertools
+from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
-from image_text.packing import PackedLoader, footprint
-from torch.utils.data import Dataset
+from image_text.datacomp import DataCompStream
+from image_text.packing import PackedLoader, PackedStreamLoader, footprint
+from image_text.render import ChatRenderer, RenderedStream
+from test_datacomp import _shards
+from torch.utils.data import Dataset, IterableDataset
 
 TOKENS_PER_IMAGE = 2
 
@@ -202,3 +207,156 @@ class TestPackedLoader:
     def test_a_pass_with_nothing_to_pack_raises(self) -> None:
         with pytest.raises(RuntimeError, match="packed no document"):
             next(iter(_loader([(9, 9), (9, 9)])))
+
+
+class DocStream(IterableDataset):
+    """``Docs`` read in index order, each with the count read so far as position.
+
+    The stream is endless unless ``end`` caps the documents read.
+    """
+
+    def __init__(self, sizes: list[tuple[int, int]], end: int | None = None) -> None:
+        self.docs = Docs(sizes)
+        self.end = end
+        self.next = 0
+
+    def __iter__(self) -> Any:
+        counts = itertools.count(self.next) if self.end is None else range(self.next, self.end)
+        for count in counts:
+            yield [count + 1], self.docs[count % len(self.docs)]
+
+    def advance(self, position: list[int]) -> None:
+        self.next = position[0]
+
+    def state_dict(self) -> dict[str, int]:
+        return {"next": self.next}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self.next = state["next"]
+
+
+def _stream_loader(
+    sizes: list[tuple[int, int]] = SIZES, end: int | None = None, **options: Any
+) -> PackedStreamLoader:
+    kwargs: dict = {"seq_len": 16, "tokens_per_image": TOKENS_PER_IMAGE, "pad_id": 0}
+    kwargs.update(options)
+    return PackedStreamLoader(DocStream(sizes, end), **kwargs)
+
+
+def _same_batches(a: list[dict[str, torch.Tensor]], b: list[dict[str, torch.Tensor]]) -> bool:
+    return len(a) == len(b) and all(
+        x.keys() == y.keys() and all(torch.equal(x[key], y[key]) for key in x)
+        for x, y in zip(a, b, strict=True)
+    )
+
+
+class TestPackedStreamLoader:
+    def test_documents_fill_rows_in_stream_order(self) -> None:
+        expected = _greedy(SIZES, list(range(len(SIZES))) * 3, 16)[:-1]
+        batches = list(itertools.islice(_stream_loader(), len(expected)))
+        assert [_documents(b) for b in batches] == [
+            [i % len(SIZES) for i in row] for row in expected
+        ]
+        assert all(b["input_ids"].shape == (1, 16) for b in batches)
+
+    def test_a_document_longer_than_a_row_is_passed_over(self) -> None:
+        sizes = [*SIZES[:4], (5, 10), *SIZES[4:]]
+        loader = _stream_loader(sizes)
+        rows = [_documents(b) for b in itertools.islice(loader, 6)]
+        assert 4 not in itertools.chain(*rows)
+        assert loader.oversize == 1 and loader.state_dict()["oversize"] == 1
+
+    @pytest.mark.parametrize("taken", [1, 3, 5])
+    def test_a_resume_packs_the_rows_of_an_uninterrupted_run(self, taken: int) -> None:
+        sizes = [*SIZES[:2], (5, 10), *SIZES[2:]]
+        reference = _stream_loader(sizes)
+        uninterrupted = list(itertools.islice(reference, 9))
+        reference_state = _stream_loader(sizes)
+        list(itertools.islice(reference_state, taken))
+        first = _stream_loader(sizes)
+        before = list(itertools.islice(first, taken))
+        saved = first.state_dict()
+        assert saved["oversize"] == 1 and saved == reference_state.state_dict()
+        resumed = _stream_loader(sizes)
+        resumed.load_state_dict(saved)
+        assert resumed.state_dict() == saved
+        after = list(itertools.islice(resumed, 9 - taken))
+        assert _same_batches(before + after, uninterrupted)
+        assert resumed.state_dict() == reference.state_dict()
+
+    def test_a_finite_stream_yields_its_last_row(self) -> None:
+        loader = _stream_loader(end=len(SIZES))
+        rows = [_documents(b) for b in loader]
+        assert rows == _greedy(SIZES, list(range(len(SIZES))), 16)
+        assert loader.state_dict()["stream"] == {"next": len(SIZES)}
+
+    def test_a_stream_with_nothing_that_fits_raises(self) -> None:
+        with pytest.raises(RuntimeError, match="ended before a document fit"):
+            list(_stream_loader([(5, 10)], end=3))
+        with pytest.raises(RuntimeError, match="5 documents in a row"):
+            next(iter(_stream_loader([(5, 10)], max_oversize_run=5)))
+
+    def test_a_datacomp_resume_packs_the_rows_of_an_uninterrupted_run(
+        self, tmp_path: Path, tokenizer: Any
+    ) -> None:
+        _shards(tmp_path, 4, 4)
+        renderer = ChatRenderer(tokenizer, max_text_len=None, image_size=8, answer_only=False)
+        opened: list[PackedStreamLoader] = []
+
+        def loader() -> PackedStreamLoader:
+            stream = DataCompStream(tmp_path, "Caption it.", num_workers=2, seed=4)
+            rendered = RenderedStream(stream, renderer, seed=4)
+            opened.append(
+                PackedStreamLoader(
+                    rendered,
+                    seq_len=96,
+                    tokens_per_image=4,
+                    pad_id=renderer.pad_id,
+                    num_workers=2,
+                    multiprocessing_context="fork",
+                )
+            )
+            return opened[-1]
+
+        try:
+            uninterrupted = list(itertools.islice(loader(), 5))
+            workers = set()
+            for taken in (1, 2):
+                first = loader()
+                before = list(itertools.islice(first, taken))
+                saved = first.state_dict()
+                workers.add(saved["stream"]["next_worker"])
+                resumed = loader()
+                resumed.load_state_dict(saved)
+                after = list(itertools.islice(resumed, 5 - taken))
+                assert _same_batches(before + after, uninterrupted)
+            assert workers - {0}
+        finally:
+            for each in opened:
+                each.close()
+
+    def test_close_shuts_the_workers_down(self) -> None:
+        loader = _stream_loader(num_workers=2)
+        next(iter(loader))
+        workers = list(loader._iterator._workers)
+        loader.close()
+        assert not any(worker.is_alive() for worker in workers)
+        loader.close()
+
+    def test_view_groups_give_each_view_its_own_group(self) -> None:
+        loader = _stream_loader([(2, 3), (0, 4), (1, 2)], view_groups=True, seq_len=32)
+        groups = next(iter(loader))["attention_group_ids"][0].tolist()
+        assert groups[:4] == [0, 0, 1, 1] and groups[4:11] == [-1] * 7
+        assert groups[11:13] == [2, 2]
+
+    def test_arguments_are_checked(self) -> None:
+        with pytest.raises(TypeError, match="needs an IterableDataset, got Docs"):
+            PackedStreamLoader(Docs(SIZES), seq_len=16, tokens_per_image=2, pad_id=0)
+        with pytest.raises(ValueError, match="sets batch_size itself"):
+            _stream_loader(batch_size=1)
+        with pytest.raises(ValueError, match="persistent_workers"):
+            _stream_loader(num_workers=2, persistent_workers=True)
+        with pytest.raises(ValueError, match="positive"):
+            _stream_loader(seq_len=0)
+        with pytest.raises(ValueError, match="positive"):
+            _stream_loader(max_oversize_run=0)

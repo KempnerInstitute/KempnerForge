@@ -16,9 +16,11 @@ examples/image_understanding/
 ├── mixture.py            # packed loader over a mixture of image-text sources
 ├── configs/
 │   ├── eval_tasks.toml   # sample evaluation tasks, with placeholder paths
+│   ├── qwen3_0.6b_siglip2_p16_512_stage1.toml          # stage 1 on DataComp captions
 │   └── qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml  # stage 2 on the packed mixture
 ├── mixtures/
-│   └── stage2_testbed_finevision_pixmo_text.toml  # its sources, with placeholder paths
+│   ├── stage1_datacomp.toml                       # stage 1's source, with a placeholder path
+│   └── stage2_testbed_finevision_pixmo_text.toml  # stage 2's sources, with placeholder paths
 ├── evaluation/           # evaluation tasks and answer scorers (below)
 ├── image_text/           # image-text dataset readers and chat renderer (below)
 ├── scripts/
@@ -43,8 +45,9 @@ uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py \
 ```
 
 `--mixture=<mixture.toml>` trains on a packed mixture of the image-text readers
-below instead of the `[data]` source; see [Stage 2 on the packed
-mixture](#stage-2-on-the-packed-mixture) for the one preset here. For other
+below instead of the `[data]` source; see [Stage 1 on DataComp
+captions](#stage-1-on-datacomp-captions) and [Stage 2 on the packed
+mixture](#stage-2-on-the-packed-mixture) for the presets here. For other
 runs, write a config the way the [VLM example](../vlm/README.md) does,
 with `vlm.arch = "joint_decoder"`, `vision_encoder.type = "siglip2"` and
 `adapter.type = "avgpool"`. The geometry is the recipe's: a 512 px view is
@@ -313,12 +316,51 @@ and the optimizer starts fresh. Stage 2 starts from a stage-1 checkpoint as
 weights alone with `checkpoint.exclude_from_loading = ["optimizer", "train_state"]`,
 so its step and schedule start again from 0.
 
+## Stage 1 on DataComp captions
+
+`configs/qwen3_0.6b_siglip2_p16_512_stage1.toml` trains the SigLIP2 so400m/16
+encoder at 512 px and the connector on DataComp-1B captions, with Qwen3-0.6B
+frozen. Each image is one 512 px view pooled 2 × 2 to 256 tokens, and the
+encoder drops its unused attention-pooling head (`drop_pooling_head`). Rows are 12288
+positions, one micro-batch per step, on 16 GPUs (`dp_replicate = 4` ×
+`dp_shard = 4`), for 50,000 steps. The optimizer is AdamW (betas 0.9 and 0.999,
+weight decay 0.01 on every parameter) at 2e-4 for the connector and 6e-6 for the
+encoder, which runs in float32, with 5000 warmup steps from 5e-4 of it, then
+cosine to a tenth; gradients are not clipped. `mixtures/stage1_datacomp.toml`
+streams the shards (replace `path-to-datacomp-1b` with the root holding
+`raw/webdataset`), asks "Provide a short caption for the image." after a space,
+and trains every text token of the conversation (`answer_only = false`). A
+`datacomp` source streams, so it is a mixture's only source; the stream's
+`state_dict` resumes at the first caption of the next row.
+
+The run starts from the pretrained backbone, written for this config with a
+fresh connector (see [Start from the pretrained backbone](#start-from-the-pretrained-backbone)):
+
+```bash
+uv run python examples/vlm/scripts/convert_hf_backbone.py \
+    --hf-dir Qwen/Qwen3-0.6B \
+    --config examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_stage1.toml \
+    --out /your/backbone/checkpoint
+```
+
+The run takes 4 nodes of 4 GPUs. Launch it the way `scripts/slurm/multinode.sh`
+does, with one task per GPU and that script's `MASTER_ADDR`, `MASTER_PORT` and
+NCCL settings, running the example's entry point:
+
+```bash
+srun --kill-on-bad-exit=1 uv run python examples/image_understanding/train.py \
+    examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_stage1.toml \
+    --mixture=examples/image_understanding/mixtures/stage1_datacomp.toml \
+    --checkpoint.load_path=/your/backbone/checkpoint --checkpoint.dir=/your/stage1/dir
+```
+
 ## Stage 2 on the packed mixture
 
 `configs/qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml` trains every module of
 Qwen3-0.6B with SigLIP2 so400m/16 at 512 px. Each image is cut into a 3 × 3 grid
 of 512 px views after the whole image, and each view is pooled 2 × 2 to 256
-tokens, so an image takes 2560 positions. Rows are 16384 positions, two
+tokens, so an image takes 2560 positions; the encoder drops its unused
+attention-pooling head (`drop_pooling_head`). Rows are 16384 positions, two
 micro-batches per step, on 16 GPUs (`dp_replicate = 4` × `dp_shard = 4`), which
 is 524,288 positions a step for 90,000 steps. The optimizer is Muon with Nesterov
 momentum, updates scaled to AdamW's RMS (`match_rms_adamw`) and orthogonalized
@@ -339,8 +381,11 @@ trained with the empty think block before them (`train_reply_prefix`), each
 prompt starts with a space (`lead_space`), and each view's tokens attend to each
 other in both directions (`view_groups`).
 
-The run starts from a stage-1 checkpoint saved as one `.pt` state dict, written
-as a DCP for this config first. On the cluster that checkpoint is
+The run starts from the last stage-1 checkpoint, `/your/stage1/dir/step_50000`,
+as weights alone (the preset excludes `optimizer` and `train_state` from loading),
+writing to a fresh `checkpoint.dir`; see the launch below. A stage-1 checkpoint
+saved as one `.pt` state dict is written as a DCP for this config first. On the
+cluster such a checkpoint is
 `/n/holystore01/LABS/kempner_project_d/Lab/checkpoints/cross-modal/init/dcpacked-s1-50k-p16-512-k2mlp.pt`,
 step 50,000 of a stage-1 run with this preset's encoder (SigLIP2 so400m/16 at
 512 px) and connector (2 × 2 pooling into the RMS-normed GELU MLP). The converter
@@ -356,16 +401,17 @@ uv run python examples/image_understanding/scripts/convert_pt_checkpoint.py \
     --out /your/init/checkpoint
 ```
 
-The run takes 4 nodes of 4 GPUs. Launch it the way `scripts/slurm/multinode.sh`
-does, with one task per GPU and that script's `MASTER_ADDR`, `MASTER_PORT` and
-NCCL settings, running the example's entry point:
+The run takes 4 nodes of 4 GPUs, launched as stage 1 is. From the last stage-1
+checkpoint:
 
 ```bash
 srun --kill-on-bad-exit=1 uv run python examples/image_understanding/train.py \
     examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml \
     --mixture=examples/image_understanding/mixtures/stage2_testbed_finevision_pixmo_text.toml \
-    --checkpoint.load_path=/your/init/checkpoint --checkpoint.dir=/your/run/dir
+    --checkpoint.load_path=/your/stage1/dir/step_50000 --checkpoint.dir=/your/stage2/dir
 ```
+
+From a converted `.pt`, pass `--checkpoint.load_path=/your/init/checkpoint` instead.
 
 The mixture file and the run's settings for it (`[vlm]`, `data.pack_sequences`,
 `train.batch_size = 1`) are checked before training starts. The run saves every
