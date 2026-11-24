@@ -37,13 +37,41 @@ from kempnerforge.data.dataset import MemoryMappedDataset
 from kempnerforge.data.sampler import DistributedSampler
 from kempnerforge.distributed.parallel import build_parallel_model, default_mp_policy
 from kempnerforge.distributed.setup import destroy_distributed, get_world_info, init_distributed
-from kempnerforge.distributed.utils import get_dp_info
+from kempnerforge.distributed.utils import data_parallel_groups, get_dp_info
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.resilience.elastic import resolve_resume_path
 from kempnerforge.training import build_loss_fn, run_eval
 from kempnerforge.training.runtime import apply_matmul_precision
 
 logger = get_logger(__name__)
+
+
+def _newest_save(checkpoint_dir: str) -> str | None:
+    """The newest save in ``checkpoint_dir`` that holds the weights, as rank 0 finds it.
+
+    Rank 0 alone resolves it and broadcasts the path, or the error it hit, so every rank
+    evaluates the same checkpoint or raises.
+
+    Raises:
+        Exception: On rank 0, what resolving the checkpoint raised.
+        RuntimeError: On every other rank, naming rank 0's error.
+    """
+    found: list[dict[str, str | None]] = [{"path": None, "error": None}]
+    error: Exception | None = None
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        try:
+            resume_path = resolve_resume_path(checkpoint_dir, require_train_state=False)
+            found = [{"path": str(resume_path) if resume_path else None, "error": None}]
+        except Exception as e:
+            error = e
+            found = [{"path": None, "error": f"{type(e).__name__}: {e}"}]
+    if dist.is_initialized():
+        dist.broadcast_object_list(found, src=0)
+    if error is not None:
+        raise error
+    if found[0]["error"] is not None:
+        raise RuntimeError(f"Rank 0 could not find the checkpoint to evaluate: {found[0]['error']}")
+    return found[0]["path"]
 
 
 def main() -> None:
@@ -81,10 +109,14 @@ def main() -> None:
     )
 
     dummy_optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
-    ckpt_mgr = CheckpointManager(config.checkpoint, model, dummy_optimizer)
+    ckpt_mgr = CheckpointManager(
+        config.checkpoint,
+        model,
+        dummy_optimizer,
+        group_timeout_sec=config.distributed.nccl_timeout_sec,
+    )
 
-    resume_path = resolve_resume_path(config.checkpoint.dir, require_train_state=False)
-    load_path = config.checkpoint.load_path or (str(resume_path) if resume_path else None)
+    load_path = config.checkpoint.load_path or _newest_save(config.checkpoint.dir)
 
     if load_path is None:
         logger.error("No checkpoint found. Specify --checkpoint.load_path or --checkpoint.dir")
@@ -155,7 +187,14 @@ def main() -> None:
     )
     logger.info(f"Eval dataset: {len(eval_dataset):,} samples, {eval_config.steps} eval steps")
 
-    metrics = run_eval(model, eval_dataloader, loss_fn, device, eval_config.steps)
+    metrics = run_eval(
+        model,
+        eval_dataloader,
+        loss_fn,
+        device,
+        eval_config.steps,
+        dp_groups=data_parallel_groups(device_mesh),
+    )
 
     if rank == 0:
         print(f"\n{'=' * 50}")

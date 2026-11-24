@@ -5,7 +5,7 @@ set -euo pipefail
 JOBID="${1:?Usage: scripts/slurm/interactive.sh <JOBID> <CONFIG> [overrides...]}"
 CONFIG="${2:?Usage: scripts/slurm/interactive.sh <JOBID> <CONFIG> [overrides...]}"
 shift 2
-OVERRIDES="$@"
+OVERRIDES=("$@")
 
 NODELIST=$(squeue -j "$JOBID" -h -o "%N")
 export MASTER_ADDR=$(scontrol show hostnames "$NODELIST" | head -n 1)
@@ -31,7 +31,7 @@ echo "Total GPUs: $((NNODES * GPUS_PER_NODE))"
 echo "Master:     ${MASTER_ADDR}:${MASTER_PORT}"
 echo "IB iface:   ${IB_IFNAME:-ib0 (default)}"
 echo "Config:     ${CONFIG}"
-echo "Overrides:  ${OVERRIDES}"
+echo "Overrides:  ${OVERRIDES[*]}"
 echo "================================"
 
 srun --jobid="$JOBID" \
@@ -39,4 +39,4 @@ srun --jobid="$JOBID" \
     --ntasks-per-node="$GPUS_PER_NODE" \
     --gpus-per-node="$GPUS_PER_NODE" \
     --kill-on-bad-exit=1 \
-    uv run python scripts/train.py "${CONFIG}" ${OVERRIDES}
+    uv run python scripts/train.py "${CONFIG}" "${OVERRIDES[@]}"

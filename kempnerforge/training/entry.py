@@ -52,6 +52,7 @@ from kempnerforge.training.freeze import (
     apply_freeze_specs,
     effective_freeze,
     freeze_meta_at_step,
+    trainable_for_the_run,
 )
 from kempnerforge.training.hooks import HookRunner
 from kempnerforge.training.loop import (
@@ -191,7 +192,7 @@ def build_checkpoint_manager(
         from kempnerforge.distributed.pipeline_parallel import build_stage_group
 
         ckpt_pp_rank = pipeline.rank
-        ckpt_pg = build_stage_group(device_mesh)
+        ckpt_pg = build_stage_group(device_mesh, config.distributed.nccl_timeout_sec)
     return CheckpointManager(
         config.checkpoint,
         model,
@@ -202,7 +203,18 @@ def build_checkpoint_manager(
         weight_decay_scope=config.optimizer.weight_decay_scope,
         lr_multipliers=config.optimizer.lr_multipliers,
         module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
+        group_timeout_sec=config.distributed.nccl_timeout_sec,
     )
+
+
+def _trainable_for_the_run(
+    model: torch.nn.Module, config: JobConfig
+) -> contextlib.AbstractContextManager[list[str]]:
+    """``trainable_for_the_run`` for a VLM with a freeze schedule; otherwise a context that
+    changes nothing and yields no names."""
+    if config.vlm is None or not config.vlm.freeze_schedule:
+        return contextlib.nullcontext([])
+    return trainable_for_the_run(model, config.vlm)
 
 
 def _mot_text_warm_start(
@@ -230,6 +242,33 @@ def _mot_text_warm_start(
     agree(error, f"MoT warm-start: reading {vlm_cfg.mot_warm_start_path}")
     mot_warm_start_from_text_stack(inner_transformer(model), source)
     logger.info(f"MoT warm-start: copied dense block weights from {vlm_cfg.mot_warm_start_path}")
+
+
+def _resume_path_on_rank_zero(checkpoint_dir: str, num_stages: int | None) -> Path | None:
+    """``resolve_resume_path`` on rank 0, broadcast to every rank with any error it raised.
+
+    Only rank 0 looks at the checkpoint tree, so every rank resumes the same checkpoint, and a
+    rank 0 that cannot read the tree leaves no rank waiting in the broadcast.
+
+    Raises:
+        Exception: On rank 0, what resolving the checkpoint raised.
+        RuntimeError: On every other rank, naming rank 0's error.
+    """
+    outcome: list[dict[str, str | None]] = [{"path": None, "error": None}]
+    error: Exception | None = None
+    if dist.get_rank() == 0:
+        try:
+            found = resolve_resume_path(checkpoint_dir, num_stages)
+            outcome = [{"path": str(found) if found else None, "error": None}]
+        except Exception as e:
+            error = e
+            outcome = [{"path": None, "error": f"{type(e).__name__}: {e}"}]
+    dist.broadcast_object_list(outcome, src=0)
+    if error is not None:
+        raise error
+    if outcome[0]["error"] is not None:
+        raise RuntimeError(f"Rank 0 could not find the checkpoint to resume: {outcome[0]['error']}")
+    return Path(outcome[0]["path"]) if outcome[0]["path"] else None
 
 
 def _unused_load_path_message(config: JobConfig, resume_path: Path) -> str:
@@ -335,7 +374,9 @@ def restore_checkpoint(
     Returns ``(step, tokens_seen)`` — ``(0, 0)`` when there is nothing to
     resume from. Also restores the metrics run ids, runs the MoT text warm
     start when no checkpoint supplied the model weights and the run starts at
-    step 0, and re-applies the effective freeze at the resumed step.
+    step 0, and re-applies the effective freeze at the resumed step. A module
+    that a freeze stage unfreezes gets its saved optimizer state back, or
+    empty state when the saved optimizer had none for it.
 
     A checkpoint in ``checkpoint.dir`` takes precedence over ``checkpoint.load_path``, so a
     requeued warm start resumes rather than starting over; rank 0 then warns that
@@ -349,13 +390,7 @@ def restore_checkpoint(
     """
     num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
-        chosen = [
-            str(resolve_resume_path(config.checkpoint.dir, num_stages) or "")
-            if dist.get_rank() == 0
-            else ""
-        ]
-        dist.broadcast_object_list(chosen, src=0)
-        resume_path = Path(chosen[0]) if chosen[0] else None
+        resume_path = _resume_path_on_rank_zero(config.checkpoint.dir, num_stages)
     else:
         resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
     vlm_cfg = config.vlm
@@ -381,13 +416,15 @@ def restore_checkpoint(
         probe_step = ckpt_mgr.peek_saved_step(str(resume_path) if resume_path else None) or 0
         vlm_freeze_expected = freeze_meta_at_step(probe_step, vlm_cfg)
 
-    step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
-        path=str(resume_path) if resume_path else None,
-        scheduler=scheduler,
-        exclude_keys=warm_start_exclude,
-        vlm_freeze_expected=vlm_freeze_expected,
-        exact_resume=resume_path is not None,
-    )
+    with _trainable_for_the_run(model, config) as unfrozen_later:
+        step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
+            path=str(resume_path) if resume_path else None,
+            scheduler=scheduler,
+            exclude_keys=warm_start_exclude,
+            vlm_freeze_expected=vlm_freeze_expected,
+            fresh_if_unheld=unfrozen_later,
+            exact_resume=resume_path is not None,
+        )
     if resume_path is not None:
         if ckpt_extra_loaded.get("wandb_run_id"):
             config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
@@ -445,11 +482,12 @@ def run_training(
                 f"forward passes run under torch.autocast({amp_dtype})"
             )
 
-        optimizer = build_optimizer(
-            model,
-            config.optimizer,
-            module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
-        )
+        with _trainable_for_the_run(model, config):
+            optimizer = build_optimizer(
+                model,
+                config.optimizer,
+                module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
+            )
         scheduler = build_scheduler(optimizer, config.scheduler, max_steps=config.train.max_steps)
 
         ckpt_mgr = build_checkpoint_manager(config, runtime, model, optimizer, pipeline)
@@ -490,6 +528,7 @@ def run_training(
             eval_dataloader=eval_dataloader,
             profiler=prof,
             autocast_dtype=amp_dtype,
+            documents_seen=ckpt_mgr.restored_extra.get("documents_seen"),
         )
 
         run_training_loop(session, step=step, tokens_seen=tokens_seen)

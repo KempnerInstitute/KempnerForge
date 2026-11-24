@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from collections.abc import Iterable
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -33,12 +34,15 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ActivationCheckpointing
+from kempnerforge.config.training import FP8_DIM_MULTIPLE
 from kempnerforge.model.attention import Attention
 from kempnerforge.model.cross_attention import CrossAttention
 from kempnerforge.model.mot import MoTAttention
 from kempnerforge.model.transformer import Transformer
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from kempnerforge.distributed.pipeline_parallel import PipelineStageModule
 
 logger = logging.getLogger(__name__)
@@ -97,6 +101,34 @@ def default_mp_policy(param_dtype: torch.dtype = torch.bfloat16) -> MixedPrecisi
 def is_fsdp_wrapped(model: torch.nn.Module) -> bool:
     """Whether ``fully_shard`` was applied to ``model`` or any of its submodules."""
     return any(isinstance(m, FSDPModule) for m in model.modules())
+
+
+def refresh_fsdp_dtypes(model: torch.nn.Module, params: Iterable[torch.Tensor]) -> None:
+    """Recompute the reduction dtypes of the FSDP2 units that manage ``params``.
+
+    Call it after unfreezing parameters of an FSDP2-wrapped model. Each unit that manages
+    one of ``params`` itself, not through a nested unit, is unsharded and resharded. Every
+    rank calls it with the same parameters.
+
+    Args:
+        model: The model, wrapped with FSDP2 or not.
+        params: The parameters whose ``requires_grad`` was turned on.
+    """
+    changed = {id(p) for p in params}
+    if not changed:
+        return
+    for module in model.modules():
+        if not isinstance(module, FSDPModule):
+            continue
+        nested = {
+            id(p)
+            for sub in module.modules()
+            if sub is not module and isinstance(sub, FSDPModule)
+            for p in sub.parameters()
+        }
+        if any(id(p) in changed and id(p) not in nested for p in module.parameters()):
+            module.unshard()
+            module.reshard()
 
 
 def autocast_dtype(
@@ -200,6 +232,25 @@ def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpoin
     return sum(wrapped.values())
 
 
+def _keep_tied_head(
+    model: torch.nn.Module, filter_fn: Callable[[torch.nn.Module, str], bool]
+) -> Callable[[torch.nn.Module, str], bool]:
+    """``filter_fn``, except that an output head tied to the token embedding stays out.
+
+    torchao gives a converted Linear's weight a parameter of its own when FSDP2
+    all-gathers in float8, which would untie the head from the embedding, so a tied
+    head stays in high precision, and an info line says so.
+    """
+    head = getattr(model, "output_head", None)
+    embedding = getattr(model, "token_embedding", None)
+    if head is None or embedding is None or head.proj.weight is not embedding.embedding.weight:
+        return filter_fn
+    logger.info(
+        "Float8: output_head.proj stays in high precision, since it is tied to the token embedding"
+    )
+    return lambda module, fqn: fqn != "output_head.proj" and filter_fn(module, fqn)
+
+
 def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True) -> None:
     """Apply Float8 training (torchao) to the model.
 
@@ -207,11 +258,18 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
     with dynamic tensorwise scaling. Master weights keep their dtype (bf16, or fp32).
 
     Must be called AFTER apply_tensor_parallel / apply_expert_parallel
-    and BEFORE apply_ac / apply_fsdp2.
+    and BEFORE apply_ac / apply_fsdp2. The shape check below reads each Linear's
+    global ``in_features`` and ``out_features``, which are its weight's dimensions
+    only without TP; config validation rejects FP8 with TP.
 
     Routed MoE experts are excluded because they use grouped GEMM
     (torch._grouped_mm), which bypasses Float8Linear.forward(). The shared expert
     is a plain Linear call; the same name filter excludes it, by convention.
+
+    A Linear whose ``in_features`` or ``out_features`` is not a multiple of
+    ``FP8_DIM_MULTIPLE`` (16) stays in high precision, because torch._scaled_mm
+    rejects it on CUDA. One warning names each such layer with its shape, and the
+    info line counts the converted Linears.
 
     Args:
         model: Transformer model.
@@ -219,6 +277,10 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
             (halves communication volume). Requires FSDP2 to be applied after.
             Must be False when TP is active — the float8 weight wrapper calls
             aten.is_pinned on DTensors, which has no sharding strategy yet.
+
+    Raises:
+        ValueError: If the model has Linear layers but none of them converts, so an
+            FP8 run would train entirely in high precision.
     """
     import dataclasses
 
@@ -233,6 +295,9 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
         enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
     )
 
+    unaligned: dict[str, int] = {}
+    counts = {"converted": 0, "linear": 0}
+
     def _filter_fn(module: torch.nn.Module, fqn: str) -> bool:
         """Skip modules that shouldn't use Float8.
 
@@ -241,17 +306,48 @@ def apply_float8(model: Transformer, enable_fsdp_float8_all_gather: bool = True)
         - Shared expert: a plain Linear call, excluded with the routed experts by convention
         - Router gate: small output dim (num_experts) often not divisible by 16,
           which torch._scaled_mm requires. Also not compute-bound.
+        - Any other Linear with a dimension not divisible by 16, which torch._scaled_mm
+          rejects in its first call. Each is recorded by name, with layer indices
+          collapsed to ``*``, and by shape, for the warning.
         """
-        if "experts" in fqn or "shared_expert" in fqn:
+        if not isinstance(module, torch.nn.Linear):
             return False
-        return "router" not in fqn
+        counts["linear"] += 1
+        if "experts" in fqn or "shared_expert" in fqn or "router" in fqn:
+            return False
+        if module.in_features % FP8_DIM_MULTIPLE or module.out_features % FP8_DIM_MULTIPLE:
+            pattern = ".".join("*" if part.isdigit() else part for part in fqn.split("."))
+            key = f"{pattern} ({module.out_features}x{module.in_features})"
+            unaligned[key] = unaligned.get(key, 0) + 1
+            return False
+        counts["converted"] += 1
+        return True
 
-    convert_to_float8_training(model, config=config, module_filter_fn=_filter_fn)
+    convert_to_float8_training(
+        model, config=config, module_filter_fn=_keep_tied_head(model, _filter_fn)
+    )
+
+    kept = ", ".join(f"{name} x{count}" for name, count in unaligned.items())
+    if counts["linear"] and not counts["converted"]:
+        raise ValueError(
+            f"Float8 converted 0 of {counts['linear']} Linear layers, so "
+            "train.mixed_precision='fp8' would train entirely in high precision. Experts, "
+            "shared experts and routers are excluded by name, and torch._scaled_mm needs both "
+            f"dimensions of a weight divisible by {FP8_DIM_MULTIPLE}, which these are not: "
+            f"{kept or 'none'}. Make those dimensions multiples of {FP8_DIM_MULTIPLE}, or "
+            "train in bf16."
+        )
 
     logger.info(
         f"Applied Float8 training: recipe=TENSORWISE, "
-        f"fsdp_float8_all_gather={enable_fsdp_float8_all_gather}"
+        f"fsdp_float8_all_gather={enable_fsdp_float8_all_gather}, "
+        f"converted {counts['converted']} of {counts['linear']} Linear layers"
     )
+    if unaligned:
+        logger.warning(
+            f"Float8 kept {sum(unaligned.values())} Linear layer(s) in high precision because "
+            f"torch._scaled_mm needs both dimensions divisible by {FP8_DIM_MULTIPLE}: {kept}"
+        )
 
 
 def _has_ep_moe(module: torch.nn.Module) -> bool:
@@ -397,10 +493,13 @@ def _apply_fsdp_vlm(
         and VLM+MoE cannot deadlock).
       - Transformer root (embedding + final norm + output head): own unit.
       - Adapter: own unit (small, but keeps grad-sync scheduling symmetric).
-      - Vision encoder: wrapped only when not fully frozen, with
+      - Vision encoder: wrapped unless ``encoder_frozen``, with
         ``encoder_mp_policy`` when given and the shared policy otherwise.
-        A frozen encoder stays as a full replica in eval mode; replication
-        is fine because requires_grad=False means no grad-reduce participation.
+        An encoder frozen for the whole run stays a full replica, put in eval
+        mode at build; replication is fine because requires_grad=False
+        means no grad-reduce participation. One with parameters that a freeze
+        stage unfreezes is wrapped from the start; one without parameters
+        follows the build freeze.
       - The ``VLMWrapper`` itself is not wrapped (no direct parameters).
     """
     if not has_dp_mesh(device_mesh):
@@ -547,28 +646,25 @@ def _build_vlm(
          ``num_tokens`` is known from the encoder.
       4. TP / EP / Float8 / AC are applied to the transformer only.
       5. FSDP2 is applied component-by-component (transformer blocks,
-         transformer root, adapter, and vision encoder iff not frozen).
-         With ``vision_config.mixed_precision`` set, the encoder's unit
-         gets its own policy that computes in that dtype.
+         transformer root, adapter, and vision encoder unless no step of
+         the run trains it, or, for an encoder without parameters, unless the
+         build freeze freezes it). With ``vision_config.mixed_precision`` set,
+         the encoder's unit gets its own policy that computes in that dtype.
       6. Meta subtrees are materialized (transformer / adapter), the
          vision encoder is moved to ``device``, and the transformer and
          adapter are cast to ``param_dtype``. The vision encoder's
          parameters stay in its HF dtype (D16) to avoid ViT LayerNorm
          numerical drift; with ``vision_config.mixed_precision`` set,
          ``_set_encoder_precision`` makes it compute in that dtype.
-      7. Freeze specs are applied via ``apply_freeze_specs`` and a fully
-         frozen encoder is switched to ``eval()``.
+      7. Freeze specs are applied via ``apply_freeze_specs`` and an encoder
+         treated as frozen in step 5 is switched to ``eval()``.
     """
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
     from kempnerforge.model.adapter import build_adapter
     from kempnerforge.model.transformer import Transformer
-    from kempnerforge.model.vlm import (
-        VLMWrapper,
-        _is_encoder_frozen,
-        build_modality_strategy,
-    )
-    from kempnerforge.training.freeze import apply_freeze_specs
+    from kempnerforge.model.vlm import VLMWrapper, _is_encoder_frozen, build_modality_strategy
+    from kempnerforge.training.freeze import apply_freeze_specs, trainable_during_run
 
     assert vlm_config is not None, "_build_vlm requires vlm_config to be set"
     assert vision_config is not None, "_build_vlm requires vision_config to be set"
@@ -611,7 +707,12 @@ def _build_vlm(
         apply_float8(transformer)
     apply_ac(transformer, ac_mode)
 
-    encoder_frozen = _is_encoder_frozen(vlm_config.freeze)
+    if any(True for _ in encoder.parameters()):
+        encoder_frozen = not any(
+            name.startswith("vision_encoder.") for name in trainable_during_run(wrapper, vlm_config)
+        )
+    else:
+        encoder_frozen = _is_encoder_frozen(vlm_config.freeze)
     encoder_dtype = vision_config.compute_dtype
     if device_mesh is not None:
         _apply_fsdp_vlm(

@@ -325,6 +325,8 @@ class HuggingFaceDataset(Dataset):
 
     Loads a HuggingFace dataset, tokenizes text on the fly, and packs
     multiple documents into fixed-length sequences (separated by EOS tokens).
+    Only the text column is read, so the dataset's other columns, images
+    included, are not decoded.
 
     Args:
         dataset_name: HuggingFace dataset name (e.g., "allenai/c4").
@@ -356,7 +358,9 @@ class HuggingFaceDataset(Dataset):
         self._eos_id = self._tokenizer.eos_token_id or 0
 
         logger.info(f"Loading HuggingFace dataset: {dataset_name} ({split})")
-        raw_dataset = load_dataset(dataset_name, dataset_config, split=split)
+        raw_dataset = load_dataset(dataset_name, dataset_config, split=split).select_columns(
+            [text_field]
+        )
         self._packed_sequences = self._pack_sequences(raw_dataset)
         logger.info(
             f"HuggingFaceDataset: {len(self._packed_sequences)} packed sequences "
@@ -424,7 +428,9 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
     """Streaming HuggingFace dataset with on-the-fly tokenization and packing.
 
     For very large datasets that don't fit in memory. Streams documents,
-    tokenizes on the fly, and packs into fixed-length sequences.
+    tokenizes on the fly, and packs into fixed-length sequences. Only the
+    text column is read, so the other columns, images included, are not
+    decoded.
 
     Handles distributed training by sharding the document stream across ranks
     (each rank processes every world_size-th document).
@@ -493,7 +499,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             self._eos_id = self._tokenizer.eos_token_id or 0
 
     def _load_stream(self):
-        """Load a shuffled HuggingFace streaming dataset."""
+        """Load the text column of a HuggingFace streaming dataset, shuffled."""
         from datasets import load_dataset
 
         ds = load_dataset(
@@ -502,6 +508,7 @@ class StreamingHuggingFaceDataset(torch.utils.data.IterableDataset):
             split=self.split,
             streaming=True,
         )
+        ds = ds.select_columns([self.text_field])
         ds = ds.shuffle(seed=self.seed + self._epoch, buffer_size=self.shuffle_buffer_size)
         return ds
 

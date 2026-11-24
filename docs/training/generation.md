@@ -94,7 +94,7 @@ Two:
 
 ```bash
 uv run python scripts/generate.py configs/train/7b.toml \
-    --checkpoint.load_path /path/to/checkpoint \
+    --checkpoint.load_path=/path/to/checkpoint \
     --prompt "The capital of France is" \
     --max_tokens 64 \
     --temperature 0.7 \
@@ -105,7 +105,7 @@ Interactive REPL:
 
 ```bash
 uv run python scripts/generate.py configs/train/7b.toml \
-    --checkpoint.load_path /path/to/checkpoint \
+    --checkpoint.load_path=/path/to/checkpoint \
     --interactive
 ```
 

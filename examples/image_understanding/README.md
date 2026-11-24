@@ -13,15 +13,17 @@ never imports it, so this directory can be deleted without touching the core.
 examples/image_understanding/
 ├── README.md
 ├── train.py              # training entry point
+├── evaluate_checkpoint.py   # evaluation entry point (below)
 ├── configs/
-│   └── eval_tasks.toml   # sample evaluation tasks, with placeholder paths
-├── evaluation/           # evaluation tasks and answer scorers (below)
+│   ├── eval_tasks.toml   # sample evaluation tasks, with placeholder paths
+│   └── evaluate_checkpoint.sbatch   # sample job script for evaluating one checkpoint
+├── evaluation/           # checkpoint evaluator, periodic evaluation, tasks and scorers (below)
 ├── image_text/           # image-text dataset readers and chat renderer (below)
 ├── scripts/
 │   └── convert_finevision_to_arrow.py  # FineVision parquet -> memory-mappable Arrow
 └── tests/
     ├── test_image_understanding_entry.py   # the entry point loads a config and hands it off
-    ├── evaluation/       # task-file and scorer tests (CPU)
+    ├── evaluation/       # evaluator, periodic evaluation, task-file and scorer tests (CPU)
     └── image_text/       # reader and renderer tests (CPU)
 ```
 
@@ -81,8 +83,12 @@ a cap of 3 keeps it.
 `FineVisionArrow` keeps only the rows with one image (`max_images`, which `None`
 lifts), using the per-row image counts `index.npz` stores; an index written
 without them takes the counts from `num_images`, and `text_only` keeps the rows
-without images. A conversation keeps its turns up to the first one missing its
-user message or reply, so a row whose first turn is incomplete is not kept.
+without images. Only an entry with image bytes counts as an image, so a blank
+entry, `{"bytes": None, "path": None}`, or a null one is neither counted nor read;
+for a subset converted before that, `index --recount-images` counts each file's
+images again from its Arrow file. A conversation keeps its turns up to the first
+one missing its user message or reply, so a row whose first turn is incomplete is
+not kept.
 
 Convert FineVision once; any number of `convert` processes can share the work,
 a file that fails to convert is listed at the end without stopping the others,
@@ -223,10 +229,11 @@ cross-attention blocks: their attention and MLP updates are zeroed for that
 row, so its text runs through the backbone alone. On `mot` the hidden blank
 image's tokens still pass through the image experts. On `moma` they are dropped
 before routing, so they take no expert capacity; a micro-batch with no image
-gives the image experts zero gradients. On `joint_decoder` and `moma` the
-FlashAttention kernel takes no mask, so an unpacked dataset with text-only rows
-is refused with `model.sdpa_backend = "flash"` under `attention_backend =
-"sdpa"`.
+gives the image experts zero gradients. On `joint_decoder` and `moma` the frame
+mask reaches attention under `model.sdpa_backend`, whose `"flash"` kernel takes
+no mask on CUDA, so on CUDA an unpacked dataset with text-only rows and
+`data.hf_max_images = 1` is refused with `model.sdpa_backend = "flash"` under
+either `attention_backend`, `"sdpa"` or `"flex"`; on CPU it is not.
 
 ## Documents with several images
 
@@ -269,11 +276,213 @@ and the optimizer starts fresh. Stage 2 starts from a stage-1 checkpoint as
 weights alone with `checkpoint.exclude_from_loading = ["optimizer", "train_state"]`,
 so its step and schedule start again from 0.
 
+## Evaluate a checkpoint
+
+`evaluate_checkpoint.py` decodes an answer for every row of each task's split
+with a saved checkpoint and scores it. It takes the config the checkpoint was
+trained with and the overrides that run used, a run directory (its latest
+checkpoint is evaluated) or one step directory, a task file (next section) and
+an output directory:
+
+```bash
+uv run torchrun --nproc_per_node=4 examples/image_understanding/evaluate_checkpoint.py \
+    <config.toml> --checkpoint /your/run/dir --tasks <tasks.toml> \
+    --output /your/results/dir --batch-size 32
+```
+
+The model is built from the config and loads the checkpoint's weights; every
+rank holds all of it, whatever parallelism the run trained with. The language
+model and the adapter compute in the dtype of `train.mixed_precision`, the image
+encoder in `vision_encoder.mixed_precision` when that is set and otherwise in
+the dtype it loads in. The decode takes a `joint_decoder` that sees one view of
+one image, so another arch, a `[video]` config or `vlm.tile_grid` is refused
+before anything is built. So is `model.moe_capacity_factor > 0`, which drops
+tokens by what else is in the batch. A save from pipeline parallelism
+(`distributed.pp > 1`) is refused too: it holds one set of shards per stage, and
+every rank here loads the whole model from one set.
+
+The inputs are training's. Each document goes through the training
+`ChatRenderer`: the prompt is the text it puts before the assistant's reply, and
+the image is preprocessed as in a training sample. A document needs one image
+and one turn; any other stops the run with the limit named
+(`evaluation/inputs.py` is where a document becomes model inputs).
+
+Decoding is greedy. A batch is laid out like a training row (image tokens, then
+text, padding last), each image is encoded once, and a row ends at the turn end
+or EOS, or after the task's `max_new_tokens`. A split is cut into consecutive
+batches, the ranks take them in turn, and rank 0 merges the rows, each scored
+once. Every batch holds the same rows whatever the number of ranks, so with one
+`--batch-size` the scores are the same on any number of GPUs of one kind. Causal
+attention keeps a row independent of its batch in exact arithmetic; across batch
+sizes the scores match up to floating-point (bf16) numerics, which can flip a
+close argmax.
+
+A row is scored as it is or counted under a reason, never changed to fit:
+
+- `unreadable_row`: the reader passed over the row because its image does not
+  decode. The row it moved on to is not scored in its place.
+- `prompt_too_long`: the prompt and `max_new_tokens` do not fit
+  `vlm.max_text_len`, the text length training lays out.
+- `unrenderable_row`: the chat template does not lay the row out as training
+  does (a `conversation` document whose turn the template mangles), so training
+  passes over it too. Its record holds the error text.
+
+A task's rows are the rows its reader yields: a reader that drops rows when it
+loads a split (a row with no question or no answer, for one) does so before the
+evaluation and does not count them. A reader that passes over rows while it is
+read must say so, either through `read_with_index`, which returns the index of
+the row it read with the document, or through a `skipped` count that moves
+whenever it passes over a row. A reader that gives up after a run of unusable
+rows raises `NoUsableRowError` (what `first_usable` raises); each such row is
+counted as `unreadable_row`, and any other error fails the run.
+
+The prediction that is scored is the generation decoded with special tokens
+skipped and nothing else cleaned up; the scorers normalize their own input. The
+predictions file keeps the raw `generation` beside it.
+
+A task's metrics are over its scored rows, with the counts beside them. A
+missing image file, a task whose cap leaves no room for any prompt, or a task
+with no scored row fails the run.
+
+```
+/your/results/dir/
+├── predictions/<task>.jsonl   # per row: question, references, generation, prediction, score
+├── metrics.json               # <task>/<metric> to value
+└── results.json               # per task: metrics, rows (its reader's), samples, skips by reason
+```
+
+When an evaluation starts, before the config and the task file are loaded, the
+files of the last one are removed from the output directory: `results.json`
+first, then `metrics.json` and the `predictions/*.jsonl` files; nothing else
+there is touched. `results.json` is written last, so it is there only for an
+evaluation that finished, and a failed one leaves no file of an earlier one; it
+names the step directory it evaluated. Each file is written to a sibling of its
+own and renamed into place, so none is ever half written, even when two
+evaluations write the same output directory at once. When that checkpoint's
+`metadata.json` records an MLflow run, rank 0 then appends the metrics to it as `eval/<task>/<metric>` at the checkpoint's
+step. `--no-publish` turns that off, and a failure to publish is a warning with
+the command that publishes `metrics.json` later, never a failed evaluation.
+
+## Evaluate during training
+
+`train.py` can evaluate every checkpoint the run saves, as the run goes on. It is
+off unless `--eval-tasks`, `--eval-command` and `--eval-output` are all given, and
+training is then exactly what it is without them:
+
+```bash
+uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py <config.toml> \
+    --eval-tasks <tasks.toml> --eval-output /your/results/root \
+    --eval-command "sbatch --job-name=eval-{step} \
+        examples/image_understanding/configs/evaluate_checkpoint.sbatch \
+        {config} {checkpoint} {tasks} {output} {overrides}"
+```
+
+`--eval-command` is a template for the command that evaluates one checkpoint.
+Its placeholders are `{config}` and `{tasks}` (the two files above), `{checkpoint}`
+(the step directory), `{step}`, `{output}` (that step's directory under
+`--eval-output`, `step_<N>`) and `{overrides}`, which stands for the run's
+`--section.key=value` overrides as separate arguments, so the evaluation builds the
+model the run trained. `{checkpoint}` and `{output}` are required. Every path is
+filled in absolute, and the task file's own relative paths are taken from its
+directory, so the command may change directory, as the job script below does;
+relative paths in the config are read from the working directory, as in training.
+The template is split into arguments first and the placeholders filled in
+afterwards, so a path with a space is still one argument, and it is run without a
+shell.
+
+The command should submit the evaluation and return, as `sbatch` does: nothing
+limits how many evaluations start at once, and every step that is due at the same
+moment starts then, for example each complete step a resumed run finds. A SLURM
+user passes an `sbatch` line, as above, so each evaluation is its own job, on GPUs
+of its own, that outlives the run;
+`examples/image_understanding/configs/evaluate_checkpoint.sbatch` is a job script
+to copy, with placeholders for the partition, account and environment. Anyone else
+passes a local script, which is started detached and keeps running when the run
+ends. A local script runs on the training job's node and shares its GPUs, so it
+slows training while it evaluates, and it should queue its evaluations itself
+rather than run each one as it is started.
+
+Everything is checked before the run builds anything: the task file, the config (the
+evaluator decodes the same runs as above), the template and its program, the output
+root, and the other arguments, each of which must be a `--section.key=value`
+override, since the evaluations get the same overrides and refuse anything else. A
+mistake stops the run with the valid options named.
+
+The hook is rank 0's alone and training never waits on it while it trains: apart
+from one look at the checkpoint directory when training begins, the training thread
+only puts a message on a queue, and a worker thread does everything else, so no
+filesystem call or scheduler call is on the step path. A saved step is launched
+once its directory is complete on disk, which is when the DCP `.metadata`,
+`train_state.pt` and `metadata.json` are all there, and not before: with
+asynchronous checkpointing the directory is still being written when the loop moves
+on, so the worker checks for it again every few seconds, with three `stat` calls,
+and once more when the loop ends, after it has drained the last save. A launch is
+started and left, detached and without the training run's rendezvous variables
+(`RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`, `SLURM_PROCID`, `SLURM_NTASKS`
+and the other per-process and `TORCHELASTIC_*` ones), so an
+evaluator or an `sbatch` job starts its own process group. Every other variable is
+inherited, the rest of the run's `SLURM_*` variables and `CUDA_VISIBLE_DEVICES`
+included: an `sbatch` job gets its own from the scheduler, but a local script
+shares the run's, so it should set the device it evaluates on. A checkpoint the
+shutdown handler saves outside the loop is found by the last look and by the next
+run's first look.
+
+A step's output directory holds `launch.log`, the command's output (the job id, for
+`sbatch`), and two records that each name the step directory they are for:
+`launched.json`, written once the command has exited with status 0 (for `sbatch`,
+once the job is queued), and the evaluator's `results.json`. The worker reads each
+command's exit status as it goes, without waiting. A step is started unless a record
+of it counts: one that names its step directory, through a symlink too, or one that
+cannot be read, which is a warning naming the file to delete to evaluate the step
+again. A record of another checkpoint does not count: after a rollback to a new
+`checkpoint.dir` with the same `--eval-output`, each step is evaluated again, with a
+warning naming both directories. So a run takes up the complete steps already on
+disk when it begins and evaluates what no run recorded, and within a run no step is
+started twice at once. Across runs one can be, since output directories are named
+by step: after a rollback, an evaluation the old run queued can still be running in
+`step_<N>` when the new run's evaluation of that step starts there, and the one that
+starts later removes the other's files. So give a rollback a fresh `--eval-output`.
+
+A command that cannot be started, or that exits non-zero, is a warning (naming
+`launch.log` for an exit status) and leaves no record. Its step is tried again at
+the next save and at the end of training, at most three times in a run; after the
+last try a warning says the step is left to a later run, which tries it again since
+nothing records it. A step that was pruned before it was complete, or never
+completed, is skipped with a log line.
+
+When training ends, the worker takes its last look, and then the training thread
+waits for the commands still running, both within a minute of the end of training,
+and records the ones that exit 0. A command still running after that, as a local
+evaluation usually is, gets a warning that its launch is not recorded: a later run
+launches the step again unless a `results.json` exists by then. A crash before a
+command's exit status is read can likewise make a later run launch a step a second
+time. That is safe: an evaluation removes the files of the last one when it starts
+and writes each file whole, so two evaluations of a checkpoint that overlap leave
+whole files from one or the other.
+
+When training begins, the hook reads the step the run resumed from in the checkpoint
+directory's `latest` link, which is where a run resumes whenever the link names a
+directory; without one, every step directory on disk counts as above it. The run may
+save a step above it again, over that step's directory: with
+asynchronous checkpointing, a crash after a save completed but before `latest` moved
+to it leaves such a step, and on a fresh start every step directory on disk is one.
+Each such step is deferred: it is evaluated once a later step has been saved, or at
+the end of training, never while it may be half rewritten. If the run does save it
+again, it holds new weights, so its earlier `results.json` and `launched.json` are
+removed, with a warning, and it is evaluated again. A run that resumes from step 0
+of a dynamic checkpoint window saves step 0 again with the weights it loaded, so
+that step is deferred too, and its records still count. If the step directories
+cannot be looked at when training begins, which ones exist is unknown, so every step
+the run saves is treated as one it saves again, with a warning.
+
+The evaluator reads a step directory while the run goes on, and the run removes old
+ones (`checkpoint.keep_last_n`). Keep as many as the evaluations in flight need,
+or the evaluator stops on a directory that is gone.
+
 ## Evaluation tasks and scorers
 
-`evaluation/` holds what an evaluation run is made of: the tasks to run and the
-scorers of their answers. The evaluator that runs them on a checkpoint is on the
-roadmap.
+`evaluation/` also holds what an evaluation run is made of: the tasks to run and
+the scorers of their answers.
 
 - `tasks.py`: `load_tasks` reads a TOML task file into frozen `EvalTask`s. A task
   has a unique `name`, a `reader` (one of the `testbed.py` loaders) with that
@@ -346,16 +555,15 @@ or in core where it belongs:
   and the mixture loader
 - Typed stage contract and pinned source manifest, which fix the stage presets
 - Per-module learning rates and schedules
-- Evaluation: the evaluator that runs the tasks on a saved checkpoint, periodic
-  evaluation during training, PixMo point and count scorers, documents with
-  several images or none, and image attention when decoding
+- Evaluation: PixMo point and count scorers, documents with several images or
+  none, image attention when decoding, and a KV cache for decoding
 - Run-comparison metrics: documents seen, token counts, MFU with the encoder
 
 ## Tests
 
 The tests live outside the repo's `tests/` tree (the main suite's
-`testpaths`), so run them by path. They need no GPU; the renderer tests download
-the `Qwen/Qwen3-0.6B` tokenizer once:
+`testpaths`), so run them by path. They need no GPU; the renderer
+tests download the `Qwen/Qwen3-0.6B` tokenizer once:
 
 ```bash
 uv run pytest examples/image_understanding/tests

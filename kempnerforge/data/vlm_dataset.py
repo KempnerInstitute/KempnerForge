@@ -248,6 +248,45 @@ def _prompt_or_none(value: Any, prompt_field: str) -> str | None:
     return value
 
 
+def _check_text_column(rows: Any, text_field: str, kept: np.ndarray) -> None:
+    """Reject a caption column that is not a string column or misses a kept row's caption.
+
+    Checked when the dataset is built, so every rank stops there, instead of the rank whose
+    sampler reaches the row stopping mid-run while the others wait in the next collective.
+    The null count of the Arrow table under ``rows`` is free to read, so a dataset with no
+    missing caption costs nothing more; one with a missing caption somewhere reads the
+    column's validity once and looks the kept rows up in it, without gathering any row.
+
+    Args:
+        rows: The dataset as loaded, before any selection, so that its Arrow table holds
+            its rows in order; it has a ``text_field`` column.
+        text_field: The caption column's name.
+        kept: The index in ``rows`` of each row the dataset keeps.
+
+    Raises:
+        TypeError: The column is not a ``datasets.Value`` of dtype ``string`` or
+            ``large_string``, or ``null``, the type of a column that holds no value.
+        ValueError: A kept row's caption is missing; the message names the first one.
+    """
+    from datasets import Value
+
+    feature = rows.select_columns([text_field]).features[text_field]
+    if not (isinstance(feature, Value) and feature.dtype in ("string", "large_string", "null")):
+        raise TypeError(
+            f"Dataset field {text_field!r} must be a string column (a Value of dtype "
+            f"'string' or 'large_string'), got {feature}"
+        )
+    column = rows.data.column(text_field)
+    if column.null_count == 0:
+        return
+    valid = column.is_valid().to_numpy(zero_copy_only=False)[kept]
+    missing = int(valid.size - np.count_nonzero(valid))
+    if missing:
+        more = f" and {missing - 1:,} more" if missing > 1 else ""
+        first = int(kept[np.argmin(valid)])
+        raise ValueError(f"Dataset field {text_field!r} has no value in row {first}{more}")
+
+
 def _check_prompt_column_is_string(rows: Any, prompt_field: str) -> None:
     """Reject a prompt column whose type admits a value that is neither a string nor missing.
 
@@ -339,13 +378,24 @@ def _decode_image(feature: Any, value: Any) -> Any:
     return value
 
 
-def _images_of(value: Any) -> list[Any]:
-    """The images an image field holds: none for ``None``, a list's present entries, else it."""
+def _is_image(value: Any) -> bool:
+    """Whether an image field's entry holds an image, as ``_images_per_row`` counts one.
+
+    ``None`` holds none, and neither does a blank entry, a stored struct such as
+    ``{"bytes": None, "path": None}`` whose every field is null, which the ``Image``
+    feature cannot decode.
+    """
     if value is None:
-        return []
+        return False
+    return not (isinstance(value, dict) and value and all(v is None for v in value.values()))
+
+
+def _images_of(value: Any) -> list[Any]:
+    """The images an image field holds: a list's entries that hold one, else the value if it
+    holds one."""
     if isinstance(value, list | tuple):
-        return [image for image in value if image is not None]
-    return [value]
+        return [image for image in value if _is_image(image)]
+    return [value] if _is_image(value) else []
 
 
 def _images_per_row(rows: Any, image_field: str) -> np.ndarray:
@@ -550,6 +600,7 @@ class HuggingFaceVLMDataset(Dataset):
                 "HuggingFaceVLMDataset (use `split=` to resolve a single split)."
             )
         keep, text_only = _usable_rows(ds, image_field, max_images)
+        _check_text_column(ds, text_field, keep)
         if len(keep) < len(ds):
             ds = ds.select(keep)
         self._ds: HFDataset = ds
@@ -640,6 +691,8 @@ class VLMCollator:
         depends on which samples have images.
       - ``input_ids``: ``(B, max_text_len)`` int64.
       - ``labels``: ``(B, max_text_len)`` int64 with ``-100`` on pad.
+      - ``text_len``: ``(B,)`` int64, each row's real text tokens: the sample's
+        ``text_len`` when it has one, else its length, at most ``max_text_len``.
       - ``image_positions``: ``(B,)`` long tensor, all zeros; the wrapper
         does not read it, and documents with several images go through
         ``PackedVLMCollator``.
@@ -684,17 +737,20 @@ class VLMCollator:
         views = shape[0] if len(shape) == 4 else 1
         input_ids = torch.full((B, self.max_text_len), self.pad_id, dtype=torch.long)
         labels = torch.full((B, self.max_text_len), -100, dtype=torch.long)
+        text_len = torch.zeros(B, dtype=torch.long)
         for i, s in enumerate(samples):
             ids = s["input_ids"]
             lbl = s["labels"]
             n = min(ids.shape[0], self.max_text_len)
             input_ids[i, :n] = ids[:n]
             labels[i, :n] = lbl[:n]
+            text_len[i] = min(int(s["text_len"]), n) if "text_len" in s else n
         image_positions = torch.zeros(B, dtype=torch.long)
         batch = {
             "pixel_values": pixels,
             "input_ids": input_ids,
             "labels": labels,
+            "text_len": text_len,
             "image_positions": image_positions,
         }
         if self.frame_mask or not all(has_image):

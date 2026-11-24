@@ -160,7 +160,8 @@ class Attention(nn.Module):
 
         Raises:
             ValueError: If ``attn_mask``'s key axis does not cover the keys
-                ``kv_cache`` holds after this forward.
+                ``kv_cache`` holds after this forward, or a dense ``attn_mask``
+                comes with ``sdpa_backend="flash"`` on CUDA.
             NotImplementedError: If ``capture_attention_weights`` is set and
                 ``attn_mask`` is a ``BlockMask``.
         """
@@ -220,6 +221,13 @@ class Attention(nn.Module):
             out, attn_weights = self._attention_with_weights(q, k, v, seq_len, attn_mask, kv_cache)
             self.last_attention_weights = attn_weights.detach().cpu()
         elif attn_mask is not None:
+            if self.sdpa_backend == "flash" and q.is_cuda:
+                raise ValueError(
+                    "model.sdpa_backend='flash' cannot run a forward with an attention mask, "
+                    "as packed documents, padded frames or attention groups need: PyTorch's "
+                    "FlashAttention kernel takes no mask on CUDA. Use another sdpa_backend, "
+                    "such as 'auto'."
+                )
             with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         elif seq_len > 1 and k.shape[2] > seq_len:

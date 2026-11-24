@@ -14,7 +14,7 @@ from kempnerforge.config.model import FLEX_BLOCK_SIZE, ModelConfig
 from kempnerforge.config.optimizer import OptimizerConfig
 from kempnerforge.config.profiling import ProfilingConfig
 from kempnerforge.config.scheduler import SchedulerConfig
-from kempnerforge.config.training import TrainConfig
+from kempnerforge.config.training import FP8_DIM_MULTIPLE, TrainConfig
 from kempnerforge.config.video import VideoConfig
 from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import MoMaConfig, MoTConfig, VLMConfig
@@ -25,10 +25,11 @@ _HF_VISION_ENCODER_TYPES = frozenset({"siglip2", "clip"})
 def _arch_of(vlm: VLMConfig) -> str:
     """The arch of ``vlm``'s class, which is what the parallelism checks act on.
 
-    The instance's ``arch`` field can name another arch, for example after a
-    ``--vlm.arch`` override, which keeps the class the TOML section built.
+    The instance's ``arch`` field can name another arch after an assignment to
+    it, which ``__post_init__`` does not see; the loader rejects a ``--vlm.arch``
+    override that would need another class.
     """
-    return type(vlm).arch
+    return type(vlm).declared_arch()
 
 
 @dataclass
@@ -153,7 +154,7 @@ class JobConfig:
                     "data.pack_sequences on a VLM run does not support "
                     "train.mixed_precision='fp8': the packed head runs over the batch's text "
                     "tokens, whose count is the inner dimension of the head's FP8 "
-                    "weight-gradient GEMM and must be a multiple of 16"
+                    f"weight-gradient GEMM and must be a multiple of {FP8_DIM_MULTIPLE}"
                 )
 
         if self.optimizer.lr_multipliers:
@@ -200,6 +201,57 @@ class JobConfig:
         if self.vlm is not None:
             return self.vlm.views_per_image
         return 1
+
+    def masks_frames_in_backend_attention(self) -> bool:
+        """Whether a frame mask reaches self-attention that runs under ``model.sdpa_backend``.
+
+        The modality strategy, which the vlm section's ``arch`` picks, masks padded frames in
+        self-attention under Joint-Decoder, MoT and MoMa; Cross-Attention masks them in its
+        cross-attention layers only. The model's attention, which the section's class picks,
+        runs SDPA under the configured backend except under MoT. A section whose ``arch`` an
+        override changed is judged by both.
+        """
+        if self.vlm is None:
+            return False
+        masks = self.vlm.arch in ("joint_decoder", "mot", "moma")
+        return masks and _arch_of(self.vlm) != "mot"
+
+    def check_flash_attention_masks(self) -> None:
+        """Refuse ``sdpa_backend="flash"`` for a training run whose batches carry a mask.
+
+        PyTorch's CUDA FlashAttention kernel takes no attention mask. Packed rows mask
+        their documents from each other under ``attention_backend="sdpa"``, where a run
+        reads them from a dataset (flex turns them into a block mask), and the padded
+        frames of a video run are masked under either backend where
+        ``masks_frames_in_backend_attention`` says so: Joint-Decoder and MoMa. The training
+        setup calls this on CUDA, after the CLI overrides and before the process group
+        starts. Evaluation and generation are not checked at setup: on CUDA, a forward
+        there that passes a dense mask to ``Attention``, such as video evaluation's frame
+        mask under Joint-Decoder or MoMa, raises the ``ValueError`` from
+        ``Attention.forward``.
+
+        Raises:
+            ValueError: The run would train with ``sdpa_backend="flash"`` and a mask.
+        """
+        if self.model.sdpa_backend != "flash":
+            return
+        data = self.data
+        masked = None
+        if (
+            data.pack_sequences
+            and self.model.attention_backend == "sdpa"
+            and (self.is_vlm or data.datasets or data.dataset_path or data.hf_dataset_name)
+        ):
+            masked = "data.pack_sequences, which masks the documents of a row from each other"
+        elif self.video is not None and self.masks_frames_in_backend_attention():
+            assert self.vlm is not None
+            masked = f"[video] on vlm.arch={self.vlm.arch!r}, which masks padded frames"
+        if masked is not None:
+            raise ValueError(
+                f"model.sdpa_backend='flash' is not supported with {masked}: PyTorch's "
+                "FlashAttention kernel takes no attention mask on CUDA. Use another "
+                "sdpa_backend, such as 'auto'."
+            )
 
     def validate(self, world_size: int = 1) -> None:
         """Run cross-config validations that depend on the world size."""
@@ -296,6 +348,23 @@ class JobConfig:
                 "FP8 + Tensor Parallelism is not yet supported (torchao Float8Linear "
                 "does not compose with DTensor sharding). Use FP8 with FSDP only, "
                 "or TP without FP8."
+            )
+        if self.train.is_fp8 and self.model.dim % FP8_DIM_MULTIPLE:
+            raise ValueError(
+                f"train.mixed_precision='fp8' needs model.dim divisible by {FP8_DIM_MULTIPLE} "
+                f"(got {self.model.dim}): torch._scaled_mm needs both dimensions of an FP8 "
+                f"weight divisible by {FP8_DIM_MULTIPLE}, and every attention and MLP "
+                "projection and the output head has model.dim on one side, so no layer would "
+                f"run in FP8. Use a multiple of {FP8_DIM_MULTIPLE} or train in bf16."
+            )
+        tokens = self.train.batch_size * self.train.seq_len
+        if self.train.is_fp8 and self.vlm is None and tokens % FP8_DIM_MULTIPLE:
+            raise ValueError(
+                "train.mixed_precision='fp8' needs train.batch_size * train.seq_len divisible "
+                f"by {FP8_DIM_MULTIPLE} (got {self.train.batch_size} * {self.train.seq_len} = "
+                f"{tokens}): the FP8 weight gradient multiplies over the micro-batch's tokens, "
+                f"and torch._scaled_mm needs that dimension divisible by {FP8_DIM_MULTIPLE}, so "
+                "the first backward would fail. Change batch_size or seq_len, or train in bf16."
             )
 
         if (
