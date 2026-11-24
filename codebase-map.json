@@ -1681,9 +1681,9 @@
           "TestRestoredExtra(2)",
           "TestUnreadableTrainStateAcrossRanks(1)",
           "TestTornStageAcrossRanks(1)",
-          "TestOptimizerTypeChangeOnResume(5)"
+          "TestOptimizerTypeChangeOnResume(6)"
         ],
-        "count": 59
+        "count": 60
       },
       "tests/unit/test_observability.py": {
         "classes": [
