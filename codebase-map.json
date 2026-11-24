@@ -1364,8 +1364,8 @@
         "claim_checkpoint_dir(directory) -> str (records this run in <dir>/.owner, linked into place; replaces this process's earlier record; replaces a record of a run that has ended through _take_over, then reads it back; refuses a live or uncheckable owner; returns the claim id; one claim or release at a time per process)",
         "_take_over(path, held, tmp, me) -> (bool, Path | None) (only the claimer that links .owner.<held claim>.takeover replaces path, after checking it still holds held, by renaming a link of tmp named for its own claim; tokens whose claimers have ended are taken over level by level; tokens removed afterward)",
         "release_checkpoint_dir(directory, claim) (marks the record of that claim released through _take_over; never removes .owner; an error is logged)",
-        "this_run() -> dict (claim id, SLURM cluster, job or array element, requeue count, host, pid, since)",
-        "_alive(owner, me) -> bool | None (a released record has ended; so has an earlier attempt of this job; another run in this job, or outside SLURM, by its pid on its own host; any other job by squeue without SQUEUE_* filters)"
+        "this_run() -> dict (claim id, SLURM cluster, job or array element, requeue count, host, pid, a random id of the process, new in a forked child, pid namespace inode, since)",
+        "_alive(owner, me) -> bool | None (a released record has ended; so has an earlier attempt of this job; another run in this job, or outside SLURM, by its pid on its own host and in its pid namespace, both known; any other job by squeue without SQUEUE_* filters)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint_ownership.py",
@@ -2024,15 +2024,15 @@
       },
       "tests/unit/test_checkpoint_ownership.py": {
         "classes": [
-          "TestThisRun(3)",
-          "TestClaim(33)",
+          "TestThisRun(6)",
+          "TestClaim(36)",
           "TestOneProcess(1)",
           "TestClaimersInProcesses(1)",
           "TestRelease(6)",
           "TestManager(5)",
           "TestLatestLink(2)"
         ],
-        "count": 51
+        "count": 57
       },
       "tests/unit/test_collective_timeouts.py": {
         "classes": [

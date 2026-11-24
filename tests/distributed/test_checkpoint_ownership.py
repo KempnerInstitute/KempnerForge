@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-import uuid
 from pathlib import Path
 
 import pytest
@@ -16,7 +15,7 @@ import torch
 import torch.distributed as dist
 
 from kempnerforge.checkpoint.manager import CheckpointManager
-from kempnerforge.checkpoint.ownership import OWNER_FILE, CheckpointDirInUseError
+from kempnerforge.checkpoint.ownership import OWNER_FILE, CheckpointDirInUseError, this_run
 from kempnerforge.config.schema import CheckpointConfig
 
 pytestmark = pytest.mark.skipif(
@@ -57,8 +56,7 @@ class TestClaimOnEveryRank:
         directory = Path(shared_tmp_dir) / "taken"
         if dist.get_rank() == 0:
             directory.mkdir()
-            owner = {"host": socket.gethostname(), "pid": os.getppid(), "since": "earlier"}
-            record = {"claim": uuid.uuid4().hex, "slurm_job": None, **owner}
+            record = {**this_run(), "pid": os.getppid(), "since": "earlier"}
             (directory / OWNER_FILE).write_text(json.dumps(record))
         dist.barrier()
         manager = _manager(directory)

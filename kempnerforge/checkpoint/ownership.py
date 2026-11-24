@@ -39,6 +39,7 @@ _ENDED_STATES = frozenset(
 )
 
 _CLAIM_ID = re.compile(r"[0-9a-f]{32}")
+_PID_NAMESPACE = "/proc/self/ns/pid"
 _ATTEMPTS = 3
 _RETRY_SEC = 1.0
 _LOCK = threading.Lock()
@@ -48,12 +49,32 @@ class CheckpointDirInUseError(RuntimeError):
     """Another run that is alive, or not known to have ended, owns the checkpoint directory."""
 
 
+def _new_process_id() -> None:
+    """Give this process, or a child forked from it, a random id of its own."""
+    global _process_id
+    _process_id = uuid.uuid4().hex
+
+
+_process_id = uuid.uuid4().hex
+os.register_at_fork(after_in_child=_new_process_id)
+
+
+def _pid_namespace() -> int | None:
+    """The inode of this process's pid namespace, or ``None`` where ``/proc`` does not show it."""
+    try:
+        return os.stat(_PID_NAMESPACE).st_ino
+    except OSError:
+        return None
+
+
 def this_run() -> dict[str, Any]:
     """A new owner record for this process.
 
-    ``claim`` is new for every record. ``slurm_job`` is the SLURM job, or job array element
-    (``<array job>_<task>``), that runs the process, and ``slurm_restart`` counts the times
-    SLURM requeued it.
+    ``claim`` is new for every record. ``process`` is a random id of this process, by which
+    it knows its own records. ``pid_ns`` is the pid namespace ``pid`` is numbered in, since
+    containers that share the host name but not that namespace reuse pids. ``slurm_job`` is
+    the SLURM job, or job array element (``<array job>_<task>``), that runs the process, and
+    ``slurm_restart`` counts the times SLURM requeued it.
     """
     job = os.environ.get("SLURM_JOB_ID") or None
     array_job = os.environ.get("SLURM_ARRAY_JOB_ID")
@@ -67,6 +88,8 @@ def this_run() -> dict[str, Any]:
         "slurm_restart": int(os.environ.get("SLURM_RESTART_COUNT") or 0) if job else None,
         "host": socket.gethostname(),
         "pid": os.getpid(),
+        "process": _process_id,
+        "pid_ns": _pid_namespace(),
         "since": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
     }
 
@@ -79,13 +102,22 @@ def _same_job(owner: dict[str, Any], me: dict[str, Any]) -> bool:
 
 def _this_process(owner: dict[str, Any], me: dict[str, Any]) -> bool:
     """Whether this process wrote ``owner`` in an earlier claim that it did not release."""
-    return all(owner.get(key) == me[key] for key in ("host", "pid", "slurm_job", "slurm_restart"))
+    keys = ("host", "pid", "process", "slurm_job", "slurm_restart")
+    return all(owner.get(key) == me[key] for key in keys)
 
 
-def _pid_alive(owner: dict[str, Any]) -> bool | None:
-    """Whether ``owner``'s pid still runs, or ``None`` when this host cannot tell."""
+def _pid_alive(owner: dict[str, Any], me: dict[str, Any]) -> bool | None:
+    """Whether ``owner``'s pid still runs, or ``None`` when this process cannot tell.
+
+    Only a process on ``owner``'s host and in its pid namespace can tell, so a namespace that
+    either record does not know cannot be checked.
+    """
     pid = owner.get("pid")
-    if owner.get("host") != socket.gethostname() or type(pid) is not int or not 0 < pid < 2**31:
+    if owner.get("host") != me["host"] or me["pid_ns"] is None:
+        return None
+    if owner.get("pid_ns") != me["pid_ns"]:
+        return None
+    if type(pid) is not int or not 0 < pid < 2**31:
         return None
     try:
         os.kill(pid, 0)
@@ -140,17 +172,17 @@ def _alive(owner: dict[str, Any], me: dict[str, Any]) -> bool | None:
     since a requeued job goes back to pending before it runs again. Another run in this job,
     like a run outside SLURM, is alive while its pid runs, which only its own host can check.
     Any other SLURM job is alive until ``squeue`` lists it in a final state or no longer lists
-    it.
+    it. A pid is checked only on its host and in its pid namespace.
     """
     if owner.get("released"):
         return False
     if not owner.get("slurm_job"):
-        return _pid_alive(owner)
+        return _pid_alive(owner, me)
     if not _same_job(owner, me):
         return _job_alive(owner, me)
     if owner.get("slurm_restart") != me["slurm_restart"]:
         return False
-    return _pid_alive(owner)
+    return _pid_alive(owner, me)
 
 
 def _read_owner(path: Path) -> dict[str, Any] | None:
@@ -251,11 +283,12 @@ def _refusal(
     directory: Path, owner: dict[str, Any] | None, alive: bool | None
 ) -> CheckpointDirInUseError:
     """The error for ``directory`` owned by ``owner``, which is alive or not known to have ended."""
+    record = directory / OWNER_FILE
     reason = (
-        "which is still running"
+        f"which is still running (its record is {record})"
         if alive
-        else "and this host cannot tell whether it is still running; "
-        f"remove {directory / OWNER_FILE} if it is not"
+        else f"and this process cannot tell whether it is still running; remove {record} if "
+        "it is not"
     )
     return CheckpointDirInUseError(
         f"Checkpoint directory {directory} belongs to {_describe(owner)}, {reason}. Two runs in "

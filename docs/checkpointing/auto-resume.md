@@ -222,8 +222,9 @@ launched twice from the same working directory, would overwrite each
 other's checkpoints, prune each other's `step_*` directories and resume
 from each other's `latest`. So before a training run resumes or saves,
 rank 0 records it in `<checkpoint.dir>/.owner`, and every rank stops
-when that fails. The record holds a claim id of its own, the host, pid
-and start time, and under SLURM the job (`SLURM_JOB_ID`, or
+when that fails. The record holds a claim id of its own, a random id of
+the process, by which a process knows its own records, the host, pid,
+pid namespace and start time, and under SLURM the job (`SLURM_JOB_ID`, or
 `<SLURM_ARRAY_JOB_ID>_<SLURM_ARRAY_TASK_ID>` for a job array element),
 its cluster (`SLURM_CLUSTER_NAME`) and its requeue count
 (`SLURM_RESTART_COUNT`). A run finds one of these:
@@ -244,7 +245,7 @@ its cluster (`SLURM_CLUSTER_NAME`) and its requeue count
   temporary file, under a name only its claim uses, so a rename that NFS
   replays finds nothing to move, and it reads the record back before it
   counts the claim.
-- **A record of a run this host cannot check**: the run stops, and the
+- **A record of a run this process cannot check**: the run stops, and the
   error names the file to remove if that run has ended.
 
 Whether the owner is alive depends on where it ran:
@@ -253,15 +254,18 @@ Whether the owner is alive depends on where it ran:
   requeue count, has ended: a requeued job goes back to pending before
   it runs again.
 - **Another run in this SLURM job**, such as a second training in one
-  allocation, is alive while its pid runs. Only its own host can check.
+  allocation, is alive while its pid runs. Only a process on its host
+  and in its pid namespace can check, since containers that share the
+  host name but not the pid namespace reuse pids, and a host where
+  `/proc` does not show the namespace cannot check at all.
 - **Another SLURM job** is alive until `squeue` lists it in a final
   state, such as `COMPLETED`, `CANCELLED`, `FAILED` or `TIMEOUT`, or no
   longer lists it. `squeue` runs without the `SQUEUE_*` and
   `SLURM_CLUSTERS` settings that narrow what it lists, and a run outside
   SLURM asks the owner's cluster by name. A job of another cluster than
   the run's own, or one `squeue` cannot answer for, cannot be checked.
-- **A run outside SLURM** is alive while its pid runs. Only its own host
-  can check.
+- **A run outside SLURM** is alive while its pid runs. Only a process on
+  its host and in its pid namespace can check.
 
 A run that ends cleanly marks its record released, replacing it the
 same way with a released record; nothing removes `.owner`, so a removal

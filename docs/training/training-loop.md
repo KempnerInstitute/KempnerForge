@@ -256,8 +256,10 @@ in order, then hands a `TrainingSession` to `run_training_loop`:
    registry lookup (see [Optimizers](optimizers.md)).
 6. `build_scheduler(optimizer, config.scheduler, max_steps=tc.max_steps)` —
    warmup + decay LambdaLR (see [Schedulers](schedulers.md)).
-7. `build_checkpoint_manager(...)` + `restore_checkpoint(...)` —
-   auto-resume from the `latest` symlink.
+7. `build_checkpoint_manager(...)`, then `ckpt_mgr.claim_dir()`, which
+   makes the run the owner of `checkpoint.dir` (see
+   [Auto-resume § One run per checkpoint directory](../checkpointing/auto-resume.md#one-run-per-checkpoint-directory)),
+   then `restore_checkpoint(...)`, which resumes from the `latest` symlink.
 8. `MetricsTracker`, profiler, `build_data_pipeline`,
    `build_eval_dataloader`, `build_phase_state`, `HookRunner`.
 
@@ -278,6 +280,7 @@ if nccl_failed_at is not None:
     raise RuntimeError(...)            # an NCCL stop fails the run
 hook_runner.on_train_end(step, tokens_seen)
 tracker.close()
+ckpt_mgr.release_dir()                 # mark <checkpoint.dir>/.owner released
 destroy_distributed()
 shutdown_handler.finish()              # restore the handlers, cancel the timer
 ```

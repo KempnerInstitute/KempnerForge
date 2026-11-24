@@ -25,6 +25,7 @@ contains two kinds of state:
 | `train_state.pt` | step, tokens_seen, scheduler, per-rank dataloader/RNG state, extras (e.g. `phase_idx`, `wandb_run_id`, `mlflow_run_id`) | [Train state](train-state.md) |
 | `metadata.json` | Human-readable `{"step": N, "tokens_seen": M}`, plus the logging runs live at save time | Plain JSON, see below |
 | `latest` symlink | Points at the most recent `step_N` (updated atomically) | [Auto-resume](auto-resume.md) |
+| `.owner` | The run that owns the directory: its claim id, host, pid, pid namespace and SLURM job | JSON, see [Auto-resume § One run per checkpoint directory](auto-resume.md#one-run-per-checkpoint-directory) |
 
 ## `metadata.json`
 

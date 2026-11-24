@@ -62,6 +62,10 @@ initializes the collaborators:
 - **`CheckpointManager`** from
   [`kempnerforge.checkpoint.manager`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/manager.py)
   — owns DCP async save/load, latest-symlink, step_N directories.
+- **`ckpt_mgr.claim_dir()`**: rank 0 records the run in
+  `<checkpoint.dir>/.owner`, and every rank stops when another run that
+  is alive, or not known to have ended, owns the directory (see
+  [Auto-resume § One run per checkpoint directory](../checkpointing/auto-resume.md#one-run-per-checkpoint-directory)).
 - **`resolve_resume_path(config.checkpoint.dir)`** from
   [`kempnerforge.resilience.elastic`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)
   — follows the `latest` symlink or picks the newest `step_N` whose
@@ -296,6 +300,8 @@ After the loop exits:
 - `ckpt_mgr.wait()` drains the last async save.
 - `hook_runner.on_train_end(step, tokens_seen)`.
 - `tracker.close()` flushes WandB / TB.
+- `ckpt_mgr.release_dir()` marks the run's `.owner` record released, on a
+  clean finish.
 - `destroy_distributed()` tears down the process group.
 - `shutdown_handler.finish()`, last, restores the signal handlers and
   cancels the forced-exit timer, so both cover the flush and the teardown.

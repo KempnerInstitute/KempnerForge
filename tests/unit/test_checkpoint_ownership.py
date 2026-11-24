@@ -78,6 +78,7 @@ def _write_owner(directory: Path, **record: Any) -> Path:
         "slurm_restart": None,
         "host": "elsewhere",
         "pid": 1,
+        "pid_ns": ownership._pid_namespace(),
         "since": "then",
     }
     path.write_text(json.dumps({**defaults, **record}))
@@ -142,6 +143,28 @@ class TestThisRun:
         monkeypatch.setenv("SLURM_ARRAY_JOB_ID", "1000")
         monkeypatch.setenv("SLURM_ARRAY_TASK_ID", "5")
         assert this_run()["slurm_job"] == "1000_5"
+
+    def test_the_record_names_the_pid_namespace(self) -> None:
+        assert this_run()["pid_ns"] == os.stat("/proc/self/ns/pid").st_ino
+
+    def test_without_proc_the_pid_namespace_is_unknown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(ownership, "_PID_NAMESPACE", str(tmp_path / "missing"))
+        assert this_run()["pid_ns"] is None
+
+    def test_a_process_keeps_its_id_and_a_forked_child_gets_its_own(self) -> None:
+        mine = this_run()["process"]
+        assert re.fullmatch(r"[0-9a-f]{32}", mine) and this_run()["process"] == mine
+        read, write = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.write(write, this_run()["process"].encode())
+            os._exit(0)
+        os.close(write)
+        os.waitpid(child, 0)
+        with os.fdopen(read) as pipe:
+            assert pipe.read() not in ("", mine)
 
 
 class TestClaim:
@@ -320,9 +343,58 @@ class TestClaim:
             claim_checkpoint_dir(tmp_path)
 
     def test_a_run_outside_slurm_is_alive_while_its_pid_runs(self, tmp_path: Path) -> None:
-        _write_owner(tmp_path, host=socket.gethostname(), pid=os.getppid())
-        with pytest.raises(CheckpointDirInUseError, match="still running"):
+        path = _write_owner(tmp_path, host=socket.gethostname(), pid=os.getppid())
+        refusal = rf"still running \(its record is {re.escape(str(path))}\)"
+        with pytest.raises(CheckpointDirInUseError, match=refusal):
             claim_checkpoint_dir(tmp_path)
+
+    @pytest.mark.parametrize("in_job", [False, True])
+    def test_a_pid_of_another_pid_namespace_is_neither_this_processs_nor_checked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, in_job: bool
+    ) -> None:
+        """Containers that share the host name but not the pid namespace reuse pids, so a
+        record from another namespace is not replaced as this process's own, and its pid,
+        this process's or a running one, says nothing."""
+        record: dict[str, Any] = {"host": socket.gethostname(), "pid_ns": -1}
+        if in_job:
+            _in_job(monkeypatch)
+            record = _in_this_job(**record)
+        for pid in (os.getpid(), os.getppid()):
+            path = _write_owner(tmp_path / str(pid), pid=pid, **record)
+            before = path.read_text()
+            refusal = f"cannot tell whether it is still running; remove {re.escape(str(path))}"
+            with pytest.raises(CheckpointDirInUseError, match=refusal):
+                claim_checkpoint_dir(tmp_path / str(pid))
+            assert path.read_text() == before
+
+    def test_without_proc_a_pid_cannot_be_checked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Where /proc does not show the pid namespace, a pid could be another container's,
+        even this process's own pid, so neither record's run can be checked by it."""
+        monkeypatch.setattr(ownership, "_PID_NAMESPACE", str(tmp_path / "missing"))
+        for pid in (os.getpid(), os.getppid()):
+            directory = tmp_path / str(pid)
+            path = _write_owner(directory, host=socket.gethostname(), pid=pid, pid_ns=None)
+            before = path.read_text()
+            with pytest.raises(CheckpointDirInUseError, match="cannot tell"):
+                claim_checkpoint_dir(directory)
+            assert path.read_text() == before
+
+    def test_this_processs_own_record_is_known_by_its_process_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without /proc too, this process replaces its own earlier claim, which holds its
+        process id, and not a record of its host and pid that another process wrote."""
+        monkeypatch.setattr(ownership, "_PID_NAMESPACE", str(tmp_path / "missing"))
+        first = claim_checkpoint_dir(tmp_path / "own")
+        second = claim_checkpoint_dir(tmp_path / "own")
+        assert second != first and _owner(tmp_path / "own" / OWNER_FILE)["claim"] == second
+        other = {**this_run(), "process": uuid.uuid4().hex}
+        path = _write_owner(tmp_path / "other", **other)
+        with pytest.raises(CheckpointDirInUseError, match="cannot tell"):
+            claim_checkpoint_dir(tmp_path / "other")
+        assert _owner(path)["claim"] == other["claim"]
 
     def test_a_run_outside_slurm_whose_pid_exited_is_taken_over(
         self, tmp_path: Path, warnings_logged: list[str]
