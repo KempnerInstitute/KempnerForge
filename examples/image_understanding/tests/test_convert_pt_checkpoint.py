@@ -203,7 +203,8 @@ class TestConvertPtCheckpoint:
     def test_a_tied_target_is_refused(self, tmp_path: Path, config: Path) -> None:
         converter = _converter()
         tied = tmp_path / "tied.toml"
-        tied.write_text(config.read_text().replace("tie_embeddings = false", "tie_embeddings = true"))
+        text = config.read_text()
+        tied.write_text(text.replace("tie_embeddings = false", "tie_embeddings = true"))
         with pytest.raises(ValueError, match="ties its embeddings"):
             converter.convert(str(tmp_path / "missing.pt"), str(tied), str(tmp_path / "dcp"))
 

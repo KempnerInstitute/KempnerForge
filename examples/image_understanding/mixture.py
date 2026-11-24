@@ -77,15 +77,22 @@ def _accepted(factory: Callable[..., Any]) -> tuple[set[str] | None, set[str]]:
 
 
 def _check_arguments(
-    where: str, given: set[str], factory: Callable[..., Any], fixed: set[str]
+    where: str,
+    given: set[str],
+    factory: Callable[..., Any],
+    fixed: set[str],
+    *,
+    complete: bool = True,
 ) -> None:
     accepted, required = _accepted(factory)
     allowed = None if accepted is None else accepted - fixed
     unknown = sorted(given - allowed) if allowed is not None else []
     if unknown:
-        raise ValueError(f"{where}: unknown option(s) {unknown}; expected some of {sorted(allowed)}")
+        raise ValueError(
+            f"{where}: unknown option(s) {unknown}; expected some of {sorted(allowed)}"
+        )
     missing = sorted(required - given - fixed)
-    if missing:
+    if complete and missing:
         raise ValueError(f"{where}: missing option(s) {missing}")
 
 
@@ -98,14 +105,11 @@ def check_mixture(mixture: dict[str, Any]) -> None:
     unknown = sorted(set(mixture) - set(TABLES))
     if unknown:
         raise ValueError(f"unknown mixture table(s) {unknown}; expected some of {list(TABLES)}")
-    render = mixture.get("render", {})
-    fixed = sorted(set(render) & set(RUN_RENDER_OPTIONS))
-    if fixed:
-        raise ValueError(f"[render]: {fixed} are set from the run config, not the mixture")
-    _check_arguments("[render]", set(render), ChatRenderer, set(RUN_RENDER_OPTIONS))
     packing = sorted(set(mixture.get("packing", {})) - set(PACKING_OPTIONS))
     if packing:
-        raise ValueError(f"[packing]: unknown option(s) {packing}; expected some of {list(PACKING_OPTIONS)}")
+        raise ValueError(
+            f"[packing]: unknown option(s) {packing}; expected some of {list(PACKING_OPTIONS)}"
+        )
     sources = mixture.get("source", [])
     if not sources:
         raise ValueError("the mixture lists no source")
@@ -137,8 +141,17 @@ def check_mixture(mixture: dict[str, Any]) -> None:
             _check_arguments(where, options, READERS[reader], set())
         else:
             raise ValueError(
-                f"{where}: unknown reader {reader!r}; expected finevision or one of {sorted(READERS)}"
+                f"{where}: unknown reader {reader!r}; "
+                f"expected finevision or one of {sorted(READERS)}"
             )
+
+    render = mixture.get("render", {})
+    fixed = sorted(set(render) & set(RUN_RENDER_OPTIONS))
+    if fixed:
+        raise ValueError(f"[render]: {fixed} are set from the run config, not the mixture")
+    _check_arguments(
+        "[render]", set(render), ChatRenderer, set(RUN_RENDER_OPTIONS), complete=False
+    )
 
 
 def check_run(config: JobConfig) -> None:

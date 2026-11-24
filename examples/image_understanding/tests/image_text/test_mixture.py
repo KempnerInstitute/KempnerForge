@@ -134,13 +134,17 @@ class TestMixture:
                 {"source": [{"reader": "finevision", "root": "r", "max_image": 1}]},
                 r"unknown option\(s\) \['max_image'\]",
             ),
-            ({"source": [{"reader": "finevision", "root": "r", "subset_dir": "s"}]}, "unknown option"),
+            (
+                {"source": [{"reader": "finevision", "root": "r", "subset_dir": "s"}]},
+                "unknown option",
+            ),
         ],
     )
     def test_a_mistaken_mixture_is_refused_before_reading(
         self, mixture: dict[str, Any], message: str
     ) -> None:
-        mixture = {"source": [{"reader": "vqav2", "annotation_file": "a", "image_root": "b"}]} | mixture
+        vqav2 = {"reader": "vqav2", "annotation_file": "a", "image_root": "b"}
+        mixture = {"source": [vqav2]} | mixture
         with pytest.raises(ValueError, match=message):
             check_mixture(mixture)
 
