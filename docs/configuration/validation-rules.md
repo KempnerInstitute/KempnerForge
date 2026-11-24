@@ -252,15 +252,21 @@ File:
 These run when `JobConfig` is built, with the per-dataclass checks:
 
 - `plugins` must be a list of module path strings.
+- `data.hf_max_images != 1` applies to VLM image runs only, not text runs
+  or `[video]`, and needs `vlm.arch = "joint_decoder"`. It is refused
+  with `train.mixed_precision = "fp8"` and, under
+  `attention_backend = "sdpa"`, with `model.sdpa_backend = "flash"`.
 - `[video]` needs a `[vlm]` section, and `vlm.tile_grid` must stay 0
   with `[video]`.
 - `[vlm]` needs a `[vision_encoder]` section; a missing `[adapter]`
   takes the defaults.
 - With `vision_encoder.num_tokens > 0`, `model.max_seq_len` must hold
   the image tokens the residual stream carries plus `vlm.max_text_len`.
-  The image tokens count every view of a sample (each frame of a clip,
-  or each view of a tiled image) after the adapter, and none under
-  Cross-Attention, whose residual stream carries text only.
+  The image tokens count every image a document may hold
+  (`data.hf_max_images`, or one clip on a `[video]` run) and every view
+  of each (each frame of a clip, or each view of a tiled image) after
+  the adapter, and none under Cross-Attention, whose residual stream
+  carries text only.
 - On a VLM run, an HF-backed encoder (`siglip2`, `clip`) with
   `feature_dim` or `num_tokens` above 0 logs a warning: the values
   override the ones the encoder probes.
