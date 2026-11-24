@@ -878,11 +878,11 @@ class TestResume:
         assert scheduler.last_epoch == 0
 
     @pytest.mark.parametrize("rank", [0, 1])
-    def test_a_weights_only_warm_start_issues_no_collective_of_its_own(
+    def test_a_weights_only_warm_start_issues_only_the_path_broadcast(
         self, tmp_path, monkeypatch, rank
     ):
-        """Every rank skips the same checks, so only the model load, which every rank enters,
-        remains."""
+        """Every rank skips the same checks, so besides the model load, which every rank enters,
+        the only collective is rank 0's broadcast of the checkpoint it resolved."""
         import kempnerforge.checkpoint.manager as mgr_mod
 
         self._save(tmp_path, {"head": 2.0})
@@ -892,7 +892,7 @@ class TestResume:
         monkeypatch.setattr(mgr_mod.dcp, "load", lambda state, **_: loaded.append(sorted(state)))
         monkeypatch.setattr(mgr_mod, "set_model_state_dict", lambda *_: None)
         assert manager.load(scheduler=scheduler, exclude_keys=self.WEIGHTS_ONLY) == (0, 0, {})
-        assert calls == []
+        assert self._past_the_path(calls) == []
         assert loaded == [["model"]]
 
     @pytest.mark.parametrize("train_state", ["without_scheduler", "absent"])
@@ -1072,20 +1072,24 @@ class TestResume:
     def _as_rank(monkeypatch, manager, rank, sent=()):
         """Run ``manager`` as ``rank`` of two, the other rank adding nothing to the all-reduce.
 
-        ``sent`` lists what rank 0's broadcasts deliver to any other rank, in order. Returns the
+        ``sent`` lists what rank 0's other broadcasts deliver to any other rank, in order; its
+        broadcast of the checkpoint it resolved delivers the one the manager resolves. Returns the
         collectives issued, in order.
         """
         import kempnerforge.checkpoint.manager as mgr_mod
 
         calls: list[tuple] = []
         delivered = iter(sent)
+        resolved = manager._resolve_load_path(None)
 
         def all_reduce(flags, group=None):
             calls.append(("all_reduce", group, flags.tolist()))
 
         def broadcast_object_list(objects, src):
             calls.append(("broadcast", src, list(objects)))
-            if rank != 0:
+            if rank != 0 and isinstance(objects[0], dict) and objects[0].keys() == {"dir", "error"}:
+                objects[0] = {"dir": str(resolved), "error": None}
+            elif rank != 0:
                 objects[0] = next(delivered)
 
         monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
@@ -1107,6 +1111,14 @@ class TestResume:
 
         monkeypatch.setattr(mgr_mod, "get_model_state_dict", reached)
 
+    @staticmethod
+    def _past_the_path(calls: list[tuple]) -> list[tuple]:
+        """The collectives after the first, rank 0's broadcast of the checkpoint it resolved."""
+        kind, src, objects = calls[0]
+        assert (kind, src) == ("broadcast", 0), calls[0]
+        assert objects[0].keys() == {"dir", "error"}, calls[0]
+        return calls[1:]
+
     RECORD = {"lr_multipliers": {"head": 2.0}, "lr_module_patterns": {"head": ["output_head.*"]}}
 
     def test_rank_zero_reads_the_record_and_broadcasts_it(self, tmp_path, monkeypatch):
@@ -1118,7 +1130,7 @@ class TestResume:
         self._stop_at_the_model_load(monkeypatch)
         with pytest.raises(_ReachedTheModel):
             manager.load(scheduler=scheduler)
-        assert calls == [
+        assert self._past_the_path(calls) == [
             ("all_reduce", "GLOO_GROUP", [[0, 0], [1, 0]]),
             ("broadcast", 0, [(meta, None)]),
             ("broadcast", 0, [True]),
@@ -1201,16 +1213,16 @@ class TestResume:
         step_dir = self._save(tmp_path, {"head": 2.0})
         train_state = torch.load(step_dir / "train_state.pt", weights_only=False)
         _, scheduler, manager = self._resume(tmp_path, {})
-        sent = [True, train_state, (self.RECORD, None)]
+        sent = [True, (train_state, None), (self.RECORD, None)]
         calls = self._as_rank(monkeypatch, manager, 1, sent=sent)
         with pytest.raises(ValueError, match="but this run uses"):
             manager.load(scheduler=scheduler, exclude_keys=["model", "optimizer"])
-        assert len(calls) == 3
+        assert len(self._past_the_path(calls)) == 3
         assert scheduler.last_epoch == 0
         without_scheduler = {k: v for k, v in train_state.items() if k != "scheduler"}
-        calls = self._as_rank(monkeypatch, manager, 1, sent=[True, without_scheduler])
+        calls = self._as_rank(monkeypatch, manager, 1, sent=[True, (without_scheduler, None)])
         assert manager.load(scheduler=scheduler, exclude_keys=["model", "optimizer"])[0] == 3
-        assert len(calls) == 2
+        assert len(self._past_the_path(calls)) == 2
 
 
 class TestLayoutChange:

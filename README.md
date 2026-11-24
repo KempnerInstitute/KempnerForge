@@ -222,7 +222,7 @@ Core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, and FSDP2 compatibility
 | Multi-token prediction (MTP) | Planned | 10-15% sample efficiency |
 | Large-scale EP (hierarchical all-to-all, 256+ experts) | Planned | 1000+ GPU scale |
 
-> Pipeline parallelism runs dense models with the 1F1B or GPipe schedule; 4-GPU end-to-end tests train and resume PP=4, PP=2 with FSDP=2, and PP=2 with TP=2; tied embeddings, VLMs and MoE are rejected with PP at config validation time. MoE data-dependent routing is incompatible with static pipeline stage splitting, so use FSDP, TP, or EP for MoE models.
+> Pipeline parallelism runs dense models with the 1F1B or GPipe schedule; 4-GPU end-to-end tests train and resume PP=4, PP=2 with FSDP=2, and PP=2 with TP=2; tied embeddings, VLMs and MoE are rejected with PP at config validation time. MoE data-dependent routing is incompatible with static pipeline stage splitting, so use FSDP, TP, or EP for MoE models (FSDP alone for MoT, which runs neither TP nor EP).
 
 ## Project structure
 

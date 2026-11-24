@@ -83,6 +83,53 @@ def test_no_script_exports_nccl_timeout(path):
     assert "NCCL_TIMEOUT" not in path.read_text()
 
 
+LAUNCHERS = {
+    "singlenode.sh": (["configs/train/debug.toml"], "uv"),
+    "multinode.sh": (["configs/train/debug.toml"], "srun"),
+    "7b_requeue.sh": ([], "srun"),
+    "interactive.sh": (["123", "configs/train/debug.toml"], "srun"),
+}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs bash")
+@pytest.mark.parametrize("overrides", [[], ["--train.max_steps=7", "--checkpoint.dir=/some dir"]])
+@pytest.mark.parametrize("name", sorted(LAUNCHERS))
+def test_each_override_reaches_train_py_as_one_argument(tmp_path, name, overrides):
+    """A quoted override with a space arrives whole, not split into a value and a stray
+    argument, and a launch without overrides passes none."""
+    head, launcher = LAUNCHERS[name]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stubs = {
+        launcher: f'#!/bin/sh\nprintf "%s\\0" "$@" > "{tmp_path}/argv"\n',
+        "ip": "#!/bin/sh\nexit 0\n",
+        "ss": "#!/bin/sh\nexit 0\n",
+        "scontrol": "#!/bin/sh\necho node1\n",
+        "squeue": '#!/bin/sh\ncase "$*" in *%D*) echo 1 ;; *) echo node1 ;; esac\n',
+    }
+    for tool, body in stubs.items():
+        (bin_dir / tool).write_text(body)
+        (bin_dir / tool).chmod(0o755)
+    env = dict(
+        os.environ,
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        SLURM_JOB_ID="1",
+        SLURM_NNODES="1",
+        SLURM_JOB_NODELIST="node1",
+    )
+    result = subprocess.run(
+        ["bash", str(SLURM / name), *head, *overrides],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    argv = (tmp_path / "argv").read_text().split("\0")[:-1]
+    assert argv[argv.index("scripts/train.py") + 2 :] == overrides
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="needs bash and POSIX signals")
 @pytest.mark.parametrize("code", [7, 0])
 @pytest.mark.parametrize(
