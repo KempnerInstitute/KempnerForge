@@ -210,6 +210,23 @@ def _characters(window: Encoding, first: int, last: int) -> tuple[int, int]:
     return window.offsets[first][0], window.offsets[last][1]
 
 
+def _check_question(tokenizer: Tokenizer, counter: Tokenizer, question: str) -> None:
+    """Refuses a question that leaves a window of ``tokenizer`` no more context than its stride.
+
+    ``tokenizer`` aborts on such a pair rather than raising an error, so the
+    question is counted first, by ``counter``, a copy that does not truncate.
+    """
+    truncation: Any = tokenizer.truncation
+    processor: Any = tokenizer.post_processor
+    room = truncation["max_length"] - processor.num_special_tokens_to_add(True)
+    tokens = len(counter.encode(question, add_special_tokens=False).ids)
+    if tokens >= room - truncation["stride"]:
+        raise ValueError(
+            f"the question is {tokens} tokens, and a window of the answer extractor takes "
+            f"at most {room - truncation['stride'] - 1} so that its context overlaps"
+        )
+
+
 def check_extractor_device(device: str) -> torch.device:
     """``device`` as a torch device, refused unless it is the CPU or a CUDA device this process has.
 
@@ -242,7 +259,9 @@ class AnswerExtractor:
     raises is tried again by the next call. Calling the extractor returns the
     span of ``context`` that answers ``question``, as described in this module,
     or ``""`` when the context holds no token (only whitespace), where the
-    pipeline finds no answer at all.
+    pipeline finds no answer at all. A question too long for a window to hold it
+    with more context than the stride (more than 3,964 tokens for BigBird) is
+    refused with ``ValueError``.
 
     Raises:
         ValueError: ``device`` is refused by ``check_extractor_device``.
@@ -251,12 +270,16 @@ class AnswerExtractor:
     def __init__(self, device: str, load: Callable[[torch.device], SpanModel]) -> None:
         self.device = check_extractor_device(device)
         self._load = load
-        self._loaded: SpanModel | None = None
+        self._loaded: tuple[SpanModel, Tokenizer] | None = None
 
-    def _span_model(self) -> SpanModel:
+    def _span_model(self) -> tuple[SpanModel, Tokenizer]:
+        """The loaded model, with a copy of its tokenizer that counts without truncating."""
         if self._loaded is None:
             started = time.perf_counter()
-            self._loaded = self._load(self.device)
+            span_model = self._load(self.device)
+            counter = type(span_model.tokenizer).from_str(span_model.tokenizer.to_str())
+            counter.no_truncation()
+            self._loaded = span_model, counter
             logger.info(
                 f"Loaded the answer extractor on {self.device} in "
                 f"{time.perf_counter() - started:.1f} s"
@@ -280,11 +303,13 @@ class AnswerExtractor:
         """The span of ``context`` that answers ``question``.
 
         Raises:
-            ValueError: ``question`` or ``context`` is empty.
+            ValueError: ``question`` or ``context`` is empty, or ``question`` is
+                too long for a window.
         """
         if not question or not context:
             raise ValueError("an answer is read from a non-empty context for a non-empty question")
-        span_model = self._span_model()
+        span_model, counter = self._span_model()
+        _check_question(span_model.tokenizer, counter, question)
         encoding = span_model.tokenizer.encode(question, context)
         windows: Sequence[Encoding] = [encoding, *encoding.overflowing]
         totals: dict[str, float] = {}

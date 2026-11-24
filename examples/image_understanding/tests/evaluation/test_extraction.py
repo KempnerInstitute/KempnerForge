@@ -244,6 +244,20 @@ class TestAnswerExtractor:
         assert extract("what?", " ".join(["a"] * 300) + " 42") == " 42"
         assert model.calls > 1
 
+    def test_a_question_too_long_for_a_window_is_refused(self, spiece_model: Path) -> None:
+        length = WINDOW_STRIDE + 40
+        extract, model = _extractor(spiece_model, {}, {}, max_length=length)
+        room = length - 3 - WINDOW_STRIDE
+        assert extract(" ".join(["a"] * (room - 1)), "a cat") == "a"
+        calls = model.calls
+        with pytest.raises(ValueError, match=f"the question is {room} tokens.*at most {room - 1}"):
+            extract(" ".join(["a"] * room), "a cat")
+        with pytest.raises(ValueError, match=f"the question is {room} tokens"):
+            extract(" ".join(["a"] * room), " ".join(["a"] * 300))
+        with pytest.raises(ValueError, match=f"the question is {length + 50} tokens"):
+            extract(" ".join(["a"] * (length + 50)), "a cat")
+        assert model.calls == calls
+
     @pytest.mark.parametrize("context", [" ", "\n", " \t\n "])
     def test_a_context_without_a_token_gives_no_answer(
         self, spiece_model: Path, context: str

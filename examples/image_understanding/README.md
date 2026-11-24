@@ -662,7 +662,9 @@ the scorers of their answers.
     (`EXTRACTOR_MODEL`, `EXTRACTOR_REVISION` and `EXTRACTOR_FILES` in
     `extraction.py`). Each rank loads the model from them when one of its rows
     first needs it, as each rank scores its own rows; a reply needing no
-    extraction loads nothing. transformers 5 has
+    extraction loads nothing. A question over 3,964 tokens, which leaves a window
+    no more context than its stride, is refused (testmini's longest query is 281).
+    transformers 5 has
     no question-answering pipeline, so `extraction.py` reads the span as the
     transformers 4 pipeline the recipe calls does, with the same tokenizer, built
     from the model's SentencePiece file with `protobuf` (the `sentencepiece`
