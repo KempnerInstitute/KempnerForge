@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -11,14 +12,23 @@ from pathlib import Path
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from convert_checkpoint import _build_hf_config, _hf_to_kf_key, _kf_to_hf_key, dcp_to_hf, main
+from convert_checkpoint import (
+    _build_hf_config,
+    _hf_to_kf_key,
+    _kf_to_hf_key,
+    dcp_to_hf,
+    hf_to_dcp,
+    main,
+)
 
+from kempnerforge.checkpoint.manager import derive_buffers, derived_buffer_owners
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.model.router import SigmoidTopKRouter
 from kempnerforge.model.transformer import Transformer
 
 
@@ -126,23 +136,27 @@ class TestRoundTrip:
 
 class TestMoEKFtoHFKeyMapping:
     def test_router_gate(self):
-        assert _kf_to_hf_key("layers.0.mlp.router.gate.weight") == "model.layers.0.mlp.gate.weight"
+        assert (
+            _kf_to_hf_key("layers.0.mlp.router.gate.weight")
+            == "model.layers.0.block_sparse_moe.gate.weight"
+        )
 
     def test_router_expert_bias(self):
         assert _kf_to_hf_key("layers.0.mlp.router.expert_bias") == "model.layers.0.mlp.expert_bias"
 
     def test_expert_projections(self):
+        """Mixtral's w1, w2 and w3 are the gate, down and up projections."""
         assert (
             _kf_to_hf_key("layers.0.mlp.experts.0.gate_proj.weight")
-            == "model.layers.0.mlp.experts.0.gate_proj.weight"
+            == "model.layers.0.block_sparse_moe.experts.0.w1.weight"
         )
         assert (
             _kf_to_hf_key("layers.0.mlp.experts.3.up_proj.weight")
-            == "model.layers.0.mlp.experts.3.up_proj.weight"
+            == "model.layers.0.block_sparse_moe.experts.3.w3.weight"
         )
         assert (
             _kf_to_hf_key("layers.0.mlp.experts.7.down_proj.weight")
-            == "model.layers.0.mlp.experts.7.down_proj.weight"
+            == "model.layers.0.block_sparse_moe.experts.7.w2.weight"
         )
 
     def test_shared_expert(self):
@@ -157,11 +171,27 @@ class TestMoEKFtoHFKeyMapping:
 
     def test_router_gate_different_layers(self):
         assert (
-            _kf_to_hf_key("layers.15.mlp.router.gate.weight") == "model.layers.15.mlp.gate.weight"
+            _kf_to_hf_key("layers.15.mlp.router.gate.weight")
+            == "model.layers.15.block_sparse_moe.gate.weight"
         )
 
 
 class TestMoEHFtoKFKeyMapping:
+    def test_mixtral_router_gate(self):
+        assert (
+            _hf_to_kf_key("model.layers.3.block_sparse_moe.gate.weight")
+            == "layers.3.mlp.router.gate.weight"
+        )
+
+    @pytest.mark.parametrize(
+        "mixtral,kf", [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]
+    )
+    def test_mixtral_expert_projections(self, mixtral, kf):
+        assert (
+            _hf_to_kf_key(f"model.layers.0.block_sparse_moe.experts.5.{mixtral}.weight")
+            == f"layers.0.mlp.experts.5.{kf}.weight"
+        )
+
     def test_router_gate(self):
         assert _hf_to_kf_key("model.layers.0.mlp.gate.weight") == "layers.0.mlp.router.gate.weight"
 
@@ -206,6 +236,380 @@ class TestMoERoundTrip:
     )
     def test_moe_kf_to_hf_to_kf(self, kf_key):
         assert _hf_to_kf_key(_kf_to_hf_key(kf_key)) == kf_key
+
+
+def _refuse_to_build(*args, **kwargs):
+    raise AssertionError("from_pretrained builds the model and can run the repository's code")
+
+
+class _Opaque:
+    """An object ``torch.load(weights_only=True)`` refuses to unpickle."""
+
+
+class TestWeightFiles:
+    """hf-to-dcp reads the weight files transformers loads by default, locally or from the Hub.
+
+    A Hub model is read without building a Hugging Face model or importing the repository's
+    code: each file comes from ``hf_hub_download``.
+    """
+
+    @staticmethod
+    def _repo(path: Path, files: dict[str, dict], index: dict | None = None) -> Path:
+        """A model directory holding ``files``, an index if given, and a config whose auto_map
+        names the repository's own module, which writes ``ran.txt`` beside it if imported."""
+        from safetensors.torch import save_file
+
+        path.mkdir(parents=True)
+        auto_map = {"AutoModelForCausalLM": "probe.ProbeForCausalLM"}
+        (path / "config.json").write_text(json.dumps({"model_type": "probe", "auto_map": auto_map}))
+        marker = str(path / "ran.txt")
+        (path / "probe.py").write_text(
+            f"import pathlib\npathlib.Path({marker!r}).write_text('ran')\n"
+        )
+        for name, weights in files.items():
+            if name.endswith(".safetensors"):
+                save_file(weights, path / name)
+            else:
+                torch.save(weights, path / name)
+        if index is not None:
+            (path / index["name"]).write_text(json.dumps({"weight_map": index["weight_map"]}))
+        return path
+
+    @staticmethod
+    def _hub(
+        monkeypatch,
+        snapshots: list[Path],
+        moves_to: str | None = None,
+        cached: set[str] | None = None,
+    ) -> list[tuple]:
+        """Serve snapshot directories, each named for its commit, through ``hf_hub_download``.
+
+        ``main`` is at the first snapshot; with ``moves_to`` it moves to that commit after the
+        first file is downloaded. With ``cached``, a lookup cannot reach the Hub and only those
+        files are had, from the cache. Returns each request's ``(filename, revision)``, with
+        ``"cache"`` added for a request that reads the cache only.
+        """
+        import huggingface_hub
+        import transformers
+        from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
+
+        commits = {snapshot.name: snapshot for snapshot in snapshots}
+        refs = {"main": snapshots[0].name}
+        asked: list[tuple] = []
+
+        def hf_hub_download(repo_id, filename, revision=None, local_files_only=False, **kwargs):
+            assert repo_id == "org/model"
+            asked.append(
+                (filename, revision, "cache") if local_files_only else (filename, revision)
+            )
+            commit = revision or refs["main"]
+            if (cached is not None or local_files_only) and filename not in (cached or ()):
+                raise LocalEntryNotFoundError(f"{filename} cannot be had: the Hub is unreachable")
+            if not (commits[commit] / filename).exists():
+                raise EntryNotFoundError(f"{filename} is not in {repo_id} at {commit}")
+            if moves_to is not None:
+                refs["main"] = moves_to
+            return str(commits[commit] / filename)
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", hf_hub_download)
+        monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", _refuse_to_build)
+        return asked
+
+    INDEX = {
+        "name": "model.safetensors.index.json",
+        "weight_map": {"a": "model-1.safetensors", "b": "model-2.safetensors"},
+    }
+    BIN_INDEX = {
+        "name": "pytorch_model.bin.index.json",
+        "weight_map": {"a": "pytorch_model-1.bin", "b": "pytorch_model-2.bin"},
+    }
+
+    def test_a_hub_id_reads_model_safetensors_and_not_an_adapter(self, tmp_path, monkeypatch):
+        from convert_checkpoint import _load_hf_hub
+
+        model = {"model.norm.weight": torch.arange(4, dtype=torch.float32)}
+        adapter = {"model.norm.weight": torch.zeros(4)}
+        files = {"model.safetensors": model, "adapter_model.safetensors": adapter}
+        repo = self._repo(tmp_path / "c0", files)
+        asked = self._hub(monkeypatch, [repo])
+
+        loaded = _load_hf_hub("org/model")
+
+        assert asked == [("model.safetensors", None)]
+        assert torch.equal(loaded["model.norm.weight"], model["model.norm.weight"])
+        assert loaded["model.norm.weight"].dtype == torch.float32
+        assert not (repo / "ran.txt").exists(), "the repository's module was imported"
+
+    def test_a_hub_index_gives_its_shards_and_no_other_file(self, tmp_path, monkeypatch):
+        from convert_checkpoint import _load_hf_hub
+
+        files = {
+            "model-1.safetensors": {"a": torch.ones(2)},
+            "model-2.safetensors": {"b": torch.full((2,), 2.0)},
+            "stray.safetensors": {"a": torch.zeros(2)},
+        }
+        repo = self._repo(tmp_path / "c0", files, self.INDEX)
+        asked = self._hub(monkeypatch, [repo])
+
+        loaded = _load_hf_hub("org/model")
+
+        assert asked == [
+            ("model.safetensors", None),
+            (self.INDEX["name"], None),
+            ("model-1.safetensors", "c0"),
+            ("model-2.safetensors", "c0"),
+        ]
+        assert torch.equal(loaded["a"], torch.ones(2))
+        assert torch.equal(loaded["b"], files["model-2.safetensors"]["b"])
+
+    def test_a_hub_shard_comes_from_its_index_commit_while_main_moves(self, tmp_path, monkeypatch):
+        from convert_checkpoint import _load_hf_hub
+
+        old = {
+            "model-1.safetensors": {"a": torch.ones(2)},
+            "model-2.safetensors": {"b": torch.ones(2)},
+        }
+        new = {
+            "model-1.safetensors": {"a": torch.zeros(2)},
+            "model-2.safetensors": {"b": torch.zeros(2)},
+        }
+        snapshots = [
+            self._repo(tmp_path / "old", old, self.INDEX),
+            self._repo(tmp_path / "new", new, self.INDEX),
+        ]
+        asked = self._hub(monkeypatch, snapshots, moves_to="new")
+
+        loaded = _load_hf_hub("org/model")
+
+        assert torch.equal(loaded["a"], torch.ones(2)) and torch.equal(loaded["b"], torch.ones(2))
+        assert asked[1:] == [
+            (self.INDEX["name"], None),
+            ("model-1.safetensors", "old"),
+            ("model-2.safetensors", "old"),
+        ]
+
+    def test_a_single_file_is_read_before_an_index_beside_it(self, tmp_path, monkeypatch):
+        """Transformers takes ``model.safetensors`` before its index, so a stale index is unused."""
+        from convert_checkpoint import _load_hf_hub, _load_hf_local
+
+        files = {
+            "model.safetensors": {"a": torch.ones(2)},
+            "model-1.safetensors": {"a": torch.zeros(2)},
+        }
+        index = {"name": "model.safetensors.index.json", "weight_map": {"a": "model-1.safetensors"}}
+        repo = self._repo(tmp_path / "c0", files, index)
+        self._hub(monkeypatch, [repo])
+
+        assert torch.equal(_load_hf_hub("org/model")["a"], torch.ones(2))
+        assert torch.equal(_load_hf_local(repo)["a"], torch.ones(2))
+
+    def test_a_hub_shard_that_cannot_be_had_fails_the_load(self, tmp_path, monkeypatch):
+        """A shard missing from the repository or from an offline cache is not left out."""
+        from convert_checkpoint import _load_hf_hub
+        from huggingface_hub.errors import EntryNotFoundError
+
+        files = {"model-1.safetensors": {"a": torch.ones(2)}}
+        repo = self._repo(tmp_path / "c0", files, self.INDEX)
+        self._hub(monkeypatch, [repo])
+
+        with pytest.raises(EntryNotFoundError, match="model-2.safetensors"):
+            _load_hf_hub("org/model")
+
+    def test_a_hub_repository_without_safetensors_gives_its_bin(self, tmp_path, monkeypatch):
+        from convert_checkpoint import _load_hf_hub
+
+        files = {
+            "pytorch_model.bin": {"model.norm.weight": torch.ones(4)},
+            "adapter_model.safetensors": {"model.norm.weight": torch.zeros(4)},
+        }
+        repo = self._repo(tmp_path / "c0", files)
+        asked = self._hub(monkeypatch, [repo])
+
+        loaded = _load_hf_hub("org/model")
+
+        assert asked[-1] == ("pytorch_model.bin", None)
+        assert torch.equal(loaded["model.norm.weight"], torch.ones(4))
+
+    def test_a_hub_repository_without_weight_files_is_refused(self, tmp_path, monkeypatch):
+        from convert_checkpoint import _load_hf_hub
+
+        repo = self._repo(tmp_path / "c0", {"adapter_model.safetensors": {"x": torch.ones(1)}})
+        self._hub(monkeypatch, [repo])
+
+        with pytest.raises(FileNotFoundError, match="Found none of model.safetensors"):
+            _load_hf_hub("org/model")
+
+    def test_a_bin_index_gives_its_shards_locally_and_from_the_hub(self, tmp_path, monkeypatch):
+        from convert_checkpoint import _load_hf_hub, _load_hf_local
+
+        files = {
+            "pytorch_model-1.bin": {"a": torch.ones(2)},
+            "pytorch_model-2.bin": {"b": torch.full((2,), 2.0)},
+            "pytorch_model-stray.bin": {"a": torch.zeros(2)},
+        }
+        repo = self._repo(tmp_path / "c0", files, self.BIN_INDEX)
+        asked = self._hub(monkeypatch, [repo])
+
+        for loaded in (_load_hf_local(repo), _load_hf_hub("org/model")):
+            assert set(loaded) == {"a", "b"}
+            assert torch.equal(loaded["a"], torch.ones(2))
+            assert torch.equal(loaded["b"], files["pytorch_model-2.bin"]["b"])
+        assert asked == [
+            ("model.safetensors", None),
+            (self.INDEX["name"], None),
+            ("pytorch_model.bin", None),
+            (self.BIN_INDEX["name"], None),
+            ("pytorch_model-1.bin", "c0"),
+            ("pytorch_model-2.bin", "c0"),
+        ]
+
+    def test_a_hub_repository_that_is_not_found_is_not_taken_for_missing_files(self, monkeypatch):
+        import httpx
+        import huggingface_hub
+        from convert_checkpoint import _load_hf_hub
+        from huggingface_hub.errors import RepositoryNotFoundError
+
+        url = "https://huggingface.co/org/model/resolve/main/model.safetensors"
+        response = httpx.Response(404, request=httpx.Request("HEAD", url))
+
+        def hf_hub_download(repo_id, filename, **kwargs):
+            raise RepositoryNotFoundError(f"Repository Not Found for url: {url}", response=response)
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", hf_hub_download)
+        with pytest.raises(RepositoryNotFoundError, match="Repository Not Found"):
+            _load_hf_hub("org/model")
+
+    def test_a_lookup_that_cannot_reach_the_hub_is_passed_over(self, tmp_path, monkeypatch):
+        """A name whose lookup fails, as offline or with the Hub down, is passed over like a
+        missing one, and the other names are still looked up as before, so a cached index
+        serves; one failed lookup does not turn the rest into cache reads."""
+        from convert_checkpoint import _load_hf_hub
+
+        files = {
+            "model-1.safetensors": {"a": torch.ones(2)},
+            "model-2.safetensors": {"b": torch.ones(2)},
+        }
+        repo = self._repo(tmp_path / "c0", files, self.INDEX)
+        cached = {self.INDEX["name"], *files}
+        asked = self._hub(monkeypatch, [repo], cached=cached)
+
+        loaded = _load_hf_hub("org/model")
+
+        assert set(loaded) == {"a", "b"}
+        assert asked == [
+            ("model.safetensors", None),
+            (self.INDEX["name"], None),
+            ("model-1.safetensors", "c0"),
+            ("model-2.safetensors", "c0"),
+        ]
+
+    def test_a_failed_lookup_without_cached_files_is_named_in_the_refusal(
+        self, tmp_path, monkeypatch
+    ):
+        """The refusal does not read as a repository without weight files: it names the first
+        lookup that failed and chains its error."""
+        from convert_checkpoint import _load_hf_hub
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        repo = self._repo(tmp_path / "c0", {"model.safetensors": {"a": torch.ones(2)}})
+        self._hub(monkeypatch, [repo], cached=set())
+
+        refusal = "the lookup of model.safetensors failed: model.safetensors cannot be had"
+        with pytest.raises(FileNotFoundError, match=refusal) as caught:
+            _load_hf_hub("org/model")
+        assert isinstance(caught.value.__cause__, LocalEntryNotFoundError)
+
+    def test_a_local_directory_reads_its_bin_and_not_an_adapter(self, tmp_path):
+        """Beside a ``pytorch_model.bin``, an adapter's safetensors file no longer replaces it."""
+        from convert_checkpoint import _load_hf_local
+
+        files = {
+            "pytorch_model.bin": {"model.norm.weight": torch.ones(4)},
+            "adapter_model.safetensors": {"model.norm.weight": torch.zeros(4)},
+        }
+        loaded = _load_hf_local(self._repo(tmp_path / "local", files))
+        assert torch.equal(loaded["model.norm.weight"], torch.ones(4))
+
+    def test_a_local_index_gives_its_shards_and_no_other_file(self, tmp_path):
+        from convert_checkpoint import _load_hf_local
+
+        files = {
+            "model-1.safetensors": {"a": torch.ones(2)},
+            "model-2.safetensors": {"b": torch.ones(2)},
+            "stray.safetensors": {"a": torch.zeros(2)},
+        }
+        loaded = _load_hf_local(self._repo(tmp_path / "local", files, self.INDEX))
+        assert torch.equal(loaded["a"], torch.ones(2)) and set(loaded) == {"a", "b"}
+
+    def test_a_local_directory_without_standard_names_reads_every_safetensors(self, tmp_path):
+        from convert_checkpoint import _load_hf_local
+
+        files = {
+            "part-a.safetensors": {"a": torch.ones(2)},
+            "part-b.safetensors": {"b": torch.ones(2)},
+        }
+        loaded = _load_hf_local(self._repo(tmp_path / "local", files))
+        assert set(loaded) == {"a", "b"}
+
+    def test_a_bin_file_holding_other_objects_is_refused(self, tmp_path):
+        """``.bin`` files load with ``weights_only=True``: tensors and plain data only."""
+        import pickle
+
+        from convert_checkpoint import _load_hf_local
+
+        local = self._repo(tmp_path / "local", {"pytorch_model.bin": {"x": _Opaque()}})
+        with pytest.raises(pickle.UnpicklingError):
+            _load_hf_local(local)
+
+    @pytest.mark.parametrize("tied", [False, True])
+    def test_a_checkpoint_without_lm_head_gives_the_head_the_embedding(
+        self, tmp_path, monkeypatch, tied
+    ):
+        """A checkpoint with tied embeddings may store no lm_head.weight; the head then takes
+        the embedding, whether the model ties them or not."""
+        from convert_checkpoint import hf_to_dcp
+
+        config = ModelConfig(
+            dim=16, n_layers=1, n_heads=2, vocab_size=32, max_seq_len=16, tie_embeddings=tied
+        )
+        torch.manual_seed(0)
+        source = Transformer(config).state_dict()
+        weights = {
+            _kf_to_hf_key(key): value.clone()
+            for key, value in source.items()
+            if key != "output_head.proj.weight"
+        }
+        assert "lm_head.weight" not in weights
+        repo = self._repo(tmp_path / "c0", {"model.safetensors": weights})
+        self._hub(monkeypatch, [repo])
+
+        hf_to_dcp("org/model", str(tmp_path / "dcp"), config)
+
+        torch.manual_seed(1)
+        state = {"model": Transformer(config).state_dict()}
+        dcp.load(state, checkpoint_id=str(tmp_path / "dcp"))
+        embedding = source["token_embedding.embedding.weight"]
+        assert torch.equal(state["model"]["output_head.proj.weight"], embedding)
+        assert torch.equal(state["model"]["token_embedding.embedding.weight"], embedding)
+
+    def test_hf_to_dcp_imports_the_weights_of_a_hub_model(self, tmp_path, monkeypatch):
+        from convert_checkpoint import hf_to_dcp
+
+        config = ModelConfig(dim=16, n_layers=1, n_heads=2, vocab_size=32, max_seq_len=16)
+        torch.manual_seed(0)
+        source = Transformer(config).state_dict()
+        weights = {_kf_to_hf_key(key): value.clone() for key, value in source.items()}
+        repo = self._repo(tmp_path / "c0", {"model.safetensors": weights})
+        self._hub(monkeypatch, [repo])
+
+        hf_to_dcp("org/model", str(tmp_path / "dcp"), config)
+
+        torch.manual_seed(1)
+        state = {"model": Transformer(config).state_dict()}
+        dcp.load(state, checkpoint_id=str(tmp_path / "dcp"))
+        for key, value in source.items():
+            assert torch.equal(state["model"][key], value), key
+        assert not (repo / "ran.txt").exists(), "the repository's module was imported"
 
 
 class TestBuildHFConfig:
@@ -256,6 +660,22 @@ class TestBuildHFConfig:
         assert hf_cfg["num_local_experts"] == 8
         assert hf_cfg["num_experts_per_tok"] == 2
         assert hf_cfg["router_aux_loss_coef"] == 0.01
+
+    def test_moe_intermediate_size_is_the_expert_width(self):
+        """Mixtral reads intermediate_size as each expert's width; a dense model keeps the
+        dense width."""
+        mc = ModelConfig(
+            dim=64,
+            n_layers=2,
+            n_heads=2,
+            vocab_size=256,
+            num_experts=4,
+            moe_expert_ffn_multiplier=0.5,
+        )
+        assert mc.computed_expert_ffn_hidden_dim != mc.computed_ffn_hidden_dim
+        assert _build_hf_config(mc)["intermediate_size"] == mc.computed_expert_ffn_hidden_dim
+        dense = replace(mc, num_experts=0)
+        assert _build_hf_config(dense)["intermediate_size"] == mc.computed_ffn_hidden_dim
 
     def test_head_dim_is_exported(self):
         """A decoupled width is not recoverable from dim // n_heads, so the
@@ -439,13 +859,18 @@ class TestExportDtypePrecedence:
         assert f"Export dtype: float32 (from {source})" in caplog.text
 
 
-def _random_dcp(path: Path, model_config: ModelConfig) -> Transformer:
-    """Save a model whose every weight, norms included, is drawn at random; return it."""
+def _random_dcp(path: Path, model_config: ModelConfig, std: float = 1.0) -> Transformer:
+    """Save a model whose every weight, norms included, is drawn at random; return it.
+
+    Buffers derived from the weights, such as the sigmoid router's FP32 masters, are
+    derived again from the drawn ones, as a trained model keeps them.
+    """
     model = Transformer(model_config)
     generator = torch.Generator().manual_seed(0)
     with torch.no_grad():
         for param in model.parameters():
-            param.normal_(generator=generator)
+            param.normal_(std=std, generator=generator)
+    derive_buffers(model, derived_buffer_owners(model))
     dcp.save({"model": model.state_dict()}, checkpoint_id=str(path))
     return model
 
@@ -513,3 +938,312 @@ class TestExportValues:
         assert weights.keys() == expected.keys()
         for name, tensor in expected.items():
             assert torch.equal(weights[name], tensor.detach().to(dtype)), name
+
+
+def _moe_config(**overrides) -> ModelConfig:
+    """A small MoE model that differs from Mixtral's defaults where an export could slip:
+    grouped-query attention, an expert width other than the dense width, and rope_theta."""
+    fields = {
+        "dim": 64,
+        "n_layers": 2,
+        "n_heads": 4,
+        "n_kv_heads": 2,
+        "vocab_size": 256,
+        "max_seq_len": 64,
+        "num_experts": 4,
+        "moe_top_k": 2,
+        "moe_expert_ffn_multiplier": 1.5,
+        "rope_theta": 10000.0,
+    }
+    fields.update(overrides)
+    return ModelConfig(**fields)
+
+
+def _read_back(hf_dir: Path, dcp_dir: Path, config: ModelConfig) -> dict[str, torch.Tensor]:
+    """Import an export with ``hf_to_dcp`` and return the model state it saved."""
+    hf_to_dcp(str(hf_dir), str(dcp_dir), config)
+    state = {"model": Transformer(config).state_dict()}
+    dcp.load(state, checkpoint_id=str(dcp_dir))
+    return state["model"]
+
+
+class TestMixtralExport:
+    """An MoE model exports as a Mixtral checkpoint, which transformers loads as trained."""
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_transformers_loads_every_weight_and_matches_the_logits(self, tmp_path, packed):
+        transformers = pytest.importorskip("transformers")
+        config = _moe_config(moe_packed_experts=packed)
+        source = _random_dcp(tmp_path / "dcp", config, std=0.05).eval()
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=torch.float32)
+        model, info = transformers.AutoModelForCausalLM.from_pretrained(
+            tmp_path / "hf", dtype=torch.float32, output_loading_info=True
+        )
+        assert type(model).__name__ == "MixtralForCausalLM"
+        assert not info["missing_keys"]
+        assert not info["unexpected_keys"]
+        assert not info["mismatched_keys"]
+        tokens = torch.randint(0, 256, (2, 16), generator=torch.Generator().manual_seed(0))
+        with torch.no_grad():
+            torch.testing.assert_close(model.eval()(tokens).logits, source(tokens))
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_packed_experts_are_written_one_tensor_per_expert(self, tmp_path, dtype):
+        """A packed model writes the names an unpacked one does, each expert's slice of the
+        packed weight transposed to the (out, in) layout of a linear layer."""
+        config = _moe_config(moe_packed_experts=True)
+        source = _random_dcp(tmp_path / "dcp", config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=dtype)
+        weights = load_file(tmp_path / "hf" / "model.safetensors")
+        unpacked = Transformer(replace(config, moe_packed_experts=False)).state_dict()
+        assert weights.keys() == {_kf_to_hf_key(name) for name in unpacked}
+        for i, block in source.layers.items():
+            for proj, mixtral in (("gate", "w1"), ("down", "w2"), ("up", "w3")):
+                packed = block.mlp.get_parameter(f"{proj}_w")
+                for j in range(config.num_experts):
+                    name = f"model.layers.{i}.block_sparse_moe.experts.{j}.{mixtral}.weight"
+                    assert torch.equal(weights[name], packed[j].t().to(dtype)), name
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_hf_to_dcp_reads_an_export_back(self, tmp_path, packed):
+        config = _moe_config(moe_packed_experts=packed)
+        source = _random_dcp(tmp_path / "dcp", config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=torch.float32)
+        back = _read_back(tmp_path / "hf", tmp_path / "back", config)
+        for name, tensor in source.state_dict().items():
+            assert torch.equal(back[name], tensor), name
+
+    def test_hf_to_dcp_reads_the_expert_names_written_before(self, tmp_path):
+        """An export written with mlp.gate and mlp.experts.{j}.*_proj still imports."""
+        config = _moe_config()
+        source = _random_dcp(tmp_path / "dcp", config)
+
+        def written_before(name: str) -> str:
+            if ".mlp.experts." in name:
+                return "model." + name
+            return _kf_to_hf_key(name).replace(".block_sparse_moe.gate.", ".mlp.gate.")
+
+        (tmp_path / "hf").mkdir()
+        old = {written_before(name): tensor for name, tensor in source.state_dict().items()}
+        assert any(".mlp.experts.0.gate_proj." in name for name in old)
+        save_file(old, tmp_path / "hf" / "model.safetensors")
+        back = _read_back(tmp_path / "hf", tmp_path / "back", config)
+        for name, tensor in source.state_dict().items():
+            assert torch.equal(back[name], tensor), name
+
+    @pytest.mark.parametrize(
+        "overrides,named",
+        [
+            ({"moe_shared_experts": 1}, "moe_shared_experts=1: Mixtral has none"),
+            ({"moe_frequency": 2}, "moe_frequency=2: every Mixtral layer is an MoE layer"),
+            (
+                {"moe_router": "sigmoid_topk"},
+                "moe_router='sigmoid_topk': Mixtral routes with softmax top-k",
+            ),
+            ({"activation": "gelu"}, "activation='gelu': Mixtral experts are SwiGLU"),
+            ({"norm_type": "layernorm"}, "norm_type='layernorm': Mixtral norms are RMSNorm"),
+            ({"qk_norm": True}, "qk_norm=True: Mixtral has no query or key norm"),
+        ],
+    )
+    def test_refuses_what_mixtral_cannot_hold_before_reading(self, tmp_path, overrides, named):
+        """The refusal names the setting before the checkpoint is read, here one that does
+        not exist, or anything is written."""
+        config = _moe_config(**overrides)
+        with pytest.raises(ValueError, match=re.escape(named)):
+            dcp_to_hf(str(tmp_path / "missing"), str(tmp_path / "hf"), config)
+        assert not (tmp_path / "hf").exists()
+
+    def test_hf_to_dcp_splits_experts_a_mixtral_checkpoint_holds_packed(self, tmp_path):
+        """transformers 5 packs each layer's experts, and saves them so with
+        ``save_original_format=False``; the import splits them back into every expert's
+        weights."""
+        transformers = pytest.importorskip("transformers")
+        from safetensors.torch import load_file
+
+        config = _moe_config()
+        source = _random_dcp(tmp_path / "dcp", config)
+        dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=torch.float32)
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            tmp_path / "hf", dtype=torch.float32
+        )
+        model.save_pretrained(tmp_path / "packed", save_original_format=False)
+        saved = load_file(tmp_path / "packed" / "model.safetensors")
+        assert "model.layers.0.mlp.experts.gate_up_proj" in saved
+        back = _read_back(tmp_path / "packed", tmp_path / "back", config)
+        for name, tensor in source.state_dict().items():
+            assert torch.equal(back[name], tensor), name
+
+    def test_capacity_warns_that_transformers_drops_no_tokens(self, tmp_path, caplog):
+        config = _moe_config(moe_capacity_factor=1.25)
+        _random_dcp(tmp_path / "dcp", config)
+        with caplog.at_level(logging.WARNING, logger="convert_checkpoint"):
+            dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=torch.float32)
+        assert "moe_capacity_factor=1.25: transformers has no expert capacity" in caplog.text
+        assert (tmp_path / "hf" / "model.safetensors").exists()
+
+    def test_every_refused_setting_is_named(self):
+        config = _moe_config(moe_shared_experts=2, moe_router="sigmoid_topk")
+        with pytest.raises(ValueError, match="moe_shared_experts=2.*; moe_router='sigmoid_topk'"):
+            _build_hf_config(config)
+
+    def test_without_the_check_a_model_exports_for_hf_to_dcp(self, tmp_path, caplog):
+        """A DeepSeek-style model exports with a warning that names what Mixtral lacks, and
+        hf-to-dcp reads every weight back, as the resharding round trip needs."""
+        config = _moe_config(moe_router="sigmoid_topk", moe_shared_experts=1, moe_frequency=2)
+        source = _random_dcp(tmp_path / "dcp", config)
+        with caplog.at_level(logging.WARNING, logger="convert_checkpoint"):
+            dcp_to_hf(
+                str(tmp_path / "dcp"),
+                str(tmp_path / "hf"),
+                config,
+                dtype=torch.float32,
+                check_architecture=False,
+            )
+        assert "moe_shared_experts=1: Mixtral has none" in caplog.text
+        assert "read it only with hf-to-dcp" in caplog.text
+        back = _read_back(tmp_path / "hf", tmp_path / "back", config)
+        for name, tensor in source.state_dict().items():
+            assert torch.equal(back[name], tensor), name
+
+    def test_the_cli_flag_turns_the_check_off(self, tmp_path, monkeypatch):
+        toml = tmp_path / "job.toml"
+        toml.write_text(_TINY_TOML + "num_experts = 2\nmoe_shared_experts = 1\n")
+        _tiny_dcp(tmp_path / "dcp", load_config(toml, cli_args=[]).model)
+        argv = ["convert_checkpoint.py", "dcp-to-hf", "--config", str(toml)]
+        argv += ["--dcp-dir", str(tmp_path / "dcp"), "--hf-dir", str(tmp_path / "hf")]
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(ValueError, match="pass --no-architecture-check"):
+            main()
+        monkeypatch.setattr(sys, "argv", [*argv, "--no-architecture-check"])
+        main()
+        assert (tmp_path / "hf" / "model.safetensors").exists()
+
+
+class TestLlamaExport:
+    """A dense model exports as Llama, and one that Llama cannot hold is refused."""
+
+    @pytest.mark.parametrize(
+        "overrides,named",
+        [
+            ({"qk_norm": True}, "qk_norm=True: Llama has no query or key norm"),
+            ({"norm_type": "layernorm"}, "norm_type='layernorm': Llama norms are RMSNorm"),
+            ({"activation": "gelu"}, "activation='gelu': Llama MLPs are SwiGLU"),
+            ({"activation": "relu"}, "activation='relu': Llama MLPs are SwiGLU"),
+        ],
+    )
+    def test_refuses_what_llama_cannot_hold_before_reading(
+        self, tmp_path, tiny_model_config, overrides, named
+    ):
+        """The refusal names the setting before the checkpoint is read, here one that does
+        not exist, or anything is written."""
+        config = replace(tiny_model_config, **overrides)
+        with pytest.raises(
+            ValueError, match="Cannot export this model as Llama: " + re.escape(named)
+        ):
+            dcp_to_hf(str(tmp_path / "missing"), str(tmp_path / "hf"), config)
+        assert not (tmp_path / "hf").exists()
+
+    def test_without_the_check_a_dense_model_exports_for_hf_to_dcp(
+        self, tmp_path, tiny_model_config, caplog
+    ):
+        """A model with a query and key norm and LayerNorm exports with a warning, and
+        hf-to-dcp reads every weight back."""
+        config = replace(tiny_model_config, qk_norm=True, norm_type="layernorm")
+        source = _random_dcp(tmp_path / "dcp", config)
+        with caplog.at_level(logging.WARNING, logger="convert_checkpoint"):
+            dcp_to_hf(
+                str(tmp_path / "dcp"),
+                str(tmp_path / "hf"),
+                config,
+                dtype=torch.float32,
+                check_architecture=False,
+            )
+        assert "Exporting a model that Llama cannot hold" in caplog.text
+        assert "qk_norm=True: Llama has no query or key norm" in caplog.text
+        back = _read_back(tmp_path / "hf", tmp_path / "back", config)
+        for name, tensor in source.state_dict().items():
+            assert torch.equal(back[name], tensor), name
+
+
+class TestSigmoidRouterMasters:
+    """The sigmoid router's FP32 masters stay out of the export and are derived on import.
+
+    Mixtral routes with softmax top-k, so these exports turn the architecture check off,
+    as a round trip through hf-to-dcp does.
+    """
+
+    CONFIG = ModelConfig(
+        dim=32,
+        n_layers=2,
+        n_heads=2,
+        vocab_size=64,
+        max_seq_len=16,
+        num_experts=4,
+        moe_top_k=2,
+        moe_router="sigmoid_topk",
+    )
+
+    def _save(self, path: Path, *, with_masters: bool) -> list[SigmoidTopKRouter]:
+        """Save a model whose routers balanced from random counts; return its routers."""
+        model = Transformer(self.CONFIG)
+        routers = [m for m in model.modules() if isinstance(m, SigmoidTopKRouter)]
+        generator = torch.Generator().manual_seed(0)
+        for router in routers:
+            router.balance(torch.randint(1, 50, (self.CONFIG.num_experts,), generator=generator))
+        state = model.state_dict()
+        if not with_masters:
+            state = {k: v for k, v in state.items() if not k.endswith("_bits")}
+        dcp.save({"model": state}, checkpoint_id=str(path))
+        return routers
+
+    def _assert_exported(self, hf_dir: Path, routers: list[SigmoidTopKRouter]) -> None:
+        weights = load_file(hf_dir / "model.safetensors")
+        assert not [k for k in weights if k.endswith("_bits")]
+        for i, router in enumerate(routers):
+            assert torch.equal(weights[f"model.layers.{i}.mlp.expert_bias"], router.expert_bias)
+            assert torch.equal(
+                weights[f"model.layers.{i}.mlp.router.expert_ema"], router.expert_ema
+            )
+
+    def test_the_masters_are_not_exported(self, tmp_path):
+        routers = self._save(tmp_path / "dcp", with_masters=True)
+        dcp_to_hf(
+            str(tmp_path / "dcp"),
+            str(tmp_path / "hf"),
+            self.CONFIG,
+            dtype=torch.float32,
+            check_architecture=False,
+        )
+        self._assert_exported(tmp_path / "hf", routers)
+
+    def test_a_checkpoint_saved_before_the_masters_exports(self, tmp_path):
+        routers = self._save(tmp_path / "dcp", with_masters=False)
+        dcp_to_hf(
+            str(tmp_path / "dcp"),
+            str(tmp_path / "hf"),
+            self.CONFIG,
+            dtype=torch.float32,
+            check_architecture=False,
+        )
+        self._assert_exported(tmp_path / "hf", routers)
+
+    def test_an_import_derives_the_masters_from_the_bias_and_the_ema(self, tmp_path, caplog):
+        routers = self._save(tmp_path / "dcp", with_masters=True)
+        dcp_to_hf(
+            str(tmp_path / "dcp"),
+            str(tmp_path / "hf"),
+            self.CONFIG,
+            dtype=torch.float32,
+            check_architecture=False,
+        )
+        with caplog.at_level(logging.WARNING):
+            hf_to_dcp(str(tmp_path / "hf"), str(tmp_path / "back"), self.CONFIG)
+        assert "Missing" not in caplog.text
+        model = Transformer(self.CONFIG)
+        state = {"model": model.state_dict()}
+        dcp.load(state, checkpoint_id=str(tmp_path / "back"))
+        model.load_state_dict(state["model"])
+        loaded = [m for m in model.modules() if isinstance(m, SigmoidTopKRouter)]
+        for router, source in zip(loaded, routers, strict=True):
+            for got, want in zip(router._masters(), source._masters(), strict=True):
+                assert torch.equal(got, want)

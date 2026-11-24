@@ -27,10 +27,9 @@ What happens:
 1. Build a bare `Transformer(model_config)` on CPU — the default
    random-initialized parameters serve only as target shapes that
    DCP overwrites on load.
-2. Detect whether `dcp_dir` contains PP stage subdirectories
-   (`pp0/`, `pp1/`, …). If yes, load each stage's shards one at a
-   time with `strict=False` — each stage holds a disjoint slice of
-   the full model.
+2. Load the checkpoint into that model with DCP. A pipeline-parallel
+   checkpoint, one with stage subdirectories (`pp0/`, `pp1/`, …),
+   fails at this step; see [With PP](#with-pp).
 3. Convert state dict keys from KempnerForge → HF naming.
 4. Cast every tensor to the export dtype (see [Dtypes](#dtypes)).
 5. Write `model.safetensors` (or fall back to `pytorch_model.bin`
@@ -47,6 +46,35 @@ With tied embeddings the export still holds both `model.embed_tokens.weight`
 and `lm_head.weight`, the head as a copy of the embedding, since safetensors
 refuses tensors that share memory. `config.json` sets `tie_word_embeddings`,
 so transformers ties the two again when it loads the export.
+
+### What transformers can load
+
+transformers builds a dense export as `LlamaForCausalLM` and an MoE export
+as `MixtralForCausalLM`. Both have SwiGLU MLPs or experts and RMSNorm, and
+neither has a query or key norm, so `dcp-to-hf` refuses, before it reads the
+checkpoint, a model with an `activation` other than `"silu"`,
+`norm_type = "layernorm"` or `qk_norm = true`, and an MoE model with what
+Mixtral lacks (see [MoE](#moe)). It names each setting; transformers would
+load such an export with those parts dropped or left random.
+`--no-architecture-check` exports such a model anyway, with a warning, for
+`hf-to-dcp` to read back (see [Resharding](resharding.md)).
+
+### MoE
+
+An MoE model exports as `MixtralForCausalLM`, under the names a Mixtral
+checkpoint uses (see [Key mapping](#key-mapping)); transformers 5 packs each
+layer's experts when it loads them. Packed experts (`moe_packed_experts`) are
+written as one tensor per expert, like unpacked ones.
+
+A Mixtral model routes with softmax top-k in every layer and has no shared
+experts, so besides the settings above `dcp-to-hf` refuses an MoE model with
+`moe_shared_experts > 0`, `moe_frequency > 1` or a `moe_router` other than
+`"softmax_topk"` (see [What transformers can load](#what-transformers-can-load)).
+
+transformers has no expert capacity: the export of a model with
+`moe_capacity_factor > 0` drops no tokens, where KempnerForge drops those
+past an expert's capacity in evaluation as in training. `dcp-to-hf` warns
+about it.
 
 ### Dtypes
 
@@ -69,6 +97,15 @@ The script logs the dtype and where it came from, e.g.
 `from_pretrained(..., dtype="auto")` loads the weights at the precision
 they were written in.
 
+At bfloat16 or float16, transformers' logits can differ from
+KempnerForge's at the same precision, enough to change some predicted
+tokens: it rounds the normalized activations before scaling them by the
+norm weight, where KempnerForge scales first, and Mixtral's router takes
+its softmax in float32, so a token whose top experts nearly tie can route
+to another one. A float32 export of an MoE model that passes the
+architecture check gives the same logits while no token passes an expert's
+capacity (see [MoE](#moe)).
+
 No optimizer / scheduler / RNG — only weights. If you need those,
 keep the DCP checkpoint; HF format doesn't carry them. A
 `schedule_free_adamw` checkpoint's weights are its averaged weights `x`,
@@ -78,25 +115,15 @@ held `x` has the training point `y` instead.
 
 ### With PP
 
-A PP checkpoint has per-stage shards. The conversion script
-handles this automatically:
-
-```python
-# scripts/convert_checkpoint.py _detect_pp_stages
-pp_dirs = sorted((d for d in dcp_path.iterdir()
-                  if d.is_dir() and d.name.startswith("pp")),
-                 key=lambda d: int(d.name[2:]))
-```
-
-If any `pp0/`, `pp1/`, … exist, the script loads each one sequentially
-into the same full-model state dict via `load_state_dict(..., strict=False)`.
-Each stage fills in its owned slice of keys; at the end, the full
-model state is assembled.
-
-This is the path to use when you want to **reshard a PP checkpoint to
-different PP** — no direct DCP resharding across PP boundaries
-exists, but `dcp-to-hf` → `hf-to-dcp` round-trips through a
-non-sharded format and lets you re-emit at a different `pp` degree.
+`dcp-to-hf` cannot export a PP checkpoint today
+([#450](https://github.com/KempnerInstitute/KempnerForge/issues/450)).
+The script finds the `pp0/`, `pp1/`, … stage subdirectories, but asks
+each stage for every tensor of the full model, and DCP stops at the
+first one the stage does not hold: a `pp=2` checkpoint of
+`configs/train/debug.toml` fails with `Missing key in checkpoint
+state_dict: model.layers.2.attention_norm.weight`. Keep a PP run's
+checkpoints in DCP and resume them at the same `pp` (see
+[Resharding § PP](resharding.md#pp-the-one-special-case)).
 
 ## HuggingFace → DCP
 
@@ -116,12 +143,31 @@ uv run python scripts/convert_checkpoint.py hf-to-dcp \
 
 What happens:
 
-1. Load the HF state dict:
-   - Local dir: prefer `*.safetensors`, fall back to
-     `pytorch_model*.bin`.
-   - HF ID: download via
-     `transformers.AutoModelForCausalLM.from_pretrained`.
-2. Convert keys HF → KempnerForge naming.
+1. Load the HF state dict from the standard weight files at the top of
+   the model, in the order transformers loads them by default:
+   `model.safetensors`, else the shards
+   `model.safetensors.index.json` names, and otherwise the same for
+   `pytorch_model.bin`. An adapter or another variant beside them is
+   left out; there is no variant or subfolder choice, and a config's
+   `transformers_weights` is not read.
+   - Local dir: those files; a directory with none of these names gives
+     every `*.safetensors` file, or else every `pytorch_model*.bin`.
+   - HF ID: the same files, each downloaded with
+     `huggingface_hub.hf_hub_download` or taken from its cache, the
+     shards at the commit their index came from. None of the
+     repository's code runs and no Hugging Face model is built, and a
+     shard that cannot be had fails the import. A name whose lookup
+     fails without the Hub saying it has no such file, as offline, is
+     passed over like a missing one, and `hf_hub_download` takes each
+     name from the cache when it cannot reach the Hub, so a cached
+     model imports with `HF_HUB_OFFLINE=1`. With none of the names
+     had, the error names the first failed lookup and chains its error.
+2. Convert keys HF → KempnerForge naming. The names converted are the
+   ones stored in the files, as [Key mapping](#key-mapping) lists
+   them, Mixtral's included; any other name is skipped with a
+   warning. A checkpoint with tied embeddings may store no
+   `lm_head.weight`: the output head then takes the token embedding,
+   whether `tie_embeddings` is true or false.
 3. `model.load_state_dict(converted, strict=False)` — missing KF
    keys (e.g. learned RoPE frequencies) stay at their default init
    and are logged as warnings.
@@ -138,6 +184,8 @@ Point a training config at this directory via
 training picks it up like any other DCP checkpoint, as a warm start
 at step 0. `load_path` is used while the run's `checkpoint.dir` holds
 no checkpoint; once the run has saved one, a restart resumes from it.
+A run with PP cannot load it, since it has no `pp{N}/` stages
+([#317](https://github.com/KempnerInstitute/KempnerForge/issues/317)).
 
 ## Key mapping
 
@@ -154,14 +202,35 @@ main translations:
 | `layers.{i}.mlp_norm.weight` | `model.layers.{i}.post_attention_layernorm.weight` |
 | `layers.{i}.mlp.{gate,up,down}_proj.weight` | `model.layers.{i}.mlp.{gate,up,down}_proj.weight` |
 
-MoE-specific:
+MoE-specific, in Mixtral's names:
 
 | KempnerForge | HuggingFace |
 |--------------|-------------|
-| `layers.{i}.mlp.router.gate.weight` | `model.layers.{i}.mlp.gate.weight` |
-| `layers.{i}.mlp.router.expert_bias` | `model.layers.{i}.mlp.expert_bias` |
-| `layers.{i}.mlp.shared_expert.*` | `model.layers.{i}.mlp.shared_experts.*` (plural in HF) |
-| `layers.{i}.mlp.experts.{j}.*` | `model.layers.{i}.mlp.experts.{j}.*` (identical) |
+| `layers.{i}.mlp.router.gate.weight` | `model.layers.{i}.block_sparse_moe.gate.weight` |
+| `layers.{i}.mlp.experts.{j}.gate_proj.weight` | `model.layers.{i}.block_sparse_moe.experts.{j}.w1.weight` |
+| `layers.{i}.mlp.experts.{j}.down_proj.weight` | `model.layers.{i}.block_sparse_moe.experts.{j}.w2.weight` |
+| `layers.{i}.mlp.experts.{j}.up_proj.weight` | `model.layers.{i}.block_sparse_moe.experts.{j}.w3.weight` |
+| `layers.{i}.mlp.{gate,down,up}_w` (packed) | the same `w1`, `w2`, `w3` of each expert, its slice transposed |
+
+`hf-to-dcp` reads these names, and the ones exports used before them:
+`model.layers.{i}.mlp.gate.weight` for the router and
+`model.layers.{i}.mlp.experts.{j}.{gate,up,down}_proj.weight` for the
+experts. It also splits the experts a checkpoint holds packed, as
+`mlp.experts.gate_up_proj` and `mlp.experts.down_proj`, which transformers 5
+saves with `save_original_format=False` and by default saves under the names
+above. For a model with packed experts it stacks each layer's experts
+into `gate_w`, `up_w` and `down_w`. Mixtral has no expert bias or shared
+experts: `dcp-to-hf` refuses models with them unless given
+`--no-architecture-check` (see [MoE](#moe)), and then writes them as
+`model.layers.{i}.mlp.expert_bias` and `model.layers.{i}.mlp.shared_experts.*`,
+which `hf-to-dcp` reads back.
+
+The sigmoid router's `fp32_ema_bits` and `fp32_bias_bits`, FP32 masters
+of its balancing state held as int32 bit patterns, are not exported.
+`hf-to-dcp` derives them from the imported `expert_bias` and
+`expert_ema`, and `dcp-to-hf` converts a checkpoint saved before they
+existed (see
+[Aux loss and balancing](../moe/aux-loss-and-balancing.md#sigmoid-router--bias-based-balancing)).
 
 A checkpoint saved with expert parallelism holds every expert under its
 global index, as one saved without it does (see
@@ -201,8 +270,9 @@ For a dense model:
 `torch_dtype` is the export dtype, so a `float32` or `float16` export
 names that dtype instead of `bfloat16`.
 
-For MoE the architecture is `MixtralForCausalLM` and three extra
-fields (`num_local_experts`, `num_experts_per_tok`,
+For MoE the architecture is `MixtralForCausalLM`, `intermediate_size`
+is the width of one expert (`computed_expert_ffn_hidden_dim`), and three
+extra fields (`num_local_experts`, `num_experts_per_tok`,
 `router_aux_loss_coef`) are added.
 
 Not included: tokenizer files. Copy `tokenizer.json`, `tokenizer_config.json`,
@@ -228,10 +298,10 @@ Not included: tokenizer files. Copy `tokenizer.json`, `tokenizer_config.json`,
 
 ## See also
 
-- [DCP model + optimizer](dcp-model.md) — the source format for
+- [DCP model + optimizer](dcp-model.md): the source format for
   `dcp-to-hf` and the target format for `hf-to-dcp`.
-- [Resharding](resharding.md) — using `dcp-to-hf` → `hf-to-dcp` as
-  an escape hatch when DCP's automatic resharding can't handle your
-  change (e.g. changing PP degree).
-- [Configuration § CheckpointConfig](../configuration/config-sections.md) —
+- [Resharding](resharding.md): the changes DCP reshards on load, and
+  the `dcp-to-hf` → `hf-to-dcp` round trip for a run without PP that
+  adds parameters.
+- [Configuration § CheckpointConfig](../configuration/config-sections.md):
   `load_path` to pick up a converted checkpoint.

@@ -82,7 +82,7 @@ second line if this is a requeue:
 ```
 SLURM job: id=123456, name=kf-7b-adamw, nodes=4, tasks/node=4,
            partition=h200_preempt, restart_count=2
-Job was requeued (restart #2) — will auto-resume
+Job was requeued (restart #2); will auto-resume
 ```
 
 If not running under SLURM it logs `"Not running under SLURM"` and

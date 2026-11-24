@@ -20,7 +20,7 @@ one saved with ``ep > 1`` before this layout existed does.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
 import torch
@@ -39,15 +39,22 @@ def _join(*parts: str) -> str:
     return ".".join(part for part in parts if part)
 
 
+def state_dict_name(name: str) -> str:
+    """A module's ``name`` without the activation-checkpoint and ``torch.compile`` wrappers.
+
+    ``get_model_state_dict`` leaves them out of the names of its entries.
+    """
+    return ".".join(part for part in name.split(".") if part not in _WRAPPERS)
+
+
 def moe_layers(model: torch.nn.Module) -> Iterator[tuple[str, MoEMLP]]:
     """Each ``MoEMLP`` in ``model`` with the name its state-dict entries start with.
 
-    The name is empty when ``model`` is itself the ``MoEMLP``. It leaves out the
-    activation-checkpoint and ``torch.compile`` wrappers, as ``get_model_state_dict`` does.
+    The name is empty when ``model`` is itself the ``MoEMLP`` (see ``state_dict_name``).
     """
     for name, module in model.named_modules():
         if isinstance(module, MoEMLP):
-            yield ".".join(part for part in name.split(".") if part not in _WRAPPERS), module
+            yield state_dict_name(name), module
 
 
 def expert_layout(model: torch.nn.Module) -> ExpertLayout | None:
@@ -178,6 +185,24 @@ class ExpertLayout:
             else:
                 result[key] = value
         return result
+
+    def global_names(self, names: Iterable[str]) -> list[str]:
+        """``names`` in order, each split expert's local index replaced by its global one.
+
+        A name outside the split layers comes back as it is.
+
+        Raises:
+            ValueError: A name gives a local expert index past this rank's experts.
+        """
+        return [self._global_name(name) for name in names]
+
+    def group_names(self, names: Iterable[str]) -> list[str]:
+        """A param group's ``names`` as a checkpoint lists them, with every EP rank's experts.
+
+        Each split expert's name stands for that expert on every EP rank, under each global
+        index in order, as ``to_global`` writes the param groups of an optimizer.
+        """
+        return self._every_rank(list(names))
 
     def to_local(self, state: Mapping[str, Any]) -> dict[str, Any]:
         """Undo ``to_global`` on the state dict that a load filled.

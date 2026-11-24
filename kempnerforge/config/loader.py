@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import ast
 import importlib
+import itertools
+import shlex
 import sys
 import tomllib
 import types
@@ -127,17 +129,68 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
             return value
         return [value]
 
-    if isinstance(field_type, type):
-        if field_type is bool:
-            if isinstance(value, str):
-                return value.lower() in ("true", "1", "yes")
-            return bool(value)
-        if field_type is int and isinstance(value, (str, float)):
-            return int(value)
-        if field_type is float and isinstance(value, (str, int)):
-            return float(value)
+    if origin is dict and isinstance(value, dict) and len(get_args(field_type)) == 2:
+        value_type = get_args(field_type)[1]
+        coerced = {}
+        for key, item in value.items():
+            try:
+                coerced[key] = _coerce_value(value_type, item)
+            except ValueError as e:
+                raise ValueError(f"key {key!r}: {e}") from None
+        return coerced
+
+    if field_type is bool:
+        return _coerce_bool(value)
+    if field_type is int or field_type is float:
+        return _coerce_number(field_type, value)
 
     return value
+
+
+_BOOL_SPELLINGS = {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False}
+
+
+def _coerce_bool(value: Any) -> bool:
+    """A bool from a bool, the number 0 or 1, or a true or false spelling in any case.
+
+    Raises:
+        ValueError: Any other value, a misspelling included.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in _BOOL_SPELLINGS:
+        return _BOOL_SPELLINGS[value.lower()]
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    raise ValueError(f"expected a bool (true or false), got {value!r}")
+
+
+def _coerce_number(field_type: type[int] | type[float], value: Any) -> int | float:
+    """An int or a float from a number or a numeric string.
+
+    Raises:
+        ValueError: A bool, a string that is not such a number, a value of another type,
+            for an int, a number with a fraction, or, for a float, an int too large for one.
+    """
+    article = "an" if field_type is int else "a"
+    refusal = f"expected {article} {field_type.__name__}, got {value!r}"
+    fractional = isinstance(value, float) and not value.is_integer()
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError(refusal)
+    if field_type is int and fractional:
+        raise ValueError(refusal)
+    try:
+        return field_type(value)
+    except (ValueError, OverflowError):
+        raise ValueError(refusal) from None
+
+
+def _coerce_field(dc_type: type, name: str, hint: Any, raw: Any) -> Any:
+    """``_coerce_value`` for the field ``name`` of ``dc_type``, whose errors name it."""
+    try:
+        return _coerce_value(hint, raw)
+    except ValueError as e:
+        raise ValueError(f"{dc_type.__name__}.{name}: {e}") from None
 
 
 _type_hints_cache: dict[type, dict[str, Any]] = {}
@@ -165,6 +218,40 @@ def _dataclass_type_from_hint(hint: Any) -> type | None:
     if isinstance(hint, type) and is_dataclass(hint):
         return hint
     return None
+
+
+class _DottedKeys(dict):
+    """The keys a dotted CLI override names below a config field, unlike a dict literal.
+
+    ``_parse_cli_overrides`` builds these for dotted paths, so a dotted key below a
+    dict-valued field sets that key and keeps the rest of the field's table.
+    """
+
+
+def _with_dotted_keys(table: dict[str, Any], keys: dict[str, Any]) -> dict[str, Any]:
+    """``table`` with the keys a dotted override sets, the rest of it kept.
+
+    A dotted key below one of ``table``'s own tables sets that key in it in turn; any other
+    value, a dict literal included, replaces the one ``table`` holds. The result holds plain
+    dicts only.
+    """
+    merged = dict(table)
+    for key, value in keys.items():
+        if isinstance(value, dict):
+            below = merged.get(key) if isinstance(value, _DottedKeys) else None
+            value = _with_dotted_keys(below if isinstance(below, dict) else {}, value)
+        merged[key] = value
+    return merged
+
+
+def _dict_field_value(raw: dict[str, Any], current: Any) -> dict[str, Any]:
+    """The table a dict ``raw`` gives a field that holds ``current``.
+
+    A dotted override sets its keys in ``current``'s table and keeps the rest; a dict
+    literal, as from a TOML table, replaces it.
+    """
+    table = current if isinstance(raw, _DottedKeys) and isinstance(current, dict) else {}
+    return _with_dotted_keys(table, raw)
 
 
 def _instantiate_from_dict(dc_type: type, data: dict[str, Any]) -> Any:
@@ -199,8 +286,13 @@ def _instantiate_from_dict(dc_type: type, data: dict[str, Any]) -> Any:
         inner = _dataclass_type_from_hint(hint)
         if inner is not None and isinstance(raw, dict):
             kwargs[f.name] = _instantiate_from_dict(inner, raw)
+        elif isinstance(raw, dict):
+            default = None
+            if isinstance(raw, _DottedKeys):
+                default = f.default_factory() if callable(f.default_factory) else f.default
+            kwargs[f.name] = _coerce_field(dc_type, f.name, hint, _dict_field_value(raw, default))
         else:
-            kwargs[f.name] = _coerce_value(hint, raw)
+            kwargs[f.name] = _coerce_field(dc_type, f.name, hint, raw)
     return dc_type(**kwargs)
 
 
@@ -264,16 +356,17 @@ def _apply_dict_to_dataclass(dc: Any, data: dict[str, Any]) -> Any:
         current_val = getattr(dc, f.name)
         if f.name in data:
             raw = data[f.name]
+            hint = type_hints[f.name]
+            inner = _dataclass_type_from_hint(hint)
             if is_dataclass(current_val) and isinstance(raw, dict):
                 kwargs[f.name] = _apply_dict_to_dataclass(current_val, raw)
-            elif current_val is None and isinstance(raw, dict):
-                inner = _dataclass_type_from_hint(type_hints[f.name])
-                if inner is not None:
-                    kwargs[f.name] = _instantiate_from_dict(inner, raw)
-                else:
-                    kwargs[f.name] = _coerce_value(type_hints[f.name], raw)
+            elif isinstance(raw, dict) and inner is not None and current_val is None:
+                kwargs[f.name] = _instantiate_from_dict(inner, raw)
+            elif isinstance(raw, dict) and inner is None:
+                table = _dict_field_value(raw, current_val)
+                kwargs[f.name] = _coerce_field(dc_type, f.name, hint, table)
             else:
-                kwargs[f.name] = _coerce_value(type_hints[f.name], raw)
+                kwargs[f.name] = _coerce_field(dc_type, f.name, hint, raw)
         else:
             kwargs[f.name] = current_val
 
@@ -286,13 +379,34 @@ def _parse_cli_overrides(args: list[str]) -> dict[str, Any]:
     Supports:
       --model.dim=512
       --train.compile_model=true
+      --train.compile_model (a bare key means true)
       --optimizer.betas=[0.9,0.95]
+
+    Arguments without ``--`` before the first override are skipped, such as the
+    config path when ``load_config`` reads ``sys.argv[1:]``.
+
+    Raises:
+        ValueError: An argument without ``--`` follows an override. After a bare key
+            it is the value of a space-separated ``--section.key value``, which would
+            otherwise be dropped while the key read as true; after a complete override
+            it is the rest of a value with a space that a shell split off, which would
+            otherwise be dropped from the value. The message shows the override with
+            the arguments up to the next override joined back, quoted for a shell.
     """
     overrides: dict[str, Any] = {}
 
-    for arg in args:
+    flag: str | None = None
+    for i, arg in enumerate(args):
         if not arg.startswith("--"):
+            if flag is not None:
+                rest = " ".join(itertools.takewhile(lambda a: not a.startswith("--"), args[i:]))
+                joined = f"{flag} {rest}" if "=" in flag else f"{flag}={rest}"
+                raise ValueError(
+                    f"Unexpected command-line argument {arg!r} after {flag}: "
+                    f"write {shlex.quote(joined)}"
+                )
             continue
+        flag = arg
         if "=" not in arg:
             key = arg[2:]
             value_str = "true"
@@ -308,7 +422,7 @@ def _parse_cli_overrides(args: list[str]) -> dict[str, Any]:
         parts = key.split(".")
         d = overrides
         for part in parts[:-1]:
-            d = d.setdefault(part, {})
+            d = d.setdefault(part, _DottedKeys())
         d[parts[-1]] = value
 
     return overrides

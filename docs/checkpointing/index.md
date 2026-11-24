@@ -25,6 +25,7 @@ contains two kinds of state:
 | `train_state.pt` | step, tokens_seen, scheduler, per-rank dataloader/RNG state, extras (e.g. `phase_idx`, `wandb_run_id`, `mlflow_run_id`) | [Train state](train-state.md) |
 | `metadata.json` | Human-readable `{"step": N, "tokens_seen": M}`, plus the logging runs live at save time | Plain JSON, see below |
 | `latest` symlink | Points at the most recent `step_N` (updated atomically) | [Auto-resume](auto-resume.md) |
+| `.owner` | The run that owns the directory: its claim id, host, pid, pid namespace and SLURM job | JSON, see [Auto-resume § One run per checkpoint directory](auto-resume.md#one-run-per-checkpoint-directory) |
 
 ## `metadata.json`
 
@@ -33,7 +34,8 @@ It holds `step` and `tokens_seen`, plus the run's `optimizer.weight_decay_scope`
 `weight_decay_scope` when the checkpoint manager was built with it, as the training entry does
 (VLM runs add `vlm_freeze`, and `lr_multipliers` with the `lr_module_patterns` of its
 modules and the module of each optimizer param group, `lr_group_modules`, when
-`optimizer.lr_multipliers` lists any). A load reads it on rank 0, once, for the checks of
+`optimizer.lr_multipliers` lists any), and the run's `plugins` list as `plugins` (see
+[Train state](train-state.md)). A load reads it on rank 0, once, for the checks of
 those records. When a logging backend has a live run at save time it also holds a
 `tracking` list, one entry per backend:
 
@@ -95,10 +97,9 @@ checkpoint can run code in the process that loads it:
   from an archive is yours, and can load silently.
 
 So load only checkpoints you trust, in practice ones you or your team saved. Take weights
-from elsewhere as safetensors in a local directory and import them with `hf-to-dcp` pointed
-at that directory ([HF conversion](hf-conversion.md)); given a Hub model ID instead,
-`hf-to-dcp` loads the model through `transformers` with `trust_remote_code=True`, which can
-run custom code from the model's repository. `metadata.json` is plain JSON: a tool that needs only
+from elsewhere with `hf-to-dcp` ([HF conversion](hf-conversion.md)), from a local directory or
+a Hub model ID: it reads safetensors files, and `.bin` files with `torch.load(weights_only=True)`,
+and runs none of the model repository's code. `metadata.json` is plain JSON: a tool that needs only
 the step, the token count or the logging runs can read it without loading the checkpoint.
 
 ## Key modules

@@ -236,6 +236,7 @@ can be threaded through `extra`:
 ```python
 # training/loop.py::checkpoint_extra
 extra = {"phase_idx": phases.next_idx} if phases.phases else {}
+extra["plugins"] = list(config.plugins)
 if config.metrics.wandb_run_id:
     extra["wandb_run_id"] = config.metrics.wandb_run_id
 if config.metrics.mlflow_run_id:
@@ -266,6 +267,12 @@ KempnerForge uses this for:
 
 - `phase_idx` — current curriculum phase (so training resumes the
   correct data mix without skipping forward).
+- `plugins`: the run's `plugins` list, which the save also records in
+  `metadata.json`. A resume, or a warm start that reads the train state,
+  compares it with that record before reading any state and refuses a
+  checkpoint saved with another list, unless
+  `checkpoint.ignore_plugins_mismatch` is set (see
+  [Registry § The plugins config key](../configuration/registry.md#the-plugins-config-key)).
 - `wandb_run_id`: so an auto-resumed run appends to the same W&B run
   rather than starting a new one. A `checkpoint.load_path` warm start
   does not restore it, since it is a new run with runs of its own.

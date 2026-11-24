@@ -33,6 +33,7 @@ import os
 import pickle
 import re
 import shutil
+import socket
 import stat
 import threading
 import time
@@ -46,6 +47,7 @@ from typing import Any, Protocol, TypeGuard, cast
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import _CHECKPOINT_PREFIX
 from torch.distributed.checkpoint import DefaultLoadPlanner, DefaultSavePlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.state_dict import (
@@ -61,7 +63,9 @@ from kempnerforge.checkpoint.expert_layout import (
     check_saved_experts,
     expert_layout,
     moe_layers,
+    state_dict_name,
 )
+from kempnerforge.checkpoint.ownership import claim_checkpoint_dir, release_checkpoint_dir
 from kempnerforge.checkpoint.state import (
     PER_RANK_KEY,
     build_per_rank_envelope,
@@ -125,9 +129,100 @@ def _saved_optimizer_param_groups(saved_keys: Iterable[str]) -> int:
     )
 
 
+def derived_buffer_owners(model: torch.nn.Module) -> dict[str, tuple[torch.nn.Module, str]]:
+    """Map the state-dict key of each buffer a module lists in ``derived_buffers`` to its owner.
+
+    A module lists there the buffers it gained after its checkpoints were first written
+    and derives from its other state when a load lacks them, as the sigmoid router does
+    for its FP32 masters. Each key maps to the module and the buffer's name; a buffer
+    another module holds under the same name is not one of them. The keys are named as
+    ``get_model_state_dict`` names them (see ``state_dict_name``).
+    """
+    owners: dict[str, tuple[torch.nn.Module, str]] = {}
+    for name, module in model.named_modules():
+        prefix = state_dict_name(name)
+        for buffer in getattr(module, "derived_buffers", ()):
+            owners[f"{prefix}.{buffer}" if prefix else buffer] = (module, buffer)
+    return owners
+
+
+def drop_derived_model_keys(
+    model_state: dict[str, Any], model: torch.nn.Module, saved_keys: Container[str]
+) -> dict[str, Any]:
+    """Take out of a load template the derived buffers its checkpoint predates.
+
+    Only the buffers ``derived_buffer_owners`` maps are taken out, and only those the
+    checkpoint, whose keys prefix the model's with ``model.``, lacks; any other key a
+    checkpoint lacks still fails the load. Returns the entries taken out. Put back after
+    the read, they let the strict ``set_model_state_dict`` find every key, under
+    ``torch.compile`` too, and ``derive_buffers`` then recomputes them from the loaded
+    state.
+    """
+    owners = derived_buffer_owners(model)
+    return {
+        key: model_state.pop(key)
+        for key in list(model_state)
+        if key in owners and f"model.{key}" not in saved_keys
+    }
+
+
+def derive_buffers(model: torch.nn.Module, keys: Iterable[str]) -> None:
+    """Have the owner of each derived buffer at ``keys`` recompute it from its loaded state.
+
+    Only those buffers are derived; every other entry keeps the value loaded. Deriving
+    may gather a parameter that FSDP2 shards, so every rank calls this with the same keys.
+
+    Raises:
+        TypeError: A module lists ``derived_buffers`` but has no ``derive_buffers``.
+    """
+    owners = derived_buffer_owners(model)
+    wanted: dict[torch.nn.Module, list[str]] = {}
+    for key in keys:
+        module, name = owners[key]
+        wanted.setdefault(module, []).append(name)
+    for module, names in wanted.items():
+        derive = getattr(module, "derive_buffers", None)
+        if derive is None:
+            raise TypeError(
+                f"{type(module).__name__} lists derived_buffers but has no derive_buffers"
+            )
+        derive(names)
+
+
+def _saved_inner_groups(
+    saved_keys: Iterable[str],
+    outer: torch.optim.Optimizer,
+    inner: Sequence[torch.optim.Optimizer],
+) -> bool:
+    """Whether a checkpoint's optimizer param groups include groups of ``inner``.
+
+    ``outer`` is the optimizer that wraps ``inner``, such as Muon around its AdamW fallback.
+    A group of ``inner`` shows by a setting that no group of ``outer`` has, such as AdamW's
+    ``betas``, so the count of saved groups alone does not decide it: ``outer`` can have as
+    many groups as the checkpoint holds of both.
+
+    Args:
+        saved_keys: The keys the checkpoint's DCP index lists.
+        outer: The optimizer that wraps ``inner``.
+        inner: The optimizers ``outer`` wraps.
+
+    Returns:
+        True when a saved group holds a setting only ``inner``'s groups have.
+    """
+    own = {key for group in outer.param_groups for key in group}
+    theirs = {key for opt in inner for group in opt.param_groups for key in group} - own
+    for key in saved_keys:
+        if not key.startswith(_OPTIM_PARAM_GROUPS_PREFIX):
+            continue
+        parts = key.removeprefix(_OPTIM_PARAM_GROUPS_PREFIX).split(".")
+        if len(parts) > 1 and parts[1] in theirs:
+            return True
+    return False
+
+
 def _drop_legacy_group_keys(
     optim_state: dict[str, Any],
-    optimizers: Iterable[torch.optim.Optimizer],
+    owners: Sequence[torch.optim.Optimizer],
     saved_keys: Container[str],
 ) -> dict[str, Any]:
     """Drop from a load template the param-group keys its checkpoint predates.
@@ -136,9 +231,15 @@ def _drop_legacy_group_keys(
     after its checkpoints were first written, and fills each one in when it loads a
     group without it. Only those keys are dropped, and only from the groups whose
     saved copy lacks them; any other key a checkpoint lacks still fails the load.
-    Returns the dropped keys with the values they resume with.
+
+    Args:
+        optim_state: The load template; its ``param_groups`` lose the dropped keys.
+        owners: The optimizer of each template group, in order.
+        saved_keys: The keys the checkpoint's DCP index lists.
+
+    Returns:
+        The dropped keys with the values they resume with.
     """
-    owners = [optimizer for optimizer in optimizers for _ in optimizer.param_groups]
     dropped: dict[str, Any] = {}
     for index, (group, owner) in enumerate(zip(optim_state["param_groups"], owners, strict=True)):
         for key, value in getattr(owner, "LEGACY_GROUP_DEFAULTS", {}).items():
@@ -146,6 +247,79 @@ def _drop_legacy_group_keys(
                 del group[key]
                 dropped[key] = value
     return dropped
+
+
+def _take_groups_the_save_lacks(
+    optim_state: dict[str, Any],
+    owners: list[torch.optim.Optimizer],
+    fixed: torch.optim.Optimizer | None,
+    left_out: set[str],
+    saved_groups: int,
+) -> list[tuple[int, dict[str, Any]]] | None:
+    """Take out of a load template the param groups that hold only parameters the save left out.
+
+    An optimizer that keeps no empty param group, such as Muon's inner AdamW, saved no group
+    for them, and neither does one whose groups follow the trainable modules, as under
+    ``optimizer.lr_multipliers``, so the template has more groups than the checkpoint; without
+    them, the template groups line up with the saved ones by position. Each taken group leaves
+    ``owners`` too.
+
+    Args:
+        optim_state: The load template; its ``param_groups`` lose the taken groups.
+        owners: The optimizer of each template group, kept in step with ``optim_state``.
+        fixed: The optimizer none of whose groups may be taken, or None. It is the one the LR
+            scheduler drives when the scheduler is not a ``LambdaLR``, whose saved per-group
+            state is restored by position instead of laid out for the groups the optimizer
+            has (see ``restore_train_state``).
+        left_out: The parameters with neither saved state nor a never-stepped record.
+        saved_groups: The number of param groups the checkpoint's index lists, 0 when it
+            stores the optimizer as one opaque entry; nothing is taken then.
+
+    Returns:
+        The index and the group of each taken group, in ascending order of index. None, with
+        nothing taken, when the checkpoint holds fewer groups than the template and taking
+        the groups of ``left_out`` does not leave as many, or takes a group of ``fixed``.
+    """
+    groups = optim_state["param_groups"]
+    if not saved_groups or len(groups) <= saved_groups:
+        return []
+    taken = [i for i, g in enumerate(groups) if g["params"] and set(g["params"]) <= left_out]
+    if len(groups) - len(taken) != saved_groups or any(owners[i] is fixed for i in taken):
+        return None
+    for i in reversed(taken):
+        del owners[i]
+    return [(i, groups.pop(i)) for i in reversed(taken)][::-1]
+
+
+def _rate_taken_groups(optimizer: torch.optim.Optimizer, scheduler: Any, taken: list[int]) -> None:
+    """Give the param groups a load took out the rate the restored schedule runs them at.
+
+    A taken group comes back with the rate ``optimizer`` was built at, while a saved group
+    comes back with the rate of its save, which the schedule set and an active phase's
+    ``lr_scale`` scaled. Each taken group gets the rate a ``LambdaLR`` sets, its restored base
+    rate times its lambda at the restored step, scaled as the first saved group with a
+    nonzero rate is. Nothing changes for a scheduler without per-group lambdas.
+
+    Args:
+        optimizer: The optimizer ``scheduler`` drives.
+        scheduler: The LR scheduler, its state restored.
+        taken: The indices of the taken groups among ``optimizer``'s param groups.
+
+    Raises:
+        ValueError: ``scheduler`` holds other than one base rate and one lambda per param
+            group of ``optimizer``, as a restored ``LambdaLR`` always does.
+    """
+    groups = optimizer.param_groups
+    base_lrs = getattr(scheduler, "base_lrs", None)
+    lambdas = getattr(scheduler, "lr_lambdas", None)
+    if not (isinstance(base_lrs, list) and isinstance(lambdas, list)):
+        return
+    epoch = scheduler.last_epoch
+    rates = [base * fn(epoch) for _, base, fn in zip(groups, base_lrs, lambdas, strict=True)]
+    saved = next((i for i, rate in enumerate(rates) if i not in taken and rate), None)
+    scale = groups[saved]["lr"] / rates[saved] if saved is not None else 1.0
+    for i in taken:
+        groups[i]["lr"] = rates[i] * scale
 
 
 def _intersect_freeze_meta_by_module(
@@ -432,17 +606,20 @@ def _reset_to_fresh(optimizer: torch.optim.Optimizer) -> None:
 
 
 class _NeverSteppedStatePlanner(DefaultLoadPlanner):
-    """Load planner that leaves out the optimizer state the save recorded as absent.
+    """Load planner that leaves out the optimizer state a checkpoint does not hold.
 
-    A fresh optimizer's template has state for every trainable parameter, but a
-    checkpoint has none for parameters that had not received a gradient when it
-    was saved. Those are dropped from the load and kept in ``never_stepped`` for
-    the caller to confirm against the saved ``param_groups``; every other key
-    stays required, including one whose state is missing without a record.
+    Drops from the load the parameters the save recorded as never stepped, kept in
+    ``never_stepped`` for the caller to confirm against the saved ``param_groups``, and the
+    parameters in ``left_out``. Every other key stays required, including one whose state
+    is missing without a record.
+
+    Args:
+        left_out: Names of parameters the saved optimizer did not hold.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, left_out: Iterable[str] = ()) -> None:
         super().__init__()
+        self.left_out = frozenset(left_out)
         self.never_stepped: set[str] = set()
 
     def set_up_planner(
@@ -455,7 +632,7 @@ class _NeverSteppedStatePlanner(DefaultLoadPlanner):
         if optim_state is not None and metadata is not None:
             fqns = set(optim_state["state"])
             self.never_stepped = _params_recorded_never_stepped(fqns, metadata.state_dict_metadata)
-            for fqn in self.never_stepped:
+            for fqn in self.never_stepped | (self.left_out & fqns):
                 del optim_state["state"][fqn]
         super().set_up_planner(state_dict, metadata, is_coordinator)
 
@@ -477,6 +654,97 @@ def _restore_never_stepped(
             f"the saved optimizer did not hold: {unheld[:8]}"
         )
     optim_state["state"].update({fqn: {} for fqn in never_stepped})
+
+
+def _params_the_save_left_out(
+    fqns: Iterable[str], saved_keys: Iterable[str], layout: ExpertLayout | None = None
+) -> set[str]:
+    """Return the names in ``fqns`` that a checkpoint's optimizer did not hold.
+
+    Names are compared without the activation-checkpoint wrapper's prefix, as DCP writes
+    them, and under ``layout`` by the global names the checkpoint keeps each expert under,
+    since a rank's local name for an expert names another expert on another rank. A
+    checkpoint that stores the optimizer as one opaque entry leaves none out.
+
+    Args:
+        fqns: This rank's parameter names of the uncompiled model, with or without the
+            activation-checkpoint wrapper's prefix.
+        saved_keys: The keys the checkpoint's DCP index lists.
+        layout: The model's expert-parallel layout, or None without expert parallelism.
+
+    Returns:
+        The names, without the wrapper's prefix and as this rank spells them, that have
+        neither saved optimizer state nor a never-stepped record.
+    """
+    keys = list(saved_keys)
+    if "optimizer" in keys:
+        return set()
+    local = sorted({fqn.replace(_CHECKPOINT_PREFIX, "") for fqn in fqns})
+    saved_names = layout.global_names(local) if layout is not None else local
+    needed = set(saved_names)
+    covered: set[str] = set()
+    for key in keys:
+        if key.startswith(_NEVER_STEPPED_PREFIX):
+            covered.add(key.removeprefix(_NEVER_STEPPED_PREFIX))
+        elif key.startswith(_OPTIM_STATE_PREFIX):
+            fqn = key.removeprefix(_OPTIM_STATE_PREFIX)
+            while fqn and fqn not in needed:
+                fqn = fqn.rpartition(".")[0]
+            covered.add(fqn)
+    return {name for name, saved in zip(local, saved_names, strict=True) if saved not in covered}
+
+
+def _restore_left_out(
+    optim_state: dict[str, Any],
+    template_groups: list[list[str]],
+    left_out: set[str],
+    where: Path,
+) -> None:
+    """Give the parameters the saved optimizer did not hold empty state in a saved group.
+
+    Each joins the saved group that holds another parameter of its group in the optimizer
+    being loaded or, when no saved group does and the saved optimizer has as many groups,
+    the saved group in its group's place if that group is empty, and takes that group's
+    saved hyperparameters.
+
+    Args:
+        optim_state: The loaded optimizer state; its ``param_groups`` list the saved names.
+        template_groups: The parameter names of each group of the optimizer being loaded,
+            with every EP rank's experts under expert parallelism (see
+            ``ExpertLayout.group_names``), as the save lists its groups.
+        left_out: The names with neither saved state nor a never-stepped record. One in no
+            group of ``template_groups`` only gets empty state.
+        where: The checkpoint directory, named in the errors.
+
+    Raises:
+        RuntimeError: The saved groups list one of ``left_out``, so the saved optimizer held
+            it and its state is missing, or no saved group fits a group of ``left_out``.
+    """
+    saved_groups = optim_state["param_groups"]
+    listed = {name for group in saved_groups for name in group["params"]}
+    held_without_state = sorted(left_out & listed)
+    if held_without_state:
+        raise RuntimeError(
+            f"Missing optimizer state in {where} for {len(held_without_state)} parameters "
+            f"the saved optimizer held: {held_without_state[:8]}"
+        )
+    same_layout = len(saved_groups) == len(template_groups)
+    for index, names in enumerate(template_groups):
+        missing = [name for name in names if name in left_out]
+        if not missing:
+            continue
+        others = set(names) - left_out
+        group = next((g for g in saved_groups if others & set(g["params"])), None)
+        if group is None and same_layout and not saved_groups[index]["params"]:
+            group = saved_groups[index]
+        if group is None:
+            raise RuntimeError(
+                f"{where} has no param group for {len(missing)} parameters its optimizer did "
+                f"not hold: {missing[:8]}. No saved group holds another parameter of their "
+                "group or stands empty in its place."
+            )
+        group["params"] = [*group["params"], *missing]
+    optim_state["state"].update({name: {} for name in left_out})
 
 
 def _check_saved_state_matches(
@@ -596,24 +864,63 @@ def _check_saved_param_groups(
             found = change
     raise RuntimeError(
         f"{where} {found}: the param groups are laid out otherwise than at the save, as when "
-        "other parameters are trainable under optimizer.lr_multipliers, or their settings "
-        "changed. Resume with the parameters trained at the save, or continue from these "
+        "other parameters are trainable under optimizer.lr_multipliers (a sigmoid router's "
+        "expert_bias, which is no longer trained, for one), or their settings changed. "
+        "Resume with the parameters trained at the save, or continue from these "
         "weights with a fresh optimizer: set checkpoint.load_path to this checkpoint and "
         'checkpoint.exclude_from_loading = ["optimizer"], with a checkpoint.dir that holds '
         "no checkpoint yet."
     )
 
 
-def _check_saved_optimizer(
+def _fit_saved_optimizer(
     optim_state: dict[str, Any],
+    owners: list[torch.optim.Optimizer],
+    fixed: torch.optim.Optimizer | None,
+    left_out: set[str],
     saved_keys: Collection[str],
     where: Path,
     groups_vary: bool,
     saved_modules: Sequence[str | None] | None = None,
-) -> None:
-    """Run the checks the checkpoint's optimizer state must pass before anything loads."""
+) -> list[tuple[int, dict[str, Any]]]:
+    """Fit a load template to the checkpoint's optimizer state, then check that it fits.
+
+    Checks that each parameter's saved state is of the kind it now keeps (see
+    ``_check_saved_state_matches``), takes out the template groups the save kept no
+    group for (see ``_take_groups_the_save_lacks``), drops the param-group keys the
+    checkpoint predates (see ``_drop_legacy_group_keys``) and checks the groups that are
+    left against the saved ones (see ``_check_saved_param_groups``). When the groups the
+    save lacks cannot be taken, that check runs on the whole template first, so a layout it
+    explains, such as other parameters trainable under ``optimizer.lr_multipliers``, fails
+    with its message.
+
+    Returns:
+        The taken groups with their template positions, to put back after the load.
+
+    Raises:
+        RuntimeError: The checkpoint's optimizer state does not fit the template, or its
+            param groups cannot be matched to the template's.
+    """
     _check_saved_state_matches(optim_state, saved_keys, where)
+    saved_groups = _saved_optimizer_param_groups(saved_keys)
+    taken = _take_groups_the_save_lacks(optim_state, owners, fixed, left_out, saved_groups)
+    if taken is None:
+        _check_saved_param_groups(optim_state, saved_keys, where, groups_vary, saved_modules)
+        raise RuntimeError(
+            f"{where} holds {saved_groups} optimizer param groups and the optimizer being "
+            f"loaded has {len(optim_state['param_groups'])}, so its groups cannot be matched "
+            "to the saved ones. To continue from these weights with a fresh optimizer, set "
+            "checkpoint.load_path to this checkpoint and checkpoint.exclude_from_loading = "
+            '["optimizer"], with a checkpoint.dir that holds no checkpoint yet.'
+        )
+    filled = _drop_legacy_group_keys(optim_state, owners, saved_keys)
+    if filled:
+        logger.warning(
+            f"{where} is missing optimizer param-group keys {sorted(filled)}; "
+            f"resuming with {filled}"
+        )
     _check_saved_param_groups(optim_state, saved_keys, where, groups_vary, saved_modules)
+    return taken
 
 
 def _load_train_state(path: Path) -> dict[str, Any]:
@@ -842,6 +1149,7 @@ class CheckpointManager:
         self._inflight_dir: Path | None = None
         self._tracking_source: TrackingSource | None = None
         self._registrar: CheckpointRegistrar | None = None
+        self._claim: str | None = None
         self._sidecar_lock = threading.Lock()
         self._sync_group: dist.ProcessGroup | None = None
         if dist.is_initialized():
@@ -873,19 +1181,45 @@ class CheckpointManager:
         deferred (async mode, after the flush future has resolved). Raises only
         while `latest` still names the previous checkpoint: once it names this
         one the checkpoint is committed, so an error while pruning is logged and
-        the next commit prunes again.
+        the next commit prunes again. The new link is made under a temporary name of
+        this host, process and call, so no other writer shares it, and is removed if
+        the rename fails.
         """
         latest = self._latest_link()
-        tmp_link = latest.with_suffix(".tmp")
-        tmp_link.unlink(missing_ok=True)
+        tag = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex}"
+        tmp_link = latest.with_name(f"{latest.name}.{tag}.tmp")
         tmp_link.symlink_to(ckpt_dir.name)
-        tmp_link.rename(latest)
+        try:
+            tmp_link.rename(latest)
+        except BaseException:
+            tmp_link.unlink(missing_ok=True)
+            raise
         logger.info(f"Checkpoint committed: {ckpt_dir} (step={step})")
         self._register_committed(step, ckpt_dir)
         try:
             self._cleanup()
         except Exception as e:
             logger.warning(f"Could not prune old checkpoints after committing {ckpt_dir} ({e})")
+
+    def claim_dir(self) -> None:
+        """Make this run the owner of the checkpoint directory before it resumes or saves.
+
+        Rank 0 records the run in ``<dir>/.owner`` (see ``claim_checkpoint_dir``), and
+        every rank raises when that fails, so two live runs never share the directory.
+        Every rank must call this.
+        """
+        claims: list[str] = []
+        error: BaseException | None = None
+        if self._rank == 0:
+            error = _attempt(lambda: claims.append(claim_checkpoint_dir(self.base_dir)))
+        self.agree(error, "Checkpoint directory claim")
+        self._claim = claims[0] if claims else None
+
+    def release_dir(self) -> None:
+        """Mark released the ``<dir>/.owner`` record that this rank's ``claim_dir`` wrote."""
+        if self._claim is not None:
+            release_checkpoint_dir(self.base_dir, self._claim)
+            self._claim = None
 
     def _drain_pending_finalize(
         self, overwriting: Path | None = None, error: BaseException | None = None
@@ -1236,11 +1570,14 @@ class CheckpointManager:
         so every reader of the model entry alone gets them; the parameters are back at the
         training point when this returns, and ``load`` rebuilds that point. The swap back
         runs as soon as ``AsyncCheckpointer.save`` returns, which is safe only because the
-        state is staged by then: ``dcp.async_save`` without a stager uses torch's
-        ``DefaultStager(StagingOptions(False, False, False, False))``, which copies every
-        tensor into new CPU storage before it returns. An asynchronous stager would let
-        the write read the parameters after the swap back, so adding one means moving the
-        swap back after staging completes.
+        state is staged by then: both async modes stage synchronously, so every tensor is
+        copied to CPU memory before ``dcp.async_save`` returns. The ``async`` mode passes
+        no stager and gets torch's default,
+        ``DefaultStager(StagingOptions(False, False, False, False))``;
+        ``async_with_pinned_mem`` passes its pinned ``DefaultStager``, built with
+        ``use_async_staging=False``, whose ``stage`` waits for its copies to finish. An
+        asynchronous stager would let the write read the parameters after the swap back,
+        so adding one means moving the swap back after staging completes.
 
         Under expert parallelism each EP rank holds a copy of every weight outside the
         routed experts, and the copies can drift apart on GPU (#482). DCP writes each
@@ -1330,7 +1667,8 @@ class CheckpointManager:
 
         ``extra["vlm_freeze"]``, when present, is recorded in ``metadata.json`` as given:
         ``canonical_freeze_meta`` has already sorted and deduplicated it, so the comparison
-        on load does not depend on order.
+        on load does not depend on order. ``extra["plugins"]``, when present, is recorded
+        there too, for ``load`` to compare before reading any state.
 
         ``per_rank`` is the envelope ``save()`` gathered from every rank; omitting it writes
         a legacy train state carrying rank 0's loader/RNG state only.
@@ -1345,8 +1683,9 @@ class CheckpointManager:
         )
         torch.save(train_state, ckpt_dir / _TRAIN_STATE_FILE)
         meta: dict[str, Any] = {"step": step, "tokens_seen": tokens_seen}
-        if extra is not None and "vlm_freeze" in extra:
-            meta["vlm_freeze"] = extra["vlm_freeze"]
+        for key in ("vlm_freeze", "plugins"):
+            if extra is not None and key in extra:
+                meta[key] = extra[key]
         text = self._sidecar_text(meta)
         with self._sidecar_lock:
             _replace_file(ckpt_dir / _METADATA_FILE, text)
@@ -1417,7 +1756,9 @@ class CheckpointManager:
         dataloader: Any | None = None,
         exclude_keys: list[str] | None = None,
         vlm_freeze_expected: list[dict[str, Any]] | None = None,
+        fresh_if_unheld: Iterable[str] = (),
         exact_resume: bool = False,
+        plugins_expected: list[str] | None = None,
     ) -> tuple[int, int, dict[str, Any]]:
         """Load a checkpoint and restore all state.
 
@@ -1443,6 +1784,15 @@ class CheckpointManager:
                 a mismatch raises ``ValueError`` unless the checkpoint
                 config has ``ignore_freeze_mismatch=True``, in which case
                 the load proceeds with a warning.
+            fresh_if_unheld: Names of parameters the saved optimizer may not hold,
+                the ones a freeze stage unfreezes after the build froze them. One
+                with neither saved state nor a never-stepped record resumes with
+                empty optimizer state, in the saved group of its group's other
+                parameters or, when the saved optimizer has as many groups, in the
+                empty saved group in its group's place. A group that holds only such
+                parameters and that the saved optimizer did not keep, as Muon's inner
+                AdamW keeps no empty group, resumes with the settings the optimizer
+                being loaded gives it and empty state.
             exact_resume: True only when the run resumes from its own
                 checkpoint (auto-resume). Each rank then restores its own
                 dataloader/RNG state from the per-rank envelope, which must
@@ -1457,6 +1807,10 @@ class CheckpointManager:
                 (see ``_agreed_load_dir``); an exact resume that reads DCP shards falls back,
                 when not every stage directory there holds them all, to the newest
                 ``step_N`` beside it whose does. Any other load takes its checkpoint as is.
+            plugins_expected: The run's ``plugins`` list, compared with the one the
+                checkpoint's ``metadata.json`` records before any state is read (see
+                ``_check_plugins``). Every rank must pass the same value. A weights-only
+                warm start, which reads no train state, is not compared.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
@@ -1470,15 +1824,23 @@ class CheckpointManager:
                 ``"train_state"`` outside ``["optimizer", "train_state"]``, or is that
                 pair with ``exact_resume``, raised before the path is resolved; the
                 checkpoint was saved under another weight-decay scope, LR multipliers or
-                patterns of their modules (see ``__init__``); or, on an exact resume, its
-                per-rank state does not fit this run's topology and
+                patterns of their modules (see ``__init__``), or with another ``plugins``
+                list (see ``plugins_expected``); or, on an exact resume, its per-rank state
+                does not fit this run's topology and
                 ``checkpoint.ignore_rank_state_mismatch`` is off (see ``exact_resume``).
-            RuntimeError: The saved optimizer state does not fit this run's optimizers.
+            RuntimeError: The saved optimizer state does not fit this run's optimizers, as
+                when a name in ``fresh_if_unheld`` with neither saved state nor a
+                never-stepped record is listed in the saved param groups, or no saved
+                param group fits it, or the checkpoint holds fewer param groups than the
+                optimizer and the missing ones are not groups of such names.
 
         A load that restores optimizer state refuses it on every rank together, before any
         state is loaded: each rank checks its own part of the checkpoint, and one all-reduce
         on the manager's gloo group, which every rank enters, has the other ranks raise a
-        ``RuntimeError`` naming the ranks that refused.
+        ``RuntimeError`` naming the ranks that refused. A second such all-reduce follows DCP's
+        load, once each rank has restored the state of the parameters its checkpoint left
+        out or never stepped, and before any state is set; every rank enters it too, also a
+        pipeline stage whose checkpoint holds no optimizer state.
         """
         if exclude_keys is not None:
             validate_exclude_keys(exclude_keys, "exclude_keys")
@@ -1497,7 +1859,7 @@ class CheckpointManager:
             requested = path if path is not None else self.config.load_path
             if requested:
                 raise FileNotFoundError(f"Checkpoint not found: {requested}")
-            logger.info("No checkpoint found — starting from scratch")
+            logger.info("No checkpoint found; starting from scratch")
             self._restored_extra = {}
             return 0, 0, {}
 
@@ -1545,12 +1907,17 @@ class CheckpointManager:
                         )
                         if getattr(self.config, "ignore_freeze_mismatch", False):
                             logger.warning(
-                                msg + " — proceeding because checkpoint.ignore_freeze_mismatch=True"
+                                msg + "; proceeding because checkpoint.ignore_freeze_mismatch=True"
                             )
                         else:
                             raise ValueError(
                                 msg + " (set checkpoint.ignore_freeze_mismatch=true to override)"
                             )
+
+        metadata: _MetadataOutcome | None = None
+        if plugins_expected is not None and load_train_state:
+            metadata = self._broadcast_metadata(ckpt_dir)
+            self._check_plugins(metadata, ckpt_dir, plugins_expected)
 
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
 
@@ -1561,16 +1928,18 @@ class CheckpointManager:
         saved_keys, restored_on_any_rank = (
             self._read_saved_keys(dcp_dir) if load_optim else ({}, False)
         )
-        metadata: _MetadataOutcome | None = None
         saved_modules: list[str | None] | None = None
+        lr_checked = False
         if restored_on_any_rank and (
             self._weight_decay_scope is not None or self._lr_multipliers is not None
         ):
-            metadata = self._broadcast_metadata(ckpt_dir)
+            if metadata is None:
+                metadata = self._broadcast_metadata(ckpt_dir)
             if self._weight_decay_scope is not None:
                 self._check_weight_decay_scope(metadata, ckpt_dir)
             if self._lr_multipliers is not None:
                 saved_modules = self._check_lr_multipliers(metadata, ckpt_dir)
+                lr_checked = True
         fresh_optimizer = load_optim and not _holds_optimizer(saved_keys)
         if fresh_optimizer:
             load_optim = False
@@ -1584,9 +1953,22 @@ class CheckpointManager:
             if load_optim and train_state_exists
             else []
         )
+        derived: dict[str, Any] = {}
         if load_model:
             dcp_state["model"] = get_model_state_dict(self.model)
+            if derived_buffer_owners(self.model):
+                model_keys = saved_keys if load_optim else _dcp_keys(dcp_dir)
+                derived = drop_derived_model_keys(dcp_state["model"], self.model, model_keys)
+            if derived:
+                logger.info(
+                    f"{dcp_dir} predates {len(derived)} derived buffers, such as "
+                    f"{next(iter(derived))}; they start from the loaded state"
+                )
         check_error: BaseException | None = None
+        left_out: set[str] = set()
+        template_groups: list[list[str]] = []
+        unsaved_groups: list[tuple[int, dict[str, Any]]] = []
+        taken_scheduled: list[int] = []
         if load_optim and not train_state_exists:
             check_error = FileNotFoundError(
                 f"Cannot resume {ckpt_dir}: it holds optimizer state but no {_TRAIN_STATE_FILE}, "
@@ -1599,26 +1981,49 @@ class CheckpointManager:
             )
         elif load_optim:
             dcp_state["optimizer"] = get_optimizer_state_dict(self.model, optimizers)
-            filled = _drop_legacy_group_keys(dcp_state["optimizer"], optimizers, saved_keys)
-            if filled:
-                logger.warning(
-                    f"{dcp_dir} is missing optimizer param-group keys {sorted(filled)}; "
-                    f"resuming with {filled}"
-                )
-            check_error = _attempt(
-                _check_saved_optimizer,
-                dcp_state["optimizer"],
-                saved_keys,
-                dcp_dir,
-                bool(self._lr_multipliers),
-                saved_modules,
+            template = cast("dict[str, Any]", dcp_state["optimizer"])
+            left_out = _params_the_save_left_out(
+                fresh_if_unheld, saved_keys, expert_layout(self.model)
+            ) & set(template["state"])
+            positions = [(o, k) for o in optimizers for k in range(len(o.param_groups))]
+            owners = [optimizer for optimizer, _ in positions]
+            positional = scheduler is not None and not isinstance(
+                scheduler, torch.optim.lr_scheduler.LambdaLR
             )
+            fitted: list[list[tuple[int, dict[str, Any]]]] = []
+            check_error = _attempt(
+                lambda: fitted.append(
+                    _fit_saved_optimizer(
+                        template,
+                        owners,
+                        self.optimizer if positional else None,
+                        left_out,
+                        saved_keys,
+                        dcp_dir,
+                        bool(self._lr_multipliers),
+                        saved_modules,
+                    )
+                )
+            )
+            unsaved_groups = fitted[0] if fitted else []
+            taken_scheduled = [
+                positions[index][1]
+                for index, _ in unsaved_groups
+                if positions[index][0] is self.optimizer
+            ]
+            template_groups = [list(group["params"]) for group in template["param_groups"]]
         if optimizer_requested:
             self.agree(check_error, "Checkpoint load")
 
+        layout: ExpertLayout | None = None
+        restore_error: BaseException | None = None
         if dcp_state:
             dcp_state, layout = self._present_experts(dcp_state, dcp_dir, saved_keys)
-            planner = _NeverSteppedStatePlanner()
+            saved_left_out, saved_template_groups = left_out, template_groups
+            if layout is not None:
+                saved_left_out = set(layout.global_names(left_out))
+                saved_template_groups = [layout.group_names(names) for names in template_groups]
+            planner = _NeverSteppedStatePlanner(saved_left_out)
             dcp.load(
                 dcp_state,
                 checkpoint_id=str(dcp_dir),
@@ -1628,11 +2033,30 @@ class CheckpointManager:
 
             if load_optim:
                 optim_state = cast("dict[str, Any]", dcp_state["optimizer"])
-                _restore_never_stepped(optim_state, planner.never_stepped, dcp_dir)
+
+                def restore_unsaved() -> None:
+                    _restore_never_stepped(optim_state, planner.never_stepped, dcp_dir)
+                    _restore_left_out(optim_state, saved_template_groups, saved_left_out, dcp_dir)
+
+                restore_error = _attempt(restore_unsaved)
+            if planner.never_stepped:
+                logger.info(
+                    f"{len(planner.never_stepped)} parameters the saved optimizer held were never "
+                    f"stepped and resume without state: {sorted(planner.never_stepped)[:8]}"
+                )
+        if optimizer_requested:
+            self.agree(restore_error, "Checkpoint load")
+        if dcp_state:
             if layout is not None:
                 dcp_state = layout.to_local(dcp_state)
+            if load_optim:
+                loaded_groups = cast("dict[str, Any]", dcp_state["optimizer"])["param_groups"]
+                for index, group in unsaved_groups:
+                    loaded_groups.insert(index, group)
             if load_model:
-                set_model_state_dict(self.model, dcp_state["model"])
+                set_model_state_dict(self.model, {**dcp_state["model"], **derived})
+                if derived:
+                    derive_buffers(self.model, derived)
             if load_optim:
                 set_optimizer_state_dict(
                     self.model, optimizers, optim_state_dict=dcp_state["optimizer"]
@@ -1640,10 +2064,10 @@ class CheckpointManager:
                 to_train = getattr(self.optimizer, "train_params", None)
                 if to_train is not None:
                     to_train()
-            if planner.never_stepped:
+            if left_out:
                 logger.info(
-                    f"{len(planner.never_stepped)} parameters the saved optimizer held were never "
-                    f"stepped and resume without state: {sorted(planner.never_stepped)[:8]}"
+                    f"{len(left_out)} parameters that a freeze stage unfreezes were not in the "
+                    f"saved optimizer and resume without state: {sorted(left_out)[:8]}"
                 )
         if fresh_optimizer:
             for optimizer in self.checkpointed_optimizers:
@@ -1659,11 +2083,13 @@ class CheckpointManager:
             train_state = self._broadcast_train_state(train_state_path)
             if (
                 self._lr_multipliers is not None
-                and metadata is None
+                and not lr_checked
                 and scheduler is not None
                 and "scheduler" in train_state
             ):
-                self._check_lr_multipliers(self._broadcast_metadata(ckpt_dir), ckpt_dir)
+                if metadata is None:
+                    metadata = self._broadcast_metadata(ckpt_dir)
+                self._check_lr_multipliers(metadata, ckpt_dir)
             if exact_resume:
                 train_state = self._per_rank_view(train_state)
             if dataloader is None and "dataloader" in train_state:
@@ -1674,6 +2100,8 @@ class CheckpointManager:
                 dataloader=dataloader,
                 lr_multipliers=self._lr_multipliers,
             )
+            if scheduler is not None and "scheduler" in train_state and taken_scheduled:
+                _rate_taken_groups(self.optimizer, scheduler, taken_scheduled)
             logger.info(f"Resumed from step {step}, {tokens_seen:,} tokens seen")
         else:
             step, tokens_seen, extra = 0, 0, {}
@@ -1805,6 +2233,54 @@ class CheckpointManager:
         if dist.is_initialized():
             dist.broadcast_object_list(outcome, src=0)
         return outcome[0]
+
+    def _check_plugins(
+        self, metadata: _MetadataOutcome, ckpt_dir: Path, expected: list[str]
+    ) -> None:
+        """Refuse a checkpoint saved with a ``plugins`` list other than ``expected``.
+
+        A plugin can register a component the model is built from, so another list can
+        build another model from the same TOML, and DCP loads a model whose parameter names
+        are a subset of the saved ones without an error. The lists compare in order, each
+        module counted once, since importing a module again does nothing. ``metadata`` is
+        what ``_broadcast_metadata`` returned on every rank, so every rank raises or goes
+        on together, and rank 0 alone warns. A checkpoint whose ``metadata.json`` records
+        no list, or cannot be read, is not compared.
+
+        Raises:
+            ValueError: The lists differ and ``checkpoint.ignore_plugins_mismatch`` is off.
+        """
+        meta, error = metadata
+        saved = None if meta is None else meta.get("plugins")
+        if not isinstance(saved, list) or not all(isinstance(p, str) for p in saved):
+            if self._rank == 0:
+                if meta is None:
+                    reason = error
+                elif saved is None:
+                    reason = f"its {_METADATA_FILE} records no plugins list"
+                else:
+                    reason = f"its {_METADATA_FILE} records plugins = {saved!r}"
+                logger.warning(
+                    f"plugins = {list(expected)!r} is not compared with {ckpt_dir}: {reason}"
+                )
+            return
+        if list(dict.fromkeys(saved)) == list(dict.fromkeys(expected)):
+            return
+        message = (
+            f"{ckpt_dir} was saved with plugins = {saved!r}, but this run sets plugins = "
+            f"{list(expected)!r}: a plugin can register a component the model is built from, "
+            "and a model whose parameters are a subset of the saved ones loads without an error."
+        )
+        if self.config.ignore_plugins_mismatch:
+            if self._rank == 0:
+                logger.warning(
+                    f"{message} Going on, since checkpoint.ignore_plugins_mismatch is set"
+                )
+            return
+        raise ValueError(
+            f"{message} Set plugins as the checkpoint has them, or, if the plugins that differ "
+            "build no part of the model, set checkpoint.ignore_plugins_mismatch = true."
+        )
 
     def _check_weight_decay_scope(self, metadata: _MetadataOutcome, ckpt_dir: Path) -> None:
         """Refuse a checkpoint saved under a weight-decay scope other than this manager's.
@@ -2012,11 +2488,20 @@ class CheckpointManager:
         return fallback
 
     def _optimizers_saved_in(
-        self, dcp_dir: Path, keys: Iterable[str]
+        self, dcp_dir: Path, keys: Collection[str]
     ) -> list[torch.optim.Optimizer]:
-        """Return the optimizers saved in ``dcp_dir``; warn if the inner ones are missing."""
+        """Return the optimizers saved in ``dcp_dir``; warn if the inner ones are missing.
+
+        The inner ones are missing from a checkpoint saved before they were checkpointed,
+        whose param groups are as many as the outer optimizer's and hold none of the inner
+        ones' settings (see ``_saved_inner_groups``).
+        """
         inner = self.checkpointed_optimizers[1:]
-        if not inner or _saved_optimizer_param_groups(keys) != len(self.optimizer.param_groups):
+        if (
+            not inner
+            or _saved_optimizer_param_groups(keys) != len(self.optimizer.param_groups)
+            or _saved_inner_groups(keys, self.optimizer, inner)
+        ):
             return self.checkpointed_optimizers
         name = type(self.optimizer).__name__
         n_params = sum(p.numel() for opt in inner for g in opt.param_groups for p in g["params"])

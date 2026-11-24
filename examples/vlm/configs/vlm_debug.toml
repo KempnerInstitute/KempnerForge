@@ -2,9 +2,10 @@
 #
 # Mode: smoke.
 #
-# Runs end-to-end in <1 minute on 1 GPU. Uses RandomVisionEncoder so no
-# HF download is needed; pair with any HF image-text dataset (the default
-# below is a placeholder). For a real vision encoder, see
+# Runs end-to-end in <1 minute on 1 GPU. Uses RandomVisionEncoder, so no
+# encoder download; the dataset and the gpt2 tokenizer download from
+# Hugging Face on first use, and any HF image-text dataset can replace the
+# default below. For a real vision encoder, see
 # examples/vlm/configs/vlm_7b_siglip2.toml.
 #
 # max_seq_len allocation (JD/MoT): residual_image_tokens + max_text_len.

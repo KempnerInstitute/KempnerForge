@@ -839,6 +839,47 @@ class TestResume:
         assert step == 3
         assert any(not torch.equal(b, p) for b, p in zip(before, model.parameters(), strict=True))
 
+    @staticmethod
+    def _record_plugins(step_dir):
+        """Record an empty plugins list in ``step_dir``'s metadata, as a training save does."""
+        meta = json.loads((step_dir / "metadata.json").read_text())
+        (step_dir / "metadata.json").write_text(json.dumps({**meta, "plugins": []}))
+
+    @pytest.mark.parametrize(
+        ("steps", "exclude"),
+        [(3, None), (3, ["optimizer"]), (0, None)],
+        ids=["resume", "no-optimizer", "unstepped"],
+    )
+    def test_the_plugins_check_leaves_the_multipliers_guard_on(self, tmp_path, steps, exclude):
+        """The plugins check reads metadata.json first, and other multipliers are still refused
+        before the scheduler is restored, also when no optimizer state is loaded."""
+        self._record_plugins(self._save(tmp_path, {"head": 2.0}, steps=steps))
+        _, scheduler, manager = self._resume(tmp_path, {})
+        with pytest.raises(ValueError, match="but this run uses"):
+            manager.load(scheduler=scheduler, exclude_keys=exclude, plugins_expected=[])
+        assert scheduler.last_epoch == 0
+
+    @pytest.mark.parametrize(
+        ("steps", "exclude"),
+        [(3, None), (3, ["optimizer"]), (0, None)],
+        ids=["resume", "no-optimizer", "unstepped"],
+    )
+    def test_the_plugins_and_multipliers_checks_share_one_metadata_read(
+        self, tmp_path, monkeypatch, steps, exclude
+    ):
+        self._record_plugins(self._save(tmp_path, {"head": 2.0}, steps=steps))
+        _, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
+        reads, checks = [], []
+        read, check = manager._broadcast_metadata, manager._check_lr_multipliers
+        monkeypatch.setattr(manager, "_broadcast_metadata", lambda *a: reads.append(a) or read(*a))
+        monkeypatch.setattr(
+            manager, "_check_lr_multipliers", lambda *a: checks.append(a) or check(*a)
+        )
+        assert (
+            manager.load(scheduler=scheduler, exclude_keys=exclude, plugins_expected=[])[0] == steps
+        )
+        assert len(reads) == 1 and len(checks) == 1
+
     WEIGHTS_ONLY = ["optimizer", "train_state"]
 
     @pytest.mark.parametrize("record", ["other", "unreadable"])
@@ -1606,6 +1647,95 @@ class TestLayoutChange:
         meta = json.loads((tmp_path / "step_1" / "metadata.json").read_text())
         assert meta["lr_multipliers"] == self.MULTIPLIERS
         assert "lr_group_modules" not in meta
+
+    ENCODER = [
+        "vision_encoder.0.weight",
+        "vision_encoder.0.bias",
+        "vision_encoder.1.weight",
+        "vision_encoder.1.bias",
+    ]
+
+    @classmethod
+    def _staged(cls, name, multipliers):
+        """A run whose stage unfreezes the encoder: built with the encoder trainable, so the
+        optimizer holds its groups, then frozen until the stage."""
+        model, optimizer, scheduler = cls._build(name, set(), cls.DEFAULT_SCOPE, multipliers)
+        model.vision_encoder.requires_grad_(False)
+        return model, optimizer, scheduler
+
+    @pytest.mark.parametrize("at_once", [False, True], ids=["before-the-stage", "at-the-stage"])
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
+    def test_a_save_without_a_staged_module_resumes_like_an_unbroken_run(
+        self, tmp_path, name, at_once
+    ):
+        """A run that built the encoder frozen saved no group for it. A run whose stage
+        unfreezes the encoder holds its groups, loads with the encoder trainable as training
+        does, takes the groups out of the load and continues as a run that held them from the
+        start, at the rates its schedule gives them, also when the encoder trains in the first
+        step after the load."""
+        multipliers = {"vision_encoder": 0.1}
+
+        def finish(model, optimizer, scheduler):
+            self._train(model, optimizer, scheduler, 0 if at_once else 1)
+            model.vision_encoder.requires_grad_(True)
+            self._train(model, optimizer, scheduler, 2)
+            return model
+
+        reference = self._staged(name, multipliers)
+        self._train(*reference, 2)
+        expected = finish(*reference)
+
+        model, optimizer, scheduler = self._build(
+            name, {"vision_encoder"}, self.DEFAULT_SCOPE, multipliers
+        )
+        self._train(model, optimizer, scheduler, 2)
+        self._manager(tmp_path, model, optimizer, multipliers).save(step=2, scheduler=scheduler)
+
+        model, optimizer, scheduler = self._staged(name, multipliers)
+        model.vision_encoder.requires_grad_(True)
+        step, _, _ = self._manager(tmp_path, model, optimizer, multipliers).load(
+            scheduler=scheduler, fresh_if_unheld=self.ENCODER
+        )
+        model.vision_encoder.requires_grad_(False)
+        assert step == 2
+        resumed = finish(model, optimizer, scheduler)
+        for (n, p), q in zip(resumed.named_parameters(), expected.parameters(), strict=True):
+            assert torch.equal(p, q), n
+
+    @pytest.mark.parametrize("name", REGISTERED_OPTIMIZERS)
+    def test_a_module_unfrozen_without_a_stage_is_refused_by_the_group_check(self, tmp_path, name):
+        """With no stage the encoder's parameters do not resume fresh, so its groups are not
+        taken, and the refusal is the one that names the layout change and the way out."""
+        multipliers = {"vision_encoder": 0.1}
+        model, optimizer, scheduler = self._build(
+            name, {"vision_encoder"}, self.DEFAULT_SCOPE, multipliers
+        )
+        self._train(model, optimizer, scheduler, 2)
+        self._manager(tmp_path, model, optimizer, multipliers).save(step=2, scheduler=scheduler)
+
+        model, optimizer, scheduler = self._build(name, set(), self.DEFAULT_SCOPE, multipliers)
+        with pytest.raises(RuntimeError, match="laid out otherwise than at the save") as raised:
+            self._manager(tmp_path, model, optimizer, multipliers).load(scheduler=scheduler)
+        assert "cannot be matched" not in str(raised.value)
+
+    def test_a_scheduler_other_than_a_lambda_lr_keeps_the_groups_of_its_optimizer(self, tmp_path):
+        """A StepLR restores its rates by position, so the load takes none of the encoder's
+        groups out of the optimizer it drives and refuses instead."""
+        multipliers = {"vision_encoder": 0.1}
+        model, optimizer, _ = self._build(
+            "adamw", {"vision_encoder"}, self.DEFAULT_SCOPE, multipliers
+        )
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5)
+        self._train(model, optimizer, scheduler, 2)
+        self._manager(tmp_path, model, optimizer, multipliers).save(step=2, scheduler=scheduler)
+
+        model, optimizer, _ = self._staged("adamw", multipliers)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5)
+        model.vision_encoder.requires_grad_(True)
+        with pytest.raises(RuntimeError, match="laid out otherwise than at the save"):
+            self._manager(tmp_path, model, optimizer, multipliers).load(
+                scheduler=scheduler, fresh_if_unheld=self.ENCODER
+            )
 
 
 class TestSchedulerStateLayout:

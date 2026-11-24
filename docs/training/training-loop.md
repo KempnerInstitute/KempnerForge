@@ -79,6 +79,7 @@ After the step body (either branch):
 ```python
 grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
 if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
+    _route_balance(session, step_ran=False)
     optimizer.zero_grad()
     if nan_detector.rollback_recommended:
         break
@@ -123,11 +124,18 @@ that. See
 
 ```python
 optimizer.step()
+_route_balance(session, step_ran=True)
 scheduler.step()
 if phase_lr_scale != 1.0:
     for pg in optimizer.param_groups: pg["lr"] *= phase_lr_scale
 optimizer.zero_grad()
 ```
+
+With MoE, `_route_balance` applies the sigmoid routers' balancing right
+after the update: one all-reduce sums their expert counts over the
+step's micro-batches and all ranks, so every rank runs it (see
+[Aux loss and balancing](../moe/aux-loss-and-balancing.md#sigmoid-router--bias-based-balancing)).
+A NaN-skipped step drops the counts instead.
 
 Phase LR scaling runs *after* the scheduler — it multiplies the base
 LR that `scheduler.step()` just computed. This lets a curriculum phase
@@ -255,8 +263,10 @@ in order, then hands a `TrainingSession` to `run_training_loop`:
    registry lookup (see [Optimizers](optimizers.md)).
 6. `build_scheduler(optimizer, config.scheduler, max_steps=tc.max_steps)` —
    warmup + decay LambdaLR (see [Schedulers](schedulers.md)).
-7. `build_checkpoint_manager(...)` + `restore_checkpoint(...)` —
-   auto-resume from the `latest` symlink.
+7. `build_checkpoint_manager(...)`, then `ckpt_mgr.claim_dir()`, which
+   makes the run the owner of `checkpoint.dir` (see
+   [Auto-resume § One run per checkpoint directory](../checkpointing/auto-resume.md#one-run-per-checkpoint-directory)),
+   then `restore_checkpoint(...)`, which resumes from the `latest` symlink.
 8. `MetricsTracker`, profiler, `build_data_pipeline`,
    `build_eval_dataloader`, `build_phase_state`, `HookRunner`.
 
@@ -277,6 +287,7 @@ if nccl_failed_at is not None:
     raise RuntimeError(...)            # an NCCL stop fails the run
 hook_runner.on_train_end(step, tokens_seen)
 tracker.close()
+ckpt_mgr.release_dir()
 destroy_distributed()
 shutdown_handler.finish()              # restore the handlers, cancel the timer
 ```

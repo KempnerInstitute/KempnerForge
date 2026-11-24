@@ -42,7 +42,7 @@ The two routers have different balance strategies — start with
 |------|--------|-----|
 | Mixtral reproduction | `softmax_topk` | Matches original recipe, aux-loss coefficient well-studied (0.01) |
 | First MoE run, any target | `softmax_topk` | Simpler: one knob (`moe_aux_loss_weight`) and balance is visible in the loss |
-| DeepSeek-V3 reproduction | `sigmoid_topk` | Bias-based balancer, matching paper |
+| DeepSeek-V3-style routing | `sigmoid_topk` | Bias-based balancer as in the paper, with the update rule and gate weights noted in [Aux loss and balancing](../moe/aux-loss-and-balancing.md#sigmoid-router--bias-based-balancing) |
 | Long runs where aux-loss coefficient is brittle | `sigmoid_topk` | Balance signal doesn't perturb the main loss gradient |
 
 See [Routers](../moe/routers.md) for the mechanics.
@@ -127,8 +127,9 @@ Recovery options, in order of what to try first:
 
 1. **Raise `moe_aux_loss_weight`** from 0.01 → 0.02 (softmax) or turn
    on `moe_sequence_aux_loss_weight = 0.001` (sigmoid).
-2. **Set `moe_capacity_factor = 1.25`** — caps hot experts at 25%
-   above average, spilling overflow to residual.
+2. **Set `moe_capacity_factor = 1.25`**: routes past an expert's
+   capacity, 25% above the average per expert rounded up, go to the
+   residual.
 3. **Enable `moe_gradient_scale = true`** — normalizes per-expert
    gradient magnitudes so cold experts aren't starved of learning
    signal.
@@ -178,26 +179,31 @@ dp_shard = 4    # unchanged
 See [Expert parallelism](../distributed/expert-parallelism.md) for the
 all-to-all mechanics and throughput measurements.
 
-## Capacity factor: only when EP is on
+## Capacity factor
 
-`moe_capacity_factor` caps tokens per expert. It's almost always the
-wrong knob to turn on without EP:
+`moe_capacity_factor` caps the routes each expert keeps: a route past
+the cap gets routing weight 0, so its expert's output no longer counts
+for that token, while the token's other routes, any shared experts and
+the residual still do. It changes the model, and it saves no memory,
+compute or communication, with or without EP:
 
-- **Without EP**: capacity factor drops tokens (residual still flows),
-  which is wasted compute with no memory upside. Leave at `0.0`.
-- **With EP**: dispatch all-to-all buffers are sized for the
-  *worst-case* token distribution. Without a cap, one rank can
-  overflow its buffer when many tokens happen to prefer its experts.
-  `moe_capacity_factor = 1.25` (Switch default) bounds the buffer
-  predictably.
+- Dropped routes are still dispatched and computed. `_apply_capacity`
+  zeroes their weights and leaves their expert indices alone, so the
+  local path computes them and the EP all-to-all sends them like any
+  other route, and the zero weight discards their output.
+- No fixed-size buffer overflows without a cap. The EP dispatch
+  exchanges token counts first and sizes each receive buffer to the
+  count it gets, so a rank that many routes pick receives more rows.
+
+Leave it at `0.0` unless you want the drops themselves, e.g. to match
+a baseline trained with capacity:
 
 ```toml
 [model]
-moe_capacity_factor = 1.25   # only meaningful with distributed.ep > 1
+moe_capacity_factor = 1.25
 ```
 
-Start at 1.25; raise to 1.5 if you see ~5%+ token drop in metrics,
-lower to 1.0 if throughput is buffer-bound. See
+See
 [Capacity and dispatch § When to use capacity](../moe/capacity-and-dispatch.md#when-to-use-capacity).
 
 ## Packed experts: on if `num_experts ≥ 16`
@@ -264,7 +270,8 @@ splitting. Use FSDP, TP, or EP instead.
 ```
 
 Raised in `JobConfig.validate` when `num_experts > 0` and
-`pp > 1`. For very large MoE runs that need PP, you'd need a
+`pp > 1`; with `vlm.arch = "mot"` it offers FSDP alone, since MoT
+runs neither TP nor EP. For very large MoE runs that need PP, you'd need a
 schedule that interleaves all-to-all with pipeline microbatches —
 not in KempnerForge today.
 
@@ -275,12 +282,20 @@ A reasonable starting point for a 9.2B-total / 2.9B-active MoE on
 
 ```toml
 [model]
+dim                     = 2048
+n_layers                = 24
+n_heads                 = 16
+n_kv_heads              = 4
+vocab_size              = 128256
+ffn_dim_multiplier      = 1.3
+max_seq_len             = 4096
+rope_theta              = 500000.0
 num_experts             = 8
 moe_top_k               = 2
 moe_router              = "softmax_topk"    # or "sigmoid_topk" for DeepSeek-V3
 moe_frequency           = 1
 moe_aux_loss_weight     = 0.01
-moe_capacity_factor     = 1.25              # because EP is on
+moe_capacity_factor     = 0.0               # no cap, as benchmarked
 moe_packed_experts      = false             # 8 experts: not worth it
 moe_gradient_scale      = false             # baseline only
 

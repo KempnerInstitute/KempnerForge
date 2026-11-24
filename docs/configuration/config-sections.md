@@ -79,7 +79,7 @@ Architecture hyperparameters and MoE knobs.
 | `moe_router` | `str` | `"softmax_topk"` | `router` registry key |
 | `moe_shared_experts` | `int` | `0` | shared experts that always process every token |
 | `moe_aux_loss_weight` | `float` | `0.01` | coefficient in training loss |
-| `moe_capacity_factor` | `float` | `0.0` | `0` → no drop; `>0` → cap tokens/expert (typical `1.25`) |
+| `moe_capacity_factor` | `float` | `0.0` | `0` → no drop; `>0` → cap the routes per expert across its top-`k` slots (typical `1.25`) |
 | `moe_sequence_aux_loss_weight` | `float` | `0.0` | sequence-level balance loss (0 = off) |
 | `moe_gradient_scale` | `bool` | `False` | per-expert gradient normalization |
 | `moe_bias_schedule` | `str` | `"constant"` | `"constant"`, `"cosine_decay"`, `"linear_warmup"` |
@@ -273,6 +273,7 @@ DCP-based checkpointing.
 | `exclude_from_loading` | `list[str]` | `[]` | state to skip when warm-starting from `load_path`: `"model"` and/or `"optimizer"`, or exactly `["optimizer", "train_state"]` for a weights-only warm start that loads the model alone and skips `train_state.pt` (step, scheduler, dataloader position, RNG) and the saved freeze comparison, so a new stage starts fresh from the weights; ignored on a resume, which always restores full state |
 | `ignore_freeze_mismatch` | `bool` | `False` | load a checkpoint whose VLM freeze metadata disagrees with the configured freeze specs, downgrading the error to a warning |
 | `ignore_rank_state_mismatch` | `bool` | `False` | resume when the saved per-rank dataloader/RNG state does not fit this run (changed world size or data-parallel layout, unreadable or incomplete envelope): discard that state on every rank with a warning instead of raising, so data order and random streams restart fresh while step, model, optimizer and scheduler continue (see [Resharding](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)) |
+| `ignore_plugins_mismatch` | `bool` | `False` | resume, or warm start with the train state, from a checkpoint saved with another `plugins` list, with a warning instead of raising; for plugins that build no part of the model (see [Registry](registry.md#the-plugins-config-key)) |
 
 ### `[checkpoint.dyn_ckpt_window]`: `DynamicCheckpointWindow`
 

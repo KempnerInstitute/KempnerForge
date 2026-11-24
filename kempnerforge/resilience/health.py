@@ -130,7 +130,7 @@ class NaNDetector:
         if self.action == "raise":
             raise RuntimeError(msg)
         elif self.action == "skip":
-            logger.warning(f"{msg} — skipping optimizer step")
+            logger.warning(f"{msg}; skipping optimizer step")
         else:
             logger.warning(msg)
 

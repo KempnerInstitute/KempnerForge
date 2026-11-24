@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from collections.abc import Iterable
+from contextlib import AbstractContextManager
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.distributed._composable.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
@@ -30,13 +32,16 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
+from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ActivationCheckpointing
 from kempnerforge.config.training import FP8_DIM_MULTIPLE
 from kempnerforge.model.attention import Attention
 from kempnerforge.model.cross_attention import CrossAttention
+from kempnerforge.model.moe import MoEMLP
 from kempnerforge.model.mot import MoTAttention
+from kempnerforge.model.router import Recomputing
 from kempnerforge.model.transformer import Transformer
 
 if TYPE_CHECKING:
@@ -102,6 +107,34 @@ def is_fsdp_wrapped(model: torch.nn.Module) -> bool:
     return any(isinstance(m, FSDPModule) for m in model.modules())
 
 
+def refresh_fsdp_dtypes(model: torch.nn.Module, params: Iterable[torch.Tensor]) -> None:
+    """Recompute the reduction dtypes of the FSDP2 units that manage ``params``.
+
+    Call it after unfreezing parameters of an FSDP2-wrapped model. Each unit that manages
+    one of ``params`` itself, not through a nested unit, is unsharded and resharded. Every
+    rank calls it with the same parameters.
+
+    Args:
+        model: The model, wrapped with FSDP2 or not.
+        params: The parameters whose ``requires_grad`` was turned on.
+    """
+    changed = {id(p) for p in params}
+    if not changed:
+        return
+    for module in model.modules():
+        if not isinstance(module, FSDPModule):
+            continue
+        nested = {
+            id(p)
+            for sub in module.modules()
+            if sub is not module and isinstance(sub, FSDPModule)
+            for p in sub.parameters()
+        }
+        if any(id(p) in changed and id(p) not in nested for p in module.parameters()):
+            module.unshard()
+            module.reshard()
+
+
 def autocast_dtype(
     model: torch.nn.Module, master_dtype: torch.dtype, compute_dtype: torch.dtype
 ) -> torch.dtype | None:
@@ -133,6 +166,31 @@ def _is_checkpointed(module: torch.nn.Module) -> bool:
     return any(isinstance(m, CheckpointWrapper) for m in module.modules())
 
 
+def _routing_contexts() -> tuple[AbstractContextManager[Any], AbstractContextManager[Any]]:
+    """The forward and recompute contexts of a checkpointed block that routes tokens.
+
+    The recompute takes the forward's ``torch.topk`` outputs instead of computing them
+    again, so it routes every token as the forward did even where a GPU computes the
+    scores a little differently, and runs as a ``Recomputing``, so the routers leave
+    their attributes and counts as the forward set them (see ``Recomputing``).
+    """
+    forward, recompute = create_selective_checkpoint_contexts([torch.ops.aten.topk.default])
+    return forward, Recomputing(recompute)
+
+
+class _RoutingCheckpointWrapper(CheckpointWrapper):
+    """The ``CheckpointWrapper`` of a block that routes tokens, run eagerly under compile.
+
+    The selective-checkpoint context of ``_routing_contexts`` sees only the ops that run
+    eagerly, and the recompute in the backward runs eagerly, so the forward does too.
+    """
+
+    @torch.compiler.disable
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the wrapped block under activation checkpointing."""
+        return super().forward(*args, **kwargs)
+
+
 def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpointing | str) -> int:
     """Apply activation checkpointing to the model's blocks.
 
@@ -153,6 +211,12 @@ def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpoin
             checkpoints the ``Attention``, ``MoTAttention`` and
             ``CrossAttention`` modules inside each block (balanced trade-off)
             and warns, naming the class, about a block that holds none of them.
+            Under ``full``, a block that holds an ``MoEMLP`` keeps its routers'
+            top-k outputs for the recompute, which leaves the routers' state as
+            the forward set it, and runs eagerly under ``torch.compile`` (see
+            ``_routing_contexts``). Its recompute uses those outputs up, so the
+            graph through it takes one backward: a second, after
+            ``backward(retain_graph=True)``, raises.
 
     Returns:
         The number of modules this call wrapped.
@@ -162,13 +226,19 @@ def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpoin
         return 0
 
     wrapper_fn = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+    routing_fn = partial(
+        _RoutingCheckpointWrapper,
+        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        context_fn=_routing_contexts,
+    )
     blocks = _ac_blocks(model)
     wrapped: dict[str, int] = {}
     for container, key in blocks:
         if _is_checkpointed(container[key]):
             continue
         if mode == ActivationCheckpointing.full:
-            container[key] = wrapper_fn(container[key])
+            routes = any(isinstance(m, MoEMLP) for m in container[key].modules())
+            container[key] = (routing_fn if routes else wrapper_fn)(container[key])
         else:
             apply_activation_checkpointing(
                 container[key],
@@ -426,7 +496,7 @@ def apply_fsdp2(
             int = rate-limit the number of concurrent all-gathers.
     """
     if not has_dp_mesh(device_mesh):
-        logger.info("No DP dimensions in mesh — skipping FSDP2")
+        logger.info("No DP dimensions in mesh; skipping FSDP2")
         return
 
     dp_mesh = get_dp_mesh(device_mesh)
@@ -464,10 +534,13 @@ def _apply_fsdp_vlm(
         and VLM+MoE cannot deadlock).
       - Transformer root (embedding + final norm + output head): own unit.
       - Adapter: own unit (small, but keeps grad-sync scheduling symmetric).
-      - Vision encoder: wrapped only when not fully frozen, with
+      - Vision encoder: wrapped unless ``encoder_frozen``, with
         ``encoder_mp_policy`` when given and the shared policy otherwise.
-        A frozen encoder stays as a full replica in eval mode; replication
-        is fine because requires_grad=False means no grad-reduce participation.
+        An encoder frozen for the whole run stays a full replica, put in eval
+        mode at build; replication is fine because requires_grad=False
+        means no grad-reduce participation. One with parameters that a freeze
+        stage unfreezes is wrapped from the start; one without parameters
+        follows the build freeze.
       - The ``VLMWrapper`` itself is not wrapped (no direct parameters).
     """
     if not has_dp_mesh(device_mesh):
@@ -614,28 +687,28 @@ def _build_vlm(
          ``num_tokens`` is known from the encoder.
       4. TP / EP / Float8 / AC are applied to the transformer only.
       5. FSDP2 is applied component-by-component (transformer blocks,
-         transformer root, adapter, and vision encoder iff not frozen).
-         With ``vision_config.mixed_precision`` set, the encoder's unit
-         gets its own policy that computes in that dtype.
+         transformer root, adapter, and vision encoder unless no step of
+         the run trains it, or, for an encoder without parameters, unless the
+         build freeze freezes it). With ``vision_config.mixed_precision`` set,
+         the encoder's unit gets its own policy that computes in that dtype.
       6. Meta subtrees are materialized (transformer / adapter), the
          vision encoder is moved to ``device``, and the transformer and
          adapter are cast to ``param_dtype``. The vision encoder's
          parameters stay in its HF dtype (D16) to avoid ViT LayerNorm
          numerical drift; with ``vision_config.mixed_precision`` set,
          ``_set_encoder_precision`` makes it compute in that dtype.
-      7. Freeze specs are applied via ``apply_freeze_specs`` and a fully
-         frozen encoder is switched to ``eval()``.
+      7. Freeze specs are applied via ``apply_freeze_specs``, and ``wrapper.train()``
+         sets the modes training runs in, which keeps an encoder whose parameters
+         are all frozen in ``eval()`` (``VLMWrapper.train``), one that a later stage
+         unfreezes included. An encoder treated as frozen in step 5 is switched to
+         ``eval()`` too, which covers one without parameters.
     """
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
     from kempnerforge.model.adapter import build_adapter
     from kempnerforge.model.transformer import Transformer
-    from kempnerforge.model.vlm import (
-        VLMWrapper,
-        _is_encoder_frozen,
-        build_modality_strategy,
-    )
-    from kempnerforge.training.freeze import apply_freeze_specs
+    from kempnerforge.model.vlm import VLMWrapper, _is_encoder_frozen, build_modality_strategy
+    from kempnerforge.training.freeze import apply_freeze_specs, trainable_during_run
 
     assert vlm_config is not None, "_build_vlm requires vlm_config to be set"
     assert vision_config is not None, "_build_vlm requires vision_config to be set"
@@ -678,7 +751,12 @@ def _build_vlm(
         apply_float8(transformer)
     apply_ac(transformer, ac_mode)
 
-    encoder_frozen = _is_encoder_frozen(vlm_config.freeze)
+    if any(True for _ in encoder.parameters()):
+        encoder_frozen = not any(
+            name.startswith("vision_encoder.") for name in trainable_during_run(wrapper, vlm_config)
+        )
+    else:
+        encoder_frozen = _is_encoder_frozen(vlm_config.freeze)
     encoder_dtype = vision_config.compute_dtype
     if device_mesh is not None:
         _apply_fsdp_vlm(
@@ -711,6 +789,7 @@ def _build_vlm(
     adapter.to(dtype=param_dtype)
 
     apply_freeze_specs(wrapper, vlm_config.freeze, vlm_config.module_patterns)
+    wrapper.train()
     if encoder_frozen:
         encoder.eval()
 

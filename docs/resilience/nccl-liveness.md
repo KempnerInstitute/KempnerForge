@@ -48,7 +48,7 @@ if (
     and step % tc.nccl_health_check_interval == 0
     and any_rank(not check_nccl_health(), session.control_group)
 ):
-    logger.error(f"NCCL health check failed at step {step} — stopping")
+    logger.error(f"NCCL health check failed at step {step}; stopping")
     nccl_failed_at = step
     break
 ...
