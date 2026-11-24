@@ -254,9 +254,11 @@
       "functions": [
         "load_toml(path) -> dict",
         "load_config(config_path, cli_args) -> JobConfig",
-        "_parse_cli_overrides(args) -> dict",
+        "_parse_cli_overrides(args) -> dict (dotted paths build _DottedKeys)",
         "_apply_dict_to_dataclass(dc, data)",
-        "_coerce_value(field_type, value) (refuses a value that cannot stand for the type)",
+        "_with_dotted_keys(table, keys) -> dict (a dotted override's keys set on a dict-valued field's table, the rest kept)",
+        "_dict_field_value(raw, current) -> dict (a dotted override merges into current, a literal replaces it)",
+        "_coerce_value(field_type, value) (refuses a value that cannot stand for the type; a dict's values take its value type)",
         "_coerce_bool(value) -> bool (a bool, 0 or 1, or a true/false spelling; else ValueError)",
         "_coerce_number(field_type, value) (an int or float from a number or numeric string; refuses bools and fractional ints)",
         "_coerce_field(dc_type, name, hint, raw) (_coerce_value whose errors name dc_type.name)",
@@ -266,6 +268,7 @@
         "tests/unit/test_config.py::TestTomlLoading",
         "tests/unit/test_config.py::TestCliOverrides",
         "tests/unit/test_config.py::TestCliParsing",
+        "tests/unit/test_config.py::TestDottedDictOverrides",
         "tests/unit/test_config.py::TestScalarCoercion",
         "tests/unit/test_mixing.py::TestMixingTomlLoading",
         "tests/unit/test_annealing.py::TestAnnealingTomlLoading"
@@ -426,7 +429,8 @@
         "VLMWrapper(nn.Module)": {
           "purpose": "VLM wrapper composing vision_encoder + adapter + transformer + strategy. Strategy is a plain Python object, not an nn.Module submodule",
           "methods": [
-            "forward(pixel_values, input_ids, labels, frame_mask, *, doc_ids, position_ids, attention_group_ids, image_rows, image_starts, image_tokens, text_rows, text_positions) -> (logits, labels)"
+            "forward(pixel_values, input_ids, labels, frame_mask, *, doc_ids, position_ids, attention_group_ids, image_rows, image_starts, image_tokens, text_rows, text_positions) -> (logits, labels)",
+            "train(mode=True) (keeps a vision encoder whose parameters are all frozen in eval mode)"
           ],
           "properties": [
             "num_image_tokens"
@@ -1631,9 +1635,10 @@
           "TestScalarCoercion(13)",
           "TestCliParsing(6)",
           "TestRegistry(12)",
-          "TestEvalConfig(7)"
+          "TestEvalConfig(7)",
+          "TestDottedDictOverrides(13)"
         ],
-        "count": 125
+        "count": 138
       },
       "tests/unit/test_training.py": {
         "classes": [
@@ -1966,6 +1971,13 @@
           "TestBuildVLMWrapperErrors(1)"
         ],
         "count": 42
+      },
+      "tests/unit/test_vlm_encoder_mode.py": {
+        "classes": [
+          "TestWrapperTrain(3)",
+          "TestTrainingLoop(3)"
+        ],
+        "count": 6
       },
       "tests/unit/test_vlm_config.py": {
         "classes": [

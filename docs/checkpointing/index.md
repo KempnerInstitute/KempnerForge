@@ -95,10 +95,9 @@ checkpoint can run code in the process that loads it:
   from an archive is yours, and can load silently.
 
 So load only checkpoints you trust, in practice ones you or your team saved. Take weights
-from elsewhere as safetensors in a local directory and import them with `hf-to-dcp` pointed
-at that directory ([HF conversion](hf-conversion.md)); given a Hub model ID instead,
-`hf-to-dcp` loads the model through `transformers` with `trust_remote_code=True`, which can
-run custom code from the model's repository. `metadata.json` is plain JSON: a tool that needs only
+from elsewhere with `hf-to-dcp` ([HF conversion](hf-conversion.md)), from a local directory or
+a Hub model ID: it reads safetensors files, and `.bin` files with `torch.load(weights_only=True)`,
+and runs none of the model repository's code. `metadata.json` is plain JSON: a tool that needs only
 the step, the token count or the logging runs can read it without loading the checkpoint.
 
 ## Key modules

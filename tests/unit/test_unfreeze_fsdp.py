@@ -194,10 +194,11 @@ class TestEncoderMode:
         assert model.vision_encoder.training
         assert [p.requires_grad for p in model.vision_encoder.parameters()] == [False, True]
 
-    def test_an_encoder_a_stage_unfreezes_stays_in_train_mode(self):
+    def test_an_encoder_a_stage_unfreezes_starts_in_eval_mode(self):
         from kempnerforge.config.vlm import FreezeSpec, FreezeStage
 
         stage = FreezeStage(5, (FreezeSpec("vision_encoder", False),))
         model = _build([FreezeSpec("vision_encoder")], [stage])
-        assert model.vision_encoder.training
+        assert not model.vision_encoder.training
+        assert model.training and model.adapter.training and model.transformer.training
         assert not any(p.requires_grad for p in model.vision_encoder.parameters())
