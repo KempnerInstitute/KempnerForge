@@ -169,7 +169,7 @@ the mismatch, what was kept and what was dropped:
 |-------|-------------------|
 | `step`, `tokens_seen` | continue |
 | Model, optimizer, scheduler | continue, resharded by DCP onto the new topology |
-| Dataloader position | continues where it carries over (below): from the saved rank 0's position, at the same sample, for a single map-style dataset, and from each data-parallel rank's own for a stream on the saved data-parallel size; otherwise restarts from the first sample on every rank, with a warning |
+| Dataloader position | continues where it carries over (below), from the saved rank 0's position, or for a stream on the saved data-parallel size from each data-parallel rank's own; otherwise restarts from the first sample on every rank, with a warning |
 | RNG streams | restart from the run's seeds |
 
 The data position kept is the one the saved rank 0 reached, except a

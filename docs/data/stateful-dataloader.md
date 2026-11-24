@@ -202,7 +202,8 @@ of a Hub dataset with the same shard count, or a new version of
 replay. A map-style position meeting a stream, or the reverse, raises too.
 Each rank checks the stream as it sees it, the sizes of its data files
 included, and the ranks share their verdicts before any rank replays, so a
-rank whose copy of a file differs stops every rank, not only itself.
+rank whose copy of a file differs stops every rank, not only itself, or under
+the flag onto another layout restarts every rank's stream.
 A `checkpoint.load_path` warm start does not raise: it logs the reason and
 every rank starts its stream at the first document (see
 [Auto-resume](../checkpointing/auto-resume.md#where-its-called)). A
