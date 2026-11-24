@@ -87,7 +87,7 @@ whole table: `--data.anneal_weights='{"c4":0.7,"books":0.3}'` drops any
 other key the TOML set.
 
 Each value takes the value type of the table, so
-`--vlm.module_patterns.vision_encoder=vision_encoder.*` gives the list
+`--vlm.module_patterns.vision_encoder="vision_encoder.*"` gives the list
 `["vision_encoder.*"]`. A key the table does not hold is added, so a
 misspelled key adds a new entry unless the field checks its keys, as
 `optimizer.lr_multipliers` does against `vlm.module_patterns`. Each dot
