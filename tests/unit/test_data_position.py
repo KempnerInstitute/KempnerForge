@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import logging
 import random
-import socket
 from datetime import timedelta
 from pathlib import Path
 
@@ -22,11 +21,11 @@ import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from kempnerforge.config.schema import DataConfig
 from kempnerforge.data.dataloader import DataPositionError, StatefulDataLoader
 from kempnerforge.data.sampler import DistributedSampler, MixtureSampler
+from tests.gloo_ranks import gloo_group, spawn
 
 SEED = 42
 _CONFIG = DataConfig(num_workers=0, pin_memory=False)
@@ -416,13 +415,6 @@ def test_auto_resume_refuses_a_position_that_cannot_carry_over(tmp_path):
         manager.apply_dataloader_state(_loader(_Indices(4_096), 2, 0, 4))
 
 
-def _free_port() -> int:
-    """An unused local TCP port for the gloo rendezvous."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _save_or_resume(
     rank: int, world: int, port: int, root: str, batch: int, steps: int, out: str, resume: bool
 ) -> None:
@@ -430,10 +422,7 @@ def _save_or_resume(
     from kempnerforge.checkpoint.manager import CheckpointManager
     from kempnerforge.config.checkpoint import CheckpointConfig
 
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         model = torch.nn.Linear(2, 2)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         manager = CheckpointManager(CheckpointConfig(dir=root), model, optimizer)
@@ -449,8 +438,6 @@ def _save_or_resume(
         dist.all_gather_object(gathered, read)
         if rank == 0:
             Path(out).write_text(json.dumps(gathered))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize(
@@ -460,16 +447,8 @@ def test_checkpoint_resume_on_another_world_size(tmp_path, before, after):
     """A checkpoint saved by one gloo job resumes in a job of another size."""
     root = str(tmp_path / "ckpt")
     saved, resumed = str(tmp_path / "saved.json"), str(tmp_path / "resumed.json")
-    mp.spawn(
-        _save_or_resume,
-        args=(before[0], _free_port(), root, before[1], 50, saved, False),
-        nprocs=before[0],
-    )
-    mp.spawn(
-        _save_or_resume,
-        args=(after[0], _free_port(), root, after[1], 5, resumed, True),
-        nprocs=after[0],
-    )
+    spawn(_save_or_resume, before[0], root, before[1], 50, saved, False)
+    spawn(_save_or_resume, after[0], root, after[1], 5, resumed, True)
     order = _order(4_096)
     reached = before[0] * before[1] * 50
     assert _positions(json.loads(Path(saved).read_text()), order) == list(range(reached))
@@ -518,16 +497,6 @@ def _kind_loader(kind: str, world: int, rank: int) -> _Recording:
     return _loader(_Indices(4_096), world, rank, 4, cls=_Recording)
 
 
-def _init_gloo(rank: int, world: int, port: int) -> None:
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=120),
-    )
-
-
 def _manager(root: str, kind: str, rank: int, world: int, lenient: bool = False):
     """A manager that records this rank's data-parallel coordinates, as the training entry's."""
     from kempnerforge.checkpoint.manager import CheckpointManager
@@ -546,8 +515,7 @@ def _save_both_kinds(rank: int, world: int, port: int, root: str, out: str) -> N
     each save. Rank 0 writes every rank's samples and its next random draw after
     each save, the draw an exact resume of that rank reproduces.
     """
-    _init_gloo(rank, world, port)
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=120)):
         report = {}
         for kind in ("single", "mixture"):
             manager = _manager(root, kind, rank, world)
@@ -561,8 +529,6 @@ def _save_both_kinds(rank: int, world: int, port: int, root: str, out: str) -> N
         dist.all_gather_object(gathered, report)
         if rank == 0:
             Path(out).write_text(json.dumps(gathered))
-    finally:
-        dist.destroy_process_group()
 
 
 def _auto_resume(
@@ -579,9 +545,8 @@ def _auto_resume(
     the fresh seeds give, the sampler ranks of the states the loader loaded, and the
     warnings logged.
     """
-    _init_gloo(rank, world, port)
-    warnings: list[str] = []
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=120)):
+        warnings: list[str] = []
         manager = _manager(root, kind, rank, world, lenient)
         loader = _kind_loader(kind, world, rank)
         logging.getLogger("kempnerforge").addHandler(_Collect(warnings))
@@ -606,8 +571,6 @@ def _auto_resume(
         dist.all_gather_object(gathered, report)
         if rank == 0:
             Path(out).write_text(json.dumps(gathered))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.fixture(scope="module")
@@ -615,17 +578,13 @@ def four_rank_checkpoints(tmp_path_factory) -> tuple[str, list[dict]]:
     """A single-dataset and a mixture checkpoint saved by a 4-rank gloo job, and its reports."""
     root = tmp_path_factory.mktemp("topology")
     out = str(root / "saved.json")
-    mp.spawn(_save_both_kinds, args=(4, _free_port(), str(root), out), nprocs=4)
+    spawn(_save_both_kinds, 4, str(root), out)
     return str(root), json.loads(Path(out).read_text())
 
 
 def _resume_job(root: str, world: int, kind: str, lenient: bool, direct: bool = False):
     out = str(Path(root) / f"resumed_{world}_{kind}_{lenient}_{direct}.json")
-    mp.spawn(
-        _auto_resume,
-        args=(world, _free_port(), root, out, kind, lenient, direct),
-        nprocs=world,
-    )
+    spawn(_auto_resume, world, root, out, kind, lenient, direct)
     return json.loads(Path(out).read_text())
 
 
