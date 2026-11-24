@@ -44,6 +44,7 @@ from kempnerforge.resilience.elastic import resolve_resume_path
 from kempnerforge.resilience.health import NaNDetector
 from kempnerforge.resilience.signal_handler import ShutdownHandler
 from kempnerforge.training.data_pipeline import (
+    DataFn,
     build_data_pipeline,
     build_eval_dataloader,
     build_phase_state,
@@ -413,14 +414,19 @@ def run_training(
     *,
     step_fn: StepFn | None = None,
     hooks: HookRunner | None = None,
+    data_fn: DataFn | None = None,
 ) -> None:
     """Run a full training job: build every phase, run the loop, tear down.
 
     ``step_fn`` and ``hooks`` let an experiment own the step body or register
-    hooks without copying the build phases. Both default to what
-    ``scripts/train.py`` uses. A custom ``step_fn`` must run its forward and
-    loss under ``session.autocast()``, which casts fp32 master weights to the
-    compute dtype when no FSDP2 wrap does (one GPU, a pp-only mesh).
+    hooks, and ``data_fn`` its data pipeline, without copying the build phases.
+    All default to what ``scripts/train.py`` uses; ``data_fn`` is called as
+    ``build_data_pipeline`` is, after the model is built, so it receives the
+    model's ``tokens_per_image`` on a packed or multi-image VLM run, and must
+    follow the ``DataFn`` contract. A custom
+    ``step_fn`` must run its forward and loss under ``session.autocast()``, which
+    casts fp32 master weights to the compute dtype when no FSDP2 wrap does (one
+    GPU, a pp-only mesh).
 
     The shutdown handler stays registered, and its forced-exit timer armed,
     until the process group is destroyed, so a second signal cannot cut the
@@ -464,7 +470,14 @@ def run_training(
 
         laid_out = config.data.pack_sequences or config.data.hf_max_images != 1
         tokens_per_image = packed_tokens_per_image(model) if config.is_vlm and laid_out else None
-        data = build_data_pipeline(config, runtime, tokens_per_image=tokens_per_image)
+        data = (data_fn or build_data_pipeline)(config, runtime, tokens_per_image=tokens_per_image)
+        expected = get_dp_info(runtime.device_mesh)
+        if (data.dp_rank, data.dp_size) != expected:
+            raise ValueError(
+                f"data_fn returned dp_rank={data.dp_rank}, dp_size={data.dp_size}, but this "
+                f"rank's data-parallel partition is dp_rank={expected[0]}, "
+                f"dp_size={expected[1]} (get_dp_info(runtime.device_mesh))"
+            )
         if data.dataloader is not None:
             ckpt_mgr.apply_dataloader_state(data.dataloader)
 

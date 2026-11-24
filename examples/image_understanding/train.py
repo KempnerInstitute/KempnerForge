@@ -4,6 +4,9 @@
 Parses argv, loads the config, and hands off to the core training scaffold.
 The VLM step body still lives in core, so ``run_training`` selects it from
 ``config.is_vlm``; when it moves out here it becomes a ``step_fn=`` argument.
+``--mixture=<file>`` trains on the packed mixture of image-text sources the file
+describes (``mixture.py``) instead of the ``[data]`` source; the file and the run
+are checked before training starts.
 
 Usage:
     # Multi-GPU (single node, via torchrun)
@@ -12,23 +15,37 @@ Usage:
     # With overrides
     uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py <config.toml> \
         --train.grad_accum_steps=4
+
+    # On a mixture of image-text sources
+    uv run torchrun --nproc_per_node=4 examples/image_understanding/train.py <config.toml> \
+        --mixture=<mixture.toml>
 """
 
 from __future__ import annotations
 
 import sys
 
+from mixture import check_run, mixture_data_fn
+
 from kempnerforge.config.loader import load_config
 from kempnerforge.training import run_training
 
+MIXTURE_FLAG = "--mixture="
+
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: train.py <config.toml> [--section.key=value ...]")
+    mixtures = [arg[len(MIXTURE_FLAG) :] for arg in sys.argv[1:] if arg.startswith(MIXTURE_FLAG)]
+    args = [arg for arg in sys.argv[1:] if not arg.startswith(MIXTURE_FLAG)]
+    if not args or len(mixtures) > 1:
+        print("Usage: train.py <config.toml> [--mixture=<mixture.toml>] [--section.key=value ...]")
         sys.exit(1)
 
-    config = load_config(sys.argv[1], cli_args=sys.argv[2:])
-    run_training(config)
+    config = load_config(args[0], cli_args=args[1:])
+    data_fn = None
+    if mixtures:
+        check_run(config)
+        data_fn = mixture_data_fn(mixtures[0])
+    run_training(config, data_fn=data_fn)
 
 
 if __name__ == "__main__":

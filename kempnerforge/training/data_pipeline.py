@@ -8,7 +8,7 @@ streaming), multi-dataset mixtures, and the VLM image/video paths.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import torch
@@ -373,6 +373,30 @@ def _build_hf_pipeline(config: JobConfig, dp_rank: int, dp_size: int) -> DataPip
             f"{config.data.hf_dataset_name} ({config.data.hf_dataset_split})"
         )
     return DataPipeline(dataloader=dataloader, dp_rank=dp_rank, dp_size=dp_size)
+
+
+class DataFn(Protocol):
+    """Builds the training data pipeline; ``build_data_pipeline`` is the default."""
+
+    def __call__(
+        self,
+        config: JobConfig,
+        runtime: RuntimeContext,
+        /,
+        *,
+        tokens_per_image: int | None = None,
+    ) -> DataPipeline:
+        """The pipeline this rank trains on.
+
+        The builder shards its own loader over the data-parallel ranks and
+        returns the ``dp_rank`` and ``dp_size`` it used, which must be
+        ``get_dp_info(runtime.device_mesh)``: the loop scales token counts by
+        ``dp_size``, and ``run_training`` refuses any other pair. Annealing
+        phases need ``mixture_dataset``, ``mixture_sampler`` and
+        ``mixture_weights``, and a resume restores the loader's position only
+        if it has ``state_dict`` and ``load_state_dict``.
+        """
+        ...
 
 
 def build_data_pipeline(

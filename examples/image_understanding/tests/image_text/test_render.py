@@ -62,6 +62,18 @@ class TestChatRenderer:
             "<|im_start|>user\n<|vision_start|><|vision_end|> What is shown?"
         )
 
+    @pytest.mark.parametrize("images", [0, 2])
+    def test_lead_space_starts_the_first_user_message(self, tokenizer: Any, images: int) -> None:
+        doc = Document(
+            images=(_image(),) * images,
+            turns=(Turn("Q1?", ("A1.",)), Turn("Q2?", ("A2.",))),
+            kind="conversation",
+        )
+        renderer = _renderer(tokenizer, max_images=None, lead_space=True)
+        text = renderer.text(doc, ["A1.", "A2."])
+        assert text.startswith("<|im_start|>user\n Q1?<|im_end|>")
+        assert "<|im_start|>user\nQ2?<|im_end|>" in text
+
     def test_answer_only_trains_the_reply_and_its_turn_end(self, tokenizer: Any) -> None:
         sample = _renderer(tokenizer).render(_qa(), ["a cat"])
         assert _trained_text(tokenizer, sample) == "a cat<|im_end|>"
