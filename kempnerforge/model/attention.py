@@ -72,6 +72,11 @@ class KVCache:
         self.seq_len = end
         return self.k[:, :, :end], self.v[:, :, :end]
 
+    def keep_rows(self, rows: torch.Tensor) -> None:
+        """Keep only the batch rows ``rows``, in that order, e.g. to drop finished sequences."""
+        self.k = self.k[rows]
+        self.v = self.v[rows]
+
 
 class Attention(nn.Module):
     """Grouped-Query Attention with RoPE and SDPA."""
@@ -139,31 +144,38 @@ class Attention(nn.Module):
                 across the batch or (batch, seq_len, head_dim // 2) per row.
             rope_sin: RoPE sine frequencies, same shape as ``rope_cos``.
             kv_cache: Optional KV cache for incremental generation. The tokens
-                of this forward are appended to it, and each attends to every
-                cached key and to the appended keys up to its own position.
-                Mutually exclusive with ``attn_mask``: a cache grows the key
-                axis every step, so the mask would have to be rebuilt each
-                step rather than shared, and a decode step needs no mask at
-                all.
+                of this forward are appended to it, and without ``attn_mask``
+                each attends to every cached key and to the appended keys up
+                to its own position.
             attn_mask: The mask from
                 ``kempnerforge.model.masking.build_attention_mask``: a
                 FlexAttention ``BlockMask``, a dense bool tensor broadcastable
                 to (batch, n_heads, seq_len, seq_len) where ``True`` = attend,
-                or ``None`` for plain causal attention.
+                or ``None`` for plain causal attention. With ``kv_cache`` its
+                key axis covers the cached keys and the appended ones, so a
+                ``BlockMask``, which is square, needs an empty cache.
 
         Returns:
             Output tensor of shape (batch, seq_len, dim).
 
         Raises:
-            ValueError: If ``attn_mask`` is combined with ``kv_cache``.
+            ValueError: If ``attn_mask``'s key axis does not cover the keys
+                ``kv_cache`` holds after this forward.
             NotImplementedError: If ``capture_attention_weights`` is set and
                 ``attn_mask`` is a ``BlockMask``.
         """
         if kv_cache is not None and attn_mask is not None:
-            raise ValueError(
-                "attn_mask (dense or BlockMask) cannot be combined with kv_cache; "
-                "visibility masks are training-only"
-            )
+            keys = kv_cache.seq_len + x.shape[1]
+            if isinstance(attn_mask, BlockMask):
+                mask_keys = attn_mask.seq_lengths[1] if kv_cache.seq_len == 0 else -1
+            else:
+                mask_keys = attn_mask.shape[-1] if attn_mask.dim() == 4 else -1
+            if mask_keys != keys:
+                raise ValueError(
+                    f"attn_mask cannot be combined with kv_cache unless it is a "
+                    f"(batch, 1, seq_len, cached + seq_len) mask over the {keys} keys "
+                    "after this forward, or a BlockMask on an empty cache"
+                )
         if isinstance(attn_mask, BlockMask) and self.capture_attention_weights:
             raise NotImplementedError(
                 "capture_attention_weights requires attention_backend='sdpa'. "

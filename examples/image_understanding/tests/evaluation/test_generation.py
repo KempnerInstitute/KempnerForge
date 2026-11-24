@@ -248,6 +248,21 @@ class TestGreedyDecode:
         assert transformer.batches == [count for count in still_decoding if count]
         assert transformer.batches[-1] < transformer.batches[0]
 
+    def test_each_step_after_the_first_runs_one_token_per_row(
+        self, model: VLMWrapper, pixels: torch.Tensor, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        widths: list[int] = []
+        forward = model.transformer.forward
+
+        def kept(*args: Any, **kwargs: Any) -> Any:
+            widths.append(kwargs["tokens"].shape[1])
+            return forward(*args, **kwargs)
+
+        monkeypatch.setattr(model.transformer, "forward", kept)
+        rows = _rows(pixels, PROMPTS)
+        _decode(model, rows)
+        assert widths == [max(footprint(model, row) for row in rows)] + [1] * 5
+
     def test_the_last_position_of_the_row_is_used(
         self, model: VLMWrapper, pixels: torch.Tensor
     ) -> None:

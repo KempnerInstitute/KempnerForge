@@ -354,9 +354,10 @@ lets each view's tokens see each other as training did.
 Decoding is greedy. Each row of a batch is one document laid out as a packed
 training row lays it out (every view's tokens, then the text, padding last),
 each view is encoded once, and a row ends at the turn end or EOS, or after the
-task's `max_new_tokens`. Attention runs on SDPA whatever the config's
-`model.attention_backend`, as the row length grows with every step. A split is
-cut into consecutive
+task's `max_new_tokens`. The batch runs once into a KV cache, and each later step
+runs only the new token of every row still decoding. Attention runs on SDPA
+whatever the config's `model.attention_backend`, as the cached keys grow with
+every step. A split is cut into consecutive
 batches, the ranks take them in turn, and rank 0 merges the rows, each scored
 once. Every batch holds the same rows whatever the number of ranks, so with one
 `--batch-size` the scores are the same on any number of GPUs of one kind. Causal
@@ -712,7 +713,6 @@ or in core where it belongs:
   DataComp), chat-template rendering with the loss on the assistant turns only
 - Typed stage contract and pinned source manifest, which fix the stage presets
 - Per-module learning rates and schedules
-- Evaluation: a KV cache for decoding
 - Run-comparison metrics: documents seen, token counts, MFU with the encoder
 
 ## Tests
