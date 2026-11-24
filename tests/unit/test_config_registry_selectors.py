@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,7 @@ import torch
 
 from kempnerforge.config.checkpoint import AsyncCheckpointMode
 from kempnerforge.config.distributed import PipelineSchedule
+from kempnerforge.config.job import JobConfig
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.model import CORE_MLP_KEY_ACTIVATIONS, Activation, ModelConfig, NormType
 from kempnerforge.config.registry import registry
@@ -146,6 +148,11 @@ class TestPluginSelection:
         assert logits.shape == (2, 8, TINY_MODEL["vocab_size"])
 
 
+def _field_prefix(section: str, field: str) -> str:
+    """The ``Class.field: `` prefix the loader puts before a refused value's reason."""
+    return f"{type(getattr(JobConfig(), section)).__name__}.{field}: "
+
+
 @pytest.mark.parametrize(("section", "field", "enum_type", "category", "suffix"), SELECTORS)
 def test_an_unregistered_name_is_rejected_with_the_valid_names(
     write_plugin, section, field, enum_type, category, suffix
@@ -156,7 +163,8 @@ def test_an_unregistered_name_is_rejected_with_the_valid_names(
 
     message = str(excinfo.value)
     assert message.startswith(
-        f"'kf250_missing' is neither in {enum_type.__name__} nor registered under '{category}'."
+        f"{_field_prefix(section, field)}'kf250_missing' is neither in {enum_type.__name__} "
+        f"nor registered under '{category}'."
     )
     assert f"{enum_type.__name__} members: {[m.value for m in enum_type]}." in message
     assert f"'{module}{suffix}'" in message.split("Registered")[1]
@@ -172,7 +180,8 @@ def test_a_name_registered_in_another_category_is_rejected(
         name = f"{module}{other}"
         with pytest.raises(
             ValueError,
-            match=f"^'{name}' is neither in {enum_type.__name__} nor registered under '{category}'",
+            match=f"^{re.escape(_field_prefix(section, field))}'{name}' is neither in "
+            f"{enum_type.__name__} nor registered under '{category}'",
         ):
             load_config(cli_args=[f'--plugins=["{module}"]', f"--{section}.{field}={name}"])
 
@@ -202,7 +211,10 @@ def test_a_member_name_still_becomes_the_member(section, field, enum_type):
 def test_a_closed_enum_rejects_names_registered_for_the_open_ones(write_plugin, key, enum_type):
     module = write_plugin("kf250_closed")
     for name in (f"{module}_sched", f"{module}_norm", f"{module}_mlp"):
-        with pytest.raises(ValueError, match=f"^'{name}' is not a valid {enum_type.__name__}$"):
+        prefix = re.escape(_field_prefix(*key.split(".")))
+        with pytest.raises(
+            ValueError, match=f"^{prefix}'{name}' is not a valid {enum_type.__name__}$"
+        ):
             load_config(cli_args=[f'--plugins=["{module}"]', f"--{key}={name}"])
 
 

@@ -4,8 +4,10 @@
 #
 # Tokenizer: meta-llama/Meta-Llama-3-8B (vocab_size = 128256). The SigLIP2
 # family uses the Llama-3 vocab to match a real Llama-3 + SigLIP2
-# production target. Other configs in this folder use gpt2 (vocab_size =
+# production target. Most other configs in this folder use gpt2 (vocab_size =
 # 50257) for fast smoke iteration.
+# The Llama-3 tokenizer is gated: it needs access granted on its Hugging
+# Face page and a token (HF_TOKEN or hf auth login) before the first run.
 #
 # max_seq_len allocation (CA): max_text_len only. The residual stream is
 # text-only; image features flow as K/V into separate CrossAttentionBlocks.
@@ -28,9 +30,8 @@
 #       examples/vlm/configs/vlm_7b_siglip2_cross_attn.toml
 #
 # Default points at sayakpaul/coco-30-val-2014: 30,000 image-caption pairs
-# sampled from the COCO 2014 val split, about 4.9 GB to download on first use,
-# so a fresh clone runs without external setup. For real training, override
-# the dataset (and tokenizer) via CLI:
+# sampled from the COCO 2014 val split, about 4.9 GB to download on first use.
+# For real training, override the dataset (and tokenizer) via CLI:
 #   --data.hf_dataset_name=<dataset> --data.tokenizer_path=<tokenizer>
 
 [model]
