@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import multiprocessing
 import time
 from collections.abc import Callable, Iterator, Sequence
 from datetime import timedelta
@@ -92,19 +93,33 @@ def _stop(processes: Sequence[BaseProcess], grace_s: float = 5.0) -> None:
             process.join()
 
 
+def _started(context: mp.ProcessContext | None, before: set[BaseProcess]) -> list[BaseProcess]:
+    """The ranks a failed start or wait leaves to stop.
+
+    That is every rank of ``context``, or, when the start was cut short before ``mp.spawn``
+    returned one, the child processes started since ``before`` was taken.
+    """
+    if context is not None:
+        return list(context.processes)
+    return [p for p in multiprocessing.active_children() if p not in before]
+
+
 def spawn(fn: Callable[..., Any], world: int, *args: Any) -> None:
     """Run ``fn(rank, world, port, *args)`` on ``world`` spawned ranks; raise what a rank raised.
 
-    When the wait is interrupted, for example by a test timeout, the ranks are stopped first.
-    A failure notes the ranks that had not finished their ``gloo_group`` block.
+    When the start or the wait is interrupted, for example by a test timeout, the ranks already
+    started are stopped first. A failure notes the ranks that had not finished their
+    ``gloo_group`` block.
     """
     with held_store(world) as port:
-        context = mp.spawn(fn, args=(world, port, *args), nprocs=world, join=False)
+        before = set(multiprocessing.active_children())
+        context = None
         try:
+            context = mp.spawn(fn, args=(world, port, *args), nprocs=world, join=False)
             while not context.join():
                 pass
         except BaseException:
-            _stop(context.processes)
+            _stop(_started(context, before))
             raise
 
 
@@ -179,16 +194,20 @@ def run_to_outcomes(
     it. ``part_s`` starts once every rank has entered, so start-up never counts against it, and
     a rank still inside then fails the test as still in ``part``. The ranks get ``start_s`` from
     the spawn to enter, and ``exit_s`` to exit once every outcome is written, each failing with
-    its own message. The ranks are stopped before the test fails, and when the wait is
-    interrupted. Under pytest-timeout, give the test a timeout above the three limits and the
+    its own message. The ranks are stopped before the test fails, and when the start or the wait
+    is interrupted. Under pytest-timeout, give the test a timeout above the three limits and the
     stop's grace period combined, or the test timeout fires before a phase limit can.
     """
     for sub in ("reached", "outcome"):
         (out_dir / sub).mkdir(parents=True)
     everyone = set(range(world))
     with held_store(world) as port:
-        context = mp.spawn(fn, args=(world, port, *args, str(out_dir)), nprocs=world, join=False)
+        before = set(multiprocessing.active_children())
+        context = None
         try:
+            context = mp.spawn(
+                fn, args=(world, port, *args, str(out_dir)), nprocs=world, join=False
+            )
             phase, deadline = "start", time.monotonic() + start_s
             while not context.join(timeout=0.5):
                 reached, done = _ranks(out_dir / "reached"), _ranks(out_dir / "outcome")
@@ -213,7 +232,7 @@ def run_to_outcomes(
                     f"ranks {alive} wrote their outcome but did not exit within {exit_s:.0f}s"
                 )
         except BaseException:
-            _stop(context.processes)
+            _stop(_started(context, before))
             raise
     done = _ranks(out_dir / "outcome")
     assert done == everyone, f"ranks {sorted(everyone - done)} exited without an outcome"

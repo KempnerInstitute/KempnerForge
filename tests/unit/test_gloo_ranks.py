@@ -185,6 +185,28 @@ def _interrupt_once_started(
     return processes
 
 
+def _interrupt_once_rank_0_started(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list:
+    """Make the next spawn start rank 0 alone, then raise ``_Interrupt`` before it returns.
+
+    This is an interrupt that lands while the ranks start, before ``mp.spawn`` has handed back
+    any of them. Rank 0 runs as a daemon, so a helper that left it running cannot hold the test
+    session open. Returns the list rank 0's process is added to.
+    """
+    processes: list = []
+    start_ranks = gloo_ranks.mp.spawn
+
+    def start_rank_0_then_interrupt(fn, args=(), **kwargs):
+        context = start_ranks(fn, args=args, nprocs=1, join=False, daemon=True)
+        processes.extend(context.processes)
+        deadline = time.monotonic() + 120
+        while not list(tmp_path.rglob("started0")) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        raise _Interrupt
+
+    monkeypatch.setattr(gloo_ranks.mp, "spawn", start_rank_0_then_interrupt)
+    return processes
+
+
 class TestHeldStore:
     def test_no_other_socket_can_take_the_port_while_it_is_held(self):
         with held_store() as port:
@@ -218,6 +240,13 @@ class TestSpawn:
             spawn(fn, 2, str(tmp_path))
         assert sorted(p.name for p in tmp_path.iterdir()) == ["started0", "started1"]
         assert [p.exitcode for p in processes] == [-signum, -signum]
+
+    def test_an_interrupted_start_stops_the_ranks_already_started(self, tmp_path, monkeypatch):
+        """An interrupt before ``mp.spawn`` returns still stops the rank it had started."""
+        processes = _interrupt_once_rank_0_started(tmp_path, monkeypatch)
+        with pytest.raises(_Interrupt):
+            spawn(_stuck, 2, str(tmp_path))
+        assert [p.exitcode for p in processes] == [-signal.SIGTERM]
 
     def test_a_rank_that_raises_fails_the_test(self):
         """Rank 1's error reaches the test, and rank 0, waiting to leave, is stopped."""
@@ -327,3 +356,10 @@ class TestRunToOutcomes:
             run_to_outcomes(_stuck, 2, (), tmp_path / "ranks", part="save()", part_s=1.0)
         assert sorted(p.name for p in tmp_path.rglob("started*")) == ["started0", "started1"]
         assert [p.exitcode for p in processes] == [-signal.SIGTERM, -signal.SIGTERM]
+
+    def test_an_interrupted_start_stops_the_ranks_already_started(self, tmp_path, monkeypatch):
+        """An interrupt before ``mp.spawn`` returns still stops the rank it had started."""
+        processes = _interrupt_once_rank_0_started(tmp_path, monkeypatch)
+        with pytest.raises(_Interrupt):
+            run_to_outcomes(_stuck, 2, (), tmp_path / "ranks", part="save()", part_s=1.0)
+        assert [p.exitcode for p in processes] == [-signal.SIGTERM]
