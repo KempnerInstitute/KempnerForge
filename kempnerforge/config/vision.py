@@ -30,12 +30,20 @@ Field summary:
   matmuls where it runs. It applies to the training build
   (``build_parallel_model``); ``build_vlm_wrapper`` leaves every dtype to
   its caller.
+- ``drop_pooling_head`` removes a SigLIP tower's attention-pooling head, which
+  HF runs for a pooled output the encoder never returns. Only an encoder whose
+  builder declares a ``drop_pooling_head`` parameter takes it (``siglip2``);
+  any other type is refused here. A checkpoint saved with the head loads into
+  a model built without it, since the head's tensors are not requested; one
+  saved without the head does not load into a model that has it.
 """
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from kempnerforge.config.registry import registry
 
@@ -48,7 +56,7 @@ class VisionEncoderConfig:
     """Configuration for the vision encoder component of a VLM.
 
     ``drop_pooling_head`` removes a SigLIP tower's attention-pooling head, whose
-    pooled output the encoder never returns.
+    pooled output the encoder never returns; the encoder's builder must declare it.
     """
 
     type: str = "random"
@@ -79,6 +87,13 @@ class VisionEncoderConfig:
                 "vision_encoder.mixed_precision must be one of ['bf16', 'fp32'] "
                 f"or unset (got {self.mixed_precision!r})"
             )
+        if self.drop_pooling_head and not _declares_drop_pooling_head(
+            registry.get_vision_encoder(self.type)
+        ):
+            raise ValueError(
+                f"vision_encoder.type = {self.type!r} cannot drop a pooling head: its builder "
+                "declares no drop_pooling_head parameter. Leave drop_pooling_head = false."
+            )
 
     @property
     def compute_dtype(self) -> torch.dtype | None:
@@ -88,3 +103,12 @@ class VisionEncoderConfig:
         import torch
 
         return {"bf16": torch.bfloat16, "fp32": torch.float32}[self.mixed_precision]
+
+
+def _declares_drop_pooling_head(builder: Callable[..., Any]) -> bool:
+    """Whether ``builder`` names a ``drop_pooling_head`` parameter passable by keyword."""
+    parameter = inspect.signature(builder, follow_wrapped=False).parameters.get("drop_pooling_head")
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )

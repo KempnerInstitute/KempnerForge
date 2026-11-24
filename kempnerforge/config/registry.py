@@ -123,7 +123,9 @@ class Registry:
 
         Builders take ``(path: str, **kwargs)`` and return a ``VisionEncoder``
         that produces ``(B, num_tokens, feature_dim)`` patch tokens from
-        ``(B, 3, H, W)`` pixel values.
+        ``(B, 3, H, W)`` pixel values. A builder that can remove a pooling head
+        declares a ``drop_pooling_head`` parameter; ``VisionEncoderConfig``
+        refuses that option for any other.
         """
 
         def decorator(fn: Callable) -> Callable:
