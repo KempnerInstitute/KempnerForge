@@ -24,8 +24,10 @@ with their documented limitation that they restore rank 0's copy everywhere.
 An envelope saved on another world size or data-parallel layout is refused
 with ``RankStateMismatchError``. Its RNG captures cannot follow the change, but
 the data position a ``StatefulDataLoader`` saves with a ``DistributedSampler``
-is the same on every rank, so ``saved_data_position`` reads it for a resume
-that continues anyway.
+is the same on every rank, and a stream's, which counts one data-parallel
+rank's part of the stream, fits that data-parallel rank on the saved
+data-parallel size, so ``saved_data_position`` reads them for a resume that
+continues anyway.
 """
 
 from __future__ import annotations

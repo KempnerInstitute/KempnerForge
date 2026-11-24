@@ -1316,7 +1316,7 @@
     "kempnerforge/checkpoint/manager.py": {
       "classes": {
         "CheckpointManager": {
-          "purpose": "DCP-based distributed checkpoint save/load/cleanup manager. Cross-arch VLM freeze-metadata validation, rank-0-authoritative train_state existence broadcast (NFS/Lustre stat() race), ownership-gated train_state.pt load. Per-rank loader/RNG envelope: an exact resume restores each rank's own entry and refuses a changed world size or data-parallel layout on every rank; checkpoint.ignore_rank_state_mismatch resumes past the refusal, keeping the saved rank 0's data position where the loader can place it and restarting the RNG streams",
+          "purpose": "DCP-based distributed checkpoint save/load/cleanup manager. Cross-arch VLM freeze-metadata validation, rank-0-authoritative train_state existence broadcast (NFS/Lustre stat() race), ownership-gated train_state.pt load. Per-rank loader/RNG envelope: an exact resume restores each rank's own entry and refuses a changed world size or data-parallel layout on every rank; checkpoint.ignore_rank_state_mismatch resumes past the refusal, keeping the saved data position (rank 0's, or for a stream on the saved data-parallel size each data-parallel rank's own) where every rank's loader can place it, else restarting the data on every rank, and restarting the RNG streams",
           "methods": [
             "save(step, tokens_seen, scheduler, dataloader, extra)",
             "has_pending_save (property: an async save to drain or a latest commit to make)",
@@ -1325,7 +1325,7 @@
             "peek_saved_step(path)",
             "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected, fresh_if_unheld, warm_start, exact_resume)",
             "_per_rank_view(train_state) -> (view, carried) (on an exact resume, this rank's own envelope entry over the single-copy keys; a mismatch refuses unless ignore_rank_state_mismatch, and a checkpoint with no envelope restores rank 0's copy unless that flag is set)",
-            "_resume_past_mismatch(view, envelope, error) -> (view, carried) (with ignore_rank_state_mismatch: a changed topology keeps the saved rank 0's data position if the envelope is sound where it was saved, else drops it; never restores RNG)",
+            "_resume_past_mismatch(view, envelope, error) -> (view, carried) (with ignore_rank_state_mismatch: a changed topology keeps the saved data position if the envelope is sound where it was saved, rank 0's or for a stream on the saved data-parallel size its own data-parallel rank's, else drops it; never restores RNG)",
             "_resume_without_rank_state(train_state) -> (view, carried) (with ignore_rank_state_mismatch, a checkpoint with no per-rank state resumes as if the topology changed: rank 0's data position kept, its RNG dropped)",
             "_read_saved_keys(dcp_dir) -> (keys, restored_on_any_rank) (this rank's DCP keys; with a scope or multipliers an all-reduce on the gloo group tells every rank whether any rank's index holds optimizer state)",
             "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope, multipliers and group-layout checks all decide from it)",

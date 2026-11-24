@@ -20,10 +20,12 @@ only on the world size and data-parallel layout that saved them, so an exact
 resume under a changed topology raises on every rank. Setting
 ``checkpoint.ignore_rank_state_mismatch`` resumes it anyway: step, model,
 optimizer and scheduler resume onto the new topology and the random streams
-restart fresh, while the data position the saved rank 0 reached, which a
-``StatefulDataLoader`` counts across all data-parallel ranks, carries over
-where the loader can place it on the new layout and restarts at the first
-sample where it cannot. An envelope the flag lets through for another reason
+restart fresh, while the saved data position carries over where every rank's
+loader can place it on the new layout, and every rank restarts at the first
+sample where one cannot. That position is the one the saved rank 0 reached,
+which a ``StatefulDataLoader`` counts across all data-parallel ranks, or for a
+stream on the saved data-parallel size the one each data-parallel rank saved
+for its own part. An envelope the flag lets through for another reason
 (unreadable or incomplete) restores neither loader nor RNG state. A checkpoint
 saved before per-rank state was recorded cannot show whether the topology
 changed, so under the flag it resumes as if it had.
