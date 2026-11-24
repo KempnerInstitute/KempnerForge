@@ -16,8 +16,8 @@ jobs:
         with:
           python-version: "3.14"
       - run: uv sync --group video
-      - run: uv run ruff check kempnerforge/ tests/ scripts/
-      - run: uv run ruff format --check kempnerforge/ tests/ scripts/
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
       - run: uv run pyright kempnerforge/
 
   unit-tests-python:

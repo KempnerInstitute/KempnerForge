@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import os
 import signal
-import socket
 import subprocess
 import sys
 import threading
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
@@ -34,21 +31,12 @@ from kempnerforge.resilience.signal_handler import (
     ShutdownHandler,
     ignore_shutdown_signals_in_worker,
 )
-
-
-def _free_port() -> int:
-    """An unused local TCP port for the gloo rendezvous."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+from tests.gloo_ranks import gloo_group, spawn
 
 
 def _check_ranks_agree(rank: int, world: int, port: int, nan_rank: int | None) -> None:
     """Only ``nan_rank`` holds a NaN, in its shard of a row-sharded weight."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
         weight = torch.zeros(2 * world, 3)
         if nan_rank is not None:
@@ -56,32 +44,22 @@ def _check_ranks_agree(rank: int, world: int, port: int, nan_rank: int | None) -
         model = torch.nn.Linear(3, 2 * world)
         model.weight = torch.nn.Parameter(distribute_tensor(weight, mesh, [Shard(0)]))
         assert params_are_finite(model, "cpu") is (nan_rank is None)
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_loss_across_ranks(rank: int, world: int, port: int) -> None:
     """Only rank 1 has a NaN loss, then a non-finite gradient norm; every rank fails both."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         det = NaNDetector(action="warn")
         assert det.check_loss(1.0, step=1) is True
         assert det.check_loss(float("nan") if rank == 1 else 1.0, step=2) is False
         assert det.check_loss(1.0, step=3, grad_norm=float("inf") if rank == 1 else 0.5) is False
         assert det.state.consecutive_nans == 2
         assert det.state.nan_steps == [2, 3]
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_gradients_across_ranks(rank: int, world: int, port: int) -> None:
     """Only rank 1 holds a NaN gradient, then in its shard of a sharded one; every rank fails."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         det = NaNDetector(action="warn")
         model = torch.nn.Linear(3, 2)
         model.weight.grad = torch.zeros(2, 3)
@@ -101,8 +79,6 @@ def _check_gradients_across_ranks(rank: int, world: int, port: int) -> None:
         grad[2] = float("nan")
         sharded.weight.grad = distribute_tensor(grad, mesh, [Shard(0)])
         assert det.check_gradients(sharded, step=4) is False
-    finally:
-        dist.destroy_process_group()
 
 
 _TRITON_COMPILE_CHILD = """
@@ -597,11 +573,11 @@ class TestNaNDetectorAcrossRanks:
 
     def test_check_loss_reduces_its_flag_over_gloo(self):
         """Rank 0's own values are finite, so only the all-reduce can fail its check."""
-        mp.spawn(_check_loss_across_ranks, args=(2, _free_port()), nprocs=2)
+        spawn(_check_loss_across_ranks, 2)
 
     def test_check_gradients_gives_every_rank_the_same_verdict(self):
         """Rank 0's own gradients are finite, so only the all-reduce can fail its check."""
-        mp.spawn(_check_gradients_across_ranks, args=(2, _free_port()), nprocs=2)
+        spawn(_check_gradients_across_ranks, 2)
 
 
 class TestParamsAreFinite:
@@ -619,7 +595,7 @@ class TestParamsAreFinite:
     @pytest.mark.parametrize("nan_rank", [None, 1], ids=["finite", "nan-on-rank-1"])
     def test_every_rank_gets_the_same_answer(self, nan_rank):
         """Rank 0's own shard is finite, so only the all-reduce can fail its check."""
-        mp.spawn(_check_ranks_agree, args=(2, _free_port(), nan_rank), nprocs=2)
+        spawn(_check_ranks_agree, 2, nan_rank)
 
 
 class TestGPUHealth:

@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import fnmatch
-import socket
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 
@@ -25,15 +22,10 @@ from kempnerforge.distributed.parallel import (
 )
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.optimizer import build_optimizer
+from tests.gloo_ranks import gloo_group, spawn
 
 CONFIG = ModelConfig(dim=64, n_layers=2, n_heads=4, vocab_size=128, max_seq_len=32)
 OPTIMIZERS = sorted(registry.list("optimizer"))
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _tokens(seed: int) -> torch.Tensor:
@@ -124,13 +116,8 @@ CHECKS: dict[str, Callable[[int, int], None]] = {
 
 
 def _run(rank: int, world: int, port: int, check: str) -> None:
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         CHECKS[check](rank, world)
-    finally:
-        dist.destroy_process_group()
 
 
 class TestShardedFp32MasterWeights:
@@ -138,7 +125,7 @@ class TestShardedFp32MasterWeights:
 
     @pytest.mark.parametrize("check", sorted(CHECKS))
     def test_check(self, check: str) -> None:
-        mp.spawn(_run, args=(2, _free_port(), check), nprocs=2)
+        spawn(_run, 2, check)
 
 
 class TestAutocastDtype:

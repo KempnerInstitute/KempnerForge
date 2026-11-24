@@ -94,9 +94,7 @@ def run_forward_benchmarks() -> list[BenchmarkResult]:
         with torch.no_grad():
             m(x)
 
-    results.append(
-        run_benchmark(mlp_fn, name="MLP (SwiGLU, 125M)", tokens_per_iter=toks_per_iter)
-    )
+    results.append(run_benchmark(mlp_fn, name="MLP (SwiGLU, 125M)", tokens_per_iter=toks_per_iter))
 
     del model, attn, mlp
     torch.cuda.empty_cache()

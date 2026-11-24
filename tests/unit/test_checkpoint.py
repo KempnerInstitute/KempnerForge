@@ -34,6 +34,7 @@ from kempnerforge.config.schema import (
 )
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.optimizer import Muon, _should_decay, build_optimizer
+from tests.gloo_ranks import gloo_group, spawn
 
 
 class TestRNGState:
@@ -698,6 +699,12 @@ def _mock_dcp_load(monkeypatch):
         "kempnerforge.checkpoint.manager.dcp.FileSystemReader", MagicMock(return_value=reader)
     )
     monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+
+
+def _listing(directory: Path) -> list[str]:
+    """The names in ``directory``, without the ``.nfs*`` entries an NFS client keeps for a
+    replaced or removed file that is still open, until its last reference closes."""
+    return sorted(p.name for p in directory.iterdir() if not p.name.startswith(".nfs"))
 
 
 def _make_mock_mgr(
@@ -1721,7 +1728,12 @@ class TestSaveCheckpointRegistration:
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
         assert len(warnings) == 1 and "<unprintable Unprintable>" in warnings[0]
 
-    def test_record_amends_one_record_atomically_through_a_temp_file(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("nfs_held", [False, True], ids=["local", "nfs-held"])
+    def test_record_amends_one_record_atomically_through_a_temp_file(
+        self, tmp_path, monkeypatch, nfs_held
+    ):
+        """With ``nfs-held`` the replace keeps the old sidecar under a ``.nfs`` name, as an NFS
+        client does while that file is still open; the listing leaves that entry out."""
         _, registrar = self._registered(tmp_path, monkeypatch, {"mlflow": {"model_name": "m"}})
         sidecar = tmp_path / "step_1" / "metadata.json"
         sidecar.chmod(0o640)
@@ -1730,6 +1742,8 @@ class TestSaveCheckpointRegistration:
 
         def spy(src, dst):
             replaced.append((Path(src), Path(dst), Path(src).read_text()))
+            if nfs_held:
+                os.link(dst, Path(dst).with_name(".nfs000000000000000200000002"))
             replace(src, dst)
 
         monkeypatch.setattr(os, "replace", spy)
@@ -1743,7 +1757,7 @@ class TestSaveCheckpointRegistration:
         }
         assert sidecar.read_text() == text == json.dumps(expected, indent=2)
         assert stat.S_IMODE(sidecar.stat().st_mode) == 0o640
-        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+        assert _listing(sidecar.parent) == [
             "metadata.json",
             "train_state.pt",
         ]
@@ -1783,7 +1797,7 @@ class TestSaveCheckpointRegistration:
         warnings = self._log(monkeypatch, "warning")
         registrar.records[0]("mlflow", {"model_id": "m-1"})
         assert sidecar.read_bytes() == before
-        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+        assert _listing(sidecar.parent) == [
             "metadata.json",
             "train_state.pt",
         ]
@@ -1804,7 +1818,7 @@ class TestSaveCheckpointRegistration:
         with pytest.raises(OSError, match="disk full"):
             mgr.save(step=1, tokens_seen=16)
         assert sidecar.read_bytes() == before
-        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+        assert _listing(sidecar.parent) == [
             "metadata.json",
             "train_state.pt",
         ]
@@ -4223,6 +4237,152 @@ class TestMuonResume:
 REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
 
 
+class TestOptimizerTypeChangeOnResume:
+    """A checkpoint saved with another optimizer fails to load, whichever has more state (#239)."""
+
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    CONFIG = ModelConfig(dim=64, n_layers=1, n_heads=2, vocab_size=256, max_seq_len=64)
+
+    def _resume(self, saved_with: str, resumed_with: str, tmp_path):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = Transformer(self.CONFIG).to(self.DEVICE)
+        saver = build_optimizer(model, OptimizerConfig(name=saved_with, lr=1e-3, fused=False))
+        TestMuonResume._save_stepped(model, saver, tmp_path)
+        model2 = Transformer(self.CONFIG).to(self.DEVICE)
+        optimizer = build_optimizer(
+            model2, OptimizerConfig(name=resumed_with, lr=1e-4, fused=False)
+        )
+        return CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, optimizer)
+
+    def test_an_adamw_checkpoint_fails_to_load_into_a_lion_run(self, tmp_path):
+        manager = self._resume("adamw", "lion", tmp_path)
+        entries = "saved with ['exp_avg', 'exp_avg_sq', 'step'] and is now kept with ['exp_avg']"
+        with pytest.raises(RuntimeError, match="holds another optimizer's state") as raised:
+            manager.load()
+        assert entries in str(raised.value)
+        assert "exclude_from_loading" in str(raised.value)
+
+    def test_a_lion_checkpoint_fails_to_load_into_an_adamw_run(self, tmp_path):
+        """Lion keeps less state than AdamW, so its checkpoint is refused as partial state,
+        with the optimizer.name change named as a cause."""
+        manager = self._resume("lion", "adamw", tmp_path)
+        with pytest.raises(RuntimeError, match="holds partial optimizer state") as raised:
+            manager.load()
+        assert "optimizer.name changed since the save" in str(raised.value)
+        assert "exclude_from_loading" in str(raised.value)
+
+    def test_the_same_optimizer_resumes(self, tmp_path):
+        assert self._resume("adamw", "adamw", tmp_path).load()[0] == 1
+
+    @staticmethod
+    def _expert_rank(
+        rank: int | None, optimizer: str, amsgrad: tuple[int, ...] = (), lr: float = 1e-3
+    ):
+        """A one-layer MoE model of four experts, or EP rank ``rank`` of two holding two of them.
+
+        Only the experts train, under ``build_optimizer``'s ``optimizer``, or with ``amsgrad`` under
+        an AdamW of two groups at ``lr``: the experts of those global indices with amsgrad, the rest
+        without.
+        """
+        torch.manual_seed(4)
+        config = ModelConfig(
+            dim=16, n_layers=1, n_heads=2, vocab_size=32, max_seq_len=16, num_experts=4
+        )
+        model = Transformer(config)
+        start = 0 if rank is None else 2 * rank
+        if rank is not None:
+            moe = model.layers["0"].mlp
+            moe.experts = torch.nn.ModuleList(list(moe.experts)[start : start + 2])
+            moe.ep_world_size, moe.local_expert_start, moe.num_local_experts = 2, start, 2
+        for name, param in model.named_parameters():
+            param.requires_grad_(".experts." in name)
+        if not amsgrad:
+            options = OptimizerConfig(name=optimizer, lr=1e-3, fused=False)
+            return model, build_optimizer(model, options)
+        groups: tuple[list, list] = ([], [])
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                index = start + int(name.split(".experts.")[1].split(".")[0])
+                groups[index not in amsgrad].append(param)
+        return model, torch.optim.AdamW(
+            [{"params": groups[0], "amsgrad": True}, {"params": groups[1]}], lr=lr
+        )
+
+    def test_each_expert_is_compared_with_its_own_saved_state_under_ep(self, tmp_path):
+        """Rank 1's local experts 0 and 1 resume the saved experts 2 and 3.
+
+        Their state, their groups' settings, and the update the next step makes all match the
+        saving run's, although the resumed optimizer was built with another learning rate.
+        """
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        source, saver = self._expert_rank(None, "adamw", amsgrad=(0, 3))
+        TestMuonResume._save_stepped(source, saver, tmp_path)
+        model, optimizer = self._expert_rank(1, "adamw", amsgrad=(0, 3), lr=5e-2)
+        assert (
+            CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer).load()[0] == 1
+        )
+
+        def settings(opt: torch.optim.Optimizer) -> list[dict]:
+            return [{k: v for k, v in group.items() if k != "params"} for group in opt.param_groups]
+
+        assert settings(optimizer) == settings(saver)
+        saved = dict(source.named_parameters())
+        held = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                local = int(name.split(".experts.")[1].split(".")[0])
+                held[name] = saved[name.replace(f".experts.{local}.", f".experts.{local + 2}.")]
+                _assert_same_state_dict(saver.state[held[name]], optimizer.state[param], name)
+                assert torch.equal(param, held[name]), name
+                param.grad = torch.randn_like(param)
+                held[name].grad = param.grad.clone()
+        optimizer.step()
+        saver.step()
+        for name, param in model.named_parameters():
+            if name in held:
+                assert torch.equal(param, held[name]), f"{name} took another update"
+
+    def test_an_adamw_expert_state_fails_to_load_into_a_lion_ep_rank(self, tmp_path):
+        """Only experts 2 and 3 were stepped, so only rank 1's experts hold the AdamW state."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        source, saver = self._expert_rank(None, "adamw")
+        for name, param in source.named_parameters():
+            if ".experts.2." in name or ".experts.3." in name:
+                param.grad = torch.randn_like(param)
+        saver.step()
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), source, saver).save(step=1)
+        model, optimizer = self._expert_rank(1, "lion")
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        with pytest.raises(RuntimeError, match=r"holds another optimizer's state.*experts\.2\."):
+            manager.load()
+
+    def test_another_or_a_partial_state_is_refused(self):
+        """A frozen parameter keeps no state, so it is not compared; a state with entries the
+        optimizer does not keep is refused as another optimizer's, and one short of entries
+        as partial."""
+        from kempnerforge.checkpoint.manager import _check_saved_state_matches
+
+        adamw, lion = ("exp_avg", "exp_avg_sq", "step"), ("exp_avg",)
+
+        def check(kept: tuple, saved: tuple) -> None:
+            optim_state = {"state": {"frozen": {}, "w": dict.fromkeys(kept, 0)}}
+            keys = [f"optimizer.state.{fqn}.{entry}" for fqn in ("frozen", "w") for entry in saved]
+            _check_saved_state_matches(optim_state, keys, Path("ckpt"))
+
+        check(kept=adamw, saved=adamw)
+        with pytest.raises(
+            RuntimeError, match=re.escape("holds partial optimizer state for 1 parameters: ['w']")
+        ):
+            check(kept=adamw, saved=lion)
+        with pytest.raises(
+            RuntimeError, match=re.escape("holds another optimizer's state for 1 parameters: ['w']")
+        ):
+            check(kept=lion, saved=adamw)
+
+
 class TestSaveBeforeFirstStep:
     """The step-0 save and a load without an optimizer, for every registered optimizer."""
 
@@ -4497,32 +4657,14 @@ class TestResumeWithoutTrainState:
         assert not missing_train_state(path)
 
 
-def _free_port() -> int:
-    """An unused local TCP port for a gloo rendezvous."""
-    import socket
-
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _load_with_a_stale_view(rank: int, world: int, port: int, ckpt_dir: str, stale: int) -> None:
     """Save on every rank, then load while rank ``stale`` cannot see ``train_state.pt``."""
     from datetime import timedelta
     from unittest.mock import patch
 
-    import torch.distributed as dist
-
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         torch.manual_seed(0)
         model = torch.nn.Linear(4, 4)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -4542,8 +4684,6 @@ def _load_with_a_stale_view(rank: int, world: int, port: int, ckpt_dir: str, sta
                     manager.load()
             else:
                 assert manager.load() == (3, 30, {})
-    finally:
-        dist.destroy_process_group()
 
 
 class TestResumeWithoutTrainStateAcrossRanks:
@@ -4552,9 +4692,7 @@ class TestResumeWithoutTrainStateAcrossRanks:
     @pytest.mark.parametrize("stale", [0, 1], ids=["rank_0_sees_none", "rank_1_sees_none"])
     def test_every_rank_follows_rank_zero(self, tmp_path, stale):
         """No rank raises alone and leaves the others waiting in a collective."""
-        import torch.multiprocessing as mp
-
-        mp.spawn(_load_with_a_stale_view, args=(2, _free_port(), str(tmp_path), stale), nprocs=2)
+        spawn(_load_with_a_stale_view, 2, str(tmp_path), stale)
 
 
 class _Unprintable(Exception):
@@ -4578,14 +4716,7 @@ def _load_an_unreadable_train_state(
     from kempnerforge.checkpoint import manager as mgr_mod
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=60),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=60)):
         torch.manual_seed(0)
         model = torch.nn.Linear(4, 4)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -4622,8 +4753,6 @@ def _load_an_unreadable_train_state(
         ):
             manager.load()
         assert time.monotonic() - start < 20
-    finally:
-        dist.destroy_process_group()
 
 
 class TestUnreadableTrainStateAcrossRanks:
@@ -4632,11 +4761,7 @@ class TestUnreadableTrainStateAcrossRanks:
     @pytest.mark.parametrize("how", ["torn", "foreign", "unprintable"])
     def test_every_rank_raises_rank_zeros_error(self, tmp_path, how):
         """Rank 0 raises its own error; rank 1 names it, instead of waiting for the timeout."""
-        import torch.multiprocessing as mp
-
-        mp.spawn(
-            _load_an_unreadable_train_state, args=(2, _free_port(), str(tmp_path), how), nprocs=2
-        )
+        spawn(_load_an_unreadable_train_state, 2, str(tmp_path), how)
 
 
 def _refuse_on_one_stage(
@@ -4649,14 +4774,7 @@ def _refuse_on_one_stage(
 
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         stages = [dist.new_group([r]) for r in range(world)]
 
         def manager(optimizer_name: str) -> tuple[torch.nn.Module, CheckpointManager]:
@@ -4691,8 +4809,6 @@ def _refuse_on_one_stage(
         with pytest.raises(RuntimeError, match=expected):
             loader.load()
         assert torch.equal(model.weight, before), "a refused load changed the model"
-    finally:
-        dist.destroy_process_group()
 
 
 def _resume_with_a_torn_stage(rank: int, world: int, port: int, ckpt_dir: str, case: str) -> None:
@@ -4714,14 +4830,7 @@ def _resume_with_a_torn_stage(rank: int, world: int, port: int, ckpt_dir: str, c
 
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         stages = [dist.new_group([r]) for r in range(world)]
 
         def manager() -> tuple[torch.nn.Module, CheckpointManager]:
@@ -4784,8 +4893,6 @@ def _resume_with_a_torn_stage(rank: int, world: int, port: int, ckpt_dir: str, c
         }.get(case, (10, 100, at_10))
         assert (step, tokens) == expected[:2], f"rank {rank} resumed step {step}"
         assert torch.equal(model.weight, expected[2]), f"rank {rank} loaded another step's weights"
-    finally:
-        dist.destroy_process_group()
 
 
 class TestTornStageAcrossRanks:
@@ -4804,9 +4911,7 @@ class TestTornStageAcrossRanks:
     )
     def test_every_stage_resumes_the_same_step(self, tmp_path, case):
         """No stage loads a step another stage does not, whatever its own view."""
-        import torch.multiprocessing as mp
-
-        mp.spawn(_resume_with_a_torn_stage, args=(2, _free_port(), str(tmp_path), case), nprocs=2)
+        spawn(_resume_with_a_torn_stage, 2, str(tmp_path), case)
 
 
 def _load_with_a_blind_rank(rank: int, world: int, port: int, ckpt_dir: str, case: str) -> None:
@@ -4818,14 +4923,7 @@ def _load_with_a_blind_rank(rank: int, world: int, port: int, ckpt_dir: str, cas
 
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         torch.manual_seed(0)
         model = torch.nn.Linear(4, 4)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -4858,8 +4956,6 @@ def _load_with_a_blind_rank(rank: int, world: int, port: int, ckpt_dir: str, cas
         expected = (0, 0) if case == "weights_only" else (5, 50)
         assert (step, tokens) == expected, f"rank {rank} loaded step {step}"
         assert torch.equal(model.weight, saved), f"rank {rank} did not load the saved weights"
-    finally:
-        dist.destroy_process_group()
 
 
 class TestBlindRankLoadsWhatRankZeroResolves:
@@ -4868,9 +4964,7 @@ class TestBlindRankLoadsWhatRankZeroResolves:
 
     @pytest.mark.parametrize("case", ["warm_start", "weights_only", "named_path", "bare_latest"])
     def test_every_rank_loads_the_checkpoint(self, tmp_path, case):
-        import torch.multiprocessing as mp
-
-        mp.spawn(_load_with_a_blind_rank, args=(2, _free_port(), str(tmp_path), case), nprocs=2)
+        spawn(_load_with_a_blind_rank, 2, str(tmp_path), case)
 
 
 class TestOptimizerChecksAcrossStages:
@@ -4880,17 +4974,11 @@ class TestOptimizerChecksAcrossStages:
     @pytest.mark.parametrize("refusing", [0, 1], ids=["stage_0_refuses", "stage_1_refuses"])
     def test_every_rank_refuses_when_one_stage_does(self, tmp_path, refusing, scope):
         """No rank goes on to load while another has refused, whatever the manager records."""
-        import torch.multiprocessing as mp
-
-        args = (2, _free_port(), str(tmp_path), refusing, scope)
-        mp.spawn(_refuse_on_one_stage, args=args, nprocs=2)
+        spawn(_refuse_on_one_stage, 2, str(tmp_path), refusing, scope)
 
     def test_a_stage_without_saved_optimizer_state_resumes_with_the_others(self, tmp_path):
         """A stage whose checkpoint holds no optimizer state still meets the other stages."""
-        import torch.multiprocessing as mp
-
-        args = (2, _free_port(), str(tmp_path))
-        mp.spawn(_resume_with_one_stage_unstepped, args=args, nprocs=2)
+        spawn(_resume_with_one_stage_unstepped, 2, str(tmp_path))
 
 
 def _resume_with_one_stage_unstepped(rank: int, world: int, port: int, ckpt_dir: str) -> None:
@@ -4905,14 +4993,7 @@ def _resume_with_one_stage_unstepped(rank: int, world: int, port: int, ckpt_dir:
 
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         stages = [dist.new_group([r]) for r in range(world)]
 
         def manager(seed: int, step: bool):
@@ -4944,8 +5025,6 @@ def _resume_with_one_stage_unstepped(rank: int, world: int, port: int, ckpt_dir:
             )
         else:
             assert not resumed_optimizer.state
-    finally:
-        dist.destroy_process_group()
 
 
 def _assert_same_state_dict(expected, actual, where="state_dict"):

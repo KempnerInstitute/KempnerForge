@@ -15,15 +15,14 @@ from __future__ import annotations
 import dataclasses
 import os
 import signal
-import socket
-import time
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
+
+from tests.gloo_ranks import gloo_group, mark, run_to_outcomes, spawn, write_outcome
 
 WORLD = 2
 PG_TIMEOUT_S = 30
@@ -33,34 +32,17 @@ SAVE_ROUNDS = 10
 VOTES_PER_SAVE = 100
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _init(rank: int, port: int, timeout_s: float = PG_TIMEOUT_S) -> None:
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=WORLD,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=timeout_s),
-    )
-
-
-def _check_any_rank(rank: int, port: int, flags: tuple[bool, ...]) -> None:
+def _check_any_rank(rank: int, world: int, port: int, flags: tuple[bool, ...]) -> None:
     from kempnerforge.distributed.utils import any_rank, new_control_group
 
-    _init(rank, port)
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=PG_TIMEOUT_S)):
         group = new_control_group(PG_TIMEOUT_S)
         assert any_rank(flags[rank], group) is any(flags)
-    finally:
-        dist.destroy_process_group()
 
 
-def _vote_beside_async_saves(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
+def _vote_beside_async_saves(
+    rank: int, world: int, port: int, case: str, root: str, out_dir: str
+) -> None:
     """Cast votes on the control group while each of a run of async saves is in flight.
 
     ``dcp.async_save`` runs gloo collectives on the default group from a background
@@ -71,25 +53,22 @@ def _vote_beside_async_saves(rank: int, port: int, case: str, root: str, out_dir
 
     from kempnerforge.distributed.utils import any_rank, new_control_group
 
-    _init(rank, port, VOTE_TIMEOUT_S)
-    try:
-        group = new_control_group(VOTE_TIMEOUT_S)
-        state = {f"w{k}": torch.full((256, 256), float(k)) for k in range(64)}
-        wrong = 0
-        for i in range(SAVE_ROUNDS):
-            future = dcp.async_save(state, checkpoint_id=f"{root}/save_{i}")
-            last = i == SAVE_ROUNDS - 1
-            for _ in range(VOTES_PER_SAVE):
-                wrong += any_rank(rank == 1 and last, group) is not last
-            future.result()
-        outcome = f"rounds={SAVE_ROUNDS} wrong={wrong}"
-    except BaseException as e:
-        outcome = f"{type(e).__name__}: {e}"
-    Path(out_dir, f"rank{rank}").write_text(outcome)
-    deadline = time.monotonic() + DEADLINE_S
-    while len(list(Path(out_dir).iterdir())) < WORLD and time.monotonic() < deadline:
-        time.sleep(0.2)
-    dist.destroy_process_group()
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=VOTE_TIMEOUT_S)):
+        try:
+            group = new_control_group(VOTE_TIMEOUT_S)
+            state = {f"w{k}": torch.full((256, 256), float(k)) for k in range(64)}
+            mark(out_dir, rank)
+            wrong = 0
+            for i in range(SAVE_ROUNDS):
+                future = dcp.async_save(state, checkpoint_id=f"{root}/save_{i}")
+                last = i == SAVE_ROUNDS - 1
+                for _ in range(VOTES_PER_SAVE):
+                    wrong += any_rank(rank == 1 and last, group) is not last
+                future.result()
+            outcome = f"rounds={SAVE_ROUNDS} wrong={wrong}"
+        except BaseException as e:
+            outcome = f"{type(e).__name__}: {e}"
+        write_outcome(out_dir, rank, outcome)
 
 
 def _signal_on(signaled_step: int):
@@ -119,83 +98,76 @@ def _group_lifetime(loop, session) -> str:
     return f"{made} kept={session.control_group is mine} works={any_rank(True, mine)}"
 
 
-def _run_loop(rank: int, port: int, case: str, root: str, out_dir: str) -> None:
-    """Run the loop on one rank and write how it ended, then wait for the other rank."""
-    _init(rank, port)
-    try:
-        import kempnerforge.training.loop as loop
-        from kempnerforge.checkpoint.manager import CheckpointManager
-        from tests.unit.test_train_entry import (
-            FakeCheckpointManager,
-            FakeShutdownHandler,
-            _nan_on,
-            make_config,
-            make_session,
-        )
-
-        config = make_config(max_steps=6)
-        config.checkpoint.dir = root
-        config.checkpoint.interval = 100
-        config.distributed.nccl_timeout_sec = PG_TIMEOUT_S
-        signaled = rank == 1 and case in ("shutdown", "shutdown-dcp")
-        overrides: dict = {"shutdown_handler": FakeShutdownHandler(2 if signaled else None)}
-        if case == "nan" and rank == 0:
-            overrides["step_fn"] = _nan_on({1})
-        if case == "timer":
-            from kempnerforge.resilience.signal_handler import ShutdownHandler
-
-            overrides["shutdown_handler"] = ShutdownHandler(timeout_sec=300)
-            overrides["shutdown_handler"].register()
-            if rank == 1:
-                overrides["step_fn"] = _signal_on(1)
-        session = make_session(config, **overrides)
-        session.runtime = dataclasses.replace(
-            session.runtime, rank=rank, local_rank=rank, world_size=WORLD
-        )
-        if case == "shutdown-dcp":
-            session.checkpointer = CheckpointManager(
-                config.checkpoint, session.model, session.optimizer
+def _run_loop(rank: int, world: int, port: int, case: str, root: str, out_dir: str) -> None:
+    """Run the loop on one rank and write how it ended."""
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=PG_TIMEOUT_S)):
+        try:
+            import kempnerforge.training.loop as loop
+            from kempnerforge.checkpoint.manager import CheckpointManager
+            from tests.unit.test_train_entry import (
+                FakeCheckpointManager,
+                FakeShutdownHandler,
+                _nan_on,
+                make_config,
+                make_session,
             )
-        if case == "health":
-            config.train.nccl_health_check_interval = 2
-            loop.check_nccl_health = lambda: rank != 1
-        if case == "groups":
-            outcome = _group_lifetime(loop, session)
-        else:
-            step, _ = loop.run_training_loop(session)
-            ckpt = session.checkpointer
-            saves = ckpt.saved_steps if isinstance(ckpt, FakeCheckpointManager) else None
-            outcome = f"step={step} saves={saves} nans={session.nan_detector.state.total_nans}"
-        if case == "timer":
-            outcome += f" armed={session.shutdown_handler._timer is not None}"
-            session.shutdown_handler.finish()
-    except BaseException as e:
-        outcome = f"{type(e).__name__}: {e}"
-    Path(out_dir, f"rank{rank}").write_text(outcome)
-    deadline = time.monotonic() + DEADLINE_S
-    while len(list(Path(out_dir).iterdir())) < WORLD and time.monotonic() < deadline:
-        time.sleep(0.2)
-    dist.destroy_process_group()
+
+            config = make_config(max_steps=6)
+            config.checkpoint.dir = root
+            config.checkpoint.interval = 100
+            config.distributed.nccl_timeout_sec = PG_TIMEOUT_S
+            signaled = rank == 1 and case in ("shutdown", "shutdown-dcp")
+            overrides: dict = {"shutdown_handler": FakeShutdownHandler(2 if signaled else None)}
+            if case == "nan" and rank == 0:
+                overrides["step_fn"] = _nan_on({1})
+            if case == "timer":
+                from kempnerforge.resilience.signal_handler import ShutdownHandler
+
+                overrides["shutdown_handler"] = ShutdownHandler(timeout_sec=300)
+                overrides["shutdown_handler"].register()
+                if rank == 1:
+                    overrides["step_fn"] = _signal_on(1)
+            session = make_session(config, **overrides)
+            session.runtime = dataclasses.replace(
+                session.runtime, rank=rank, local_rank=rank, world_size=world
+            )
+            if case == "shutdown-dcp":
+                session.checkpointer = CheckpointManager(
+                    config.checkpoint, session.model, session.optimizer
+                )
+            if case == "health":
+                config.train.nccl_health_check_interval = 2
+                loop.check_nccl_health = lambda: rank != 1
+            mark(out_dir, rank)
+            if case == "groups":
+                outcome = _group_lifetime(loop, session)
+            else:
+                step, _ = loop.run_training_loop(session)
+                ckpt = session.checkpointer
+                saves = ckpt.saved_steps if isinstance(ckpt, FakeCheckpointManager) else None
+                outcome = f"step={step} saves={saves} nans={session.nan_detector.state.total_nans}"
+            if case == "timer":
+                outcome += f" armed={session.shutdown_handler._timer is not None}"
+                session.shutdown_handler.finish()
+        except BaseException as e:
+            outcome = f"{type(e).__name__}: {e}"
+        write_outcome(out_dir, rank, outcome)
 
 
-def _outcomes(tmp_path: Path, case: str, target=_run_loop) -> dict[int, str]:
-    """How ``target`` ended on each rank; fails the test when a rank is still running."""
-    out_dir = tmp_path / "outcomes"
-    out_dir.mkdir()
-    context = mp.spawn(
-        target,
-        args=(_free_port(), case, str(tmp_path / "ckpt"), str(out_dir)),
-        nprocs=WORLD,
-        join=False,
-    )
-    deadline = time.monotonic() + DEADLINE_S
-    while not context.join(timeout=1):
-        if time.monotonic() > deadline:
-            for process in context.processes:
-                process.terminate()
-            done = {int(p.name[4:]): p.read_text() for p in out_dir.iterdir()}
-            pytest.fail(f"a rank is still running after {DEADLINE_S}s; finished: {done}")
-    return {int(p.name[4:]): p.read_text() for p in out_dir.iterdir()}
+def _outcomes(
+    tmp_path: Path, case: str, target=_run_loop, part: str = "run_training_loop()"
+) -> dict[int, str]:
+    """How ``target`` ended on each rank, by rank, run under ``run_to_outcomes``.
+
+    The ranks get 240 s to reach ``part``, 45 s in it and 60 s to exit, so start-up and exit do
+    not count against ``part``. Each test that calls this carries a 360 s timeout, which covers
+    all three and the 5 s grace period for stopping the ranks, so CI's shorter default does not
+    cut a hung case short. A rank that has finished waits to leave the group for the group's
+    timeout, 30 s for the loop and 10 s for the votes, so a hung case usually fails with that
+    wait's error naming the stuck rank, or with the phase message if that comes first.
+    """
+    args = (case, str(tmp_path / "ckpt"))
+    return run_to_outcomes(target, WORLD, args, tmp_path / "outcomes", part=part, part_s=DEADLINE_S)
 
 
 class TestAnyRank:
@@ -212,14 +184,18 @@ class TestAnyRank:
 
     @pytest.mark.parametrize("flags", [(False, False), (False, True), (True, True)], ids=str)
     def test_every_rank_gets_the_same_answer(self, flags):
-        mp.spawn(_check_any_rank, args=(_free_port(), flags), nprocs=WORLD)
+        spawn(_check_any_rank, WORLD, flags)
 
+    @pytest.mark.timeout(360)
     def test_votes_stay_right_while_async_saves_run(self, tmp_path):
         """The control group is not the default group that ``dcp.async_save`` also uses."""
-        outcomes = _outcomes(tmp_path, "votes", target=_vote_beside_async_saves)
+        outcomes = _outcomes(
+            tmp_path, "votes", target=_vote_beside_async_saves, part="the votes beside async saves"
+        )
         assert outcomes == {r: f"rounds={SAVE_ROUNDS} wrong=0" for r in range(WORLD)}
 
 
+@pytest.mark.timeout(360)
 class TestLoopStopsOnEveryRank:
     @pytest.fixture(autouse=True)
     def _hide_cuda(self, monkeypatch):

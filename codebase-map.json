@@ -1340,7 +1340,7 @@
         "derived_buffer_owners(model) -> dict (state-dict key of each buffer a module lists in derived_buffers -> (module, buffer name))",
         "drop_derived_model_keys(model_state, model, saved_keys) -> dict (takes out of a load template the derived buffers its checkpoint lacks; put back before set_model_state_dict)",
         "derive_buffers(model, keys) (the owner of each derived buffer at keys recomputes it from its loaded state)",
-        "_fit_saved_optimizer(optim_state, owners, fixed, left_out, saved_keys, where, groups_vary, saved_modules) -> taken groups (checks the saved state kinds, takes the groups the save kept none of, drops legacy group keys, then checks the remaining groups; when none can be taken, the group check speaks before the generic mismatch error)",
+        "_fit_saved_optimizer(optim_state, owners, fixed, left_out, saved_keys, where, groups_vary, saved_modules, layout) -> taken groups (checks the saved state kinds, each EP expert under its global name, takes the groups the save kept none of, drops legacy group keys, then checks the remaining groups; when none can be taken, the group check speaks before the generic mismatch error)",
         "_params_the_save_left_out(fqns, saved_keys, layout) -> set[str] (named parameters with neither saved optimizer state nor a never-stepped record, compared by global expert names under expert parallelism)",
         "_restore_left_out(optim_state, template_groups, left_out, where) (empty state for them, in the saved group of their group's other parameters, every EP rank's experts included, or an empty saved group in its place; refuses a name the saved groups list; load() agrees on its outcome across ranks)"
       ],
@@ -1781,9 +1781,10 @@
           "TestWeightDecayScopeOnResume(46)",
           "TestRestoredExtra(2)",
           "TestUnreadableTrainStateAcrossRanks(1)",
-          "TestTornStageAcrossRanks(1)"
+          "TestTornStageAcrossRanks(1)",
+          "TestOptimizerTypeChangeOnResume(6)"
         ],
-        "count": 323
+        "count": 329
       },
       "tests/unit/test_observability.py": {
         "classes": [
