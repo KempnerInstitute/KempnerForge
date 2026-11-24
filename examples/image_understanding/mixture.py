@@ -138,9 +138,7 @@ def check_mixture(mixture: dict[str, Any]) -> None:
     fixed = sorted(set(render) & set(RUN_RENDER_OPTIONS))
     if fixed:
         raise ValueError(f"[render]: {fixed} are set from the run config, not the mixture")
-    _check_arguments(
-        "[render]", set(render), ChatRenderer, set(RUN_RENDER_OPTIONS), complete=False
-    )
+    _check_arguments("[render]", set(render), ChatRenderer, set(RUN_RENDER_OPTIONS), complete=False)
 
 
 def check_run(config: JobConfig) -> None:
