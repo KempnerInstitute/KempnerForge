@@ -4223,6 +4223,152 @@ class TestMuonResume:
 REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
 
 
+class TestOptimizerTypeChangeOnResume:
+    """A checkpoint saved with another optimizer fails to load, whichever has more state (#239)."""
+
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    CONFIG = ModelConfig(dim=64, n_layers=1, n_heads=2, vocab_size=256, max_seq_len=64)
+
+    def _resume(self, saved_with: str, resumed_with: str, tmp_path):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = Transformer(self.CONFIG).to(self.DEVICE)
+        saver = build_optimizer(model, OptimizerConfig(name=saved_with, lr=1e-3, fused=False))
+        TestMuonResume._save_stepped(model, saver, tmp_path)
+        model2 = Transformer(self.CONFIG).to(self.DEVICE)
+        optimizer = build_optimizer(
+            model2, OptimizerConfig(name=resumed_with, lr=1e-4, fused=False)
+        )
+        return CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, optimizer)
+
+    def test_an_adamw_checkpoint_fails_to_load_into_a_lion_run(self, tmp_path):
+        manager = self._resume("adamw", "lion", tmp_path)
+        entries = "saved with ['exp_avg', 'exp_avg_sq', 'step'] and is now kept with ['exp_avg']"
+        with pytest.raises(RuntimeError, match="holds another optimizer's state") as raised:
+            manager.load()
+        assert entries in str(raised.value)
+        assert "exclude_from_loading" in str(raised.value)
+
+    def test_a_lion_checkpoint_fails_to_load_into_an_adamw_run(self, tmp_path):
+        """Lion keeps less state than AdamW, so its checkpoint is refused as partial state,
+        with the optimizer.name change named as a cause."""
+        manager = self._resume("lion", "adamw", tmp_path)
+        with pytest.raises(RuntimeError, match="holds partial optimizer state") as raised:
+            manager.load()
+        assert "optimizer.name changed since the save" in str(raised.value)
+        assert "exclude_from_loading" in str(raised.value)
+
+    def test_the_same_optimizer_resumes(self, tmp_path):
+        assert self._resume("adamw", "adamw", tmp_path).load()[0] == 1
+
+    @staticmethod
+    def _expert_rank(
+        rank: int | None, optimizer: str, amsgrad: tuple[int, ...] = (), lr: float = 1e-3
+    ):
+        """A one-layer MoE model of four experts, or EP rank ``rank`` of two holding two of them.
+
+        Only the experts train, under ``build_optimizer``'s ``optimizer``, or with ``amsgrad`` under
+        an AdamW of two groups at ``lr``: the experts of those global indices with amsgrad, the rest
+        without.
+        """
+        torch.manual_seed(4)
+        config = ModelConfig(
+            dim=16, n_layers=1, n_heads=2, vocab_size=32, max_seq_len=16, num_experts=4
+        )
+        model = Transformer(config)
+        start = 0 if rank is None else 2 * rank
+        if rank is not None:
+            moe = model.layers["0"].mlp
+            moe.experts = torch.nn.ModuleList(list(moe.experts)[start : start + 2])
+            moe.ep_world_size, moe.local_expert_start, moe.num_local_experts = 2, start, 2
+        for name, param in model.named_parameters():
+            param.requires_grad_(".experts." in name)
+        if not amsgrad:
+            options = OptimizerConfig(name=optimizer, lr=1e-3, fused=False)
+            return model, build_optimizer(model, options)
+        groups: tuple[list, list] = ([], [])
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                index = start + int(name.split(".experts.")[1].split(".")[0])
+                groups[index not in amsgrad].append(param)
+        return model, torch.optim.AdamW(
+            [{"params": groups[0], "amsgrad": True}, {"params": groups[1]}], lr=lr
+        )
+
+    def test_each_expert_is_compared_with_its_own_saved_state_under_ep(self, tmp_path):
+        """Rank 1's local experts 0 and 1 resume the saved experts 2 and 3.
+
+        Their state, their groups' settings, and the update the next step makes all match the
+        saving run's, although the resumed optimizer was built with another learning rate.
+        """
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        source, saver = self._expert_rank(None, "adamw", amsgrad=(0, 3))
+        TestMuonResume._save_stepped(source, saver, tmp_path)
+        model, optimizer = self._expert_rank(1, "adamw", amsgrad=(0, 3), lr=5e-2)
+        assert (
+            CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer).load()[0] == 1
+        )
+
+        def settings(opt: torch.optim.Optimizer) -> list[dict]:
+            return [{k: v for k, v in group.items() if k != "params"} for group in opt.param_groups]
+
+        assert settings(optimizer) == settings(saver)
+        saved = dict(source.named_parameters())
+        held = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                local = int(name.split(".experts.")[1].split(".")[0])
+                held[name] = saved[name.replace(f".experts.{local}.", f".experts.{local + 2}.")]
+                _assert_same_state_dict(saver.state[held[name]], optimizer.state[param], name)
+                assert torch.equal(param, held[name]), name
+                param.grad = torch.randn_like(param)
+                held[name].grad = param.grad.clone()
+        optimizer.step()
+        saver.step()
+        for name, param in model.named_parameters():
+            if name in held:
+                assert torch.equal(param, held[name]), f"{name} took another update"
+
+    def test_an_adamw_expert_state_fails_to_load_into_a_lion_ep_rank(self, tmp_path):
+        """Only experts 2 and 3 were stepped, so only rank 1's experts hold the AdamW state."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        source, saver = self._expert_rank(None, "adamw")
+        for name, param in source.named_parameters():
+            if ".experts.2." in name or ".experts.3." in name:
+                param.grad = torch.randn_like(param)
+        saver.step()
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), source, saver).save(step=1)
+        model, optimizer = self._expert_rank(1, "lion")
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        with pytest.raises(RuntimeError, match=r"holds another optimizer's state.*experts\.2\."):
+            manager.load()
+
+    def test_another_or_a_partial_state_is_refused(self):
+        """A frozen parameter keeps no state, so it is not compared; a state with entries the
+        optimizer does not keep is refused as another optimizer's, and one short of entries
+        as partial."""
+        from kempnerforge.checkpoint.manager import _check_saved_state_matches
+
+        adamw, lion = ("exp_avg", "exp_avg_sq", "step"), ("exp_avg",)
+
+        def check(kept: tuple, saved: tuple) -> None:
+            optim_state = {"state": {"frozen": {}, "w": dict.fromkeys(kept, 0)}}
+            keys = [f"optimizer.state.{fqn}.{entry}" for fqn in ("frozen", "w") for entry in saved]
+            _check_saved_state_matches(optim_state, keys, Path("ckpt"))
+
+        check(kept=adamw, saved=adamw)
+        with pytest.raises(
+            RuntimeError, match=re.escape("holds partial optimizer state for 1 parameters: ['w']")
+        ):
+            check(kept=adamw, saved=lion)
+        with pytest.raises(
+            RuntimeError, match=re.escape("holds another optimizer's state for 1 parameters: ['w']")
+        ):
+            check(kept=lion, saved=adamw)
+
+
 class TestSaveBeforeFirstStep:
     """The step-0 save and a load without an optimizer, for every registered optimizer."""
 

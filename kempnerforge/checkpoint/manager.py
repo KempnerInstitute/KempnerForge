@@ -754,8 +754,9 @@ def _check_saved_state_matches(
 
     The save holds either another optimizer's state, or only part of this one's, as a
     ``schedule_free_adamw`` checkpoint written before each parameter kept its own ``step``
-    does. Either way the run cannot continue exactly, so the load stops before DCP reads
-    anything and says how to continue from the weights alone.
+    does, or a Lion checkpoint does for AdamW. Either way the run cannot continue exactly,
+    so the load stops before DCP reads anything and says how to continue from the weights
+    alone.
     """
     kept = {fqn: set(state) for fqn, state in optim_state["state"].items()}
     saved: dict[str, set[str]] = {}
@@ -768,9 +769,7 @@ def _check_saved_state_matches(
             fqn = fqn.rpartition(".")[0]
         if fqn:
             saved.setdefault(fqn, set()).add(name.removeprefix(f"{fqn}.").split(".", 1)[0])
-    moved = sorted(
-        fqn for fqn, entries in saved.items() if entries - kept[fqn] and kept[fqn] - entries
-    )
+    moved = sorted(fqn for fqn, entries in saved.items() if entries - kept[fqn] and kept[fqn])
     if moved:
         first = moved[0]
         raise RuntimeError(
@@ -789,9 +788,10 @@ def _check_saved_state_matches(
         raise RuntimeError(
             f"{where} holds partial optimizer state for {len(short)} parameters: "
             f"{short[:8]}. {first} was saved without {sorted(kept[first] - saved[first])}, "
-            "which its optimizer now keeps: an earlier version of the optimizer saved it, "
-            "e.g. schedule_free_adamw before each parameter kept its own step count, so "
-            "the run cannot continue exactly. To continue from these weights with a fresh "
+            "which its optimizer now keeps: another optimizer saved it (optimizer.name "
+            "changed since the save), or an earlier version of this one did, e.g. "
+            "schedule_free_adamw before each parameter kept its own step count, so the run "
+            "cannot continue exactly. To continue from these weights with a fresh "
             "optimizer, set checkpoint.load_path to this checkpoint and "
             'checkpoint.exclude_from_loading = ["optimizer"], with a checkpoint.dir that '
             "holds no checkpoint yet."
@@ -882,14 +882,16 @@ def _fit_saved_optimizer(
     where: Path,
     groups_vary: bool,
     saved_modules: Sequence[str | None] | None = None,
+    layout: ExpertLayout | None = None,
 ) -> list[tuple[int, dict[str, Any]]]:
     """Fit a load template to the checkpoint's optimizer state, then check that it fits.
 
     Checks that each parameter's saved state is of the kind it now keeps (see
-    ``_check_saved_state_matches``), takes out the template groups the save kept no
-    group for (see ``_take_groups_the_save_lacks``), drops the param-group keys the
-    checkpoint predates (see ``_drop_legacy_group_keys``) and checks the groups that are
-    left against the saved ones (see ``_check_saved_param_groups``). When the groups the
+    ``_check_saved_state_matches``), each of this rank's experts under the global name the
+    checkpoint holds its state by when ``layout`` gives one, takes out the template groups
+    the save kept no group for (see ``_take_groups_the_save_lacks``), drops the param-group
+    keys the checkpoint predates (see ``_drop_legacy_group_keys``) and checks the groups
+    that are left against the saved ones (see ``_check_saved_param_groups``). When the groups the
     save lacks cannot be taken, that check runs on the whole template first, so a layout it
     explains, such as other parameters trainable under ``optimizer.lr_multipliers``, fails
     with its message.
@@ -901,7 +903,10 @@ def _fit_saved_optimizer(
         RuntimeError: The checkpoint's optimizer state does not fit the template, or its
             param groups cannot be matched to the template's.
     """
-    _check_saved_state_matches(optim_state, saved_keys, where)
+    states = optim_state
+    if layout is not None:
+        states = layout.to_global({"optimizer": optim_state})["optimizer"]
+    _check_saved_state_matches(states, saved_keys, where)
     saved_groups = _saved_optimizer_param_groups(saved_keys)
     taken = _take_groups_the_save_lacks(optim_state, owners, fixed, left_out, saved_groups)
     if taken is None:
@@ -2002,6 +2007,7 @@ class CheckpointManager:
                         dcp_dir,
                         bool(self._lr_multipliers),
                         saved_modules,
+                        expert_layout(self.model),
                     )
                 )
             )
