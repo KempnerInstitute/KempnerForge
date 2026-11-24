@@ -18,7 +18,7 @@ nan_detector = NaNDetector(action="warn", max_consecutive=10)
 if not nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
     optimizer.zero_grad()
     if nan_detector.should_rollback:
-        logger.error("Too many consecutive NaNs — stopping")
+        logger.error("Too many consecutive NaNs; stopping")
         break
     _advance_lr_schedule(session)            # scheduler.step(), then the phase lr_scale
     step += 1
@@ -54,7 +54,7 @@ tick except the shutdown check are dropped:
 
 | Work | On a skipped step |
 |------|-------------------|
-| Optimizer update | Skipped. Gradients are zeroed; weights and optimizer state stay as they were, except that the sigmoid router updates its `expert_bias` and `expert_ema` during the forward pass, before the loss is checked. |
+| Optimizer update | Skipped. Gradients are zeroed and the sigmoid routers' expert counts dropped; weights, optimizer state and the routers' balancing state stay as they were. |
 | `tokens_seen`, metrics, `on_step_end` hooks | Skipped. |
 | LR schedule | Advanced: `scheduler.step()`, then the active phase's `lr_scale`, so warmup and decay stay on the step counter. |
 | `FreezeStage` and data phases due at the new step | Applied. A `FreezeStage` waits behind the same async-save fence as on a finite step. |
@@ -131,7 +131,7 @@ if action not in ("warn", "skip", "raise"):
 | Action | Behavior | When to pick it |
 |--------|----------|-----------------|
 | `"warn"` | Log a warning, return `False`. Loop zeros grads and continues. | Default. NaN-tolerant training where a single bad step shouldn't kill the run. |
-| `"skip"` | Same as `"warn"` but logs `"— skipping optimizer step"` explicitly. | Same as warn; the two are nearly equivalent since the caller already skips the optimizer step on `False`. |
+| `"skip"` | Same as `"warn"` but logs `"; skipping optimizer step"` explicitly. | Same as warn; the two are nearly equivalent since the caller already skips the optimizer step on `False`. |
 | `"raise"` | Raise `RuntimeError` immediately. | Early development when you want the run to die loudly on first NaN. |
 
 In the shipped training loop, `"warn"` and `"skip"` produce the same
@@ -200,7 +200,7 @@ automatically:
 ```python
 # training/loop.py::run_training_loop
 if nan_detector.should_rollback:
-    logger.error("Too many consecutive NaNs — stopping")
+    logger.error("Too many consecutive NaNs; stopping")
     break
 ```
 
@@ -239,9 +239,9 @@ A rule-of-thumb: if you hit `should_rollback`, don't resume from the
 most recent checkpoint. It holds the weights from just before the NaN
 storm, so whatever state caused the explosion is baked in. That also
 holds for an emergency checkpoint a shutdown wrote during the storm:
-skipped steps leave the weights as they were (the sigmoid router's
-`expert_bias` aside), so it carries the pre-storm weights under a later
-step. A storm that a bad update started leaves no such checkpoint (see
+skipped steps leave the weights as they were, so it carries the
+pre-storm weights under a later step. A storm that a bad update started
+leaves no such checkpoint (see
 [A shutdown after a bad update](#a-shutdown-after-a-bad-update)).
 
 ## Manual use

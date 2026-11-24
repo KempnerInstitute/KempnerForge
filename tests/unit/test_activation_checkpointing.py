@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
+from dataclasses import replace
 
 import pytest
 import torch
@@ -35,12 +36,20 @@ from kempnerforge.config.vlm import (
     MoTConfig,
     VLMConfig,
 )
-from kempnerforge.distributed.parallel import apply_ac, build_parallel_model, default_mp_policy
+from kempnerforge.distributed.parallel import (
+    _RoutingCheckpointWrapper,
+    apply_ac,
+    build_parallel_model,
+    default_mp_policy,
+)
 from kempnerforge.distributed.pipeline_parallel import build_stage_module
 from kempnerforge.metrics.logger import get_logger
+from kempnerforge.model import router as router_module
 from kempnerforge.model.mot import MoTBlock, mot_warm_start_from_text_stack
+from kempnerforge.model.router import Recomputing, SigmoidTopKRouter, SoftmaxTopKRouter
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import inner_transformer
+from kempnerforge.training.loop import add_moe_losses
 
 NONE = ActivationCheckpointing.none
 FULL = ActivationCheckpointing.full
@@ -390,3 +399,162 @@ class TestUnderFsdp2:
     def test_checkpointed_vlm_blocks_match_under_fsdp2(self, tmp_path):
         """Two gloo ranks shard each VLM with FSDP2 after ``apply_ac`` wrapped its blocks."""
         mp.spawn(_check_fsdp_parity, args=(2, str(tmp_path / "store")), nprocs=2)
+
+
+ROUTERS = ["softmax_topk", "sigmoid_topk"]
+
+
+def _moe_model(arch: str, router: str, mode: ActivationCheckpointing, **overrides) -> nn.Module:
+    """A 4-layer fp32 MoE model on CPU: text, or MoT with one router per modality."""
+    torch.manual_seed(0)
+    config = replace(_model_config(), num_experts=4, moe_top_k=2, moe_router=router, **overrides)
+    if arch == "text":
+        return build_parallel_model(
+            config, torch.device("cpu"), None, ac_mode=mode, param_dtype=torch.float32
+        )
+    return build_parallel_model(
+        config,
+        torch.device("cpu"),
+        None,
+        vision_config=VisionEncoderConfig(type="random", feature_dim=96, num_tokens=8),
+        adapter_config=AdapterConfig(),
+        vlm_config=_vlm_config(arch),
+        ac_mode=mode,
+        param_dtype=torch.float32,
+    )
+
+
+def _routers(model: nn.Module) -> list[SoftmaxTopKRouter | SigmoidTopKRouter]:
+    return [m for m in model.modules() if isinstance(m, (SoftmaxTopKRouter, SigmoidTopKRouter))]
+
+
+def _counts(model: nn.Module) -> list[torch.Tensor]:
+    return [r.pending_counts.clone() for r in _routers(model) if isinstance(r, SigmoidTopKRouter)]
+
+
+def _moe_loss(arch: str, model: nn.Module, step: int) -> torch.Tensor:
+    """The fixed batch's loss at ``step`` plus the MoE terms, the way the loop adds them."""
+    config = replace(_model_config(), moe_aux_loss_weight=0.01, moe_router_z_loss_weight=0.001)
+    gen = torch.Generator().manual_seed(step)
+    ids = torch.randint(0, 256, (4, 16), generator=gen)
+    pixels = torch.randn(4, 3, 32, 32, generator=gen)
+    out = model(ids) if arch == "text" else model(pixels, ids, ids)[0]
+    return add_moe_losses(out.float().pow(2).mean(), model, config)
+
+
+class TestMoERecompute:
+    """Under ``full``, the recompute leaves the routers as the forward set them (#563)."""
+
+    @pytest.mark.parametrize("router", ROUTERS)
+    @pytest.mark.parametrize("arch", ["text", "mot"])
+    def test_full_trains_like_none(self, arch, router):
+        """Losses, parameters and router state match over steps with the per-step balance."""
+        runs = []
+        for mode in (NONE, FULL):
+            model = _moe_model(arch, router, mode)
+            optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.1)
+            losses, counts = [], []
+            for step in range(3):
+                loss = _moe_loss(arch, model, step)
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                counts.append(_counts(model))
+                inner_transformer(model).balance_routers()
+                losses.append(loss.detach())
+            runs.append((model, losses, counts))
+        (none, none_losses, none_counts), (full, full_losses, full_counts) = runs
+        torch.testing.assert_close(full_losses, none_losses)
+        for a, b in zip(full_counts, none_counts, strict=True):
+            assert all(torch.equal(x, y) for x, y in zip(a, b, strict=True))
+        torch.testing.assert_close(full.state_dict(), none.state_dict())
+
+    @pytest.mark.parametrize("router", ROUTERS)
+    @pytest.mark.parametrize("arch", ["text", "mot"])
+    def test_the_recompute_leaves_the_routers_as_the_forward_set_them(self, arch, router):
+        """No attribute is replaced and no token counted twice; nothing keeps a graph."""
+        model = _moe_model(arch, router, FULL)
+        loss = _moe_loss(arch, model, 0)
+        routers = _routers(model)
+        kept = [(r.aux_loss, r.z_loss, r.expert_counts) for r in routers]
+        counts = _counts(model)
+        assert all(r.aux_loss.grad_fn is None and r.z_loss.grad_fn is None for r in routers)
+        loss.backward()
+        for router_, attrs in zip(routers, kept, strict=True):
+            now = (router_.aux_loss, router_.z_loss, router_.expert_counts)
+            assert all(a is b for a, b in zip(now, attrs, strict=True))
+        assert all(torch.equal(a, b) for a, b in zip(_counts(model), counts, strict=True))
+        assert all(c.sum() > 0 for c in counts) and len(counts) == (
+            len(routers) if router == "sigmoid_topk" else 0
+        )
+
+    @pytest.mark.parametrize("router", ROUTERS)
+    def test_the_recompute_routes_as_the_forward_did(self, router):
+        """Gate weights moved between the forward and the backward change no token's experts.
+
+        The move stands in for a GPU computing the recompute's scores a little
+        differently: the recompute takes the forward's top-k.
+        """
+        model = _moe_model("text", router, FULL)
+        routed: dict[str, dict[nn.Module, torch.Tensor]] = {"forward": {}, "recompute": {}}
+
+        def record(module: nn.Module, args: tuple, out: tuple) -> None:
+            phase = "forward" if torch._C._current_graph_task_id() == -1 else "recompute"
+            routed[phase][module] = out[1].clone()
+
+        for router_ in _routers(model):
+            router_.register_forward_hook(record)
+        loss = _moe_loss("text", model, 0)
+        with torch.no_grad():
+            for router_ in _routers(model):
+                weight = router_.gate.weight
+                weight.add_(10.0 * torch.sin(1.7 * torch.arange(weight.numel())).view_as(weight))
+        loss.backward()
+        assert (
+            len(routed["forward"]) == 4 and routed["recompute"].keys() == routed["forward"].keys()
+        )
+        for module, indices in routed["forward"].items():
+            assert torch.equal(routed["recompute"][module], indices)
+
+    def test_only_blocks_with_an_moe_layer_get_the_routing_wrapper(self):
+        model = _moe_model("text", "softmax_topk", FULL, moe_frequency=2)
+        wrappers = [m for m in model.modules() if isinstance(m, CheckpointWrapper)]
+        routing = [isinstance(m, _RoutingCheckpointWrapper) for m in wrappers]
+        assert routing == [False, True, False, True]
+        selective = _moe_model("text", "softmax_topk", SELECTIVE)
+        assert not any(isinstance(m, _RoutingCheckpointWrapper) for m in selective.modules())
+
+    def test_the_routing_wrapper_runs_eagerly_under_compile(self):
+        assert getattr(_RoutingCheckpointWrapper.forward, "_torchdynamo_disable", False)
+
+
+class _Context:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def __enter__(self) -> None:
+        self.events.append("enter")
+
+    def __exit__(self, *exc) -> None:
+        self.events.append("exit")
+
+
+class TestRecomputing:
+    def test_sets_the_flag_inside_and_enters_the_inner_context(self):
+        inner = _Context()
+        context = Recomputing(inner)
+        assert not router_module._RECOMPUTING.get()
+        for _ in range(2):
+            with context:
+                assert router_module._RECOMPUTING.get()
+            assert not router_module._RECOMPUTING.get()
+        assert inner.events == ["enter", "exit"] * 2
+
+    def test_an_inner_context_that_fails_to_enter_leaves_the_flag_unset(self):
+        class Failing(_Context):
+            def __enter__(self) -> None:
+                raise RuntimeError("inner")
+
+        with pytest.raises(RuntimeError, match="inner"), Recomputing(Failing()):
+            pass
+        assert not router_module._RECOMPUTING.get()

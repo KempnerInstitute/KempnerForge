@@ -101,7 +101,7 @@ def validate(data_path: Path, token_dtype: str = "") -> None:
         print()
         sys.exit(1)
     if sample_dtype not in (np.dtype("uint16"), np.dtype("uint32")):
-        print(f"\n  WARNING: dtype {sample_dtype} — expected uint16 or uint32")
+        print(f"\n  WARNING: dtype {sample_dtype}: expected uint16 or uint32")
     else:
         if fmt == "bin" and not bin_dtype:
             print("\n  The .bin dtype is not declared, so training reads these shards as")

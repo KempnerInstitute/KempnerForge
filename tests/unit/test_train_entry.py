@@ -69,6 +69,7 @@ class TinyTextModel(nn.Module):
 
 class FakeCheckpointManager:
     def __init__(self) -> None:
+        self.ownership: list[str] = []
         self.saves: list[tuple[int, int, dict]] = []
         self.waits = 0
         self.flushes = 0
@@ -97,6 +98,12 @@ class FakeCheckpointManager:
     @property
     def saved_steps(self) -> list[int]:
         return [s for s, _, _ in self.saves]
+
+    def claim_dir(self) -> None:
+        self.ownership.append("claim")
+
+    def release_dir(self) -> None:
+        self.ownership.append("release")
 
 
 class FakeShutdownHandler:
@@ -540,19 +547,26 @@ class TestVlmTextTokenGuard:
 
 
 class TestCheckpointExtra:
-    def test_empty_without_phases_or_run_ids(self):
-        assert checkpoint_extra(make_config(), 5, PhaseState()) == {}
+    def test_only_the_plugins_list_without_phases_or_run_ids(self):
+        assert checkpoint_extra(make_config(), 5, PhaseState()) == {"plugins": []}
+
+    def test_records_a_copy_of_the_plugins_list(self):
+        config = make_config()
+        config.plugins = ["pkg.components"]
+        extra = checkpoint_extra(config, 5, PhaseState())
+        assert extra["plugins"] == ["pkg.components"]
+        assert extra["plugins"] is not config.plugins
 
     def test_includes_phase_index_when_phases_configured(self):
         phases = PhaseState(phases=[TrainingPhase(start_step=1)], next_idx=1)
-        assert checkpoint_extra(make_config(), 5, phases) == {"phase_idx": 1}
+        assert checkpoint_extra(make_config(), 5, phases) == {"phase_idx": 1, "plugins": []}
 
     def test_includes_metrics_run_ids(self):
         config = make_config()
         config.metrics.wandb_run_id = "wid"
         config.metrics.mlflow_run_id = "mid"
         extra = checkpoint_extra(config, 5, PhaseState())
-        assert extra == {"wandb_run_id": "wid", "mlflow_run_id": "mid"}
+        assert extra == {"wandb_run_id": "wid", "mlflow_run_id": "mid", "plugins": []}
 
     def test_includes_vlm_freeze_metadata(self, tiny_vlm_configs):
         mc, vision, adapter, vlm = tiny_vlm_configs
@@ -1116,7 +1130,7 @@ class TestNanSkippedStep:
         monkeypatch.setattr(ckpt, "save", save)
         step, tokens_seen = run_training_loop(session)
         assert step == 2
-        assert ckpt.saves == [(2, tokens_seen, {})]
+        assert ckpt.saves == [(2, tokens_seen, {"plugins": []})]
         assert ckpt.waits == 1
         assert epochs == [2]
         assert handler.finished is False
@@ -1158,7 +1172,7 @@ class TestNanSkippedStep:
         monkeypatch.setattr(ckpt, "save", save)
         step, tokens_seen = run_training_loop(session)
         assert step == 2
-        assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1})]
+        assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1, "plugins": []})]
         assert loaders == [session.data.dataloader]
         assert loaders[0] is not None
 
@@ -1476,6 +1490,60 @@ class TestRunTraining:
         )
         assert destroys == [1]
         assert closes == [1, 1]
+
+    def test_the_checkpoint_dir_is_claimed_before_resuming_and_released_at_a_clean_exit(
+        self, monkeypatch
+    ):
+        """A run owns checkpoint.dir from before it resumes until it ends cleanly; a run that
+        raises keeps the claim, which a later run takes over once this one has ended (#353)."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        events = ckpt.ownership
+        monkeypatch.setattr(
+            entry, "restore_checkpoint", lambda *_a, **_k: events.append("restore") or (0, 0)
+        )
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: events.append("destroy"))
+
+        def boom(_session, _step):
+            raise RuntimeError("step blew up")
+
+        with pytest.raises(RuntimeError, match="step blew up"):
+            run_training(make_config(max_steps=2), step_fn=boom)
+        assert events == ["claim", "restore"]
+        events.clear()
+        run_training(
+            make_config(max_steps=2),
+            step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5),
+        )
+        assert events == ["claim", "restore", "release", "destroy"]
+
+    def test_the_teardown_runs_when_releasing_the_checkpoint_dir_fails(self, monkeypatch):
+        """The process group is destroyed and the handler retired even so (#353)."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        handler = FakeShutdownHandler()
+        monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: handler)
+        events = ckpt.ownership
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: events.append("destroy"))
+
+        def release_fails():
+            events.append("release")
+            raise RuntimeError("release failed")
+
+        monkeypatch.setattr(ckpt, "release_dir", release_fails)
+        with pytest.raises(RuntimeError, match="release failed"):
+            run_training(
+                make_config(max_steps=2),
+                step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5),
+            )
+        assert events == ["claim", "release", "destroy"]
+        assert handler.finished
 
     def test_finish_runs_after_the_emergency_flush_and_the_teardown(self, monkeypatch):
         """The handler and its timer outlive the last ``wait()`` and the teardown (#313)."""
@@ -2658,6 +2726,22 @@ class TestRestoreCheckpoint:
         assert config.metrics.wandb_run_id == "W1"
         assert config.metrics.mlflow_run_id == "M1"
         assert config.metrics.mlflow_tags == {}
+
+    @pytest.mark.parametrize("load_path", [False, True], ids=["resume", "warm_start"])
+    def test_the_load_compares_the_runs_plugins_list(self, monkeypatch, tmp_path, load_path):
+        """restore_checkpoint hands the manager a copy of the run's plugins list to compare
+        before it reads any state."""
+        import kempnerforge.training.entry as entry
+
+        resume = None if load_path else tmp_path / "step_7"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: resume)
+        config = make_config()
+        config.plugins = ["pkg.big"]
+        config.checkpoint.load_path = str(tmp_path / "step_7") if load_path else None
+        mgr = FakeResumeManager()
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.load_kwargs["plugins_expected"] == ["pkg.big"]
+        assert mgr.load_kwargs["plugins_expected"] is not config.plugins
 
     def test_absent_run_ids_do_not_clobber_existing_ones(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
@@ -4321,6 +4405,66 @@ class TestMoELossComposition:
         assert session.model.moe_steps == [(7, session.config.train.max_steps)]
 
 
+def _sigmoid_moe_session(**train_kwargs):
+    """A session around a real sigmoid-router MoE ``Transformer`` on CPU."""
+    from kempnerforge.model.transformer import Transformer
+
+    config = _moe_config(**train_kwargs)
+    config.model.moe_router = "sigmoid_topk"
+    torch.manual_seed(0)
+    model = Transformer(config.model)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(trainable, lr=0.05)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _s: 1.0)
+    return make_session(config, model=model, optimizer=optimizer, scheduler=scheduler)
+
+
+class TestRouterBalancing:
+    """The loop balances the sigmoid routers once per optimizer step (#571)."""
+
+    def test_routers_balance_once_per_optimizer_step(self, monkeypatch):
+        from kempnerforge.model.router import SigmoidTopKRouter
+        from kempnerforge.model.transformer import Transformer
+
+        session = _sigmoid_moe_session(max_steps=3, grad_accum_steps=2)
+        balance, calls, events = Transformer.balance_routers, [], []
+
+        def counted(model):
+            events.append("balance")
+            calls.append([int(r.pending_counts.sum()) for r in routers])
+            balance(model)
+
+        def logged(name, step):
+            def run(*args, **kwargs):
+                events.append(name)
+                return step(*args, **kwargs)
+
+            return run
+
+        monkeypatch.setattr(Transformer, "balance_routers", counted)
+        monkeypatch.setattr(session.optimizer, "step", logged("optimizer", session.optimizer.step))
+        monkeypatch.setattr(session.scheduler, "step", logged("scheduler", session.scheduler.step))
+        routers = [m for m in session.model.modules() if isinstance(m, SigmoidTopKRouter)]
+        emas = [router.expert_ema.clone() for router in routers]
+        run_training_loop(session)
+        tc = session.config.train
+        per_step = 2 * tc.batch_size * tc.seq_len * session.config.model.moe_top_k
+        assert calls == [[per_step] * len(routers)] * 3
+        assert events == ["optimizer", "balance", "scheduler"] * 3
+        assert all(not router.pending_counts.any() for router in routers)
+        assert all(not torch.equal(r.expert_ema, e) for r, e in zip(routers, emas, strict=True))
+
+    def test_a_step_skipped_for_a_nan_loss_drops_its_counts(self, monkeypatch):
+        from kempnerforge.model.router import SigmoidTopKRouter
+
+        session = _sigmoid_moe_session(max_steps=1)
+        monkeypatch.setattr(session.nan_detector, "check_loss", lambda *_a, **_k: False)
+        run_training_loop(session)
+        for router in (m for m in session.model.modules() if isinstance(m, SigmoidTopKRouter)):
+            assert not router.pending_counts.any()
+            assert torch.equal(router.expert_ema, torch.full((4,), 0.25))
+
+
 class TestMoEMetrics:
     def _run_one_step(self, model, config):
         session = make_session(config, model=model)
@@ -5330,8 +5474,8 @@ class TestFreezeStageFence:
         monkeypatch.setattr(session.checkpointer, "save", save)
         run_training_loop(session)
         assert order == ["flush", "freeze", "save"]
-        meta = freeze_meta_at_step(2, session.config.vlm)
-        assert saved == [(2, {"documents_seen": 2, "vlm_freeze": meta})]
+        freeze = freeze_meta_at_step(2, session.config.vlm)
+        assert saved == [(2, {"plugins": [], "documents_seen": 2, "vlm_freeze": freeze})]
 
 
 class TestBatchStreamGuard:

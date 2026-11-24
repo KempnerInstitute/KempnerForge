@@ -97,6 +97,7 @@ class CheckpointConfig:
     exclude_from_loading: list[str] = field(default_factory=list)
     ignore_freeze_mismatch: bool = False
     ignore_rank_state_mismatch: bool = False
+    ignore_plugins_mismatch: bool = False
 
     def __post_init__(self) -> None:
         if self.interval <= 0:

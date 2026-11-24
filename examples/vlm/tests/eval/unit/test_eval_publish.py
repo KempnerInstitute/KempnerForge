@@ -682,8 +682,9 @@ class TestPreflight:
 class TestResolveCheckpoint:
     def test_a_run_directory_resolves_to_its_latest_step(self, tmp_path):
         run = tmp_path / "run"
-        (run / "step_100").mkdir(parents=True)
-        (run / "step_200").mkdir()
+        for step in (100, 200):
+            (run / f"step_{step}").mkdir(parents=True, exist_ok=True)
+            (run / f"step_{step}" / ".metadata").write_text("")
         (run / "latest").symlink_to("step_100")
         assert resolve_checkpoint(str(run)) == (run / "step_100").resolve()
 
@@ -811,8 +812,8 @@ class TestEvalScript:
         install_pandas(monkeypatch)
         mlflow = install_mlflow(monkeypatch)
         run = tmp_path / "run"
-        _checkpoint(run, "step_100", step=100)
-        _checkpoint(run, "step_200", step=200)
+        for step in (100, 200):
+            (_checkpoint(run, f"step_{step}", step=step) / ".metadata").write_text("")
         (run / "latest").symlink_to("step_100")
 
         def scoring():

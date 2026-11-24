@@ -308,13 +308,17 @@ class TestSigmoidTopKRouter:
         assert router.expert_counts.shape == (8,)
         assert router.expert_counts.sum().item() == 32 * 2
 
-    def test_ema_updates_in_training(self):
+    def test_a_training_forward_counts_tokens_and_balance_moves_the_ema(self):
         router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2)
         router.train()
         initial_ema = router.expert_ema.clone()
         x = torch.randn(128, 64)
         router(x)
+        assert int(router.pending_counts.sum()) == 128 * 2
+        assert torch.equal(router.expert_ema, initial_ema)
+        router.balance(router.pending_counts.clone())
         assert not torch.allclose(router.expert_ema, initial_ema)
+        assert not router.pending_counts.any()
 
     def test_ema_frozen_in_eval(self):
         router = SigmoidTopKRouter(dim=64, num_experts=4, top_k=2)
@@ -323,6 +327,7 @@ class TestSigmoidTopKRouter:
         x = torch.randn(128, 64)
         router(x)
         assert torch.allclose(router.expert_ema, initial_ema)
+        assert not router.pending_counts.any()
 
     def test_bias_adjusts_toward_balance(self):
         """Expert bias should shift to balance utilization over many steps."""
@@ -332,6 +337,7 @@ class TestSigmoidTopKRouter:
         for _ in range(50):
             x = torch.randn(64, 64)
             router(x)
+            router.balance(router.pending_counts.clone())
         assert not torch.allclose(router.expert_bias.data, initial_bias)
 
     def test_backward_through_gate(self):
@@ -1116,7 +1122,10 @@ class TestMoESigmoidConfigValidation:
         assert aux.item() > 0.0
         logits.sum().backward()
         for name, p in model.named_parameters():
-            assert p.grad is not None, f"{name} has no gradient"
+            if name.endswith("router.expert_bias"):
+                assert not p.requires_grad and p.grad is None, f"{name} is trained"
+            else:
+                assert p.grad is not None, f"{name} has no gradient"
 
 
 class TestPackedExperts:
@@ -1453,7 +1462,11 @@ def _expert_grads(moe: MoEMLP, i: int) -> list[torch.Tensor | None]:
 
 
 def _assert_zero_grads(moe: MoEMLP) -> None:
+    """Every trained weight has a zero gradient; the frozen sigmoid router bias has none."""
     for name, param in moe.named_parameters():
+        if not param.requires_grad:
+            assert param.grad is None, name
+            continue
         assert param.grad is not None, name
         assert not torch.count_nonzero(param.grad), name
 
