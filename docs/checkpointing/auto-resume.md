@@ -165,7 +165,10 @@ start runs only when no checkpoint supplied the model, that is on a run
 with nothing to resume from or a warm start that excludes `"model"` and
 starts at step 0, and never on a resume. A weights-only warm start also skips the
 `metadata.json` probe for the freeze check, since the new run's own
-freeze applies.
+freeze applies, and the `plugins` comparison. Any other warm start, like
+a resume, compares the run's `plugins` list with the one `metadata.json`
+records before reading any state, and refuses another list unless
+`checkpoint.ignore_plugins_mismatch` is set.
 
 ## Symlink updates
 
