@@ -129,14 +129,12 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
             return value
         return [value]
 
-    if origin is dict:
-        args = get_args(field_type)
-        if not isinstance(value, dict) or len(args) != 2:
-            return value
+    if origin is dict and isinstance(value, dict) and len(get_args(field_type)) == 2:
+        value_type = get_args(field_type)[1]
         coerced = {}
         for key, item in value.items():
             try:
-                coerced[key] = _coerce_value(args[1], item)
+                coerced[key] = _coerce_value(value_type, item)
             except ValueError as e:
                 raise ValueError(f"key {key!r}: {e}") from None
         return coerced
