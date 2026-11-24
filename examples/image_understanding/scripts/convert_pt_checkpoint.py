@@ -2,14 +2,15 @@
 """Write a joint-decoder VLM saved as one ``.pt`` state dict as a checkpoint to warm-start from.
 
 The source holds a Hugging Face SigLIP vision model under
-``image_encoder.model.vision_model``, an adapter of an RMS norm (``adapter.norm``)
-and a two-layer MLP (``adapter.proj.0`` and ``adapter.proj.2``) over pooled
-patches, and a Qwen3 decoder as ``multimodal_core`` (Hugging Face layer names),
-``text_preprocessor.embed`` and an untied ``text_head``. The target VLM is built
-from ``--config`` and every one of its tensors is filled from the source; nothing
-is written unless each source tensor maps onto a target tensor of the same shape
-and each target tensor is filled. The source's SigLIP attention-pooling head is
-dropped when the model has none. The result is one DCP that
+``image_encoder.model.vision_model``, an adapter of an RMS norm and a two-layer
+MLP over pooled patches (``adapter.norm`` and ``adapter.proj.{0,2}``, or
+``adapter.model.ln_q`` and ``adapter.model.mlp.{0,2}``), and a Qwen3 decoder as
+``multimodal_core`` (Hugging Face layer names), ``text_preprocessor.embed`` and
+an untied ``text_head``. The target VLM is built from ``--config``, whose
+embeddings must be untied, and every one of its tensors is filled from the
+source; nothing is written unless each source tensor maps onto its own target
+tensor of the same shape and each target tensor is filled. The source's SigLIP
+attention-pooling head is dropped when the model has none. The result is one DCP that
 ``[checkpoint].load_path`` warm-starts from with
 ``exclude_from_loading = ["optimizer", "train_state"]``.
 
@@ -42,6 +43,11 @@ _RENAMES = {
     "adapter.proj.0.bias": "adapter.proj.proj1.bias",
     "adapter.proj.2.weight": "adapter.proj.proj2.weight",
     "adapter.proj.2.bias": "adapter.proj.proj2.bias",
+    "adapter.model.ln_q.weight": "adapter.proj.ln_q.weight",
+    "adapter.model.mlp.0.weight": "adapter.proj.proj1.weight",
+    "adapter.model.mlp.0.bias": "adapter.proj.proj1.bias",
+    "adapter.model.mlp.2.weight": "adapter.proj.proj2.weight",
+    "adapter.model.mlp.2.bias": "adapter.proj.proj2.bias",
     "multimodal_core.norm.weight": "transformer.norm.weight",
     "text_preprocessor.embed.weight": "transformer.token_embedding.embedding.weight",
     "text_head.weight": "transformer.output_head.proj.weight",
@@ -78,11 +84,18 @@ def map_key(key: str) -> str | None:
 
 
 def map_state_dict(source: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """The source tensors under their target keys, refusing keys without a counterpart."""
+    """The source tensors under their target keys, refusing keys without one or sharing one."""
     unmapped = sorted(key for key in source if map_key(key) is None)
     if unmapped:
         raise ValueError(f"{len(unmapped)} source keys have no target: {unmapped[:10]}")
-    return {map_key(key): tensor for key, tensor in source.items()}  # type: ignore[misc]
+    mapped: dict[str, torch.Tensor] = {}
+    for key, tensor in source.items():
+        target = map_key(key)
+        assert target is not None
+        if target in mapped:
+            raise ValueError(f"two source keys map to {target}, {key} among them")
+        mapped[target] = tensor
+    return mapped
 
 
 def convert(checkpoint: str, config_path: str, out: str) -> Path:
@@ -90,6 +103,11 @@ def convert(checkpoint: str, config_path: str, out: str) -> Path:
     config = load_config(config_path, cli_args=[])
     if config.vlm is None or config.vision_encoder is None or config.adapter is None:
         raise ValueError(f"{config_path} does not describe a VLM")
+    if config.model.tie_embeddings:
+        raise ValueError(
+            f"{config_path} ties its embeddings, but the source's embedding and output head "
+            "are separate tensors: set model.tie_embeddings = false"
+        )
     out_path = Path(out)
     if out_path.exists() and (not out_path.is_dir() or any(out_path.iterdir())):
         raise FileExistsError(f"{out_path} already exists and is not an empty directory")

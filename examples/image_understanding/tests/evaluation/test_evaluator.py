@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import socket
@@ -24,6 +25,7 @@ from evaluation.evaluator import (
     PROMPT_TOO_LONG,
     UNREADABLE_ROW,
     UNRENDERABLE_ROW,
+    Budgets,
     ClearedResults,
     Decoder,
     check_token_budgets,
@@ -37,7 +39,12 @@ from evaluation.evaluator import (
     token_budgets,
 )
 from evaluation.generation import Generation, greedy_decode, stop_token_ids
-from evaluation.inputs import UnsupportedDocumentError, build_renderer, document_inputs
+from evaluation.inputs import (
+    RenderSettings,
+    UnsupportedDocumentError,
+    build_renderer,
+    document_inputs,
+)
 from evaluation.scorers import SCORERS, Scorer, anls
 from evaluation.tasks import READERS, EvalTask, build_reader, load_tasks
 from image_text.document import Document, Turn
@@ -291,6 +298,21 @@ class TestShardBatches:
     def test_ranks_take_the_batches_in_turn(self) -> None:
         assert shard_batches(11, 2, 1, 3) == [range(2, 4), range(8, 10)]
         assert shard_batches(11, 2, 2, 3) == [range(4, 6), range(10, 11)]
+
+
+class TestTokenBudgets:
+    def test_a_packed_run_fits_rows_of_its_seq_len(self, run: Run) -> None:
+        config = run.config
+        packed = dataclasses.replace(
+            config,
+            data=dataclasses.replace(config.data, pack_sequences=True),
+            train=dataclasses.replace(config.train, seq_len=40),
+        )
+        assert config.model.max_seq_len == 48 and config.vlm is not None
+        cap = config.vlm.max_text_len
+        assert token_budgets(packed, RenderSettings(mixture=True)) == Budgets(row_len=40)
+        assert token_budgets(packed) == Budgets(row_len=40, text_len=cap)
+        assert token_budgets(config) == Budgets(row_len=48, text_len=cap)
 
 
 class TestEvaluateBatch:
@@ -1175,6 +1197,8 @@ def _evaluate_on_rank(
     from datetime import timedelta
 
     import torch.distributed as dist
+
+    torch.cuda.is_available = lambda: False
 
     notes = Path(output).parent
 

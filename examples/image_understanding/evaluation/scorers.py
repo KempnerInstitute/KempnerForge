@@ -196,7 +196,10 @@ _INTEGER = re.compile(r"\d+")
 def stated_count(text: str) -> int | None:
     """The count a counting answer states: the ``N`` of "I count N", else its last integer.
 
-    Point tags are dropped first, as their coordinates are numbers too.
+    Point tags are dropped first, as their coordinates are numbers too. A tag cut
+    off before its ``>`` is not a tag, so the integer fallback reads its last
+    coordinate digit, as the board's scorer does; a cap that fits the trained
+    point-then-count answer leaves no tag cut.
     """
     prose = _TAG.sub(" ", text)
     phrase = _COUNT_PHRASE.search(prose)

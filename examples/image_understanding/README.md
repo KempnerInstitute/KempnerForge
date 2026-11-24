@@ -64,7 +64,8 @@ samples `VLMCollator` batches.
   answer for single-turn rows, the full template for conversations) and trains only
   the assistant replies when `answer_only` (with `train_reply_prefix`, also what
   the template writes between the assistant header and a reply, such as an empty
-  think block); `max_images` sets how many images a document may bring.
+  think block, for each reply the text budget keeps part of); `max_images` caps
+  how many images a document may bring (no cap by default).
   `RenderedDataset` draws one reference
   answer per turn from a seed and the row index, so a resume draws the same answers,
   and passes over a document the renderer refuses (replies that are all empty, or
@@ -83,10 +84,12 @@ samples `VLMCollator` batches.
 
 The renderer resizes each image square to `image_size`, or with `tile_grid` cuts
 it into views as `vlm.tile_grid` does. A sample has the core dataset's shapes, so
-`VLMCollator` and `PackedVLMCollator` batch it: one image by default, up to
-`max_images` images (every image with `None`) concatenated, or none for a
-text-only document, and `text_len` counts its real tokens. A document with more
-images than `max_images` is passed over. `max_text_len=None` keeps the whole text
+`VLMCollator` and `PackedVLMCollator` batch it: every image of a document
+concatenated by default (`max_images=None`), at most `max_images` of them, a
+single image with `max_images=1`, or none for a text-only document, and
+`text_len` counts its real tokens. A document with more images than
+`max_images` is passed over, and `RenderedDataset` refuses a reader that keeps
+rows with more images than its renderer takes. `max_text_len=None` keeps the whole text
 unpadded, for packing. PixMo-Count stores its points in pixels; they are
 converted to percent of the image, the unit the other PixMo sources use. A
 counting answer lists its points before the count, so a row with many points
@@ -102,7 +105,9 @@ a row, and the rows without images as text-only documents, so a `text_*` subset
 reads as is; `min_images=1` leaves out the text-only rows, and `text_only` keeps
 only them without reading the image column. A row is kept when its conversation
 holds a turn and the last turn has a reply; every turn is read, a missing user
-message or reply as empty text.
+message or reply as empty text. `index` recomputes the keep flags of a file
+converted under an earlier keep rule, so a copy converted before needs only
+`index` run again.
 
 Convert FineVision once; any number of `convert` processes can share the work,
 a file that fails to convert is listed at the end without stopping the others,
@@ -129,7 +134,11 @@ counted in `oversize`. Text-only documents pack beside image documents. With
 each image view attend to each other in both directions, while attention stays
 causal across views and text and never crosses documents. Passes
 follow one another without end, and `state_dict` records where the next row
-starts, so a resume packs the same rows. Render for it with `max_text_len=None`
+starts, so a resume packs the same rows. Each pass seeds its loader workers from
+its own generator, so iterating leaves the global random state alone, and
+`in_order=False` is refused. The workers ignore SIGTERM, so outside the training
+loop, whose `BatchStream.close` shuts them down, call `close()` in a `finally`
+block: an open loader with workers blocks the interpreter at exit. Render for it with `max_text_len=None`
 and `max_images=None`, so documents are neither cut nor capped and `seq_len`
 alone bounds them.
 
@@ -354,15 +363,19 @@ once. Every batch holds the same rows whatever the number of ranks, so with one
 `--batch-size` the scores are the same on any number of GPUs of one kind. Causal
 attention keeps a row independent of its batch in exact arithmetic; across batch
 sizes the scores match up to floating-point (bf16) numerics, which can flip a
-close argmax.
+close argmax. On a GPU the decode runs SDPA's memory-efficient kernel whatever
+`model.sdpa_backend` says, so view-group masks do not land on different kernels
+from one run to the next, which would break near-ties differently.
 
 A row is scored as it is or counted under a reason, never changed to fit:
 
 - `unreadable_row`: the reader passed over the row because its image does not
   decode. The row it moved on to is not scored in its place.
 - `prompt_too_long`: the document and `max_new_tokens` do not fit what training
-  lays out: `train.seq_len` positions for the views and text of a packed run, and
-  `vlm.max_text_len` for the text of an unpacked one.
+  lays out: `train.seq_len` positions for the views and text of a packed run
+  (`model.max_seq_len` for an unpacked one), and `vlm.max_text_len` for the text,
+  which the core pipeline cuts to that length packed or not. A run trained on a
+  mixture (`--mixture`) rendered its documents uncut, so its text has no cap.
 - `unrenderable_row`: the chat template does not lay the row out as training
   does (a `conversation` document whose turn the template mangles), so training
   passes over it too. Its record holds the error text.
@@ -545,23 +558,49 @@ prompt starts with a space (`lead_space`), and each view's tokens attend to each
 other in both directions (`view_groups`).
 
 The run starts from a stage-1 checkpoint saved as one `.pt` state dict, written
-as a DCP for this config first:
+as a DCP for this config first. On the cluster that checkpoint is
+`/n/holystore01/LABS/kempner_project_d/Lab/checkpoints/cross-modal/init/dcpacked-s1-50k-p16-512-k2mlp.pt`,
+step 50,000 of a stage-1 run with this preset's encoder (SigLIP2 so400m/16 at
+512 px) and connector (2 × 2 pooling into the RMS-normed GELU MLP). The converter
+reads either name of the connector's tensors (`adapter.norm` and
+`adapter.proj.{0,2}`, or `adapter.model.ln_q` and `adapter.model.mlp.{0,2}`); a
+checkpoint of another encoder, such as SigLIP so400m/14 at 224 px, is refused on
+its shapes.
 
 ```bash
 uv run python examples/image_understanding/scripts/convert_pt_checkpoint.py \
-    --checkpoint path-to-stage-1.pt \
+    --checkpoint /n/holystore01/LABS/kempner_project_d/Lab/checkpoints/cross-modal/init/dcpacked-s1-50k-p16-512-k2mlp.pt \
     --config examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml \
     --out /your/init/checkpoint
-uv run torchrun --nnodes=4 --nproc_per_node=4 examples/image_understanding/train.py \
+```
+
+The run takes 4 nodes of 4 GPUs. Launch it the way `scripts/slurm/multinode.sh`
+does, with one task per GPU and that script's `MASTER_ADDR`, `MASTER_PORT` and
+NCCL settings, running the example's entry point:
+
+```bash
+srun --kill-on-bad-exit=1 uv run python examples/image_understanding/train.py \
     examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml \
     --mixture=examples/image_understanding/mixtures/stage2_testbed_finevision_pixmo_text.toml \
     --checkpoint.load_path=/your/init/checkpoint --checkpoint.dir=/your/run/dir
 ```
 
+The mixture file and the run's settings for it (`[vlm]`, `data.pack_sequences`,
+`train.batch_size = 1`) are checked before training starts. The run saves every
+1000 steps and keeps the last three checkpoints.
+
 ## Evaluation tasks and scorers
 
 `evaluation/` also holds what an evaluation run is made of: the tasks to run and
 the scorers of their answers.
+
+The board, below, is the set of nine evaluations this recipe's runs are reported
+on: A-OKVQA, DocVQA, TextVQA, ChartQA human and machine, PixMo pointing and
+counting, GSM8K and MMLU, each with a fixed prompt, answer cap and scorer.
+`configs/eval_tasks.toml` holds them. Where the board's scoring departs from a
+task's published metric, the scorers here follow the board, so their numbers
+compare with the recipe's reported ones; each such departure is noted with its
+scorer.
 
 - `tasks.py`: `load_tasks` reads a TOML task file into frozen `EvalTask`s. A task
   has a unique `name`, a `reader` (a `testbed.py` loader or one of
@@ -615,14 +654,25 @@ the scorers of their answers.
     `0.45` and `45.1%` but not `45`. `1,000` is text, while `1_000` is 1000.
 
   - `exact_vqa_accuracy` (A-OKVQA): `min(1, m / 3)` for the `m` direct answers
-    the prediction equals exactly, nothing normalized.
+    the prediction equals exactly, nothing normalized; the reader keeps the
+    direct answers as written, blank ones included. As on the board, every val
+    question is scored, the 70 of 1145 marked `difficult_direct_answer` included,
+    which the official direct-answer evaluation leaves out (about 2 points lower
+    on the correct choices), and each row needs an `image` path, which the
+    released annotation files give as `image_id`.
   - `count_accuracy` (PixMo counting): the stated count is the `N` of "I count
     N", else the last integer outside point tags; `accuracy` is whether it is the
-    reference count and `mae` how far off it is (the whole count without one).
+    reference count and `mae` how far off it is (the whole count without one). A
+    tag cut off before its `>` is read as text, so its last coordinate digit can
+    be taken for the count, as on the board.
   - `points_in_masks` (PixMo pointing): the points of every `<point>`/`<points>`
     tag, in percent, land on the nearest mask pixel; `precision` is the share
     inside any object, `recall` the share of objects hit, `count_mae` the gap
-    between the counts of points and objects.
+    between the counts of points and objects. This is the board's rule, not the
+    published one (Molmo, Deitke et al. 2024, appendix D): points are not matched
+    one-to-one to objects, so several points on one object all count as inside,
+    and a row with no target, stored as one empty mask, counts as one object and
+    scores 0 even for a correct "not present" answer.
   - `final_number` (GSM8K): 1 when the last number, commas dropped, equals the
     reference.
   - `choice_letter` (MMLU): 1 when the first standalone capital `A` to `D` is the
@@ -630,8 +680,13 @@ the scorers of their answers.
 
 `configs/eval_tasks.toml` is a sample with VQAv2 (10) and the nine tasks of the
 board, with its caps: A-OKVQA 10, DocVQA 50, TextVQA 75, ChartQA human and
-machine 50, PixMo pointing 75 and counting 20, GSM8K 256 and MMLU 10. Its paths
-are placeholders:
+machine 50, PixMo pointing 75 and counting 20, GSM8K 256 and MMLU 10. The
+PixMo caps are short for answers in the trained point-then-count format, which
+lists a point tag before the count (two to ten objects take about 50 to 180
+tokens with Qwen3's tokenizer), so such answers are cut before their count or
+past four points; they are kept to score as the board does, and a task file
+that raises them (to 256, say) scores those answers whole. The sample's paths are
+placeholders:
 
 ```toml
 [[tasks]]

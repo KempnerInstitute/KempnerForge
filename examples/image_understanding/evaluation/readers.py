@@ -26,6 +26,7 @@ MMLU_LETTERS = ("A", "B", "C", "D")
 _STRING = r'"((?:[^"\\]|\\.)*)"'
 _IMAGE = re.compile(rf'"image"\s*:\s*{_STRING}')
 _LABEL = re.compile(rf'"label"\s*:\s*{_STRING}')
+_POINTS = re.compile(r'"points"\s*:\s*(\[[^\]]*\])')
 
 
 def _string(pattern: re.Pattern[str], line: str, name: str) -> str:
@@ -86,10 +87,17 @@ class PixmoPointsEval(Dataset):
         masks = np.asarray(self._row(index)["masks"], dtype=bool)
         return masks.reshape(0, 0, 0) if masks.size == 0 else masks
 
+    def _points(self, index: int) -> list[dict[str, Any]]:
+        """Row ``index``'s annotated points, read without parsing its masks."""
+        with open(self.annotation_file, "rb") as file:
+            file.seek(self._offsets[index])
+            found = _POINTS.findall(file.readline().decode())
+        return json.loads(found[-1]) if found else []
+
     def _read(self, index: int) -> Document:
         image = decode_rgb(self.image_root / self._images[index])
         label = self._labels[index]
-        points = self._row(index).get("points") or []
+        points = self._points(index)
         answer = format_point_answer(
             [(float(p["x"]), float(p["y"])) for p in points], label, absent_text="none"
         )

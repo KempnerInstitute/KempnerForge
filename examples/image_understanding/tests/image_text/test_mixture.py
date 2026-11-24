@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 import torch
-from mixture import finevision_subsets, mixture_data_fn, mixture_sources
+from mixture import check_mixture, check_run, finevision_subsets, mixture_data_fn, mixture_sources
 from test_finevision import _row, _run, _write_parquet
 
 from kempnerforge.config.loader import load_config
@@ -29,6 +29,7 @@ num_workers = 0
 [train]
 seq_len = 384
 seed = 3
+batch_size = 1
 """
 
 
@@ -106,6 +107,59 @@ class TestMixture:
             mixture_sources({"source": [source]})
         with pytest.raises(ValueError, match="no source"):
             mixture_sources({})
+
+    @pytest.mark.parametrize(
+        ("mixture", "message"),
+        [
+            ({"packng": {"view_groups": True}}, "unknown mixture table"),
+            ({"render": {"answer_onlyy": True}}, r"\[render\]: unknown option"),
+            ({"render": {"max_images": 1}}, "set from the run config"),
+            ({"packing": {"view_group": True}}, r"\[packing\]: unknown option"),
+            ({"source": [{"reader": "vqav2", "annotation_file": "a"}]}, "missing option"),
+            (
+                {"source": [{"reader": "vqav2", "annotation_file": "a", "image_rot": "b"}]},
+                r"unknown option\(s\) \['image_rot'\]",
+            ),
+            ({"source": [{"reader": "finevision"}]}, r"missing option\(s\) \['root'\]"),
+            (
+                {"source": [{"reader": "finevision", "root": "r", "max_image": 1}]},
+                r"unknown option\(s\) \['max_image'\]",
+            ),
+            (
+                {"source": [{"reader": "finevision", "root": "r", "subset_dir": "s"}]},
+                "unknown option",
+            ),
+        ],
+    )
+    def test_a_mistaken_mixture_is_refused_before_reading(
+        self, mixture: dict[str, Any], message: str
+    ) -> None:
+        vqav2 = {"reader": "vqav2", "annotation_file": "a", "image_root": "b"}
+        mixture = {"source": [vqav2]} | mixture
+        with pytest.raises(ValueError, match=message):
+            check_mixture(mixture)
+
+    def test_the_mixture_file_is_checked_when_the_data_fn_is_made(self, tmp_path: Path) -> None:
+        path = tmp_path / "mixture.toml"
+        path.write_text('[packng]\nview_groups = true\n[[source]]\nreader = "vqav2"\n')
+        with pytest.raises(ValueError, match="unknown mixture table"):
+            mixture_data_fn(path)
+
+    @pytest.mark.parametrize(
+        ("override", "message"),
+        [
+            ("--train.batch_size=2", "batch_size = 1"),
+            ("--data.pack_sequences=false", "pack_sequences"),
+        ],
+    )
+    def test_a_run_the_mixture_cannot_train_is_refused(
+        self, tmp_path: Path, override: str, message: str
+    ) -> None:
+        config_path = tmp_path / "run.toml"
+        config_path.write_text(CONFIG)
+        check_run(load_config(str(config_path), cli_args=[]))
+        with pytest.raises(ValueError, match=message):
+            check_run(load_config(str(config_path), cli_args=[override]))
 
     def test_the_data_fn_packs_every_source(
         self, tmp_path: Path, finevision: Path, captions: dict[str, str]

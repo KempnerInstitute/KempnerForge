@@ -19,6 +19,13 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+
+@pytest.fixture(autouse=True)
+def _decode_on_the_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The evaluator decodes on the CPU here, as the references the tests compare with were."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+
 SPECIAL_TOKENS = ("<|endoftext|>", "<|im_start|>", "<|im_end|>", "<unk>")
 WORDS = (
     "user assistant what is shown in the image ? how many which color a an one two three "

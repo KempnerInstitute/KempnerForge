@@ -96,12 +96,17 @@ class Budgets:
     text_len: int | None = None
 
 
-def token_budgets(config: JobConfig) -> Budgets:
-    """The lengths of ``config``'s training: a packed row, or an unpacked sample's text."""
+def token_budgets(config: JobConfig, settings: RenderSettings | None = None) -> Budgets:
+    """The lengths of ``config``'s training: a packed row or an unpacked sample, and its text.
+
+    The core pipeline cuts a document's text to ``vlm.max_text_len`` packed or
+    not; a mixture's documents are uncut.
+    """
     assert config.vlm is not None
+    text_len = None if settings is not None and settings.mixture else config.vlm.max_text_len
     if config.data.pack_sequences:
-        return Budgets(row_len=config.train.seq_len)
-    return Budgets(row_len=config.model.max_seq_len, text_len=config.vlm.max_text_len)
+        return Budgets(row_len=config.train.seq_len, text_len=text_len)
+    return Budgets(row_len=config.model.max_seq_len, text_len=text_len)
 
 
 @dataclass(frozen=True)
@@ -348,7 +353,7 @@ def evaluate_checkpoint(
     apply_matmul_precision(config.train)
     output = Path(output)
     settings = settings or RenderSettings()
-    budgets = token_budgets(config)
+    budgets = token_budgets(config, settings)
     renderer, readers = _on_every_rank(
         partial(_prepare, config, tasks, cleared.failure, settings, budgets),
         "Preparing the evaluation",

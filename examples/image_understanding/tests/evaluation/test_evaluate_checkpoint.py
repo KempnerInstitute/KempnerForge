@@ -108,6 +108,26 @@ def test_options_and_config_overrides_reach_the_evaluation(
     assert seen["config"].train.tf32 is True
 
 
+def test_the_mixture_render_settings_reach_the_evaluation(
+    config_path: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from evaluation.inputs import RenderSettings
+
+    mixture = tmp_path / "mixture.toml"
+    mixture.write_text(
+        "[render]\nanswer_only = true\ntrain_reply_prefix = true\nlead_space = true\n"
+        "[packing]\nview_groups = true\n"
+    )
+    argv = [str(config_path), "--checkpoint=runs/a", "--tasks", str(SAMPLE_TASKS)]
+    seen = _handed_off(monkeypatch, *argv, "--output", "results/a", f"--mixture={mixture}")
+    assert seen["settings"] == RenderSettings(
+        {"answer_only": True, "train_reply_prefix": True, "lead_space": True},
+        view_groups=True,
+        mixture=True,
+    )
+    assert _handed_off(monkeypatch, *argv, "--output", "results/b")["settings"] == RenderSettings()
+
+
 @pytest.mark.parametrize("missing", ["config", "--checkpoint", "--tasks", "--output"])
 def test_every_input_is_required(
     config_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str

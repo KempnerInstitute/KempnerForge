@@ -39,10 +39,12 @@ class RenderSettings:
     ``render`` holds ``ChatRenderer`` keyword options (``train_reply_prefix``,
     ``lead_space``, ...) and ``view_groups`` says each image view's tokens attended
     to each other in both directions, as a mixture's ``[packing]`` sets it.
+    ``mixture`` says the run trained on a mixture, whose documents render uncut.
     """
 
     render: Mapping[str, Any] = field(default_factory=dict)
     view_groups: bool = False
+    mixture: bool = False
 
     @classmethod
     def from_mixture(cls, path: str | Path | None) -> RenderSettings:
@@ -57,7 +59,9 @@ class RenderSettings:
             raise ValueError(
                 f"the mixture's [packing] holds options the evaluator lacks: {unknown}"
             )
-        return cls(dict(mixture.get("render", {})), bool(packing.get("view_groups", False)))
+        return cls(
+            dict(mixture.get("render", {})), bool(packing.get("view_groups", False)), mixture=True
+        )
 
 
 @dataclass(frozen=True)
@@ -91,16 +95,18 @@ def check_renderer_config(config: JobConfig) -> None:
 def build_renderer(config: JobConfig, settings: RenderSettings | None = None) -> ChatRenderer:
     """The training renderer for ``config`` with ``settings``' options.
 
-    It takes the run's tokenizer, image size and tiling, and the text length an
-    unpacked run lays out; a packed run's text is uncut.
+    It takes the run's tokenizer, image size and tiling, and the text length the
+    run cut its documents to: ``vlm.max_text_len``, as the core pipeline cuts
+    them packed or not, or none for a run that trained on a mixture.
     """
     check_renderer_config(config)
     assert config.vlm is not None
+    settings = settings or RenderSettings()
     options: dict[str, Any] = {"answer_only": True}
-    options.update((settings or RenderSettings()).render)
+    options.update(settings.render)
     return ChatRenderer(
         build_tokenizer(config.data.tokenizer_path),
-        max_text_len=None if config.data.pack_sequences else config.vlm.max_text_len,
+        max_text_len=None if settings.mixture else config.vlm.max_text_len,
         image_size=config.data.hf_image_size,
         max_images=None,
         tile_grid=config.vlm.tile_grid,

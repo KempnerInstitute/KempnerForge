@@ -89,6 +89,9 @@ class FakeCheckpointManager:
     def flush_pending_save(self) -> None:
         self.flushes += 1
 
+    def apply_dataloader_state(self, dataloader) -> None:
+        pass
+
     @property
     def saved_steps(self) -> list[int]:
         return [s for s, _, _ in self.saves]
@@ -1302,8 +1305,7 @@ class TestRunTraining:
             pack_vlm_samples([doc(30, 4), doc(24, 5)], seq_len=64, tokens_per_image=8, pad_id=0),
         ]
         assert [b["input_ids"].shape[0] for b in batches] == [1, 2]
-        ckpt = _stub_entry(monkeypatch, model)
-        ckpt.apply_dataloader_state = lambda _loader: None
+        _stub_entry(monkeypatch, model)
         monkeypatch.setattr(
             entry, "build_data_pipeline", lambda *_a, **_k: DataPipeline(dataloader=batches)
         )
@@ -1334,8 +1336,7 @@ class TestRunTraining:
             "text_len": torch.tensor(12),
         }
         batch = pack_vlm_samples([doc, doc], seq_len=64, tokens_per_image=tokens, pad_id=0)
-        ckpt = _stub_entry(monkeypatch, model)
-        ckpt.apply_dataloader_state = lambda _loader: None
+        _stub_entry(monkeypatch, model)
         monkeypatch.setattr(
             entry, "build_data_pipeline", lambda *_a, **_k: pytest.fail("default pipeline built")
         )
@@ -1348,6 +1349,57 @@ class TestRunTraining:
         run_training(config, data_fn=data_fn)
         assert calls == [(config, 0, tokens)]
         assert not torch.equal(before, next(model.transformer.parameters()))
+
+    def test_a_saved_loader_position_reaches_an_injected_loader(self, monkeypatch):
+        """The stashed loader state is loaded into data_fn's loader before its first batch."""
+        from typing import cast
+
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.training.entry import run_training
+
+        class Restoring(FakeCheckpointManager):
+            def __init__(self) -> None:
+                super().__init__()
+                self._pending_dataloader_state: dict | None = {"position": 7}
+
+            def apply_dataloader_state(self, dataloader) -> None:
+                CheckpointManager.apply_dataloader_state(cast(CheckpointManager, self), dataloader)
+
+        _stub_entry(monkeypatch, nn.Linear(4, 4))
+        ckpt = Restoring()
+        monkeypatch.setattr(entry, "build_checkpoint_manager", lambda *_a, **_k: ckpt)
+
+        class Loader:
+            def __init__(self) -> None:
+                self.loaded: list[dict] = []
+
+            def load_state_dict(self, state: dict) -> None:
+                self.loaded.append(state)
+
+            def __iter__(self):
+                raise RuntimeError(f"iterated after loading {self.loaded}")
+
+        loader = Loader()
+        config = _vlm_config()
+        with pytest.raises(RuntimeError, match=r"iterated after loading \[\{'position': 7\}\]"):
+            run_training(config, data_fn=lambda _c, _r, **_k: DataPipeline(dataloader=loader))
+        assert loader.loaded == [{"position": 7}]
+        assert ckpt._pending_dataloader_state is None
+
+    @pytest.mark.parametrize("partition", [(1, 1), (0, 2)])
+    def test_a_data_fn_with_another_partition_is_refused(self, monkeypatch, partition):
+        """A builder whose dp_rank/dp_size differ from the mesh's is refused before training."""
+        from kempnerforge.training.entry import run_training
+
+        _stub_entry(monkeypatch, nn.Linear(4, 4))
+        rank, size = partition
+
+        def data_fn(cfg, runtime, *, tokens_per_image=None):
+            return DataPipeline(dp_rank=rank, dp_size=size)
+
+        with pytest.raises(ValueError, match=rf"dp_rank={rank}, dp_size={size}, but"):
+            run_training(_vlm_config(), data_fn=data_fn)
 
     def test_defaults_to_the_registry_selected_step_body(self, monkeypatch):
         from kempnerforge.training.entry import run_training

@@ -10,6 +10,7 @@ import torch
 import torch.distributed.checkpoint as dcp
 
 from kempnerforge.config.job import JobConfig
+from kempnerforge.config.model import ModelConfig
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 from kempnerforge.resilience.elastic import resolve_resume_path
 
@@ -104,6 +105,18 @@ def step_dir_complete(step_dir: Path) -> bool:
     )
 
 
+def decode_model_config(model: ModelConfig, device: torch.device) -> ModelConfig:
+    """``model`` with the attention a decode runs: SDPA, on one kernel.
+
+    SDPA's masks need no compile for each row length the decode meets. On a GPU
+    the memory-efficient kernel is pinned, which takes the view-group mask, so a
+    near-tie breaks the same way on any run instead of with whichever kernel SDPA
+    picks; ``sdpa_backend = "flash"``, which takes no mask, is replaced too.
+    """
+    backend = "efficient" if device.type == "cuda" else "auto"
+    return dataclasses.replace(model, attention_backend="sdpa", sdpa_backend=backend)
+
+
 def load_model(config: JobConfig, step_dir: Path, device: torch.device) -> VLMWrapper:
     """The model ``config`` describes with the weights saved in ``step_dir``, in eval mode.
 
@@ -112,12 +125,12 @@ def load_model(config: JobConfig, step_dir: Path, device: torch.device) -> VLMWr
     ``vision_encoder.mixed_precision`` when that is set and otherwise in the
     dtype it loads in, which is how a training build on one device leaves it.
     The calling process loads the whole model, whatever saved it. Attention runs
-    on SDPA, whose masks need no compile for each row length the decode meets.
+    as ``decode_model_config`` sets it.
     """
     vision, adapter, vlm = config.vision_encoder, config.adapter, config.vlm
     assert vision is not None and adapter is not None and vlm is not None
     model = build_vlm_wrapper(
-        dataclasses.replace(config.model, attention_backend="sdpa"),
+        decode_model_config(config.model, device),
         vision,
         adapter,
         vlm,
