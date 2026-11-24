@@ -129,6 +129,16 @@ def _coerce_value(field_type: Any, value: Any) -> Any:
             return value
         return [value]
 
+    if origin is dict and isinstance(value, dict) and len(get_args(field_type)) == 2:
+        value_type = get_args(field_type)[1]
+        coerced = {}
+        for key, item in value.items():
+            try:
+                coerced[key] = _coerce_value(value_type, item)
+            except ValueError as e:
+                raise ValueError(f"key {key!r}: {e}") from None
+        return coerced
+
     if field_type is bool:
         return _coerce_bool(value)
     if field_type is int or field_type is float:
@@ -210,6 +220,40 @@ def _dataclass_type_from_hint(hint: Any) -> type | None:
     return None
 
 
+class _DottedKeys(dict):
+    """The keys a dotted CLI override names below a config field, unlike a dict literal.
+
+    ``_parse_cli_overrides`` builds these for dotted paths, so a dotted key below a
+    dict-valued field sets that key and keeps the rest of the field's table.
+    """
+
+
+def _with_dotted_keys(table: dict[str, Any], keys: dict[str, Any]) -> dict[str, Any]:
+    """``table`` with the keys a dotted override sets, the rest of it kept.
+
+    A dotted key below one of ``table``'s own tables sets that key in it in turn; any other
+    value, a dict literal included, replaces the one ``table`` holds. The result holds plain
+    dicts only.
+    """
+    merged = dict(table)
+    for key, value in keys.items():
+        if isinstance(value, dict):
+            below = merged.get(key) if isinstance(value, _DottedKeys) else None
+            value = _with_dotted_keys(below if isinstance(below, dict) else {}, value)
+        merged[key] = value
+    return merged
+
+
+def _dict_field_value(raw: dict[str, Any], current: Any) -> dict[str, Any]:
+    """The table a dict ``raw`` gives a field that holds ``current``.
+
+    A dotted override sets its keys in ``current``'s table and keeps the rest; a dict
+    literal, as from a TOML table, replaces it.
+    """
+    table = current if isinstance(raw, _DottedKeys) and isinstance(current, dict) else {}
+    return _with_dotted_keys(table, raw)
+
+
 def _instantiate_from_dict(dc_type: type, data: dict[str, Any]) -> Any:
     """Construct a dataclass directly from a dict, without first building a
     default instance.
@@ -242,6 +286,11 @@ def _instantiate_from_dict(dc_type: type, data: dict[str, Any]) -> Any:
         inner = _dataclass_type_from_hint(hint)
         if inner is not None and isinstance(raw, dict):
             kwargs[f.name] = _instantiate_from_dict(inner, raw)
+        elif isinstance(raw, dict):
+            default = None
+            if isinstance(raw, _DottedKeys):
+                default = f.default_factory() if callable(f.default_factory) else f.default
+            kwargs[f.name] = _coerce_field(dc_type, f.name, hint, _dict_field_value(raw, default))
         else:
             kwargs[f.name] = _coerce_field(dc_type, f.name, hint, raw)
     return dc_type(**kwargs)
@@ -307,16 +356,17 @@ def _apply_dict_to_dataclass(dc: Any, data: dict[str, Any]) -> Any:
         current_val = getattr(dc, f.name)
         if f.name in data:
             raw = data[f.name]
+            hint = type_hints[f.name]
+            inner = _dataclass_type_from_hint(hint)
             if is_dataclass(current_val) and isinstance(raw, dict):
                 kwargs[f.name] = _apply_dict_to_dataclass(current_val, raw)
-            elif current_val is None and isinstance(raw, dict):
-                inner = _dataclass_type_from_hint(type_hints[f.name])
-                if inner is not None:
-                    kwargs[f.name] = _instantiate_from_dict(inner, raw)
-                else:
-                    kwargs[f.name] = _coerce_field(dc_type, f.name, type_hints[f.name], raw)
+            elif isinstance(raw, dict) and inner is not None and current_val is None:
+                kwargs[f.name] = _instantiate_from_dict(inner, raw)
+            elif isinstance(raw, dict) and inner is None:
+                table = _dict_field_value(raw, current_val)
+                kwargs[f.name] = _coerce_field(dc_type, f.name, hint, table)
             else:
-                kwargs[f.name] = _coerce_field(dc_type, f.name, type_hints[f.name], raw)
+                kwargs[f.name] = _coerce_field(dc_type, f.name, hint, raw)
         else:
             kwargs[f.name] = current_val
 
@@ -372,7 +422,7 @@ def _parse_cli_overrides(args: list[str]) -> dict[str, Any]:
         parts = key.split(".")
         d = overrides
         for part in parts[:-1]:
-            d = d.setdefault(part, {})
+            d = d.setdefault(part, _DottedKeys())
         d[parts[-1]] = value
 
     return overrides

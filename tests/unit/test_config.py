@@ -2173,6 +2173,146 @@ class TestRegistry:
             assert callable(registry.get("norm", name))
 
 
+class TestDottedDictOverrides:
+    """A dotted CLI override below a dict-valued field sets one key and keeps the rest (#509)."""
+
+    _VLM = '[vision_encoder]\ntype = "random"\n\n[adapter]\ntype = "mlp_2layer"\n'
+
+    @staticmethod
+    def _tables_with(args: list[str]):
+        """An Optional and a nested dict field, which no built-in config has, after ``args``."""
+        from dataclasses import dataclass, field
+
+        @dataclass
+        class Tables:
+            optional: dict[str, str] | None = None
+            nested: dict[str, dict[str, int]] = field(
+                default_factory=lambda: {"a": {"x": 1, "y": 2}, "b": {"z": 3}}
+            )
+            tree: dict[str, typing.Any] = field(default_factory=dict)
+
+        return loader._apply_dict_to_dataclass(Tables(), _parse_cli_overrides(args))
+
+    @staticmethod
+    def _toml(tmp_path: Path, body: str) -> str:
+        path = tmp_path / "base.toml"
+        path.write_text(body)
+        return str(path)
+
+    def test_a_dotted_key_keeps_the_rest_of_a_toml_table(self, tmp_path):
+        path = self._toml(tmp_path, '[metrics.mlflow_tags]\nteam = "kf"\nstage = "one"\n')
+        tags = load_config(path, cli_args=["--metrics.mlflow_tags.stage=two"]).metrics.mlflow_tags
+        assert tags == {"team": "kf", "stage": "two"}
+        assert type(tags) is dict
+
+    def test_dotted_keys_set_and_add_keys_of_the_table(self, tmp_path):
+        path = self._toml(tmp_path, "[data.anneal_weights]\na = 0.5\nb = 0.5\n")
+        args = ["--data.anneal_weights.c=0.25", "--data.anneal_weights.a=0.9"]
+        weights = load_config(path, cli_args=args).data.anneal_weights
+        assert weights == {"a": 0.9, "b": 0.5, "c": 0.25}
+
+    def test_a_dict_literal_replaces_the_table(self, tmp_path):
+        path = self._toml(tmp_path, '[metrics.mlflow_tags]\nteam = "kf"\nstage = "one"\n')
+        override = "--metrics.mlflow_tags={'stage': 'two'}"
+        assert load_config(path, cli_args=[override]).metrics.mlflow_tags == {"stage": "two"}
+
+    def test_a_dotted_key_keeps_the_defaults_of_a_toml_vlm_section(self, tmp_path):
+        path = self._toml(tmp_path, self._VLM + '\n[vlm]\narch = "joint_decoder"\n')
+        defaults = load_config(path, cli_args=[]).vlm
+        assert defaults is not None and len(defaults.module_patterns) > 1
+        override = "--vlm.module_patterns.adapter=['adapter.*', 'extra.*']"
+        vlm = load_config(path, cli_args=[override]).vlm
+        assert vlm is not None
+        assert vlm.module_patterns == {
+            **defaults.module_patterns,
+            "adapter": ["adapter.*", "extra.*"],
+        }
+
+    def test_a_dotted_key_keeps_the_defaults_of_a_vlm_section_the_cli_builds(self, tmp_path):
+        path = self._toml(tmp_path, self._VLM)
+        defaults = load_config(path, cli_args=["--vlm.arch=mot"]).vlm
+        assert defaults is not None and "mot" in defaults.module_patterns
+        args = ["--vlm.arch=mot", "--vlm.module_patterns.adapter=['adapter.*']"]
+        vlm = load_config(path, cli_args=args).vlm
+        assert vlm is not None
+        assert vlm.module_patterns == {**defaults.module_patterns, "adapter": ["adapter.*"]}
+
+    def test_dotted_keys_merge_nested_tables_into_plain_dicts(self):
+        args = ["--nested.a.x=5", "--nested.b.w=4"]
+        tables = self._tables_with(args)
+        assert tables.nested == {"a": {"x": 5, "y": 2}, "b": {"z": 3, "w": 4}}
+        assert all(type(t) is dict for t in (tables.nested, *tables.nested.values()))
+
+    def test_an_optional_dict_left_at_none_takes_dotted_keys_as_a_plain_dict(self):
+        tables = self._tables_with(["--optional.k=v"])
+        assert tables.optional == {"k": "v"}
+        assert type(tables.optional) is dict
+
+    def test_a_given_table_does_not_build_the_field_default(self):
+        """A dataclass built from a dict reads a field's default only for dotted keys."""
+        from dataclasses import dataclass, field
+
+        def no_default() -> dict[str, str]:
+            raise AssertionError("the default was built")
+
+        @dataclass
+        class Raising:
+            table: dict[str, str] = field(default_factory=no_default)
+
+        for raw in ({"k": "v"}, _parse_cli_overrides(["--table={'k': 'v'}"])["table"]):
+            assert loader._instantiate_from_dict(Raising, {"table": raw}).table == {"k": "v"}
+
+    def test_dotted_keys_inside_an_earlier_literal_give_plain_dicts(self):
+        args = ["--tree={'a': {}}", "--tree.a.p.q=1", "--tree.c.d=2"]
+        tables = self._tables_with(args)
+        assert tables.tree == {"a": {"p": {"q": 1}}, "c": {"d": 2}}
+        assert type(tables.tree["a"]["p"]) is dict and type(tables.tree["c"]) is dict
+
+    def test_a_dotted_key_takes_the_value_type_of_the_table(self, tmp_path):
+        path = self._toml(tmp_path, self._VLM + '\n[vlm]\narch = "joint_decoder"\n')
+        override = "--vlm.module_patterns.vision_encoder=vision_encoder.*"
+        vlm = load_config(path, cli_args=[override]).vlm
+        assert vlm is not None
+        assert vlm.module_patterns["vision_encoder"] == ["vision_encoder.*"]
+        weights = load_config(path, cli_args=["--data.anneal_weights.c=1"]).data.anneal_weights
+        assert weights == {"c": 1.0} and type(weights["c"]) is float
+
+    def test_a_table_built_from_a_dict_takes_the_value_type(self):
+        from dataclasses import dataclass, field
+
+        @dataclass
+        class Tables:
+            patterns: dict[str, list[str]] = field(default_factory=dict)
+            weights: dict[str, float] = field(default_factory=dict)
+
+        for raw in ({"k": "v.*"}, _parse_cli_overrides(["--patterns.k=v.*"])["patterns"]):
+            built = loader._instantiate_from_dict(Tables, {"patterns": raw})
+            assert built.patterns == {"k": ["v.*"]}
+        with pytest.raises(ValueError, match=r"^Tables\.weights: key 'a': expected a float"):
+            loader._instantiate_from_dict(Tables, {"weights": {"a": "x"}})
+
+    @pytest.mark.parametrize(
+        ("toml", "args", "got"),
+        [
+            ('[data.anneal_weights]\nc4 = "x"\n', [], "'x'"),
+            ("", ["--data.anneal_weights.c4.en=0.9"], "{'en': 0.9}"),
+        ],
+    )
+    def test_a_value_the_value_type_refuses_names_the_field_and_key(
+        self, tmp_path, toml, args, got
+    ):
+        path = self._toml(tmp_path, toml)
+        refusal = rf"^DataConfig\.anneal_weights: key 'c4': expected a float, got {re.escape(got)}$"
+        with pytest.raises(ValueError, match=refusal):
+            load_config(path, cli_args=args)
+
+    def test_values_of_nested_tables_are_coerced(self):
+        tables = self._tables_with(["--nested.a.x=2.0"])
+        assert tables.nested["a"] == {"x": 2, "y": 2} and type(tables.nested["a"]["x"]) is int
+        with pytest.raises(ValueError, match=r"^Tables\.nested: key 'a': key 'x': expected an int"):
+            self._tables_with(["--nested.a.x=2.5"])
+
+
 class TestEvalConfig:
     def test_defaults(self):
         ec = EvalConfig()
