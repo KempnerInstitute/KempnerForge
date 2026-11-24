@@ -641,10 +641,13 @@ the scorers of their answers.
     `0.45` and `45.1%` but not `45`. `1,000` is text, while `1_000` is 1000.
 
   - `exact_vqa_accuracy` (A-OKVQA): `min(1, m / 3)` for the `m` direct answers
-    the prediction equals exactly, nothing normalized.
+    the prediction equals exactly, nothing normalized; the reader keeps the
+    direct answers as written, blank ones included.
   - `count_accuracy` (PixMo counting): the stated count is the `N` of "I count
     N", else the last integer outside point tags; `accuracy` is whether it is the
-    reference count and `mae` how far off it is (the whole count without one).
+    reference count and `mae` how far off it is (the whole count without one). A
+    tag cut off before its `>` is read as text, so its last coordinate digit can
+    be taken for the count, as on the board.
   - `points_in_masks` (PixMo pointing): the points of every `<point>`/`<points>`
     tag, in percent, land on the nearest mask pixel; `precision` is the share
     inside any object, `recall` the share of objects hit, `count_mae` the gap
@@ -656,8 +659,13 @@ the scorers of their answers.
 
 `configs/eval_tasks.toml` is a sample with VQAv2 (10) and the nine tasks of the
 board, with its caps: A-OKVQA 10, DocVQA 50, TextVQA 75, ChartQA human and
-machine 50, PixMo pointing 75 and counting 20, GSM8K 256 and MMLU 10. Its paths
-are placeholders:
+machine 50, PixMo pointing 75 and counting 20, GSM8K 256 and MMLU 10. The
+PixMo caps are short for answers in the trained point-then-count format, which
+lists a point tag before the count (two to ten objects take about 50 to 180
+tokens with Qwen3's tokenizer), so such answers are cut before their count or
+past four points; they are kept to score as the board does, and a task file
+that raises them (to 256, say) scores those answers whole. The sample's paths are
+placeholders:
 
 ```toml
 [[tasks]]

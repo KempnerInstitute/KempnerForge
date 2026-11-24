@@ -212,6 +212,14 @@ class TestLoadModel:
         loaded = load_model(config, step_dir, CPU).state_dict()
         assert all(torch.equal(loaded[name], value) for name, value in saved.state_dict().items())
 
+    def test_a_flex_attention_run_loads_to_decode_on_sdpa(
+        self, load: Callable[..., JobConfig], save_checkpoint: Callable[..., Path]
+    ) -> None:
+        config = load("--model.attention_backend=flex")
+        model = load_model(config, save_checkpoint(config, seed=5), CPU)
+        assert config.model.attention_backend == "flex"
+        assert model.transformer.config.attention_backend == "sdpa"
+
     def test_the_model_computes_in_the_training_dtype(
         self, load: Callable[..., JobConfig], save_checkpoint: Callable[..., Path]
     ) -> None:

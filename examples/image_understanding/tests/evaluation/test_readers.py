@@ -52,6 +52,14 @@ class TestPixmoPointsEval:
         assert first.images[0].size == (8, 6)
         assert second.turns[0].answers == ("none",)
 
+    def test_a_row_is_read_without_parsing_its_masks(
+        self, points_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reader = pixmo_points_eval(points_file, tmp_path / "pixmo")
+        monkeypatch.setattr(reader, "_row", lambda index: pytest.fail("the masks were parsed"))
+        assert reader[0].turns[0].answers[0].startswith('<points x1="0.0" y1="0.0"')
+        assert reader[1].turns[0].answers == ("none",)
+
     def test_the_reference_is_the_rows_masks(self, points_file: Path, tmp_path: Path) -> None:
         reader = pixmo_points_eval(points_file, tmp_path / "pixmo")
         masks = reader.reference(0)
@@ -85,6 +93,18 @@ def test_aokvqa_rows_keep_every_direct_answer(tmp_path: Path) -> None:
     (document,) = list(aokvqa(path, tmp_path / "coco"))
     assert document.turns[0].user == "What is it?"
     assert document.turns[0].answers == ("cat", "dog")
+
+
+def test_aokvqa_references_keep_blank_and_spaced_answers(tmp_path: Path) -> None:
+    _image(tmp_path / "coco" / "val2014" / "x.jpg")
+    path = tmp_path / "aokvqa.json"
+    rows = [
+        {"image": "val2014/x.jpg", "question": "What?", "direct_answers": ["cat", "", " dog"]},
+        {"image": "val2014/x.jpg", "question": "Who?", "direct_answers": ["", " "]},
+    ]
+    path.write_text(json.dumps(rows))
+    (document,) = list(aokvqa(path, tmp_path / "coco"))
+    assert document.turns[0].answers == ("cat", "", " dog")
 
 
 def test_gsm8k_rows_are_text_answered_by_the_final_number(tmp_path: Path) -> None:

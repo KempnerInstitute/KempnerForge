@@ -24,7 +24,9 @@ class ImageTextRows(Dataset):
     The table is shared with forked loader workers without the per-row copies that
     touching Python objects would cause. Blank answers are dropped, and with them
     any row left without an answer or without a user message; answers lose their
-    surrounding whitespace, which would otherwise be trained. Images are decoded
+    surrounding whitespace, which would otherwise be trained. With ``raw_answers``
+    the answers are kept as given, blank ones included, as an evaluation's
+    references; a row still needs one that is not blank. Images are decoded
     upright; a row whose image does not decode is passed over for the next one,
     up to ``max_attempts`` in a row, and ``skipped`` counts them. A missing image
     file is an error.
@@ -37,14 +39,22 @@ class ImageTextRows(Dataset):
         users: list[str],
         answers: list[list[str]],
         max_attempts: int = MAX_ATTEMPTS,
+        raw_answers: bool = False,
     ) -> None:
         if not len(images) == len(users) == len(answers):
             raise ValueError(
                 f"column lengths differ: {len(images)} images, {len(users)} users, "
                 f"{len(answers)} answer lists"
             )
-        usable = [[answer.strip() for answer in row if is_text(answer)] for row in answers]
-        kept = [i for i, row in enumerate(usable) if row and is_text(users[i])]
+        if raw_answers:
+            usable = [[str(answer) for answer in row] for row in answers]
+        else:
+            usable = [[answer.strip() for answer in row if is_text(answer)] for row in answers]
+        kept = [
+            i
+            for i, row in enumerate(usable)
+            if is_text(users[i]) and any(is_text(answer) for answer in row)
+        ]
         self.image_root = Path(image_root)
         self.max_attempts = check_max_attempts(max_attempts)
         self._skips = SkipLog()
@@ -141,13 +151,14 @@ def docvqa(annotation_file: str | Path, image_root: str | Path) -> ImageTextRows
 
 
 def aokvqa(annotation_file: str | Path, image_root: str | Path) -> ImageTextRows:
-    """A-OKVQA, every direct answer kept as a candidate."""
+    """A-OKVQA, every direct answer kept as written, blank ones included, as references."""
     rows = _load_json(annotation_file)
     return ImageTextRows(
         image_root,
         [row["image"] for row in rows],
         [row["question"] for row in rows],
-        [_answers(row["direct_answers"]) for row in rows],
+        [list(row["direct_answers"]) for row in rows],
+        raw_answers=True,
     )
 
 

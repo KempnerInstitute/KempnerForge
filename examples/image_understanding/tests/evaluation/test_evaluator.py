@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import socket
@@ -36,6 +37,7 @@ from evaluation.evaluator import (
     summarize,
     token_budgets,
 )
+from evaluation.evaluator import Budgets
 from evaluation.generation import Generation, greedy_decode, stop_token_ids
 from evaluation.inputs import UnsupportedDocumentError, build_renderer, document_inputs
 from evaluation.scorers import SCORERS, Scorer, anls
@@ -291,6 +293,19 @@ class TestShardBatches:
     def test_ranks_take_the_batches_in_turn(self) -> None:
         assert shard_batches(11, 2, 1, 3) == [range(2, 4), range(8, 10)]
         assert shard_batches(11, 2, 2, 3) == [range(4, 6), range(10, 11)]
+
+
+class TestTokenBudgets:
+    def test_a_packed_run_fits_rows_of_its_seq_len(self, run: Run) -> None:
+        config = run.config
+        packed = dataclasses.replace(
+            config,
+            data=dataclasses.replace(config.data, pack_sequences=True),
+            train=dataclasses.replace(config.train, seq_len=40),
+        )
+        assert config.model.max_seq_len == 48 and config.vlm is not None
+        assert token_budgets(packed) == Budgets(row_len=40)
+        assert token_budgets(config) == Budgets(row_len=48, text_len=config.vlm.max_text_len)
 
 
 class TestEvaluateBatch:

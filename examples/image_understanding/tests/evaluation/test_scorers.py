@@ -327,6 +327,10 @@ class TestCountAccuracy:
     def test_the_stated_count_prefers_the_counting_phrase(self, text: str, count: int) -> None:
         assert stated_count(text) == count
 
+    def test_a_tag_cut_before_its_end_is_read_as_the_board_reads_it(self) -> None:
+        assert stated_count('<points x1="12.5" y1="40.2" x2="7') == 7
+        assert stated_count('<points x1="1" y1="2"/>Counting the cats, I count 2.') == 2
+
     def test_the_count_scores_accuracy_and_error(self) -> None:
         assert count_accuracy("I count 5.", ["5"]) == {"accuracy": 1.0, "mae": 0.0}
         assert count_accuracy("I count 2.", ["5"]) == {"accuracy": 0.0, "mae": 3.0}
