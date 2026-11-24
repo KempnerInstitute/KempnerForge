@@ -2,11 +2,14 @@
 
 A row holds one document laid out the way a packed training row lays a document
 out: the tokens of every view of every image, then the text, padding last. The
-views are encoded once and written over their slots at every step. Attention is
-causal, and with ``view_groups`` a view's tokens also see each other, as training
-let them. Nothing after a row's last token reaches it, so in exact arithmetic a
-row decodes to the same tokens alone or in any batch; across batch sizes the
-tokens match up to floating-point (bf16) numerics, which can flip a close argmax.
+rows are run once into a KV cache, with the views encoded once and written over
+their slots, and each step then runs only the new token of every row against the
+cache. Attention is causal, and with ``view_groups`` a view's tokens also see each
+other, as training let them. A row's padding stays in the cache, where its later
+tokens skip it. Nothing after a row's last token reaches it, so in exact
+arithmetic a row decodes to the same tokens alone or in any batch; across batch
+sizes the tokens match up to floating-point (bf16) numerics, which can flip a
+close argmax.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from kempnerforge.model.modality import ModalityContext
+from kempnerforge.model.attention import KVCache
 from kempnerforge.model.vlm import VLMWrapper, packed_tokens_per_image
 
 if TYPE_CHECKING:
@@ -75,21 +78,6 @@ def _check_budget(
         raise ValueError(f"a row of {row_len} exceeds the model's max_seq_len={max_seq_len}")
 
 
-def _rows_of(context: ModalityContext, alive: torch.Tensor, batch: int) -> ModalityContext:
-    """``context`` with the image tokens of the rows in ``alive`` only, renumbered in order."""
-    assert context.inline_rows is not None and context.inline_embeds is not None
-    assert context.inline_positions is not None
-    renumber = torch.full((batch,), -1, dtype=torch.long, device=alive.device)
-    renumber[alive] = torch.arange(alive.numel(), device=alive.device)
-    keep = renumber[context.inline_rows] >= 0
-    return replace(
-        context,
-        inline_embeds=context.inline_embeds[keep],
-        inline_rows=renumber[context.inline_rows[keep]],
-        inline_positions=context.inline_positions[keep],
-    )
-
-
 @torch.inference_mode()
 def greedy_decode(
     model: VLMWrapper,
@@ -104,11 +92,12 @@ def greedy_decode(
     """What ``model`` decodes greedily after each document's prompt, given its images.
 
     Each row is one document of ``rows``: its views' token slots, then its prompt,
-    right-padded with ``pad_id``. The views are encoded once, and each step appends
-    the most likely next token to every row still decoding; the head runs on each
-    row's last token only. A row ends on a token of ``stop_ids`` or after
-    ``max_new_tokens`` tokens, and rows that have ended leave the batch. ``model``
-    is decoded as it is, so pass it in eval mode.
+    right-padded with ``pad_id``. The rows run once into a KV cache, with the views
+    encoded once, and each step appends the most likely next token to every row
+    still decoding, running only that token; the head runs on each row's last
+    token only. A row ends on a token of ``stop_ids`` or after ``max_new_tokens``
+    tokens, and rows that have ended leave the batch and the cache. ``model`` is
+    decoded as it is, so pass it in eval mode.
 
     Raises:
         ValueError: before anything is computed, when there is no row, a prompt is
@@ -118,10 +107,11 @@ def greedy_decode(
     """
     _check_budget(model, rows, max_new_tokens, row_len)
     device = next(model.transformer.parameters()).device
+    cache_dtype = next(model.transformer.parameters()).dtype
     pixel_dtype = next((p.dtype for p in model.vision_encoder.parameters()), torch.float32)
     tokens = packed_tokens_per_image(model)
     batch = len(rows)
-    width = max(footprint(model, row) for row in rows) + max_new_tokens
+    width = max(footprint(model, row) for row in rows)
 
     ids = torch.full((batch, width), pad_id, dtype=torch.long)
     groups = torch.full((batch, width), -1, dtype=torch.long)
@@ -138,7 +128,6 @@ def greedy_decode(
         ids[index, slots : slots + len(row.prompt_ids)] = torch.tensor(row.prompt_ids)
         start[index] = slots + len(row.prompt_ids)
     ids, groups, start = ids.to(device), groups.to(device), start.to(device)
-    length = start.clone()
     pixels = torch.cat([row.pixel_values for row in rows]).to(device=device, dtype=pixel_dtype)
     context = model.strategy.prepare(
         model,
@@ -148,35 +137,56 @@ def greedy_decode(
         image_starts=torch.tensor(image_starts, dtype=torch.long, device=device),
         image_tokens=tokens,
     )
+    config = model.transformer.config
+    caches = [
+        KVCache(
+            batch,
+            width + max_new_tokens,
+            config.n_kv_heads or config.n_heads,
+            config.head_dim,
+            cache_dtype,
+            device,
+        )
+        for _ in range(config.n_layers)
+    ]
+    logits = model.transformer(
+        tokens=ids,
+        modality=replace(
+            context, output_rows=torch.arange(batch, device=device), output_positions=start - 1
+        ),
+        attention_group_ids=groups if view_groups else None,
+        kv_caches=caches,
+    )
     stops = torch.tensor(sorted(stop_ids), dtype=torch.long, device=device)
-    stopped = torch.zeros(batch, dtype=torch.bool, device=device)
+    prompt_keys = torch.arange(width, device=device) < start.unsqueeze(1)
+    decoded: list[list[int]] = [[] for _ in range(batch)]
+    stopped = [False] * batch
 
     alive = torch.arange(batch, device=device)
-    current = context
-    for _ in range(max_new_tokens):
-        span = int(length[alive].max())
-        last = length[alive] - 1
-        logits = model.transformer(
-            tokens=ids[alive, :span],
-            modality=replace(
-                current,
-                output_rows=torch.arange(alive.numel(), device=device),
-                output_positions=last,
-            ),
-            attention_group_ids=groups[alive, :span] if view_groups else None,
-        )
+    for step in range(max_new_tokens):
         token = logits[0].argmax(dim=-1)
         ended = torch.isin(token, stops)
+        for row, value, end in zip(alive.tolist(), token.tolist(), ended.tolist(), strict=True):
+            if end:
+                stopped[row] = True
+            else:
+                decoded[row].append(value)
+        if step == max_new_tokens - 1:
+            break
         if ended.any():
-            stopped[alive[ended]] = True
-            alive, token = alive[~ended], token[~ended]
+            keep = (~ended).nonzero().squeeze(1)
+            alive, token = alive[keep], token[keep]
             if alive.numel() == 0:
                 break
-            current = _rows_of(context, alive, batch)
-        ids[alive, length[alive]] = token
-        length[alive] += 1
+            for cache in caches:
+                cache.keep_rows(keep)
+        generated = torch.ones(alive.numel(), step + 1, dtype=torch.bool, device=device)
+        logits = model.transformer(
+            tokens=token.unsqueeze(1),
+            position_ids=(start[alive] + step).unsqueeze(1),
+            kv_caches=caches,
+            valid_keys=torch.cat([prompt_keys[alive], generated], dim=1),
+        )
+        logits = logits[:, -1].unsqueeze(0)
 
-    return [
-        Generation(tuple(ids[row, start[row] : length[row]].tolist()), bool(stopped[row]))
-        for row in range(batch)
-    ]
+    return [Generation(tuple(decoded[row]), stopped[row]) for row in range(batch)]
