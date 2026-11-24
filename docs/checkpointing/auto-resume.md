@@ -103,14 +103,16 @@ if resume_path or config.checkpoint.load_path:
         (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
     )
     vlm_freeze_expected = ...  # VLM runs, unless a weights-only warm start
-    step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
-        path=str(resume_path) if resume_path else None,
-        scheduler=scheduler,
-        warm_start=resume_path is None,
-        exclude_keys=warm_start_exclude,
-        vlm_freeze_expected=vlm_freeze_expected,
-        exact_resume=resume_path is not None,
-    )
+    with _trainable_for_the_run(model, config) as unfrozen_later:
+        step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
+            path=str(resume_path) if resume_path else None,
+            scheduler=scheduler,
+            warm_start=resume_path is None,
+            exclude_keys=warm_start_exclude,
+            vlm_freeze_expected=vlm_freeze_expected,
+            fresh_if_unheld=unfrozen_later,
+            exact_resume=resume_path is not None,
+        )
     if resume_path:
         if ckpt_extra_loaded.get("wandb_run_id"):
             config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
