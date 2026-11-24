@@ -185,16 +185,13 @@ def _build_clip(
     path: str,
     num_tokens: int | None = None,
     feature_dim: int | None = None,
-    drop_pooling_head: bool = False,
     **_: Any,
 ) -> VisionEncoder:
     """Builder for a CLIP ViT vision tower. CLIP output includes a CLS
     token; we strip it so ``num_tokens`` matches the number of image
     patches.
     """
-    enc = _HFVisionEncoder(
-        path, strip_cls=True, has_cls_token=True, drop_pooling_head=drop_pooling_head
-    )
+    enc = _HFVisionEncoder(path, strip_cls=True, has_cls_token=True)
     if num_tokens is not None:
         enc.num_tokens = num_tokens
     if feature_dim is not None:

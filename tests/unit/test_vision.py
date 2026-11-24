@@ -229,6 +229,79 @@ class TestSigLIPPoolingHead:
 
         assert _head_params(build(False)) and not _head_params(build(True))
 
+    def test_the_training_build_drops_the_head(self, monkeypatch):
+        from kempnerforge.config.adapter import AdapterConfig
+        from kempnerforge.config.model import ModelConfig
+        from kempnerforge.config.vision import VisionEncoderConfig
+        from kempnerforge.config.vlm import JointDecoderConfig
+        from kempnerforge.distributed.parallel import build_parallel_model
+
+        _tiny_siglip(monkeypatch)
+        model = ModelConfig(dim=32, n_layers=1, n_heads=2, vocab_size=64, max_seq_len=128)
+
+        def build(drop: bool) -> torch.nn.Module:
+            return build_parallel_model(
+                model,
+                torch.device("cpu"),
+                None,
+                vision_config=VisionEncoderConfig(
+                    type="siglip2", path="tiny", drop_pooling_head=drop
+                ),
+                adapter_config=AdapterConfig(),
+                vlm_config=JointDecoderConfig(max_text_len=32),
+                param_dtype=torch.float32,
+            )
+
+        assert _head_params(build(False)) and not _head_params(build(True))
+
+    @pytest.mark.parametrize("encoder", ["random", "clip"])
+    def test_encoders_without_the_option_are_refused_at_config_time(self, encoder):
+        from kempnerforge.config.vision import VisionEncoderConfig
+
+        with pytest.raises(ValueError, match="cannot drop a pooling head"):
+            VisionEncoderConfig(type=encoder, path="x", drop_pooling_head=True)
+
+    def test_a_registered_builder_takes_the_option_only_by_declaring_it(self):
+        from typing import Any
+
+        from kempnerforge.config.vision import VisionEncoderConfig
+
+        def declares(path: str, drop_pooling_head: bool = False, **_: Any) -> VisionEncoder:
+            raise AssertionError
+
+        def forwards(path: str, **kwargs: Any) -> VisionEncoder:
+            raise AssertionError
+
+        for name, builder in (("_test_declares", declares), ("_test_forwards", forwards)):
+            registry.register_vision_encoder(name)(builder)
+        try:
+            VisionEncoderConfig(type="_test_declares", drop_pooling_head=True)
+            VisionEncoderConfig(type="_test_forwards")
+            with pytest.raises(ValueError, match="cannot drop a pooling head"):
+                VisionEncoderConfig(type="_test_forwards", drop_pooling_head=True)
+        finally:
+            for name in ("_test_declares", "_test_forwards"):
+                registry.unregister("vision_encoder", name)
+
+    def test_a_checkpoint_with_the_head_loads_without_it(self, monkeypatch, tmp_path):
+        import torch.distributed.checkpoint as dcp
+
+        _tiny_siglip(monkeypatch)
+        builder = registry.get_vision_encoder("siglip2")
+        saved = builder("tiny")
+        with torch.no_grad():
+            for parameter in saved.parameters():
+                parameter.add_(1.0)
+        dcp.save(saved.state_dict(), checkpoint_id=tmp_path)
+        loaded = builder("tiny", drop_pooling_head=True)
+        state = loaded.state_dict()
+        dcp.load(state, checkpoint_id=tmp_path)
+        loaded.load_state_dict(state)
+        expected = saved.state_dict()
+        assert set(state) < set(expected)
+        for key, value in loaded.state_dict().items():
+            torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
+
 
 class TestHFVisionEncoderMocked:
     """Exercise the HF-encoder build/forward paths without network access by
