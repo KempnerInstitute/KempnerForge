@@ -57,7 +57,8 @@ samples `VLMCollator` batches.
   answer for single-turn rows, the full template for conversations) and trains only
   the assistant replies when `answer_only` (with `train_reply_prefix`, also what
   the template writes between the assistant header and a reply, such as an empty
-  think block); `max_images` sets how many images a document may bring.
+  think block, for each reply the text budget keeps part of); `max_images` caps
+  how many images a document may bring (no cap by default).
   `RenderedDataset` draws one reference
   answer per turn from a seed and the row index, so a resume draws the same answers,
   and passes over a document the renderer refuses (replies that are all empty, or
@@ -76,10 +77,12 @@ samples `VLMCollator` batches.
 
 The renderer resizes each image square to `image_size`, or with `tile_grid` cuts
 it into views as `vlm.tile_grid` does. A sample has the core dataset's shapes, so
-`VLMCollator` and `PackedVLMCollator` batch it: one image by default, up to
-`max_images` images (every image with `None`) concatenated, or none for a
-text-only document, and `text_len` counts its real tokens. A document with more
-images than `max_images` is passed over. `max_text_len=None` keeps the whole text
+`VLMCollator` and `PackedVLMCollator` batch it: every image of a document
+concatenated by default (`max_images=None`), at most `max_images` of them, a
+single image with `max_images=1`, or none for a text-only document, and
+`text_len` counts its real tokens. A document with more images than
+`max_images` is passed over, and `RenderedDataset` refuses a reader that keeps
+rows with more images than its renderer takes. `max_text_len=None` keeps the whole text
 unpadded, for packing. PixMo-Count stores its points in pixels; they are
 converted to percent of the image, the unit the other PixMo sources use. A
 counting answer lists its points before the count, so a row with many points
@@ -95,7 +98,9 @@ a row, and the rows without images as text-only documents, so a `text_*` subset
 reads as is; `min_images=1` leaves out the text-only rows, and `text_only` keeps
 only them without reading the image column. A row is kept when its conversation
 holds a turn and the last turn has a reply; every turn is read, a missing user
-message or reply as empty text.
+message or reply as empty text. `index` recomputes the keep flags of a file
+converted under an earlier keep rule, so a copy converted before needs only
+`index` run again.
 
 Convert FineVision once; any number of `convert` processes can share the work,
 a file that fails to convert is listed at the end without stopping the others,
@@ -122,7 +127,11 @@ counted in `oversize`. Text-only documents pack beside image documents. With
 each image view attend to each other in both directions, while attention stays
 causal across views and text and never crosses documents. Passes
 follow one another without end, and `state_dict` records where the next row
-starts, so a resume packs the same rows. Render for it with `max_text_len=None`
+starts, so a resume packs the same rows. Each pass seeds its loader workers from
+its own generator, so iterating leaves the global random state alone, and
+`in_order=False` is refused. The workers ignore SIGTERM, so outside the training
+loop, whose `BatchStream.close` shuts them down, call `close()` in a `finally`
+block: an open loader with workers blocks the interpreter at exit. Render for it with `max_text_len=None`
 and `max_images=None`, so documents are neither cut nor capped and `seq_len`
 alone bounds them.
 

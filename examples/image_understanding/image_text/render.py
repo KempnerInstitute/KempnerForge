@@ -55,16 +55,18 @@ class ChatRenderer:
     padding and, when ``answer_only``, outside the replies and their turn ends, and
     ``text_len``, the count of real tokens. ``max_text_len=None`` keeps the whole
     text unpadded, for packing. ``pixel_values`` follows the core dataset's shapes:
-    an image is ``(3, H, W)``, or its ``V`` views ``(V, 3, H, W)`` with
-    ``tile_grid``, and a text-only document is empty, ``(0, 3, H, W)`` or
-    ``(0, V, 3, H, W)``; with ``max_images`` above 1, or ``None`` for no cap, a
-    document's images, or all their views, are concatenated to ``(N, 3, H, W)``.
-    A document with more than ``max_images`` images is refused with
-    ``UnrenderableDocumentError``. The replies are located by character span in the
-    templated text, each where the template of the turns before it ends, so a user
-    message that quotes a reply is not mistaken for it. What the template writes
+    by default (``max_images=None``, no cap) a document's images, or all their
+    views, are concatenated to ``(N, 3, H, W)``, as with ``max_images`` above 1.
+    With ``max_images=1`` an image is ``(3, H, W)``, or its ``V`` views
+    ``(V, 3, H, W)`` with ``tile_grid``, and a text-only document is empty,
+    ``(0, 3, H, W)`` or ``(0, V, 3, H, W)``. A document with more than
+    ``max_images`` images is refused with ``UnrenderableDocumentError``. The
+    replies are located by character span in the templated text, each where the
+    template of the turns before it ends, so a user message that quotes a reply is
+    not mistaken for it. What the template writes
     between the assistant header and a reply (an empty think block, for instance)
-    is trained only with ``train_reply_prefix``.
+    is trained only with ``train_reply_prefix``, and only for a reply the text
+    budget keeps a token of.
     Leading newlines of a reply are dropped, as the template drops them. A document
     whose replies are all blank, a reply that carries template text (``turn_start``,
     ``turn_end`` or a think tag), or replies that ``max_text_len`` cuts away
@@ -80,7 +82,7 @@ class ChatRenderer:
         max_text_len: int | None,
         image_size: int,
         answer_only: bool,
-        max_images: int | None = 1,
+        max_images: int | None = None,
         tile_grid: int = 0,
         tile_global: bool = True,
         train_reply_prefix: bool = False,
@@ -205,6 +207,18 @@ class ChatRenderer:
             f"the chat template did not render {reply!r} as an assistant turn"
         )
 
+    def _kept_replies(
+        self, text: str, spans: list[Span], offsets: Sequence[tuple[int, int]]
+    ) -> list[Span]:
+        """The reply spans of which a token past any trained reply prefix is kept."""
+        prefix = self._reply_prefix if self.train_reply_prefix else ""
+        kept = []
+        for start, end in spans:
+            reply = start + len(prefix) if prefix and text.startswith(prefix, start) else start
+            if any(s < end and e > reply for s, e in offsets):
+                kept.append((start, end))
+        return kept
+
     def token_ids(self, document: Document, answers: Sequence[str]) -> list[int]:
         """Token ids of :meth:`text`, before truncation."""
         return self.tokenizer(self.text(document, answers), add_special_tokens=False)["input_ids"]
@@ -225,10 +239,9 @@ class ChatRenderer:
         ends_already = cut and kept[-1] == self._end_id
         ids = kept if ends_already or not cut else kept + [self._end_id]
         if self.answer_only:
-            trained = [
-                any(s < end and e > start for start, end in spans)
-                for s, e in encoded["offset_mapping"][: len(kept)]
-            ]
+            offsets = encoded["offset_mapping"][: len(kept)]
+            spans = self._kept_replies(text, spans, offsets)
+            trained = [any(s < end and e > start for start, end in spans) for s, e in offsets]
             if len(ids) > len(kept):
                 trained.append(trained[-1])
         else:
@@ -280,7 +293,9 @@ class RenderedDataset(Dataset):
     """Renders a reader's documents, drawing replies from a generator seeded by seed and index.
 
     A document the renderer refuses is passed over for the next one, up to
-    ``max_attempts`` in a row. ``skipped`` counts them with the rows the reader
+    ``max_attempts`` in a row. A reader whose ``max_images`` keeps rows with more
+    images than the renderer's ``max_images`` is refused, since each such row would
+    be passed over. ``skipped`` counts them with the rows the reader
     passed over, per rank: loader workers forked from the training process add to
     its count, and the first skip in each process is logged.
     """
@@ -292,6 +307,12 @@ class RenderedDataset(Dataset):
         seed: int | str = 0,
         max_attempts: int = MAX_ATTEMPTS,
     ) -> None:
+        kept = getattr(reader, "max_images", renderer.max_images)
+        if renderer.max_images is not None and (kept is None or kept > renderer.max_images):
+            raise ValueError(
+                f"the reader keeps rows of up to {kept} images (None: any number), over the "
+                f"renderer's max_images={renderer.max_images}; give both the same cap"
+            )
         self.reader = reader
         self.renderer = renderer
         self.seed = seed

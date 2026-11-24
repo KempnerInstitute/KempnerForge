@@ -108,6 +108,58 @@ class TestPackedLoader:
         after = [_documents(b) for b in itertools.islice(resumed, 9 - taken)]
         assert before + after == uninterrupted
 
+    def test_a_resume_at_a_pass_boundary_starts_the_next_pass(self) -> None:
+        rows = len(_greedy(SIZES, _loader().order(0).tolist(), 16))
+        uninterrupted = [_documents(b) for b in itertools.islice(_loader(), rows + 4)]
+        first = _loader()
+        before = [_documents(b) for b in itertools.islice(first, rows)]
+        assert first.state_dict() == {"pass": 1, "start": 0, "oversize": 0}
+        resumed = _loader()
+        resumed.load_state_dict(first.state_dict())
+        after = [_documents(b) for b in itertools.islice(resumed, 4)]
+        assert before + after == uninterrupted
+
+    def test_a_resume_in_a_later_pass_with_workers(self) -> None:
+        loader = _loader()
+        rows = len(_greedy(SIZES, loader.order(0).tolist(), 16))
+        total = rows + len(_greedy(SIZES, loader.order(1).tolist(), 16)) + 2
+        whole = _loader(num_workers=2)
+        try:
+            uninterrupted = [_documents(b) for b in itertools.islice(whole, total)]
+        finally:
+            whole.close()
+        first = _loader(num_workers=2)
+        try:
+            before = [_documents(b) for b in itertools.islice(first, rows + 2)]
+        finally:
+            first.close()
+        state = first.state_dict()
+        assert state["pass"] == 1 and state["start"] > 0
+        resumed = _loader(num_workers=2)
+        resumed.load_state_dict(state)
+        try:
+            after = [_documents(b) for b in itertools.islice(resumed, total - rows - 2)]
+        finally:
+            resumed.close()
+        assert before + after == uninterrupted
+
+    def test_iterating_leaves_the_global_random_state_alone(self) -> None:
+        state = torch.get_rng_state()
+        list(itertools.islice(_loader(), 12))
+        assert torch.equal(torch.get_rng_state(), state)
+
+    def test_close_shuts_its_workers_down(self) -> None:
+        loader = _loader(num_workers=2)
+        next(iter(loader))
+        workers = list(loader._iterator._workers)
+        loader.close()
+        assert workers and not any(worker.is_alive() for worker in workers)
+        loader.close()
+
+    def test_out_of_order_loading_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="in_order=True"):
+            _loader(in_order=False)
+
     def test_samples_render_in_loader_workers(self) -> None:
         loader = _loader(num_workers=2)
         expected = _greedy(SIZES, loader.order(0).tolist(), 16)
@@ -132,7 +184,9 @@ class TestPackedLoader:
         assert groups[11:13] == [2, 2] and set(groups[13:]) == {-1}
         assert "attention_group_ids" not in next(iter(_loader()))
 
-    @pytest.mark.parametrize("option", ["batch_size", "sampler", "shuffle", "collate_fn"])
+    @pytest.mark.parametrize(
+        "option", ["batch_size", "sampler", "shuffle", "collate_fn", "generator"]
+    )
     def test_options_it_sets_are_refused(self, option: str) -> None:
         with pytest.raises(ValueError, match=f"sets {option} itself"):
             _loader(**{option: None})

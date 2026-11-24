@@ -5,9 +5,11 @@
 one record batch per row group so rows keep their order, plus a ``<name>.meta.npz``
 sidecar (rows per batch, a per-row keep flag, image count, ratings and the size of
 the source file). A row is kept when its conversation holds a turn and the last
-turn has a reply. Each file is claimed with an exclusive ``.claim`` file first, so
-any number of ``convert`` processes can share the work and a rerun skips finished
-files; a claim is touched after every row group, and one older than
+turn has a reply; ``index`` recomputes the flags of a sidecar written under an
+earlier keep rule, as it fills in image counts a sidecar lacks. Each file is
+claimed with an exclusive ``.claim`` file first, so any number of ``convert``
+processes can share the work and a rerun skips finished files; a claim is touched
+after every row group, and one older than
 ``--stale-claim-hours`` is taken over, so each process writes through temp files
 named for it and releases only a claim it still holds. A file that fails to
 convert leaves no temp files, the other files go on, and the failures are listed
@@ -64,6 +66,9 @@ def arrow_path(dst: Path, parquet_file: Path) -> Path:
 
 def meta_path(arrow_file: Path) -> Path:
     return arrow_file.with_name(arrow_file.stem + ".meta.npz")
+
+
+KEEP_RULE = 2
 
 
 def keep_flags(texts: pa.Array) -> np.ndarray:
@@ -156,6 +161,7 @@ def _convert_file(
         keep=np.concatenate(keep) if keep else np.zeros(0, dtype=bool),
         num_images=np.concatenate(images) if images else np.zeros(0, dtype=np.int16),
         source_size=np.int64(source_size),
+        keep_rule=np.int64(KEEP_RULE),
         **{
             name: np.concatenate(values) if values else np.zeros(0, dtype=np.int16)
             for name, values in ratings.items()
@@ -270,6 +276,14 @@ def _file_image_counts(arrow_file: Path) -> np.ndarray:
     return np.concatenate(counts) if counts else np.zeros(0, dtype=np.int16)
 
 
+def _file_keep_flags(arrow_file: Path) -> np.ndarray:
+    reader = pa.ipc.open_file(pa.memory_map(str(arrow_file), "r"))
+    flags = [
+        keep_flags(reader.get_batch(i).column("texts")) for i in range(reader.num_record_batches)
+    ]
+    return np.concatenate(flags) if flags else np.zeros(0, dtype=bool)
+
+
 def _subset_index(job: tuple[Path, Path, str]) -> str:
     src, dst, subset = job
     sources = source_files(src, subset)
@@ -293,6 +307,8 @@ def _subset_index(job: tuple[Path, Path, str]) -> str:
     for meta, arrow in zip(metas, arrows, strict=True):
         if "num_images" not in meta:
             meta["num_images"] = _file_image_counts(arrow)
+        if int(meta.get("keep_rule", 1)) != KEEP_RULE:
+            meta["keep"] = _file_keep_flags(arrow)
     tmp = dst / subset / "index.tmp.npz"
     np.savez(
         tmp,
