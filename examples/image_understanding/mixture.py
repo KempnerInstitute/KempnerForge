@@ -5,8 +5,9 @@ A mixture file lists ``[[source]]`` tables, each naming a ``reader`` (a key of
 the reader's arguments; a ``finevision`` source reads every subset under ``root``
 that holds an ``index.npz``, or those in ``subsets``, less those in ``exclude``,
 each repeated. A ``datacomp`` source streams ``DataCompStream``'s shards from
-``shard_dir`` and is the mixture's only source, without repeats. ``[render]`` holds ``ChatRenderer`` options and ``[packing]`` ``PackedLoader``
-options (``view_groups``). ``check_mixture`` refuses any other table, an unknown
+``shard_dir`` and is the mixture's only source, without repeats. ``[render]``
+holds ``ChatRenderer`` options and ``[packing]`` ``PackedLoader`` options
+(``view_groups``). ``check_mixture`` refuses any other table, an unknown
 reader and an argument its reader, the renderer or the packer does not take, and
 ``check_run`` a run the mixture cannot train, both before the run starts.
 """
