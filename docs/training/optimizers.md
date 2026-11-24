@@ -366,9 +366,9 @@ name the checkpoint holds it by): an AdamW checkpoint would otherwise load
 into a Lion run with its `exp_avg` as Lion's momentum and its other entries
 dropped. Only parameters the current optimizer keeps state for are
 compared, so one frozen since the save is not. A saved state short of
-entries, as a Lion checkpoint is for AdamW, stops `dcp.load` at the first
-missing key, and a checkpoint saved before the first step holds no
-optimizer state, so it loads under any optimizer. To
+entries, as a Lion checkpoint is for AdamW, is refused the same way before
+anything loads, as partial state, and a checkpoint saved before the first
+step holds no optimizer state, so it loads under any optimizer. To
 change `optimizer.name`, continue from the checkpoint's weights with a
 fresh optimizer: `checkpoint.load_path` set to it and
 `checkpoint.exclude_from_loading = ["optimizer"]`, with a `checkpoint.dir`

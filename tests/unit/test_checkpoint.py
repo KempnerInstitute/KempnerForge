@@ -3704,6 +3704,15 @@ class TestOptimizerTypeChangeOnResume:
         assert entries in str(raised.value)
         assert "exclude_from_loading" in str(raised.value)
 
+    def test_a_lion_checkpoint_fails_to_load_into_an_adamw_run(self, tmp_path):
+        """Lion keeps less state than AdamW, so its checkpoint is refused as partial state,
+        with the optimizer.name change named as a cause."""
+        manager = self._resume("lion", "adamw", tmp_path)
+        with pytest.raises(RuntimeError, match="holds partial optimizer state") as raised:
+            manager.load()
+        assert "optimizer.name changed since the save" in str(raised.value)
+        assert "exclude_from_loading" in str(raised.value)
+
     def test_the_same_optimizer_resumes(self, tmp_path):
         assert self._resume("adamw", "adamw", tmp_path).load()[0] == 1
 
@@ -3791,8 +3800,10 @@ class TestOptimizerTypeChangeOnResume:
         with pytest.raises(RuntimeError, match=r"holds another optimizer's state.*experts\.2\."):
             manager.load()
 
-    def test_only_a_state_with_entries_the_optimizer_does_not_keep_is_refused(self):
-        """A frozen parameter keeps no state; a state short of entries is dcp.load's to refuse."""
+    def test_another_or_a_partial_state_is_refused(self):
+        """A frozen parameter keeps no state, so it is not compared; a state with entries the
+        optimizer does not keep is refused as another optimizer's, and one short of entries
+        as partial."""
         from kempnerforge.checkpoint.manager import _check_saved_state_matches
 
         adamw, lion = ("exp_avg", "exp_avg_sq", "step"), ("exp_avg",)
@@ -3803,8 +3814,13 @@ class TestOptimizerTypeChangeOnResume:
             _check_saved_state_matches(optim_state, keys, Path("ckpt"))
 
         check(kept=adamw, saved=adamw)
-        check(kept=adamw, saved=lion)
-        with pytest.raises(RuntimeError, match=re.escape("['w']")):
+        with pytest.raises(
+            RuntimeError, match=re.escape("holds partial optimizer state for 1 parameters: ['w']")
+        ):
+            check(kept=adamw, saved=lion)
+        with pytest.raises(
+            RuntimeError, match=re.escape("holds another optimizer's state for 1 parameters: ['w']")
+        ):
             check(kept=lion, saved=adamw)
 
 

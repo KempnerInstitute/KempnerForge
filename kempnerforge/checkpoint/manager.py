@@ -486,8 +486,9 @@ def _check_saved_state_matches(
 
     The save holds either another optimizer's state, or only part of this one's, as a
     ``schedule_free_adamw`` checkpoint written before each parameter kept its own ``step``
-    does. Either way the run cannot continue exactly, so the load stops before DCP reads
-    anything and says how to continue from the weights alone.
+    does, or a Lion checkpoint does for AdamW. Either way the run cannot continue exactly,
+    so the load stops before DCP reads anything and says how to continue from the weights
+    alone.
     """
     kept = {fqn: set(state) for fqn, state in optim_state["state"].items()}
     saved: dict[str, set[str]] = {}
@@ -519,9 +520,10 @@ def _check_saved_state_matches(
         raise RuntimeError(
             f"{where} holds partial optimizer state for {len(short)} parameters: "
             f"{short[:8]}. {first} was saved without {sorted(kept[first] - saved[first])}, "
-            "which its optimizer now keeps: an earlier version of the optimizer saved it, "
-            "e.g. schedule_free_adamw before each parameter kept its own step count, so "
-            "the run cannot continue exactly. To continue from these weights with a fresh "
+            "which its optimizer now keeps: another optimizer saved it (optimizer.name "
+            "changed since the save), or an earlier version of this one did, e.g. "
+            "schedule_free_adamw before each parameter kept its own step count, so the run "
+            "cannot continue exactly. To continue from these weights with a fresh "
             "optimizer, set checkpoint.load_path to this checkpoint and "
             'checkpoint.exclude_from_loading = ["optimizer"], with a checkpoint.dir that '
             "holds no checkpoint yet."
