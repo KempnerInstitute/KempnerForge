@@ -16,7 +16,6 @@ from safetensors.torch import load_file, save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-import convert_checkpoint
 from convert_checkpoint import (
     _build_hf_config,
     _hf_to_kf_key,
@@ -235,6 +234,380 @@ class TestMoERoundTrip:
     )
     def test_moe_kf_to_hf_to_kf(self, kf_key):
         assert _hf_to_kf_key(_kf_to_hf_key(kf_key)) == kf_key
+
+
+def _refuse_to_build(*args, **kwargs):
+    raise AssertionError("from_pretrained builds the model and can run the repository's code")
+
+
+class _Opaque:
+    """An object ``torch.load(weights_only=True)`` refuses to unpickle."""
+
+
+class TestWeightFiles:
+    """hf-to-dcp reads the weight files transformers loads by default, locally or from the Hub.
+
+    A Hub model is read without building a Hugging Face model or importing the repository's
+    code: each file comes from ``hf_hub_download``.
+    """
+
+    @staticmethod
+    def _repo(path: Path, files: dict[str, dict], index: dict | None = None) -> Path:
+        """A model directory holding ``files``, an index if given, and a config whose auto_map
+        names the repository's own module, which writes ``ran.txt`` beside it if imported."""
+        from safetensors.torch import save_file
+
+        path.mkdir(parents=True)
+        auto_map = {"AutoModelForCausalLM": "probe.ProbeForCausalLM"}
+        (path / "config.json").write_text(json.dumps({"model_type": "probe", "auto_map": auto_map}))
+        marker = str(path / "ran.txt")
+        (path / "probe.py").write_text(
+            f"import pathlib\npathlib.Path({marker!r}).write_text('ran')\n"
+        )
+        for name, weights in files.items():
+            if name.endswith(".safetensors"):
+                save_file(weights, path / name)
+            else:
+                torch.save(weights, path / name)
+        if index is not None:
+            (path / index["name"]).write_text(json.dumps({"weight_map": index["weight_map"]}))
+        return path
+
+    @staticmethod
+    def _hub(
+        monkeypatch,
+        snapshots: list[Path],
+        moves_to: str | None = None,
+        cached: set[str] | None = None,
+    ) -> list[tuple]:
+        """Serve snapshot directories, each named for its commit, through ``hf_hub_download``.
+
+        ``main`` is at the first snapshot; with ``moves_to`` it moves to that commit after the
+        first file is downloaded. With ``cached``, a lookup cannot reach the Hub and only those
+        files are had, from the cache. Returns each request's ``(filename, revision)``, with
+        ``"cache"`` added for a request that reads the cache only.
+        """
+        import huggingface_hub
+        import transformers
+        from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
+
+        commits = {snapshot.name: snapshot for snapshot in snapshots}
+        refs = {"main": snapshots[0].name}
+        asked: list[tuple] = []
+
+        def hf_hub_download(repo_id, filename, revision=None, local_files_only=False, **kwargs):
+            assert repo_id == "org/model"
+            asked.append(
+                (filename, revision, "cache") if local_files_only else (filename, revision)
+            )
+            commit = revision or refs["main"]
+            if (cached is not None or local_files_only) and filename not in (cached or ()):
+                raise LocalEntryNotFoundError(f"{filename} cannot be had: the Hub is unreachable")
+            if not (commits[commit] / filename).exists():
+                raise EntryNotFoundError(f"{filename} is not in {repo_id} at {commit}")
+            if moves_to is not None:
+                refs["main"] = moves_to
+            return str(commits[commit] / filename)
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", hf_hub_download)
+        monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", _refuse_to_build)
+        return asked
+
+    INDEX = {
+        "name": "model.safetensors.index.json",
+        "weight_map": {"a": "model-1.safetensors", "b": "model-2.safetensors"},
+    }
+    BIN_INDEX = {
+        "name": "pytorch_model.bin.index.json",
+        "weight_map": {"a": "pytorch_model-1.bin", "b": "pytorch_model-2.bin"},
+    }
+
+    def test_a_hub_id_reads_model_safetensors_and_not_an_adapter(self, tmp_path, monkeypatch):
+        from convert_checkpoint import _load_hf_hub
+
+        model = {"model.norm.weight": torch.arange(4, dtype=torch.float32)}
+        adapter = {"model.norm.weight": torch.zeros(4)}
+        files = {"model.safetensors": model, "adapter_model.safetensors": adapter}
+        repo = self._repo(tmp_path / "c0", files)
+        asked = self._hub(monkeypatch, [repo])
+
+        loaded = _load_hf_hub("org/model")
+
+        assert asked == [("model.safetensors", None)]
+        assert torch.equal(loaded["model.norm.weight"], model["model.norm.weight"])
+        assert loaded["model.norm.weight"].dtype == torch.float32
+        assert not (repo / "ran.txt").exists(), "the repository's module was imported"
+
+    def test_a_hub_index_gives_its_shards_and_no_other_file(self, tmp_path, monkeypatch):
+        from convert_checkpoint import _load_hf_hub
+
+        files = {
+            "model-1.safetensors": {"a": torch.ones(2)},
+            "model-2.safetensors": {"b": torch.full((2,), 2.0)},
+            "stray.safetensors": {"a": torch.zeros(2)},
+        }
+        repo = self._repo(tmp_path / "c0", files, self.INDEX)
+        asked = self._hub(monkeypatch, [repo])
+
+        loaded = _load_hf_hub("org/model")
+
+        assert asked == [
+            ("model.safetensors", None),
+            (self.INDEX["name"], None),
+            ("model-1.safetensors", "c0"),
+            ("model-2.safetensors", "c0"),
+        ]
+        assert torch.equal(loaded["a"], torch.ones(2))
+        assert torch.equal(loaded["b"], files["model-2.safetensors"]["b"])
+
+    def test_a_hub_shard_comes_from_its_index_commit_while_main_moves(self, tmp_path, monkeypatch):
+        from convert_checkpoint import _load_hf_hub
+
+        old = {
+            "model-1.safetensors": {"a": torch.ones(2)},
+            "model-2.safetensors": {"b": torch.ones(2)},
+        }
+        new = {
+            "model-1.safetensors": {"a": torch.zeros(2)},
+            "model-2.safetensors": {"b": torch.zeros(2)},
+        }
+        snapshots = [
+            self._repo(tmp_path / "old", old, self.INDEX),
+            self._repo(tmp_path / "new", new, self.INDEX),
+        ]
+        asked = self._hub(monkeypatch, snapshots, moves_to="new")
+
+        loaded = _load_hf_hub("org/model")
+
+        assert torch.equal(loaded["a"], torch.ones(2)) and torch.equal(loaded["b"], torch.ones(2))
+        assert asked[1:] == [
+            (self.INDEX["name"], None),
+            ("model-1.safetensors", "old"),
+            ("model-2.safetensors", "old"),
+        ]
+
+    def test_a_single_file_is_read_before_an_index_beside_it(self, tmp_path, monkeypatch):
+        """Transformers takes ``model.safetensors`` before its index, so a stale index is unused."""
+        from convert_checkpoint import _load_hf_hub, _load_hf_local
+
+        files = {
+            "model.safetensors": {"a": torch.ones(2)},
+            "model-1.safetensors": {"a": torch.zeros(2)},
+        }
+        index = {"name": "model.safetensors.index.json", "weight_map": {"a": "model-1.safetensors"}}
+        repo = self._repo(tmp_path / "c0", files, index)
+        self._hub(monkeypatch, [repo])
+
+        assert torch.equal(_load_hf_hub("org/model")["a"], torch.ones(2))
+        assert torch.equal(_load_hf_local(repo)["a"], torch.ones(2))
+
+    def test_a_hub_shard_that_cannot_be_had_fails_the_load(self, tmp_path, monkeypatch):
+        """A shard missing from the repository or from an offline cache is not left out."""
+        from convert_checkpoint import _load_hf_hub
+        from huggingface_hub.errors import EntryNotFoundError
+
+        files = {"model-1.safetensors": {"a": torch.ones(2)}}
+        repo = self._repo(tmp_path / "c0", files, self.INDEX)
+        self._hub(monkeypatch, [repo])
+
+        with pytest.raises(EntryNotFoundError, match="model-2.safetensors"):
+            _load_hf_hub("org/model")
+
+    def test_a_hub_repository_without_safetensors_gives_its_bin(self, tmp_path, monkeypatch):
+        from convert_checkpoint import _load_hf_hub
+
+        files = {
+            "pytorch_model.bin": {"model.norm.weight": torch.ones(4)},
+            "adapter_model.safetensors": {"model.norm.weight": torch.zeros(4)},
+        }
+        repo = self._repo(tmp_path / "c0", files)
+        asked = self._hub(monkeypatch, [repo])
+
+        loaded = _load_hf_hub("org/model")
+
+        assert asked[-1] == ("pytorch_model.bin", None)
+        assert torch.equal(loaded["model.norm.weight"], torch.ones(4))
+
+    def test_a_hub_repository_without_weight_files_is_refused(self, tmp_path, monkeypatch):
+        from convert_checkpoint import _load_hf_hub
+
+        repo = self._repo(tmp_path / "c0", {"adapter_model.safetensors": {"x": torch.ones(1)}})
+        self._hub(monkeypatch, [repo])
+
+        with pytest.raises(FileNotFoundError, match="Found none of model.safetensors"):
+            _load_hf_hub("org/model")
+
+    def test_a_bin_index_gives_its_shards_locally_and_from_the_hub(self, tmp_path, monkeypatch):
+        from convert_checkpoint import _load_hf_hub, _load_hf_local
+
+        files = {
+            "pytorch_model-1.bin": {"a": torch.ones(2)},
+            "pytorch_model-2.bin": {"b": torch.full((2,), 2.0)},
+            "pytorch_model-stray.bin": {"a": torch.zeros(2)},
+        }
+        repo = self._repo(tmp_path / "c0", files, self.BIN_INDEX)
+        asked = self._hub(monkeypatch, [repo])
+
+        for loaded in (_load_hf_local(repo), _load_hf_hub("org/model")):
+            assert set(loaded) == {"a", "b"}
+            assert torch.equal(loaded["a"], torch.ones(2))
+            assert torch.equal(loaded["b"], files["pytorch_model-2.bin"]["b"])
+        assert asked == [
+            ("model.safetensors", None),
+            (self.INDEX["name"], None),
+            ("pytorch_model.bin", None),
+            (self.BIN_INDEX["name"], None),
+            ("pytorch_model-1.bin", "c0"),
+            ("pytorch_model-2.bin", "c0"),
+        ]
+
+    def test_a_hub_repository_that_is_not_found_is_not_taken_for_missing_files(self, monkeypatch):
+        import httpx
+        import huggingface_hub
+        from convert_checkpoint import _load_hf_hub
+        from huggingface_hub.errors import RepositoryNotFoundError
+
+        url = "https://huggingface.co/org/model/resolve/main/model.safetensors"
+        response = httpx.Response(404, request=httpx.Request("HEAD", url))
+
+        def hf_hub_download(repo_id, filename, **kwargs):
+            raise RepositoryNotFoundError(f"Repository Not Found for url: {url}", response=response)
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", hf_hub_download)
+        with pytest.raises(RepositoryNotFoundError, match="Repository Not Found"):
+            _load_hf_hub("org/model")
+
+    def test_a_lookup_that_cannot_reach_the_hub_is_passed_over(self, tmp_path, monkeypatch):
+        """A name whose lookup fails, as offline or with the Hub down, is passed over like a
+        missing one, and the other names are still looked up as before, so a cached index
+        serves; one failed lookup does not turn the rest into cache reads."""
+        from convert_checkpoint import _load_hf_hub
+
+        files = {
+            "model-1.safetensors": {"a": torch.ones(2)},
+            "model-2.safetensors": {"b": torch.ones(2)},
+        }
+        repo = self._repo(tmp_path / "c0", files, self.INDEX)
+        cached = {self.INDEX["name"], *files}
+        asked = self._hub(monkeypatch, [repo], cached=cached)
+
+        loaded = _load_hf_hub("org/model")
+
+        assert set(loaded) == {"a", "b"}
+        assert asked == [
+            ("model.safetensors", None),
+            (self.INDEX["name"], None),
+            ("model-1.safetensors", "c0"),
+            ("model-2.safetensors", "c0"),
+        ]
+
+    def test_a_failed_lookup_without_cached_files_is_named_in_the_refusal(
+        self, tmp_path, monkeypatch
+    ):
+        """The refusal does not read as a repository without weight files: it names the first
+        lookup that failed and chains its error."""
+        from convert_checkpoint import _load_hf_hub
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        repo = self._repo(tmp_path / "c0", {"model.safetensors": {"a": torch.ones(2)}})
+        self._hub(monkeypatch, [repo], cached=set())
+
+        refusal = "the lookup of model.safetensors failed: model.safetensors cannot be had"
+        with pytest.raises(FileNotFoundError, match=refusal) as caught:
+            _load_hf_hub("org/model")
+        assert isinstance(caught.value.__cause__, LocalEntryNotFoundError)
+
+    def test_a_local_directory_reads_its_bin_and_not_an_adapter(self, tmp_path):
+        """Beside a ``pytorch_model.bin``, an adapter's safetensors file no longer replaces it."""
+        from convert_checkpoint import _load_hf_local
+
+        files = {
+            "pytorch_model.bin": {"model.norm.weight": torch.ones(4)},
+            "adapter_model.safetensors": {"model.norm.weight": torch.zeros(4)},
+        }
+        loaded = _load_hf_local(self._repo(tmp_path / "local", files))
+        assert torch.equal(loaded["model.norm.weight"], torch.ones(4))
+
+    def test_a_local_index_gives_its_shards_and_no_other_file(self, tmp_path):
+        from convert_checkpoint import _load_hf_local
+
+        files = {
+            "model-1.safetensors": {"a": torch.ones(2)},
+            "model-2.safetensors": {"b": torch.ones(2)},
+            "stray.safetensors": {"a": torch.zeros(2)},
+        }
+        loaded = _load_hf_local(self._repo(tmp_path / "local", files, self.INDEX))
+        assert torch.equal(loaded["a"], torch.ones(2)) and set(loaded) == {"a", "b"}
+
+    def test_a_local_directory_without_standard_names_reads_every_safetensors(self, tmp_path):
+        from convert_checkpoint import _load_hf_local
+
+        files = {
+            "part-a.safetensors": {"a": torch.ones(2)},
+            "part-b.safetensors": {"b": torch.ones(2)},
+        }
+        loaded = _load_hf_local(self._repo(tmp_path / "local", files))
+        assert set(loaded) == {"a", "b"}
+
+    def test_a_bin_file_holding_other_objects_is_refused(self, tmp_path):
+        """``.bin`` files load with ``weights_only=True``: tensors and plain data only."""
+        import pickle
+
+        from convert_checkpoint import _load_hf_local
+
+        local = self._repo(tmp_path / "local", {"pytorch_model.bin": {"x": _Opaque()}})
+        with pytest.raises(pickle.UnpicklingError):
+            _load_hf_local(local)
+
+    @pytest.mark.parametrize("tied", [False, True])
+    def test_a_checkpoint_without_lm_head_gives_the_head_the_embedding(
+        self, tmp_path, monkeypatch, tied
+    ):
+        """A checkpoint with tied embeddings may store no lm_head.weight; the head then takes
+        the embedding, whether the model ties them or not."""
+        from convert_checkpoint import hf_to_dcp
+
+        config = ModelConfig(
+            dim=16, n_layers=1, n_heads=2, vocab_size=32, max_seq_len=16, tie_embeddings=tied
+        )
+        torch.manual_seed(0)
+        source = Transformer(config).state_dict()
+        weights = {
+            _kf_to_hf_key(key): value.clone()
+            for key, value in source.items()
+            if key != "output_head.proj.weight"
+        }
+        assert "lm_head.weight" not in weights
+        repo = self._repo(tmp_path / "c0", {"model.safetensors": weights})
+        self._hub(monkeypatch, [repo])
+
+        hf_to_dcp("org/model", str(tmp_path / "dcp"), config)
+
+        torch.manual_seed(1)
+        state = {"model": Transformer(config).state_dict()}
+        dcp.load(state, checkpoint_id=str(tmp_path / "dcp"))
+        embedding = source["token_embedding.embedding.weight"]
+        assert torch.equal(state["model"]["output_head.proj.weight"], embedding)
+        assert torch.equal(state["model"]["token_embedding.embedding.weight"], embedding)
+
+    def test_hf_to_dcp_imports_the_weights_of_a_hub_model(self, tmp_path, monkeypatch):
+        from convert_checkpoint import hf_to_dcp
+
+        config = ModelConfig(dim=16, n_layers=1, n_heads=2, vocab_size=32, max_seq_len=16)
+        torch.manual_seed(0)
+        source = Transformer(config).state_dict()
+        weights = {_kf_to_hf_key(key): value.clone() for key, value in source.items()}
+        repo = self._repo(tmp_path / "c0", {"model.safetensors": weights})
+        self._hub(monkeypatch, [repo])
+
+        hf_to_dcp("org/model", str(tmp_path / "dcp"), config)
+
+        torch.manual_seed(1)
+        state = {"model": Transformer(config).state_dict()}
+        dcp.load(state, checkpoint_id=str(tmp_path / "dcp"))
+        for key, value in source.items():
+            assert torch.equal(state["model"][key], value), key
+        assert not (repo / "ran.txt").exists(), "the repository's module was imported"
 
 
 class TestBuildHFConfig:
@@ -673,19 +1046,23 @@ class TestMixtralExport:
             dcp_to_hf(str(tmp_path / "missing"), str(tmp_path / "hf"), config)
         assert not (tmp_path / "hf").exists()
 
-    def test_hf_to_dcp_reads_the_experts_a_loaded_mixtral_packs(self, tmp_path, monkeypatch):
-        """A hub ID goes through a loaded model's state dict, where transformers 5 packs each
-        layer's experts; the import splits them back into every expert's weights."""
+    def test_hf_to_dcp_splits_experts_a_mixtral_checkpoint_holds_packed(self, tmp_path):
+        """transformers 5 packs each layer's experts, and saves them so with
+        ``save_original_format=False``; the import splits them back into every expert's
+        weights."""
         transformers = pytest.importorskip("transformers")
+        from safetensors.torch import load_file
+
         config = _moe_config()
         source = _random_dcp(tmp_path / "dcp", config)
         dcp_to_hf(str(tmp_path / "dcp"), str(tmp_path / "hf"), config, dtype=torch.float32)
-        loaded = transformers.AutoModelForCausalLM.from_pretrained(
+        model = transformers.AutoModelForCausalLM.from_pretrained(
             tmp_path / "hf", dtype=torch.float32
-        ).state_dict()
-        assert "model.layers.0.mlp.experts.gate_up_proj" in loaded
-        monkeypatch.setattr(convert_checkpoint, "_load_hf_hub", lambda model_id: loaded)
-        back = _read_back(tmp_path / "some-org-mixtral", tmp_path / "back", config)
+        )
+        model.save_pretrained(tmp_path / "packed", save_original_format=False)
+        saved = load_file(tmp_path / "packed" / "model.safetensors")
+        assert "model.layers.0.mlp.experts.gate_up_proj" in saved
+        back = _read_back(tmp_path / "packed", tmp_path / "back", config)
         for name, tensor in source.state_dict().items():
             assert torch.equal(back[name], tensor), name
 

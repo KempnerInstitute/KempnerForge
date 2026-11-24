@@ -657,9 +657,12 @@ def _build_vlm(
          numerical drift; with ``vision_config.mixed_precision`` set,
          ``_set_encoder_precision`` makes it compute in that dtype.
       7. Every parameter pattern in ``vlm.freeze`` and ``vlm.freeze_schedule``
-         must match a parameter (``ValueError`` names those that match none);
-         the freeze specs are applied via ``apply_freeze_specs`` and an encoder
-         treated as frozen in step 5 is switched to ``eval()``.
+         must match a parameter (``ValueError`` names those that match none).
+         Freeze specs are applied via ``apply_freeze_specs``, and ``wrapper.train()``
+         sets the modes training runs in, which keeps an encoder whose parameters
+         are all frozen in ``eval()`` (``VLMWrapper.train``), one that a later stage
+         unfreezes included. An encoder treated as frozen in step 5 is switched to
+         ``eval()`` too, which covers one without parameters.
     """
     from kempnerforge.distributed.expert_parallel import apply_expert_parallel
     from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
@@ -763,6 +766,7 @@ def _build_vlm(
             f"parameters, such as {example!r}."
         )
     apply_freeze_specs(wrapper, vlm_config.freeze, vlm_config.module_patterns)
+    wrapper.train()
     if encoder_frozen:
         encoder.eval()
 
