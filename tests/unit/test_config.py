@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import random
+import re
+import shlex
 import sys
+import typing
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +36,7 @@ from kempnerforge.config.schema import (
     VisionEncoderConfig,
     VLMConfig,
 )
+from kempnerforge.config.video import VideoConfig
 
 
 class TestModelConfig:
@@ -630,7 +635,7 @@ class TestDataConfig:
         toml = tmp_path / "data.toml"
         toml.write_text("[data]\ntoken_dtype = false\n")
         with pytest.raises(ValueError, match="data.token_dtype must be 'uint16' or 'uint32'"):
-            load_config(str(toml))
+            load_config(str(toml), cli_args=[])
 
 
 class TestMetricsConfig:
@@ -950,6 +955,99 @@ class TestJobConfig:
         with pytest.raises(ValueError, match="hf_max_images != 1 is not supported with model"):
             config("sdpa")
         config("flex")
+
+    @pytest.mark.parametrize("attention_backend", ["sdpa", "flex"])
+    def test_packed_sequences_are_refused_with_flash_attention_under_sdpa(self, attention_backend):
+        """Packed rows mask their documents; flex expresses that as a block mask, not SDPA's."""
+
+        def config(sdpa_backend: str, **data) -> JobConfig:
+            return JobConfig(
+                model=ModelConfig(
+                    max_seq_len=1024, sdpa_backend=sdpa_backend, attention_backend=attention_backend
+                ),
+                train=TrainConfig(seq_len=512),
+                data=DataConfig(pack_sequences=True, **data),
+            )
+
+        refused = config("flash", dataset_path="/some/data")
+        if attention_backend == "sdpa":
+            match = "sdpa_backend='flash' is not supported with data.pack_sequences"
+            with pytest.raises(ValueError, match=match):
+                refused.check_flash_attention_masks()
+        else:
+            refused.check_flash_attention_masks()
+        config("flash").check_flash_attention_masks()
+        config("auto", dataset_path="/some/data").check_flash_attention_masks()
+
+    def test_a_cli_override_lifts_the_flash_refusal(self, tmp_path):
+        """The check runs on the merged config, so the command line can correct the TOML."""
+        path = tmp_path / "c.toml"
+        path.write_text(
+            '[model]\nsdpa_backend = "flash"\n[data]\npack_sequences = true\n'
+            'dataset_path = "/some/data"\n'
+        )
+        with pytest.raises(ValueError, match="sdpa_backend='flash'"):
+            load_config(str(path), cli_args=[]).check_flash_attention_masks()
+        for override in ("--model.sdpa_backend=auto", "--data.pack_sequences=false"):
+            load_config(str(path), cli_args=[override]).check_flash_attention_masks()
+
+    @pytest.mark.parametrize("attention_backend", ["sdpa", "flex"])
+    @pytest.mark.parametrize("arch", ["joint_decoder", "moma", "mot", "cross_attention"])
+    def test_video_is_refused_with_flash_attention_where_frames_are_masked(
+        self, arch, attention_backend
+    ):
+        """Joint-Decoder and MoMa mask padded frames in self-attention, under flex as well."""
+
+        def config(sdpa_backend: str) -> JobConfig:
+            return JobConfig(
+                model=ModelConfig(
+                    max_seq_len=1024, sdpa_backend=sdpa_backend, attention_backend=attention_backend
+                ),
+                train=TrainConfig(seq_len=512),
+                vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+                adapter=AdapterConfig(),
+                vlm=VLMConfig.for_arch(arch, max_text_len=64),
+                video=VideoConfig(data_root="/some/root"),
+            )
+
+        if arch in ("joint_decoder", "moma"):
+            with pytest.raises(ValueError, match=rf"\[video\] on vlm.arch='{arch}'"):
+                config("flash").check_flash_attention_masks()
+        else:
+            config("flash").check_flash_attention_masks()
+        config("auto").check_flash_attention_masks()
+
+    @pytest.mark.parametrize(
+        ("built", "named", "refused"),
+        [
+            ("moma", "mot", True),
+            ("mot", "moma", False),
+            ("cross_attention", "joint_decoder", True),
+            ("joint_decoder", "cross_attention", False),
+        ],
+    )
+    def test_the_video_rule_follows_the_strategy_and_the_attention_built(
+        self, built, named, refused
+    ):
+        """The arch field picks the strategy that masks frames; the class, the attention."""
+        config = JobConfig(
+            model=ModelConfig(max_seq_len=1024, sdpa_backend="flash"),
+            train=TrainConfig(seq_len=512),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=16),
+            adapter=AdapterConfig(),
+            vlm=VLMConfig.for_arch(built, max_text_len=64),
+            video=VideoConfig(data_root="/some/root"),
+        )
+        assert config.vlm is not None
+        config.vlm.arch = named
+        if refused:
+            with pytest.raises(ValueError, match=rf"\[video\] on vlm.arch='{named}'"):
+                config.check_flash_attention_masks()
+        else:
+            config.check_flash_attention_masks()
+
+    def test_a_run_without_a_vlm_masks_no_frames(self):
+        assert not JobConfig().masks_frames_in_backend_attention()
 
     def test_vlm_packing_inherits_the_sequence_parallel_refusal(self):
         """Packed rows are indexed as plain tensors, which sequence parallelism cannot carry."""
@@ -1571,6 +1669,69 @@ class TestCliOverrides:
         assert config.model.n_layers == 4
 
 
+_SHELL_OPERATORS = frozenset("|&;<>()")
+
+
+def _fenced_commands(markdown: str) -> list[str]:
+    """The commands in the fenced blocks of ``markdown``, each joined across backslash
+    continuations and across the lines of a quoted value."""
+    commands = []
+    fence, command = None, ""
+    for line in markdown.splitlines():
+        marker = line.lstrip()[:3]
+        if marker in ("```", "~~~") and (fence is None or marker == fence):
+            fence, command = (marker if fence is None else None), ""
+            continue
+        if fence is None:
+            continue
+        command += line
+        if command.endswith("\\"):
+            command = command[:-1] + " "
+            continue
+        try:
+            shlex.split(command, comments=True)
+        except ValueError:
+            command += "\n"
+            continue
+        commands.append(command)
+        command = ""
+    return commands
+
+
+def _space_separated_overrides(markdown: str) -> list[str]:
+    """The fenced commands in ``markdown`` that pass the value of a dotted override, or of a
+    top-level key such as plugins, as the argument after it.
+
+    A bare section name is not checked, since other tools' flags share those names
+    (``--checkpoint`` of scripts/eval_harness.py).
+    """
+    hints = typing.get_type_hints(JobConfig)
+    names = {field.name for field in dataclasses.fields(JobConfig)}
+    sections = {
+        name
+        for name in names
+        if any(dataclasses.is_dataclass(t) for t in (hints[name], *typing.get_args(hints[name])))
+    }
+    found = []
+    for command in _fenced_commands(markdown):
+        lexer = shlex.shlex(
+            re.sub(r"(?<!\S)\d+(?=[<>])", "", command), posix=True, punctuation_chars=True
+        )
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+        for flag, value in zip(tokens, tokens[1:], strict=False):
+            name = flag.removeprefix("--")
+            in_config = name.split(".")[0] in sections if "." in name else name in names - sections
+            if not (flag.startswith("--") and "=" not in flag and in_config):
+                continue
+            quoted = f"'{value}'" in command or f'"{value}"' in command
+            operator = bool(value) and set(value) <= _SHELL_OPERATORS and not quoted
+            if not value.startswith("--") and not operator:
+                found.append(command.strip())
+                break
+    return found
+
+
 class TestCliParsing:
     def test_parse_int(self):
         result = _parse_cli_overrides(["--model.dim=512"])
@@ -1591,6 +1752,134 @@ class TestCliParsing:
     def test_ignores_non_flag_args(self):
         result = _parse_cli_overrides(["config.toml", "--model.dim=512"])
         assert result == {"model": {"dim": 512}}
+
+    def test_skips_an_interpreters_own_arguments(self):
+        """A notebook kernel's argv, read when load_config gets no cli_args, is skipped."""
+        assert _parse_cli_overrides(["-f", "/run/kernel-1.json"]) == {}
+
+    @pytest.mark.parametrize(
+        "args,fix",
+        [
+            (["--model.dim=512", "extra"], "'--model.dim=512 extra'"),
+            (["--metrics.wandb_run_name=7b", "baseline"], "'--metrics.wandb_run_name=7b baseline'"),
+            (["--checkpoint.dir=/some", "dir"], "'--checkpoint.dir=/some dir'"),
+            (
+                ["--metrics.wandb_run_name=my", "long", "name", "--train.max_steps=7"],
+                "'--metrics.wandb_run_name=my long name'",
+            ),
+            (["--checkpoint.dir", "/some", "dir"], "'--checkpoint.dir=/some dir'"),
+        ],
+    )
+    def test_an_argument_after_an_override_is_refused_with_the_fix(self, args, fix):
+        """An argument without -- after an override, such as the rest of a value with a
+        space that a shell split off, is refused instead of dropped, and the message
+        joins the arguments up to the next override back into the override."""
+        with pytest.raises(ValueError, match=f"write {re.escape(fix)}$"):
+            _parse_cli_overrides(args)
+
+    @pytest.mark.parametrize("value", ["7b baseline", "/some dir", "a  b", "x -7"])
+    def test_following_the_suggestion_after_a_split_value_gives_the_value(self, value):
+        """Typing the suggestion for a value a shell split on spaces passes it whole."""
+        with pytest.raises(ValueError) as refused:
+            _parse_cli_overrides(f"--metrics.wandb_run_name={value}".split())
+        suggestion = str(refused.value).split("write ", 1)[1]
+        expected = {"metrics": {"wandb_run_name": " ".join(value.split())}}
+        assert _parse_cli_overrides(shlex.split(suggestion)) == expected
+
+    @pytest.mark.parametrize(
+        "args,fix",
+        [
+            (["--optimizer.lr", "1e-3"], "--optimizer.lr=1e-3"),
+            (["--train.max_steps", "7"], "--train.max_steps=7"),
+            (["--train.compile_model", "false"], "--train.compile_model=false"),
+            (["--model.dim=512", "--checkpoint.dir", "/some/dir"], "--checkpoint.dir=/some/dir"),
+            (["--checkpoint.dir", "/some dir"], "'--checkpoint.dir=/some dir'"),
+        ],
+    )
+    def test_a_space_separated_value_is_refused_with_the_fix(self, args, fix):
+        """The value after a bare key is refused instead of dropped while the key reads
+        as true, and the message shows the override as it should be written."""
+        with pytest.raises(ValueError, match=f"write {fix}$"):
+            _parse_cli_overrides(args)
+
+    @pytest.mark.parametrize("value", ["/some dir", "1e-3", "it's", "[0.9,0.95]", "-7"])
+    def test_following_the_suggestion_gives_the_value(self, value):
+        """The suggested override is quoted for a shell, so typing it as shown passes the
+        value whole."""
+        with pytest.raises(ValueError) as refused:
+            _parse_cli_overrides(["--checkpoint.dir", value])
+        suggestion = str(refused.value).split("write ", 1)[1]
+        expected = _parse_cli_overrides([f"--checkpoint.dir={value}"])
+        assert _parse_cli_overrides(shlex.split(suggestion)) == expected
+
+    def test_load_config_refuses_a_space_separated_override(self):
+        with pytest.raises(ValueError, match="write --train.max_steps=7"):
+            load_config("configs/train/debug.toml", cli_args=["--train.max_steps", "7"])
+
+    def test_load_config_refuses_an_argument_after_a_complete_override(self):
+        with pytest.raises(ValueError, match="write '--metrics.wandb_run_name=7b baseline'"):
+            load_config(
+                "configs/train/debug.toml",
+                cli_args=["--metrics.wandb_run_name=7b", "baseline"],
+            )
+
+    def test_documented_commands_write_each_override_with_an_equals_sign(self):
+        """Commands in the docs pass --section.key=value, since a value after a space is
+        refused."""
+        root = Path(__file__).resolve().parents[2]
+        pages = [root / "README.md"]
+        for folder in ("docs", "examples", "plugins"):
+            pages += sorted((root / folder).rglob("*.md"))
+        commands = [command for page in pages for command in _fenced_commands(page.read_text())]
+        assert len(pages) > 50
+        assert any("scripts/train.py" in command and "--train." in command for command in commands)
+        found = [
+            f"{page.relative_to(root)}: {command}"
+            for page in pages
+            for command in _space_separated_overrides(page.read_text())
+        ]
+        assert not found, "\n".join(found)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "train.py c.toml --train.seed -7",
+            "train.py c.toml --checkpoint.dir -scratch",
+            "train.py c.toml --train.fp8 true",
+            "train.py c.toml --train.max_steps\t7",
+            "train.py c.toml --checkpoint.dir \\\n    /scratch/run",
+            "train.py c.toml --plugins my_module",
+            "train.py c.toml --vlm.arch joint_decoder",
+            "train.py c.toml --optimizer.betas '[0.9,\n    0.95]'",
+            "train.py c.toml --checkpoint.dir ''",
+            "train.py c.toml --train.max_steps 7 >train.log",
+            "train.py c.toml --checkpoint.dir '(run)'",
+            "train.py c.toml --data.sep '|'",
+        ],
+    )
+    def test_the_docs_scan_finds_a_value_after_a_space(self, command):
+        assert _space_separated_overrides(f"```bash\n{command}\n```")
+        assert _space_separated_overrides(f"~~~bash\n{command}\n~~~")
+
+    @pytest.mark.parametrize(
+        "markdown",
+        [
+            "```bash\ntrain.py c.toml --model.dim=512 --train.max_steps=7\n```",
+            "```bash\ntrain.py c.toml --train.compile_model --model.dim=512\n```",
+            "```bash\ntrain.py c.toml --train.compile_model | tee log\n```",
+            "```bash\ntrain.py c.toml --train.compile_model  # a bare key means true\n```",
+            '```bash\ngenerate.py c.toml --prompt "Hi there" --max_tokens 64\n```',
+            "```bash\ntorchrun --nproc_per_node 4 scripts/train.py c.toml\n```",
+            "```bash\ntrain.py c.toml --train.compile_model 2>/dev/null\n```",
+            "```bash\ntrain.py c.toml --train.compile_model >train.log\n```",
+            "```bash\ntrain.py c.toml --train.compile_model; echo done\n```",
+            "```bash\ntrain.py c.toml --train.compile_model 2>&1 | tee log\n```",
+            "```bash\neval_harness.py --checkpoint checkpoints/step_10\n```",
+            "Prose that names `--train.max_steps 7` outside a fence.",
+        ],
+    )
+    def test_the_docs_scan_passes_overrides_written_with_an_equals_sign(self, markdown):
+        assert _space_separated_overrides(markdown) == []
 
     def test_multiple_overrides(self):
         result = _parse_cli_overrides(["--model.dim=512", "--model.n_layers=8"])
@@ -2020,3 +2309,109 @@ class TestModelConfigHeadDim:
         model = load_config(str(path), cli_args=[]).model
         assert model.head_dim_override == 0
         assert model.head_dim == 64
+
+
+class TestScalarCoercion:
+    """A bool or int value that does not stand for one is refused, naming the field (#580)."""
+
+    @staticmethod
+    def _toml(tmp_path: Path, section: str, line: str) -> JobConfig:
+        path = tmp_path / "c.toml"
+        path.write_text(f"[{section}]\n{line}\n")
+        return load_config(str(path), cli_args=[])
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("true", True),
+            ("True", True),
+            ("YES", True),
+            ("1", True),
+            ("1.0", True),
+            ("false", False),
+            ("No", False),
+            ("0", False),
+            ("0.0", False),
+        ],
+    )
+    def test_bool_spellings_from_the_cli(self, raw, expected):
+        assert (
+            load_config(cli_args=[f"--train.compile_model={raw}"]).train.compile_model is expected
+        )
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("true", True),
+            ("false", False),
+            ("1", True),
+            ("0", False),
+            ("1.0", True),
+            ("0.0", False),
+        ],
+    )
+    def test_bool_values_from_toml(self, tmp_path, raw, expected):
+        train = self._toml(tmp_path, "train", f"compile_model = {raw}").train
+        assert train.compile_model is expected
+
+    @pytest.mark.parametrize("raw", ["ture", "on", "''", "2", "-1", "0.5"])
+    def test_a_value_that_is_no_bool_is_refused(self, raw):
+        with pytest.raises(ValueError, match=r"TrainConfig\.compile_model: expected a bool"):
+            load_config(cli_args=[f"--train.compile_model={raw}"])
+
+    @pytest.mark.parametrize("raw", ['"ture"', "2", "0.5"])
+    def test_a_toml_value_that_is_no_bool_is_refused(self, tmp_path, raw):
+        with pytest.raises(ValueError, match=r"TrainConfig\.tf32: expected a bool"):
+            self._toml(tmp_path, "train", f"tf32 = {raw}")
+
+    @pytest.mark.parametrize(("raw", "expected"), [("4", 4), ("4.0", 4), ("'4'", 4)])
+    def test_whole_numbers_load_as_ints(self, raw, expected):
+        batch_size = load_config(cli_args=[f"--train.batch_size={raw}"]).train.batch_size
+        assert batch_size == expected and type(batch_size) is int
+
+    @pytest.mark.parametrize("raw", ["2.7", "True", "False", "'2.7'", "'4.0'", "'four'"])
+    def test_a_value_that_is_no_int_is_refused(self, raw):
+        with pytest.raises(ValueError, match=r"TrainConfig\.batch_size: expected an int"):
+            load_config(cli_args=[f"--train.batch_size={raw}"])
+
+    @pytest.mark.parametrize("raw", ["2.7", "true"])
+    def test_a_toml_value_that_is_no_int_is_refused(self, tmp_path, raw):
+        with pytest.raises(ValueError, match=r"TrainConfig\.batch_size: expected an int"):
+            self._toml(tmp_path, "train", f"batch_size = {raw}")
+
+    @pytest.mark.parametrize(("raw", "expected"), [("3e-4", 3e-4), ("1", 1.0), ("'0.5'", 0.5)])
+    def test_numbers_load_as_floats(self, raw, expected):
+        lr = load_config(cli_args=[f"--optimizer.lr={raw}"]).optimizer.lr
+        assert lr == expected and type(lr) is float
+
+    @pytest.mark.parametrize("raw", ["True", "'fast'", "1" + "0" * 400])
+    def test_a_value_that_is_no_float_is_refused(self, raw):
+        """An int too large for a float is refused too, rather than raising OverflowError."""
+        with pytest.raises(ValueError, match=r"OptimizerConfig\.lr: expected a float"):
+            load_config(cli_args=[f"--optimizer.lr={raw}"])
+
+    def test_a_toml_bool_for_a_float_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match=r"OptimizerConfig\.lr: expected a float"):
+            self._toml(tmp_path, "optimizer", "lr = true")
+
+    @pytest.mark.parametrize(
+        ("override", "field", "kind"),
+        [
+            ("--train.data_seed={'seed': 4}", "TrainConfig.data_seed", "an int"),
+            ("--train.batch_size=[4]", "TrainConfig.batch_size", "an int"),
+            ("--optimizer.lr=None", "OptimizerConfig.lr", "a float"),
+        ],
+    )
+    def test_a_value_of_another_type_is_refused(self, override, field, kind):
+        with pytest.raises(ValueError, match=rf"{field}: expected {kind}"):
+            load_config(cli_args=[override])
+
+    def test_a_literal_refusal_names_the_field(self):
+        with pytest.raises(ValueError, match=r"TrainConfig\.mixed_precision: Value 'bf61'"):
+            load_config(cli_args=["--train.mixed_precision=bf61"])
+
+    def test_a_nested_value_names_its_own_field(self, tmp_path):
+        path = tmp_path / "c.toml"
+        path.write_text('[[data.datasets]]\npath = "/d"\nweight = "heavy"\n')
+        with pytest.raises(ValueError, match=r"DatasetSource\.weight: expected a float"):
+            load_config(str(path), cli_args=[])

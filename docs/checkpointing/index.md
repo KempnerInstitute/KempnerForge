@@ -78,6 +78,29 @@ those records. When a logging backend has a live run at save time it also holds 
   [`kempnerforge.metrics.mlflow.publish`](../metrics-and-profiling/mlflow.md#publishing-eval-results)
   appends eval metrics to the MLflow run its `mlflow` entry names.
 
+## Loading runs pickle
+
+A load passes checkpoint files to an unrestricted unpickler in three places, so a crafted
+checkpoint can run code in the process that loads it:
+
+- Every rank reads the DCP index, the `.metadata` file in the shard directory, through
+  PyTorch's `FileSystemReader.read_metadata`, which unpickles it with no check.
+- Values in the DCP shards (the `.distcp` files) that are not tensors, such as the
+  optimizer's param group settings, go through PyTorch's `DefaultLoadPlanner.load_bytes`,
+  which loads them with `torch.load(weights_only=False)`, also with no check.
+- Rank 0 reads `train_state.pt` with `torch.load(weights_only=False)`, since the file holds
+  scheduler, dataloader and RNG state and the run's extras. Before that it refuses a file
+  another user owns, and warns about, but still loads, one that is group- or world-writable.
+  It checks only the file's owner and mode: a checkpoint you downloaded, copied or extracted
+  from an archive is yours, and can load silently.
+
+So load only checkpoints you trust, in practice ones you or your team saved. Take weights
+from elsewhere as safetensors in a local directory and import them with `hf-to-dcp` pointed
+at that directory ([HF conversion](hf-conversion.md)); given a Hub model ID instead,
+`hf-to-dcp` loads the model through `transformers` with `trust_remote_code=True`, which can
+run custom code from the model's repository. `metadata.json` is plain JSON: a tool that needs only
+the step, the token count or the logging runs can read it without loading the checkpoint.
+
 ## Key modules
 
 - [`kempnerforge/checkpoint/manager.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/manager.py)
@@ -85,7 +108,8 @@ those records. When a logging backend has a live run at save time it also holds 
   maintenance, retention cleanup.
 - [`kempnerforge/checkpoint/async_save.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/async_save.py)
   — `AsyncCheckpointer`: the sync and async save modes
-  (`async_with_pinned_mem` runs the same call as `async`).
+  (`async_with_pinned_mem` stages the snapshot in pinned CPU memory where a CUDA
+  device is available).
 - [`kempnerforge/checkpoint/state.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/state.py)
   — `build_train_state` / `restore_train_state`, RNG capture.
 - [`kempnerforge/resilience/elastic.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)
