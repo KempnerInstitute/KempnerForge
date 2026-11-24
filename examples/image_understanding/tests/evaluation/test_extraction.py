@@ -222,6 +222,35 @@ class TestBigBirdTokenizer:
         assert all(window.tokens[:3] == ["[CLS]", "\u2581what", "?"] for window in windows)
 
 
+class _Window:
+    """A stand-in encoding with chosen words, word characters and token offsets."""
+
+    def __init__(self, words: list[int | None], chars: dict[int, tuple[int, int]]) -> None:
+        self.words, self.chars = words, chars
+        self.offsets = [(0, 2), (2, 5), (6, 9)]
+
+    def token_to_word(self, token: int) -> int | None:
+        return self.words[token]
+
+    def word_to_chars(self, word: int, sequence: int) -> tuple[int, int] | None:
+        return self.chars.get(word)
+
+
+@pytest.mark.parametrize(
+    ("words", "chars", "span"),
+    [
+        ([0, 0, 1], {0: (0, 5), 1: (6, 9)}, (0, 5)),
+        ([0, None, 1], {0: (0, 5), 1: (6, 9)}, (2, 5)),
+        ([0, 0, 1], {}, (2, 5)),
+    ],
+)
+def test_a_span_covers_its_words_or_else_its_tokens(
+    words: list[int | None], chars: dict[int, tuple[int, int]], span: tuple[int, int]
+) -> None:
+    window: Any = _Window(words, chars)
+    assert extraction._characters(window, 1, 1) == span
+
+
 class TestAnswerExtractor:
     def test_the_best_span_widens_to_its_words(self, spiece_model: Path) -> None:
         extract, _ = _extractor(spiece_model, {"\u258142": 8.0}, {"\u258142": 8.0})
@@ -237,12 +266,17 @@ class TestAnswerExtractor:
         extract, _ = _extractor(spiece_model, logits, logits)
         assert extract("what?", "a Cat " + FAR + "dog " + FAR + "cat") == " Cat"
 
-    def test_every_window_of_a_long_context_is_read(self, spiece_model: Path) -> None:
+    def test_an_answer_only_an_overflowing_window_holds_is_found(self, spiece_model: Path) -> None:
         extract, model = _extractor(
             spiece_model, {"\u258142": 9.0}, {"\u258142": 9.0}, max_length=WINDOW_STRIDE + 40
         )
-        assert extract("what?", " ".join(["a"] * 300) + " 42") == " 42"
-        assert model.calls > 1
+        tokenizer = bigbird_tokenizer(spiece_model, WINDOW_STRIDE + 40)
+        context = "42 " + " ".join(["a"] * 300)
+        encoding = tokenizer.encode("what?", context)
+        assert "\u258142" not in encoding.tokens
+        assert any("\u258142" in window.tokens for window in encoding.overflowing)
+        assert extract("what?", context) == "42"
+        assert model.calls == 1 + len(encoding.overflowing)
 
     def test_a_question_too_long_for_a_window_is_refused(self, spiece_model: Path) -> None:
         length = WINDOW_STRIDE + 40

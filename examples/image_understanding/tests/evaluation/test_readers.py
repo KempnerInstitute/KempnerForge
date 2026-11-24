@@ -14,7 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import torch
-from evaluation import extraction
+from evaluation import extraction, readers
 from evaluation.extraction import AnswerExtractor
 from evaluation.readers import (
     MATHVISTA_COLUMNS,
@@ -215,6 +215,18 @@ class TestMathVista:
         assert (reader.reference(1).choices, reader.reference(1).precision) == ((), None)
         assert reader.reference(2).precision == 2
         assert isinstance(reader.reference(2).precision, int)
+
+    @pytest.mark.parametrize("row", [-1, 3])
+    def test_a_row_outside_the_split_is_refused(
+        self, write_mathvista: Callable[..., Path], row: int
+    ) -> None:
+        reader = MathVistaRows(write_mathvista(MATHVISTA_PROBLEMS), lambda: _extract)
+        with pytest.raises(IndexError, match=f"index {row} is out of range for 3 rows"):
+            reader.read_with_index(row)
+
+    def test_the_rows_are_checked_with_a_stand_in_that_never_extracts(self) -> None:
+        with pytest.raises(RuntimeError, match="once the split is checked"):
+            readers._unset_extractor("what?", "a cat")
 
     @pytest.mark.parametrize("broken", [{"bytes": b"not an image", "path": "0.png"}, None])
     def test_a_row_whose_image_cannot_be_used_is_passed_over(
