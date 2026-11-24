@@ -394,6 +394,8 @@ class TestRealWorldQAAccuracy:
             ("A or B", "B", 0.0),
             ("b", "B", 1.0),
             ("Answer: c", "C", 1.0),
+            ("Answer: Option B", "B", 1.0),
+            ("B,", "B", 1.0),
             ("Left", "B", 0.0),
             ("", "A", 0.0),
         ],
@@ -404,22 +406,20 @@ class TestRealWorldQAAccuracy:
         assert realworldqa_accuracy(prediction, [answer]) == expected
 
     @pytest.mark.parametrize(
-        ("prediction", "answer", "expected"),
+        ("prediction", "answer"),
         [
-            ("Answer: Option B", "B", 1.0),
-            ("B,", "B", 1.0),
-            ("**B**ecause it is red.", "B", 0.0),
-            ("A-list", "A", 0.0),
-            ("B's", "B", 0.0),
-            ("B.com", "B", 0.0),
-            ("C:/path", "C", 0.0),
-            ("<answer B", "B", 0.0),
+            ("**B**ecause it is red.", "B"),
+            ("A-list", "A"),
+            ("B's", "B"),
+            ("B.com", "B"),
+            ("C:/path", "C"),
+            ("<answer B", "B"),
         ],
     )
     def test_a_letter_inside_a_word_or_a_broken_tag_names_no_option(
-        self, prediction: str, answer: str, expected: float
+        self, prediction: str, answer: str
     ) -> None:
-        assert realworldqa_accuracy(prediction, [answer]) == expected
+        assert realworldqa_accuracy(prediction, [answer]) == 0.0
 
     @pytest.mark.parametrize(
         ("prediction", "answer", "expected"),
