@@ -248,6 +248,45 @@ def _prompt_or_none(value: Any, prompt_field: str) -> str | None:
     return value
 
 
+def _check_text_column(rows: Any, text_field: str, kept: np.ndarray) -> None:
+    """Reject a caption column that is not a string column or misses a kept row's caption.
+
+    Checked when the dataset is built, so every rank stops there, instead of the rank whose
+    sampler reaches the row stopping mid-run while the others wait in the next collective.
+    The null count of the Arrow table under ``rows`` is free to read, so a dataset with no
+    missing caption costs nothing more; one with a missing caption somewhere reads the
+    column's validity once and looks the kept rows up in it, without gathering any row.
+
+    Args:
+        rows: The dataset as loaded, before any selection, so that its Arrow table holds
+            its rows in order; it has a ``text_field`` column.
+        text_field: The caption column's name.
+        kept: The index in ``rows`` of each row the dataset keeps.
+
+    Raises:
+        TypeError: The column is not a ``datasets.Value`` of dtype ``string`` or
+            ``large_string``, or ``null``, the type of a column that holds no value.
+        ValueError: A kept row's caption is missing; the message names the first one.
+    """
+    from datasets import Value
+
+    feature = rows.select_columns([text_field]).features[text_field]
+    if not (isinstance(feature, Value) and feature.dtype in ("string", "large_string", "null")):
+        raise TypeError(
+            f"Dataset field {text_field!r} must be a string column (a Value of dtype "
+            f"'string' or 'large_string'), got {feature}"
+        )
+    column = rows.data.column(text_field)
+    if column.null_count == 0:
+        return
+    valid = column.is_valid().to_numpy(zero_copy_only=False)[kept]
+    missing = int(valid.size - np.count_nonzero(valid))
+    if missing:
+        more = f" and {missing - 1:,} more" if missing > 1 else ""
+        first = int(kept[np.argmin(valid)])
+        raise ValueError(f"Dataset field {text_field!r} has no value in row {first}{more}")
+
+
 def _check_prompt_column_is_string(rows: Any, prompt_field: str) -> None:
     """Reject a prompt column whose type admits a value that is neither a string nor missing.
 
@@ -561,6 +600,7 @@ class HuggingFaceVLMDataset(Dataset):
                 "HuggingFaceVLMDataset (use `split=` to resolve a single split)."
             )
         keep, text_only = _usable_rows(ds, image_field, max_images)
+        _check_text_column(ds, text_field, keep)
         if len(keep) < len(ds):
             ds = ds.select(keep)
         self._ds: HFDataset = ds
