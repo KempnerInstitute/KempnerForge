@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import socket
 from typing import Any
 
 import pytest
@@ -12,6 +11,7 @@ from torch import nn
 
 from kempnerforge.config.registry import registry
 from kempnerforge.model.vision import VisionEncoder
+from tests.gloo_ranks import gloo_group, spawn
 
 _ENCODER = "trainable_for_unfreeze_tests"
 
@@ -40,12 +40,6 @@ def _build_encoder(
 def _register_encoder() -> None:
     if _ENCODER not in registry.list_vision_encoders():
         registry.register_vision_encoder(_ENCODER)(_build_encoder)
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _vlm_model(device_mesh: Any, vlm_config: Any, mp_policy: Any = None) -> nn.Module:
@@ -89,7 +83,6 @@ def _check_unfreeze(rank: int, world: int, port: int, unfreeze: bool) -> None:
     and the next step's encoder gradients are fp32 and match an unsharded reference fed
     every rank's batch, which one rank's own batch would not.
     """
-    import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
     from torch.distributed.tensor import DTensor
@@ -100,10 +93,7 @@ def _check_unfreeze(rank: int, world: int, port: int, unfreeze: bool) -> None:
     from kempnerforge.training.freeze import apply_freeze_specs, trainable_for_the_run
     from kempnerforge.training.optimizer import build_optimizer
 
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
         stage = FreezeStage(2, (FreezeSpec("vision_encoder", False),))
         vlm = VLMConfig(
@@ -173,16 +163,12 @@ def _check_unfreeze(rank: int, world: int, port: int, unfreeze: bool) -> None:
         assert not any(
             torch.equal(p.full_tensor(), b) for p, b in zip(encoder, before, strict=True)
         )
-    finally:
-        dist.destroy_process_group()
 
 
 class TestUnfreezeUnderFSDP2:
     @pytest.mark.parametrize("unfreeze", [True, False])
     def test_an_encoder_a_stage_unfreezes_is_sharded_and_trains_in_step(self, unfreeze):
-        import torch.multiprocessing as mp
-
-        mp.spawn(_check_unfreeze, args=(2, _free_port(), unfreeze), nprocs=2)
+        spawn(_check_unfreeze, 2, unfreeze)
 
 
 def _build(freeze: list, schedule: list | None = None) -> nn.Module:
