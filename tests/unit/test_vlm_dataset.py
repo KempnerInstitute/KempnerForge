@@ -667,40 +667,38 @@ class TestCaptionColumn:
         with pytest.raises(ValueError, match=r"'caption' has no value in row 2 and 1 more$"):
             HuggingFaceVLMDataset(path, max_text_len=8, **self._LOAD)
 
-    def test_a_missing_caption_is_found_across_chunks_and_scan_batches(self, monkeypatch):
-        """Two chunks scanned two rows at a time: the first missing caption is in the second
-        batch and the other in the third, so the row and the count carry across batches."""
+    def test_a_missing_caption_is_found_across_chunks(self):
+        """The column spans two Arrow chunks: the kept rows are looked up across both, and a
+        missing caption in a row the dataset skips does not count."""
         from datasets import Dataset, concatenate_datasets
 
         first, second = {"caption": ["a", "b", None]}, {"caption": ["d", None]}
         rows = concatenate_datasets([Dataset.from_dict(first), Dataset.from_dict(second)])
         assert rows.data.column("caption").num_chunks == 2
-        monkeypatch.setattr(vlm_dataset, "_CAPTION_SCAN_ROWS", 2)
-        with pytest.raises(ValueError, match=r"'caption' has no value in row 7 and 1 more$"):
-            vlm_dataset._check_text_column(rows, "caption", np.arange(5, 10))
-
-    def test_the_scan_reads_at_most_a_batch_of_rows_at_a_time(self, monkeypatch):
-        from datasets import Dataset
-
-        rows = Dataset.from_dict({"caption": ["a", "b", None, "d", "e"]}).select([0, 1, 2, 3, 4])
-        monkeypatch.setattr(vlm_dataset, "_CAPTION_SCAN_ROWS", 2)
-        sizes = []
-        getitem = Dataset.__getitem__
-
-        def recording(self, key):
-            if isinstance(key, slice):
-                sizes.append(len(range(*key.indices(len(self)))))
-            return getitem(self, key)
-
-        monkeypatch.setattr(Dataset, "__getitem__", recording)
-        with pytest.raises(ValueError, match=r"'caption' has no value in row 2$"):
+        with pytest.raises(ValueError, match=r"'caption' has no value in row 2 and 1 more$"):
             vlm_dataset._check_text_column(rows, "caption", np.arange(5))
-        assert sizes and max(sizes) <= 2
+        with pytest.raises(ValueError, match=r"'caption' has no value in row 4$"):
+            vlm_dataset._check_text_column(rows, "caption", np.array([0, 1, 3, 4]))
 
-    def test_a_selection_without_the_missing_caption_passes(self):
+    def test_the_check_reads_no_row(self, monkeypatch):
+        """The check reads the column's validity, not rows, so a dataset with a missing
+        caption somewhere costs no row gather, whichever rows are kept."""
         from datasets import Dataset
 
-        rows = Dataset.from_dict({"caption": ["a", None, "c"]}).select([0, 2])
+        rows = Dataset.from_dict({"caption": ["a", None, "c", None]})
+
+        def no_rows(self, key):
+            raise AssertionError("the caption check read rows")
+
+        monkeypatch.setattr(Dataset, "__getitem__", no_rows)
+        vlm_dataset._check_text_column(rows, "caption", np.array([0, 2]))
+        with pytest.raises(ValueError, match=r"'caption' has no value in row 1$"):
+            vlm_dataset._check_text_column(rows, "caption", np.array([0, 1, 2]))
+
+    def test_kept_rows_without_the_missing_caption_pass(self):
+        from datasets import Dataset
+
+        rows = Dataset.from_dict({"caption": ["a", None, "c"]})
         vlm_dataset._check_text_column(rows, "caption", np.array([0, 2]))
 
     def test_a_missing_caption_in_a_skipped_row_is_never_read(self, tmp_path):

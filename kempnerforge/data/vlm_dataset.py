@@ -248,22 +248,20 @@ def _prompt_or_none(value: Any, prompt_field: str) -> str | None:
     return value
 
 
-_CAPTION_SCAN_ROWS = 1 << 16
-
-
 def _check_text_column(rows: Any, text_field: str, kept: np.ndarray) -> None:
     """Reject a caption column that is not a string column or misses a kept row's caption.
 
     Checked when the dataset is built, so every rank stops there, instead of the rank whose
     sampler reaches the row stopping mid-run while the others wait in the next collective.
     The null count of the Arrow table under ``rows`` is free to read, so a dataset with no
-    missing caption costs nothing more; only one with a missing caption somewhere has its
-    kept rows scanned, ``_CAPTION_SCAN_ROWS`` at a time.
+    missing caption costs nothing more; one with a missing caption somewhere reads the
+    column's validity once and looks the kept rows up in it, without gathering any row.
 
     Args:
-        rows: The kept rows, a ``datasets.Dataset`` with a ``text_field`` column.
+        rows: The dataset as loaded, before any selection, so that its Arrow table holds
+            its rows in order; it has a ``text_field`` column.
         text_field: The caption column's name.
-        kept: The index of each of ``rows`` in the dataset as loaded, for the message.
+        kept: The index in ``rows`` of each row the dataset keeps.
 
     Raises:
         TypeError: The column is not a ``datasets.Value`` of dtype ``string`` or
@@ -278,21 +276,15 @@ def _check_text_column(rows: Any, text_field: str, kept: np.ndarray) -> None:
             f"Dataset field {text_field!r} must be a string column (a Value of dtype "
             f"'string' or 'large_string'), got {feature}"
         )
-    if rows.data.column(text_field).null_count == 0:
+    column = rows.data.column(text_field)
+    if column.null_count == 0:
         return
-    view = rows.select_columns([text_field]).with_format("arrow")
-    first, missing = -1, 0
-    for start in range(0, len(view), _CAPTION_SCAN_ROWS):
-        column = view[start : start + _CAPTION_SCAN_ROWS].column(text_field)
-        if column.null_count and first < 0:
-            valid = column.is_valid().to_numpy(zero_copy_only=False)
-            first = start + int(np.flatnonzero(~valid)[0])
-        missing += column.null_count
+    valid = column.is_valid().to_numpy(zero_copy_only=False)[kept]
+    missing = int(valid.size - np.count_nonzero(valid))
     if missing:
         more = f" and {missing - 1:,} more" if missing > 1 else ""
-        raise ValueError(
-            f"Dataset field {text_field!r} has no value in row {int(kept[first])}{more}"
-        )
+        first = int(kept[np.argmin(valid)])
+        raise ValueError(f"Dataset field {text_field!r} has no value in row {first}{more}")
 
 
 def _check_prompt_column_is_string(rows: Any, prompt_field: str) -> None:
@@ -597,9 +589,9 @@ class HuggingFaceVLMDataset(Dataset):
                 "HuggingFaceVLMDataset (use `split=` to resolve a single split)."
             )
         keep, text_only = _usable_rows(ds, image_field, max_images)
+        _check_text_column(ds, text_field, keep)
         if len(keep) < len(ds):
             ds = ds.select(keep)
-        _check_text_column(ds, text_field, keep)
         self._ds: HFDataset = ds
         used = [text_field, *([prompt_field] if prompt_field is not None else [])]
         self._text_columns: Any = ds.select_columns(used)
