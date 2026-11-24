@@ -48,10 +48,10 @@ state_dict`, naming the tensor.
 | Rename a parameter | no | Old name not in `.metadata` → error (or you patch the state dict keys before `load_state_dict`) |
 
 The table is about model and optimizer state, which is all DCP reshards. The
-dataloader cursor and the RNG streams are rank-local and live outside DCP, so
-any row above that moves a rank onto a different data partition (a changed
-world size, `dp_shard`, `dp_replicate`, `tp` or `ep`) needs one extra config
-line on resume: see
+dataloader position and the RNG streams live outside DCP and are saved per
+rank, so any row above that moves a rank onto a different data partition (a
+changed world size, `dp_shard`, `dp_replicate`, `tp` or `ep`) needs one extra
+config line on resume: see
 [Scaling a run to a different world size](#scaling-a-run-to-a-different-world-size).
 
 ## PP: the one special case
@@ -125,19 +125,21 @@ checkpoint loads into an EP run. Packed experts under FSDP need torch
   others were never written. The load refuses it and says how many
   experts it holds; no `ep` can restore the missing ones.
 - **"checkpoint per-rank state was saved with world_size=..."**: not
-  a DCP failure at all. The model and optimizer reshard fine; the
-  dataloader and RNG state cannot follow the topology change. See
+  a DCP failure at all. The model and optimizer reshard fine; it is
+  each rank's saved RNG and loader state that belongs to the saved
+  topology. See
   [Scaling a run to a different world size](#scaling-a-run-to-a-different-world-size).
 
 ## Scaling a run to a different world size
 
 DCP reshards model and optimizer state freely, but the dataloader
-cursor and the RNG streams are not DCP state. They are rank-local:
-`train_state.pt` holds one payload per rank
-([Train state](train-state.md#per-rank-state-schema-v1)), and a
-payload is only meaningful on the rank and data partition that saved
-it. An auto-resume is an *exact* resume, so it refuses to start when
-the topology moved:
+position and the RNG streams are not DCP state. `train_state.pt` holds
+one payload of them per rank
+([Train state](train-state.md#per-rank-state-schema-v1)), and an
+auto-resume is an *exact* resume: each rank restores the payload its
+own rank saved, its RNG streams and its loader's state. Those payloads
+fit only the topology that saved them, so an auto-resume refuses to
+start when the topology moved:
 
 - a different world size, or
 - a different data-parallel layout at the same world size, which is
@@ -145,12 +147,11 @@ the topology moved:
   `dp_shard=4` rank 2 reads data partition 2 of 4, and with
   `dp_shard=2`, `tp=2` it reads partition 1 of 2.
 
-Both raise on every rank, with an error naming the saved topology,
-the current one, and the setting below. The refusal is deliberate:
-restoring rank 0's single copy on every rank instead would move every
-other rank's data position silently, with a loss curve that looks
-entirely normal and nothing in the logs to say that data was re-read
-or skipped.
+Both raise on every rank, before any rank restores loader or RNG
+state, with an error naming the saved topology, the current one, and
+the setting below. The refusal is deliberate: an exact resume
+continues every rank's random streams as they were, and on another
+topology no rank has saved streams of its own to continue.
 
 To scale anyway, add one line to the config:
 
@@ -160,28 +161,66 @@ ignore_rank_state_mismatch = true
 ```
 
 or pass `--checkpoint.ignore_rank_state_mismatch=true` on the command
-line. Every rank then discards the saved per-rank dataloader and RNG
-state (rank 0 logs a warning saying so) and resumes from the rest of
-the checkpoint:
+line. Every rank then resumes from the rest of the checkpoint, keeps
+the data position and drops its saved RNG state, and a warning names
+the mismatch, what was kept and what was dropped:
 
 | State | With the flag set |
 |-------|-------------------|
 | `step`, `tokens_seen` | continue |
 | Model, optimizer, scheduler | continue, resharded by DCP onto the new topology |
-| Dataloader position | restarts from the first sample |
+| Dataloader position | continues where it carries over (below), from the saved rank 0's position, or for a stream on the saved data-parallel size from each data-parallel rank's own; otherwise restarts from the first sample on every rank, with a warning |
 | RNG streams | restart from the run's seeds |
+
+The data position kept is the one the saved rank 0 reached, except a
+stream's (below), and every rank's loader applies it by the loader's
+own rule
+([Stateful dataloader § Resuming on another data-parallel size](../data/stateful-dataloader.md#resuming-on-another-data-parallel-size)).
+Every rank checks the position before any rank applies it, and the
+ranks agree: they all keep it, or all restart the data, also where one
+rank's view of the data, such as a data file's size, differs.
+A single map-style dataset's position (`data.dataset_path`, an
+in-memory Hugging Face dataset or a VLM dataset) counts the samples of
+the epoch's order that all data-parallel ranks consumed, so it carries
+over to any data-parallel size and batch size: each rank resumes at
+its first sample past that count, and no sample is read twice. To keep
+the ranks in step, up to one sample per rank at the end of that epoch
+goes unread, beside the partial batch `drop_last` drops (see
+[Stateful dataloader § Resuming on another data-parallel size](../data/stateful-dataloader.md#resuming-on-another-data-parallel-size)).
+Three positions carry over only on the saved data-parallel
+size: a weighted mixture (`data.datasets`), a streamed dataset
+(`data.hf_streaming`), and a checkpoint saved before the loader
+recorded its batch size. On another data-parallel size their data
+restarts from the first sample, with a warning that names the reason,
+and the resume goes on, since the flag opted in. A stream resumed this
+way on the saved data-parallel size continues each data-parallel rank
+from the count that rank saved, so it resumes exactly in every pass
+([Stateful dataloader § Several ranks](../data/stateful-dataloader.md#several-ranks)).
+The data order does not depend on the RNG streams: the samplers and
+the stream shuffle with the data seed and the epoch.
+
+Two cases keep no data position. A loader other than
+`StatefulDataLoader` and `StreamingDataLoader`, passed to
+`CheckpointManager` directly, does not check that rank 0's state fits
+its rank, so that state is dropped with a warning. An envelope that the
+flag lets through for another reason, unreadable or incomplete, keeps
+neither the data position nor the RNG state.
+
+A checkpoint saved before per-rank state was recorded holds no envelope
+to compare, so it cannot show whether the topology changed. Without the
+flag every rank applies rank 0's data position and RNG streams, and a
+position that cannot carry over stops the resume with a
+`DataPositionError`; with the flag the resume goes on as if the topology
+changed, even on the topology that saved it, with rank 0's data
+position by the rule above and fresh RNG streams.
 
 Resharding model and optimizer state never needs the flag; it is
 untouched by the per-rank state. Nor do the loads that are not an
 exact resume: a `checkpoint.load_path` warm start and
 `scripts/eval.py` ignore the per-rank state and never check the
-topology, on any world size or layout.
-
-Restarting the data is not the same as continuing it: a run that
-scales mid-flight will re-read the samples it already consumed.
-Exact data continuity across a change in the data-parallel size is
-tracked separately in
-[issue #314](https://github.com/KempnerInstitute/KempnerForge/issues/314).
+topology, on any world size or layout. A warm start applies rank 0's
+data position by the same rule and restores rank 0's RNG streams on
+every rank.
 
 ### Example: scale-up from 16 to 64 GPUs
 
@@ -199,10 +238,15 @@ uv run torchrun --nproc_per_node=64 scripts/train.py configs/train/7b.toml \
 Auto-resume follows the `latest` symlink, `CheckpointManager.load`
 calls `dcp.load`, and DCP reshards the 16-way sharded state into
 64-way. Training continues from step 5000 with the model, optimizer
-and scheduler intact; the data order and the RNG streams restart,
-because the 64-rank job's data partitions are not the ones the
-16-rank job saved cursors for. Without that last flag the resume
-stops instead, naming the saved and current world sizes.
+and scheduler intact, and the data continues from the same sample:
+the saved position counts the samples of the epoch's order that the
+16 ranks consumed, and each of the 64 ranks resumes at its first
+sample past that count. The RNG streams restart from the run's seeds,
+since each of the 16 ranks saved streams of its own. With a weighted
+mixture, a streamed dataset or a checkpoint saved before the loader
+recorded its batch size, the data restarts from its first sample, with
+a warning. Without that last flag the resume stops instead, naming the
+saved and current world sizes.
 
 The other thing that changes is the effective batch size: 4× the DP
 ranks means 4× the batch per step. Adjust `grad_accum_steps` downward

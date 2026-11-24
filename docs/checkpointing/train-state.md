@@ -90,7 +90,8 @@ the layout gather.
 
 Dataloader cursors and RNG streams are rank-local: pipeline stages
 seed `seed + pp_rank`, CUDA streams diverge during training, and a
-stateful loader's position is its own rank's. The gather spans every
+stateful loader's state can be its own rank's, such as a mixture's
+position in this rank's list of samples. The gather spans every
 rank of every pipeline stage, so each stage resumes its own streams
 rather than stage 0's. The `per_rank` envelope records each rank's
 payload:
@@ -99,13 +100,13 @@ payload:
   the running code understands refuses to load.
 - `world_size`: the topology that saved the checkpoint. Resuming
   under a **different world size raises** with an actionable error:
-  exact data/RNG continuity only exists on the saved topology, while
-  model/optimizer resharding via DCP is unaffected.
+  every rank's own data and RNG state exists only on the saved
+  topology, while model/optimizer resharding via DCP is unaffected.
 - `data_parallel`: every global rank's `(dp_rank, dp_size)`, the data
   partition its loader read. The same world size can split into a
   different partition per rank (for example DP=4 vs DP=2 x TP=2), so
-  resuming under a **different layout also raises**: a loader cursor
-  is only valid on the partition it was saved on. `None` when the saving
+  resuming under a **different layout also raises**: a rank's saved
+  loader and RNG state belong to the partition it read. `None` when the saving
   `CheckpointManager` was built without `dp_info` (the training entry
   always passes it); the layout check is then skipped and only the
   world size is checked.
@@ -118,12 +119,33 @@ missing, extra or incomplete entry (no full `rng` capture, an RNG
 stream such as `torch_cuda` or `dataloader` state on only some ranks)
 refuses the resume. The check reads only what every rank shares (the
 broadcast envelope, the world size, the gathered current layout), so
-all ranks restore, refuse, or discard together. To proceed past a
-refusal, set
-`checkpoint.ignore_rank_state_mismatch = true`: the saved loader/RNG
-state is discarded on every rank with a warning and data order /
-random streams restart fresh (model, optimizer, scheduler and step
-still resume). See
+all ranks restore, refuse, keep the data position or discard together.
+To proceed past a refusal, set
+`checkpoint.ignore_rank_state_mismatch = true`. Model, optimizer,
+scheduler and step still resume, no rank restores saved RNG state, so
+the random streams restart fresh, and a warning names what was kept and
+what was dropped. What happens to the data position depends on the
+refusal:
+
+- **A changed world size or data-parallel layout**: when the envelope
+  is sound on the topology that saved it, every rank keeps the data
+  position the saved rank 0 reached, `per_rank["ranks"][0]["dataloader"]`.
+  With a `DistributedSampler` that position counts the samples all
+  data-parallel ranks consumed, so it means the same on every rank.
+  A stream's count is one data-parallel rank's, so on the saved
+  data-parallel size each rank keeps the entry whose stream state
+  records its own `data_parallel_rank`. Every rank's loader checks the
+  position and the ranks agree before any rank applies it: every rank
+  applies it where it fits the new layout, and otherwise every rank
+  starts at its first sample with a warning (see
+  [Stateful dataloader § Resuming on another data-parallel size](../data/stateful-dataloader.md#resuming-on-another-data-parallel-size)).
+  Only `StatefulDataLoader` and `StreamingDataLoader` take it, since
+  they check the fit; another loader's state is dropped.
+- **A malformed or incomplete envelope**, or one written by a newer
+  schema version: the loader state is discarded as well, and the data
+  restarts from its first sample.
+
+See
 [Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size)
 for the scale-up recipe and what it costs.
 
@@ -131,7 +153,10 @@ Compatibility:
 
 - **Old checkpoint, new reader**: no `per_rank` key, so rank 0's
   single-copy `rng`/`dataloader` keys restore on every rank, exactly
-  as before.
+  as before. Such a checkpoint cannot show whether the topology
+  changed, so with `checkpoint.ignore_rank_state_mismatch = true` an
+  auto-resume treats it as changed: rank 0's data position carries over
+  where the loader can place it, and the RNG streams restart.
 - **New checkpoint, old reader**: the single-copy keys (rank 0's)
   are still written beside the envelope, so pre-envelope readers
   keep loading. Their documented limitation is unchanged: they
@@ -206,9 +231,10 @@ See [Training § Schedulers](../training/schedulers.md).
 
 ## Dataloader state
 
-`StatefulDataLoader` exposes `state_dict()` / `load_state_dict()`, and the
-training loop passes `dataloader=` at every save site, so `build_train_state`
-records the loader position under the `dataloader` key:
+`StatefulDataLoader` and, on the streaming path, `StreamingDataLoader` expose
+`state_dict()` / `load_state_dict()`, and the training loop passes
+`dataloader=` at every save site, so `build_train_state` records the loader
+position under the `dataloader` key:
 
 ```python
 # training/loop.py::run_training_loop
@@ -221,12 +247,18 @@ ckpt_mgr.save(
 )
 ```
 
-A checkpoint taken mid-epoch carries e.g.
-`{'epoch': 7, 'batches_yielded': 14, 'sampler': {...}}`. On resume
-`StatefulDataLoader.__iter__` re-applies the skip, so training continues at the
-same sample boundary rather than restarting the epoch. Plain
-`torch.utils.data.DataLoader` (the streaming and eval paths) has no
-`state_dict`, so it is skipped and those loaders do restart.
+A checkpoint taken mid-epoch on 64 data-parallel ranks carries e.g.
+`{'epoch': 7, 'batch_size': 4, 'dataset_length': 1000000, 'global_position': 3584, 'batches_yielded': 14, 'sampler': {...}}`.
+`global_position` counts the samples of the epoch's order that all ranks
+consumed, so on resume `StatefulDataLoader.__iter__` continues at the same
+sample rather than restarting the epoch, on this or another data-parallel
+size and batch size. A mixture saves this rank's `samples_consumed` instead
+and resumes on the saved data-parallel size only (see
+[Stateful dataloader](../data/stateful-dataloader.md#resuming-on-another-data-parallel-size)).
+The streaming loader saves how many batches training took and replays its
+stream to that point. The eval loader is a plain `torch.utils.data.DataLoader`
+with no `state_dict`; it is skipped, and it reads the full eval set at every
+evaluation anyway.
 
 ## The `extra` dict
 

@@ -6,6 +6,7 @@ Run with: torchrun --nproc_per_node=4 -m pytest tests/distributed/test_checkpoin
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import shutil
@@ -19,6 +20,7 @@ import torch.distributed as dist
 
 from kempnerforge.checkpoint import manager as mgr_mod
 from kempnerforge.checkpoint.manager import CheckpointManager
+from kempnerforge.checkpoint.state import RankStateMismatchError
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import AsyncCheckpointMode, CheckpointConfig, ModelConfig
 from kempnerforge.distributed.parallel import apply_fsdp2
@@ -799,13 +801,19 @@ class TestPerRankState:
         assert loader3.restored == {"cursor": 200 + rank}
         dist.barrier()
 
-    def test_layout_change_refused_or_discarded_on_every_rank(
-        self, distributed_env, shared_tmp_dir
+    def test_layout_change_refused_or_overridden_alike_on_every_rank(
+        self, distributed_env, shared_tmp_dir, caplog, monkeypatch
     ):
-        """Same world size, another data-parallel layout: an exact resume refuses
-        on all ranks, or with the override discards on all ranks, never a
-        per-rank mix; a load that is not a resume restores rank 0's single
-        copy on every rank, as before.
+        """Same world size, another data-parallel layout: every rank does the same.
+
+        An exact resume refuses on all ranks. With the override every rank
+        resumes, restarts its RNG streams and keeps the saved rank 0's data
+        position, which goes only to a loader that checks it fits the new
+        layout: this cursor loader may hold one rank's own cursor, so every
+        rank drops the position with a warning. Never a per-rank mix. A load
+        that is not a resume restores rank 0's single copy on every rank, as
+        before. The ``kempnerforge`` logger stops propagation once configured,
+        so the test lets records reach ``caplog``.
 
         The checkpoint is saved as dp x 2 (rank -> rank // 2) and resumed as
         2 x dp (rank -> rank % half), so with 4 ranks only ranks 0 and 3 keep
@@ -850,7 +858,7 @@ class TestPerRankState:
 
         loader = _CursorLoader(cursor=-1)
         refusing = CheckpointManager(cfg, model, opt, dp_info=current_dp)
-        with pytest.raises(ValueError, match="data-parallel layout"):
+        with pytest.raises(RankStateMismatchError, match="data-parallel layout"):
             refusing.load(path=path, dataloader=loader, exact_resume=True)
         assert loader.restored is None
 
@@ -861,10 +869,14 @@ class TestPerRankState:
         self._seed_all(7)
         fresh = self._draw()
         self._seed_all(7)
-        step, tokens_seen, _ = mgr.load(path=path, dataloader=loader, exact_resume=True)
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        with caplog.at_level(logging.WARNING, logger="kempnerforge.checkpoint.manager"):
+            step, tokens_seen, _ = mgr.load(path=path, dataloader=loader, exact_resume=True)
         assert (step, tokens_seen) == (5, 320)
         assert loader.restored is None, f"rank {rank} restored a cursor across a layout change"
         assert self._draw() == fresh, f"rank {rank} restored RNG across a layout change"
+        assert "Kept: the saved data position" in caplog.text, f"rank {rank}: {caplog.text}"
+        assert "Dropping the saved data position" in caplog.text, f"rank {rank}: {caplog.text}"
 
         plain_loader = _CursorLoader(cursor=-1)
         plain = CheckpointManager(cfg, model, opt, dp_info=current_dp)

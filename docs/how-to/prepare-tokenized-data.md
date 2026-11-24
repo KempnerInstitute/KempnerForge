@@ -121,9 +121,10 @@ tokenizer_path        = "gpt2"
 
 With `hf_streaming = true`,
 [`StreamingHuggingFaceDataset`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/data/dataset.py)
-downloads and tokenizes on the fly during iteration. Each rank
-processes every `world_size`-th document, so no coordination is
-needed for distributed runs.
+downloads and tokenizes on the fly during iteration. The stream is
+split across data-parallel ranks with `split_dataset_by_node`: a rank
+reads only its own shards when the shard count divides by the
+data-parallel size, and otherwise keeps every `world_size`-th document.
 
 The tokenizer path is loaded through
 `transformers.AutoTokenizer.from_pretrained`, so it can be a
@@ -203,14 +204,19 @@ Both paths work with
 different mechanisms:
 
 - **Pre-tokenized (Path A)**: wrapped in `StatefulDataLoader`, which
-  saves and restores the sampler's position via
-  `DistributedSampler.set_skip()`. A job that preempts at step 3,500
-  picks up at sample `3500 × batch_size × world_size` without replay.
-- **HF streaming (Path B)**: wrapped in a plain `DataLoader`;
-  `StreamingHuggingFaceDataset` tracks its own position and exposes
-  `load_state_dict` / `state_dict`, which the training loop drives
-  directly. Same guarantee — no replay, no skip — via a different
-  code path.
+  saves the position in the epoch's sample order and restores it with
+  `DistributedSampler.set_position()`. A job that preempts at step 3,500
+  of its first epoch picks up at sample
+  `3500 × grad_accum_steps × batch_size × data-parallel size` without
+  replay. A resume on a different number of GPUs does too, with
+  `checkpoint.ignore_rank_state_mismatch = true` (see
+  [Resharding](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)).
+- **HF streaming (Path B)**: wrapped in `StreamingDataLoader`, which
+  saves how many batches each rank took and on resume replays each
+  rank's stream to that point, exact in every pass (see
+  [Stateful dataloader § Streaming loader](../data/stateful-dataloader.md#streaming-loader)).
+  The replay reads the consumed part of the stream again, and the
+  data-parallel size, batch size and `num_workers` must stay the same.
 
 ## See also
 
