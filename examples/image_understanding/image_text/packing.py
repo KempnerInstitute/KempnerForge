@@ -47,9 +47,14 @@ class PackedLoader:
     documents until the next one would overflow it, and that document opens the next
     row. Each batch is ``pack_vlm_samples`` over one row's documents. A document
     longer than ``seq_len`` is passed over and counted in ``oversize``, the first
-    one logged. With ``view_groups`` each batch also carries
-    ``attention_group_ids``, one group per image view's tokens and ``-1`` elsewhere,
-    so the tokens of a view attend to each other in both directions. Passes follow
+    one logged. The ``DataLoader`` of a pass is seeded by its own generator, drawn
+    from ``seed``, ``rank``, the pass and its start, so starting it leaves the
+    global random state alone; ``in_order=False`` is refused, as a resume needs the
+    documents in order. The workers ignore SIGTERM, so ``close`` shuts them down
+    when done, as the training loop's ``BatchStream.close`` does. With
+    ``view_groups`` each batch also carries ``attention_group_ids``, one group per
+    image view's tokens and ``-1`` elsewhere, so the tokens of a view attend to each
+    other in both directions. Passes follow
     one another without end, so every rank draws as many batches as training asks
     for. ``state_dict`` holds the pass and the position in it of the next row's
     first document, so a resume packs the same rows a run without the interruption
@@ -75,9 +80,18 @@ class PackedLoader:
             raise ValueError(f"rank {rank} is outside world_size {world_size}")
         if not isinstance(dataset, Sized) or len(dataset) < world_size:
             raise ValueError(f"the dataset needs at least {world_size} samples, one per rank")
-        for name in ("batch_size", "sampler", "shuffle", "batch_sampler", "collate_fn"):
+        for name in (
+            "batch_size",
+            "sampler",
+            "shuffle",
+            "batch_sampler",
+            "collate_fn",
+            "generator",
+        ):
             if name in options:
                 raise ValueError(f"PackedLoader sets {name} itself")
+        if options.get("in_order", True) is not True:
+            raise ValueError("PackedLoader needs in_order=True to resume at its recorded position")
         self.dataset = dataset
         self.seq_len = seq_len
         self.tokens_per_image = tokens_per_image
@@ -117,10 +131,12 @@ class PackedLoader:
         return batch
 
     def _documents(self, pass_index: int, start: int) -> Iterator[dict[str, torch.Tensor]]:
+        draw = np.random.default_rng([self.seed, self.rank, pass_index, start]).integers(2**62)
         loader = DataLoader(
             self.dataset,
             batch_size=None,
             sampler=_Order(self.order(pass_index)[start:]),
+            generator=torch.Generator().manual_seed(int(draw)),
             **self.options,
         )
         self._iterator = iter(loader)
@@ -157,6 +173,17 @@ class PackedLoader:
                 yield self._pack(rows)
             if not packed and start == 0:
                 raise RuntimeError(f"pass {pass_index} packed no document for rank {self.rank}")
+
+    def close(self) -> None:
+        """Shut the loader workers down; an open loader with workers blocks interpreter exit."""
+        iterator, self._iterator = self._iterator, None
+        if iterator is None or not hasattr(iterator, "_shutdown_workers"):
+            return
+        iterator._shutdown_workers()
+        for worker in getattr(iterator, "_workers", ()):
+            if worker.is_alive():
+                worker.kill()
+                worker.join(timeout=5)
 
     def state_dict(self) -> dict[str, Any]:
         return {"pass": self._pass, "start": self._start, "oversize": self.oversize}
