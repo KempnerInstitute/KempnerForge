@@ -27,10 +27,9 @@ What happens:
 1. Build a bare `Transformer(model_config)` on CPU — the default
    random-initialized parameters serve only as target shapes that
    DCP overwrites on load.
-2. Detect whether `dcp_dir` contains PP stage subdirectories
-   (`pp0/`, `pp1/`, …). If yes, load each stage's shards one at a
-   time with `strict=False` — each stage holds a disjoint slice of
-   the full model.
+2. Load the checkpoint into that model with DCP. A pipeline-parallel
+   checkpoint, one with stage subdirectories (`pp0/`, `pp1/`, …),
+   fails at this step; see [With PP](#with-pp).
 3. Convert state dict keys from KempnerForge → HF naming.
 4. Cast every tensor to the export dtype (see [Dtypes](#dtypes)).
 5. Write `model.safetensors` (or fall back to `pytorch_model.bin`
@@ -116,25 +115,15 @@ held `x` has the training point `y` instead.
 
 ### With PP
 
-A PP checkpoint has per-stage shards. The conversion script
-handles this automatically:
-
-```python
-# scripts/convert_checkpoint.py _detect_pp_stages
-pp_dirs = sorted((d for d in dcp_path.iterdir()
-                  if d.is_dir() and d.name.startswith("pp")),
-                 key=lambda d: int(d.name[2:]))
-```
-
-If any `pp0/`, `pp1/`, … exist, the script loads each one sequentially
-into the same full-model state dict via `load_state_dict(..., strict=False)`.
-Each stage fills in its owned slice of keys; at the end, the full
-model state is assembled.
-
-This is the path to use when you want to **reshard a PP checkpoint to
-different PP** — no direct DCP resharding across PP boundaries
-exists, but `dcp-to-hf` → `hf-to-dcp` round-trips through a
-non-sharded format and lets you re-emit at a different `pp` degree.
+`dcp-to-hf` cannot export a PP checkpoint today
+([#450](https://github.com/KempnerInstitute/KempnerForge/issues/450)).
+The script finds the `pp0/`, `pp1/`, … stage subdirectories, but asks
+each stage for every tensor of the full model, and DCP stops at the
+first one the stage does not hold: a `pp=2` checkpoint of
+`configs/train/debug.toml` fails with `Missing key in checkpoint
+state_dict: model.layers.2.attention_norm.weight`. Keep a PP run's
+checkpoints in DCP and resume them at the same `pp` (see
+[Resharding § PP](resharding.md#pp-the-one-special-case)).
 
 ## HuggingFace → DCP
 
@@ -176,6 +165,8 @@ Point a training config at this directory via
 training picks it up like any other DCP checkpoint, as a warm start
 at step 0. `load_path` is used while the run's `checkpoint.dir` holds
 no checkpoint; once the run has saved one, a restart resumes from it.
+A run with PP cannot load it, since it has no `pp{N}/` stages
+([#317](https://github.com/KempnerInstitute/KempnerForge/issues/317)).
 
 ## Key mapping
 
@@ -287,10 +278,10 @@ Not included: tokenizer files. Copy `tokenizer.json`, `tokenizer_config.json`,
 
 ## See also
 
-- [DCP model + optimizer](dcp-model.md) — the source format for
+- [DCP model + optimizer](dcp-model.md): the source format for
   `dcp-to-hf` and the target format for `hf-to-dcp`.
-- [Resharding](resharding.md) — using `dcp-to-hf` → `hf-to-dcp` as
-  an escape hatch when DCP's automatic resharding can't handle your
-  change (e.g. changing PP degree).
-- [Configuration § CheckpointConfig](../configuration/config-sections.md) —
+- [Resharding](resharding.md): the changes DCP reshards on load, and
+  the `dcp-to-hf` → `hf-to-dcp` round trip for a run without PP that
+  adds parameters.
+- [Configuration § CheckpointConfig](../configuration/config-sections.md):
   `load_path` to pick up a converted checkpoint.

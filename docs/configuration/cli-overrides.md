@@ -85,9 +85,11 @@ A flag with no `=` becomes `True`:
 
 For `False`, write it explicitly: `--train.compile_model=false`.
 
-The bool coercion also accepts the strings `"true"`, `"1"`, `"yes"`
-(case-insensitive) as `True`; everything else falls back to
-`bool(value)`.
+A bool field also takes the strings `"true"`, `"1"` and `"yes"` as
+`True` and `"false"`, `"0"` and `"no"` as `False`, in any case, and the
+numbers 1 and 0. Any other value, such as the misspelling `ture` or the
+number 2, is refused with an error that names the field, from the TOML
+file as from the command line.
 
 ## Type coercion
 
@@ -96,9 +98,9 @@ the dataclass type hint and coerces:
 
 | Field type | Input | Result |
 |------------|-------|--------|
-| `int` | `"512"` or `3.0` | `int(…)` |
-| `float` | `"3e-4"` or `1` | `float(…)` |
-| `bool` | `"true"`, `"1"`, `"yes"` | `True`; else `bool(value)` |
+| `int` | `"512"` or `3.0` | `int(…)`; a fraction such as `2.7`, a bool, another string or another type → `ValueError` |
+| `float` | `"3e-4"` or `1` | `float(…)`; a bool, a non-numeric string, an int too large for a float or another type → `ValueError` |
+| `bool` | `"true"`, `"1"`, `"yes"` or `1` / `"false"`, `"0"`, `"no"` or `0` | `True` / `False`; anything else → `ValueError` |
 | `tuple[float, float]` | `[0.9, 0.95]` | `(0.9, 0.95)` |
 | `list[str]` | `"a"` | `["a"]` (wraps bare scalar) |
 | `list[DatasetSource]` | `[{"path": …}]` | `[DatasetSource(path=…)]` (recursive) |
@@ -109,9 +111,12 @@ the dataclass type hint and coerces:
 
 `Literal` fields reject unknown strings at coercion time — a typo like
 `--train.mixed_precision=bfloat16` (should be `"bf16"`) fails before
-training starts. `"fp16"` passes this check on purpose and is then
-rejected by `TrainConfig.__post_init__`, whose error explains that
-fp16 would train with no loss scaling.
+training starts. Every coercion refusal starts with the class and
+field it concerns, such as
+`TrainConfig.batch_size: expected an int, got 2.7`. `"fp16"` passes
+this check on purpose and is then rejected by
+`TrainConfig.__post_init__`, whose error explains that fp16 would
+train with no loss scaling.
 
 Three enums select a registry builder, so they also accept a name
 registered in their category: `scheduler.name` (`SchedulerType`,
