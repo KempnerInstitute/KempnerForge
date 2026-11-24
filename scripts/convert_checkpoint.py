@@ -125,10 +125,10 @@ def _hf_tensors(state_dict: dict[str, torch.Tensor]) -> Iterator[tuple[str, torc
 def _unpack_mixtral_experts(hf_state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Split the experts a transformers 5 Mixtral holds packed into Mixtral's per-expert names.
 
-    A loaded model's state dict, which a hub ID goes through, holds each layer's experts as
-    ``mlp.experts.gate_up_proj`` of shape ``(num_experts, 2 * width, dim)``, each expert's
-    gate rows then its up rows, and ``mlp.experts.down_proj`` of shape
-    ``(num_experts, dim, width)``. Other keys pass through.
+    A checkpoint transformers 5 saves with ``save_original_format=False`` holds, as its loaded
+    model does, each layer's experts as ``mlp.experts.gate_up_proj`` of shape
+    ``(num_experts, 2 * width, dim)``, each expert's gate rows then its up rows, and
+    ``mlp.experts.down_proj`` of shape ``(num_experts, dim, width)``. Other keys pass through.
     """
     unpacked = {}
     for key, tensor in hf_state.items():
@@ -288,6 +288,14 @@ def hf_to_dcp(
     if unmapped:
         logger.warning(f"Skipped {len(unmapped)} unmapped HF keys: {unmapped[:5]}...")
 
+    head, embedding = "output_head.proj.weight", "token_embedding.embedding.weight"
+    if head in kf_state and head not in converted and embedding in converted:
+        converted[head] = converted[embedding]
+        logger.info(
+            "The checkpoint holds no lm_head.weight, as one with tied embeddings may not: "
+            "the output head takes the token embedding"
+        )
+
     missing = set(kf_state.keys()) - set(converted.keys())
     if missing:
         logger.warning(f"Missing {len(missing)} keys (using random init): {list(missing)[:5]}...")
@@ -350,18 +358,24 @@ def _load_hf_hub(model_id: str) -> dict[str, torch.Tensor]:
     The first of the standard names the repository has is downloaded as ``hf_hub_download``
     resolves the branch, which keeps the cache's record of that branch for offline loads. The
     shards an index names are downloaded at the commit of the snapshot it came from, so a branch
-    that moves meanwhile mixes no files, and a shard that cannot be had fails the load. None of
-    the repository's code runs, no Hugging Face model is built, and the weights keep the
-    precision they are stored in.
+    that moves meanwhile mixes no files, and a shard that cannot be had fails the load. A name
+    whose lookup fails without an answer from the Hub that it has no such file, as in offline
+    mode, is passed over like a missing one, and with none of the names had, the error chains
+    the first such failure. None of the repository's code runs, no Hugging Face model is built,
+    and the weights keep the precision they are stored in.
     """
     from huggingface_hub import hf_hub_download
-    from huggingface_hub.errors import EntryNotFoundError
+    from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 
     logger.info(f"Downloading the weight files of {model_id} from the HuggingFace Hub")
+    failed: tuple[str, LocalEntryNotFoundError] | None = None
     for single, index in _WEIGHT_FILES:
         for name in (single, index):
             try:
                 path = Path(hf_hub_download(model_id, name))
+            except LocalEntryNotFoundError as e:
+                failed = failed or (name, e)
+                continue
             except EntryNotFoundError:
                 continue
             if name == single:
@@ -370,7 +384,11 @@ def _load_hf_hub(model_id: str) -> dict[str, torch.Tensor]:
             shards = [hf_hub_download(model_id, f, revision=commit) for f in _indexed_shards(path)]
             return _read_weight_files([Path(shard) for shard in shards])
     names = ", ".join(name for pair in _WEIGHT_FILES for name in pair)
-    raise FileNotFoundError(f"Found none of {names} for {model_id} on the Hub or in its cache")
+    found_none = f"Found none of {names} for {model_id} on the Hub or in its cache"
+    if failed is None:
+        raise FileNotFoundError(found_none)
+    name, error = failed
+    raise FileNotFoundError(f"{found_none}; the lookup of {name} failed: {error}") from error
 
 
 def _architecture_problems(config: ModelConfig) -> list[str]:

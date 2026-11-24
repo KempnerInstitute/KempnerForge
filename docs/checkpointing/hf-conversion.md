@@ -156,12 +156,18 @@ What happens:
      `huggingface_hub.hf_hub_download` or taken from its cache, the
      shards at the commit their index came from. None of the
      repository's code runs and no Hugging Face model is built, and a
-     shard that cannot be had fails the import.
+     shard that cannot be had fails the import. A name whose lookup
+     fails without the Hub saying it has no such file, as offline, is
+     passed over like a missing one, and `hf_hub_download` takes each
+     name from the cache when it cannot reach the Hub, so a cached
+     model imports with `HF_HUB_OFFLINE=1`. With none of the names
+     had, the error names the first failed lookup and chains its error.
 2. Convert keys HF → KempnerForge naming. The names converted are the
-   ones stored in the files: the Llama-style names, and the MoE names
-   `dcp-to-hf` writes. Others, such as Mixtral's `block_sparse_moe`
-   weights, are not mapped and keep their initialization, with a
-   warning.
+   ones stored in the files, as [Key mapping](#key-mapping) lists
+   them, Mixtral's included; any other name is skipped with a
+   warning. A checkpoint with tied embeddings may store no
+   `lm_head.weight`: the output head then takes the token embedding,
+   whether `tie_embeddings` is true or false.
 3. `model.load_state_dict(converted, strict=False)` — missing KF
    keys (e.g. learned RoPE frequencies) stay at their default init
    and are logged as warnings.
@@ -209,9 +215,10 @@ MoE-specific, in Mixtral's names:
 `hf-to-dcp` reads these names, and the ones exports used before them:
 `model.layers.{i}.mlp.gate.weight` for the router and
 `model.layers.{i}.mlp.experts.{j}.{gate,up,down}_proj.weight` for the
-experts. From a hub ID it reads a loaded model, whose experts transformers
-5 packs into `mlp.experts.gate_up_proj` and `mlp.experts.down_proj`, and
-splits them. For a model with packed experts it stacks each layer's experts
+experts. It also splits the experts a checkpoint holds packed, as
+`mlp.experts.gate_up_proj` and `mlp.experts.down_proj`, which transformers 5
+saves with `save_original_format=False` and by default saves under the names
+above. For a model with packed experts it stacks each layer's experts
 into `gate_w`, `up_w` and `down_w`. Mixtral has no expert bias or shared
 experts: `dcp-to-hf` refuses models with them unless given
 `--no-architecture-check` (see [MoE](#moe)), and then writes them as
