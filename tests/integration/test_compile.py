@@ -12,8 +12,12 @@ import torch
 import torch.nn.functional as F
 
 from kempnerforge.config.model import FLEX_BLOCK_SIZE
-from kempnerforge.config.schema import ModelConfig
+from kempnerforge.config.schema import ActivationCheckpointing, ModelConfig
+from kempnerforge.distributed.parallel import build_parallel_model
+from kempnerforge.model.router import SigmoidTopKRouter, SoftmaxTopKRouter
 from kempnerforge.model.transformer import Transformer
+from kempnerforge.model.vlm import inner_transformer
+from kempnerforge.training.loop import add_moe_losses
 
 
 @pytest.mark.gpu
@@ -291,3 +295,66 @@ class TestFlexCompile:
             eager_out = model(tokens, doc_ids=doc_ids)
             compiled_out = torch.compile(model)(tokens, doc_ids=doc_ids)
         torch.testing.assert_close(compiled_out, eager_out, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.gpu
+class TestCompiledMoECheckpointing:
+    """Under compile, full-checkpointed MoE blocks run eagerly and their routers stay intact."""
+
+    @pytest.mark.parametrize("router", ["softmax_topk", "sigmoid_topk"])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    def test_compiled_full_checkpointing_trains_like_eager(self, router, dtype):
+        """Every step counts each token once, keeps no router loss graph and replaces no router
+        attribute in the recompute, and the losses match eager."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        config = ModelConfig(
+            dim=128,
+            n_layers=2,
+            n_heads=2,
+            vocab_size=256,
+            max_seq_len=64,
+            num_experts=4,
+            moe_top_k=2,
+            moe_router=router,
+            moe_router_z_loss_weight=0.001,
+        )
+        device = torch.device("cuda")
+        runs = []
+        for compiled in (False, True):
+            torch.manual_seed(0)
+            model = build_parallel_model(
+                config,
+                device,
+                None,
+                ac_mode=ActivationCheckpointing.full,
+                compile_model=compiled,
+                param_dtype=dtype,
+            )
+            model.train()
+            optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad])
+            routers = [
+                m for m in model.modules() if isinstance(m, (SoftmaxTopKRouter, SigmoidTopKRouter))
+            ]
+            assert len(routers) == 2
+            losses = []
+            for step in range(3):
+                torch.manual_seed(step)
+                tokens = torch.randint(0, 256, (2, 64), device=device)
+                logits = model(tokens)
+                loss = F.cross_entropy(logits.float().flatten(0, 1), tokens.flatten())
+                loss = add_moe_losses(loss, model, config)
+                kept = [(r.aux_loss, r.z_loss, r.expert_counts) for r in routers]
+                assert all(r.aux_loss.grad_fn is None and r.z_loss.grad_fn is None for r in routers)
+                loss.backward()
+                for router_, attrs in zip(routers, kept, strict=True):
+                    now = (router_.aux_loss, router_.z_loss, router_.expert_counts)
+                    assert all(a is b for a, b in zip(now, attrs, strict=True))
+                    if isinstance(router_, SigmoidTopKRouter):
+                        assert int(router_.pending_counts.sum()) == 2 * 64 * 2
+                optimizer.step()
+                optimizer.zero_grad()
+                inner_transformer(model).balance_routers()
+                losses.append(loss.item())
+            runs.append(losses)
+        assert runs[1] == pytest.approx(runs[0], rel=1e-4 if dtype == torch.float32 else 1e-2)

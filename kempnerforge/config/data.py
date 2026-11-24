@@ -118,6 +118,6 @@ class DataConfig:
             raise ValueError("anneal_start_step must be non-negative")
         if self.phases and self.anneal_start_step > 0:
             raise ValueError(
-                "Cannot use both data.phases and data.anneal_start_step — "
+                "Cannot use both data.phases and data.anneal_start_step; "
                 "use phases for multi-phase scheduling"
             )

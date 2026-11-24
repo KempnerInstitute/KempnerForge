@@ -41,6 +41,7 @@ import os
 import pickle
 import re
 import shutil
+import socket
 import stat
 import threading
 import time
@@ -70,7 +71,9 @@ from kempnerforge.checkpoint.expert_layout import (
     check_saved_experts,
     expert_layout,
     moe_layers,
+    state_dict_name,
 )
+from kempnerforge.checkpoint.ownership import claim_checkpoint_dir, release_checkpoint_dir
 from kempnerforge.checkpoint.state import (
     PER_RANK_KEY,
     RankStateMismatchError,
@@ -139,6 +142,66 @@ def _saved_optimizer_param_groups(saved_keys: Iterable[str]) -> int:
             if key.startswith(_OPTIM_PARAM_GROUPS_PREFIX)
         }
     )
+
+
+def derived_buffer_owners(model: torch.nn.Module) -> dict[str, tuple[torch.nn.Module, str]]:
+    """Map the state-dict key of each buffer a module lists in ``derived_buffers`` to its owner.
+
+    A module lists there the buffers it gained after its checkpoints were first written
+    and derives from its other state when a load lacks them, as the sigmoid router does
+    for its FP32 masters. Each key maps to the module and the buffer's name; a buffer
+    another module holds under the same name is not one of them. The keys are named as
+    ``get_model_state_dict`` names them (see ``state_dict_name``).
+    """
+    owners: dict[str, tuple[torch.nn.Module, str]] = {}
+    for name, module in model.named_modules():
+        prefix = state_dict_name(name)
+        for buffer in getattr(module, "derived_buffers", ()):
+            owners[f"{prefix}.{buffer}" if prefix else buffer] = (module, buffer)
+    return owners
+
+
+def drop_derived_model_keys(
+    model_state: dict[str, Any], model: torch.nn.Module, saved_keys: Container[str]
+) -> dict[str, Any]:
+    """Take out of a load template the derived buffers its checkpoint predates.
+
+    Only the buffers ``derived_buffer_owners`` maps are taken out, and only those the
+    checkpoint, whose keys prefix the model's with ``model.``, lacks; any other key a
+    checkpoint lacks still fails the load. Returns the entries taken out. Put back after
+    the read, they let the strict ``set_model_state_dict`` find every key, under
+    ``torch.compile`` too, and ``derive_buffers`` then recomputes them from the loaded
+    state.
+    """
+    owners = derived_buffer_owners(model)
+    return {
+        key: model_state.pop(key)
+        for key in list(model_state)
+        if key in owners and f"model.{key}" not in saved_keys
+    }
+
+
+def derive_buffers(model: torch.nn.Module, keys: Iterable[str]) -> None:
+    """Have the owner of each derived buffer at ``keys`` recompute it from its loaded state.
+
+    Only those buffers are derived; every other entry keeps the value loaded. Deriving
+    may gather a parameter that FSDP2 shards, so every rank calls this with the same keys.
+
+    Raises:
+        TypeError: A module lists ``derived_buffers`` but has no ``derive_buffers``.
+    """
+    owners = derived_buffer_owners(model)
+    wanted: dict[torch.nn.Module, list[str]] = {}
+    for key in keys:
+        module, name = owners[key]
+        wanted.setdefault(module, []).append(name)
+    for module, names in wanted.items():
+        derive = getattr(module, "derive_buffers", None)
+        if derive is None:
+            raise TypeError(
+                f"{type(module).__name__} lists derived_buffers but has no derive_buffers"
+            )
+        derive(names)
 
 
 def _saved_inner_groups(
@@ -816,8 +879,9 @@ def _check_saved_param_groups(
             found = change
     raise RuntimeError(
         f"{where} {found}: the param groups are laid out otherwise than at the save, as when "
-        "other parameters are trainable under optimizer.lr_multipliers, or their settings "
-        "changed. Resume with the parameters trained at the save, or continue from these "
+        "other parameters are trainable under optimizer.lr_multipliers (a sigmoid router's "
+        "expert_bias, which is no longer trained, for one), or their settings changed. "
+        "Resume with the parameters trained at the save, or continue from these "
         "weights with a fresh optimizer: set checkpoint.load_path to this checkpoint and "
         'checkpoint.exclude_from_loading = ["optimizer"], with a checkpoint.dir that holds '
         "no checkpoint yet."
@@ -1103,6 +1167,7 @@ class CheckpointManager:
         self._inflight_dir: Path | None = None
         self._tracking_source: TrackingSource | None = None
         self._registrar: CheckpointRegistrar | None = None
+        self._claim: str | None = None
         self._sidecar_lock = threading.Lock()
         self._sync_group: dist.ProcessGroup | None = None
         if dist.is_initialized():
@@ -1134,19 +1199,45 @@ class CheckpointManager:
         deferred (async mode, after the flush future has resolved). Raises only
         while `latest` still names the previous checkpoint: once it names this
         one the checkpoint is committed, so an error while pruning is logged and
-        the next commit prunes again.
+        the next commit prunes again. The new link is made under a temporary name of
+        this host, process and call, so no other writer shares it, and is removed if
+        the rename fails.
         """
         latest = self._latest_link()
-        tmp_link = latest.with_suffix(".tmp")
-        tmp_link.unlink(missing_ok=True)
+        tag = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex}"
+        tmp_link = latest.with_name(f"{latest.name}.{tag}.tmp")
         tmp_link.symlink_to(ckpt_dir.name)
-        tmp_link.rename(latest)
+        try:
+            tmp_link.rename(latest)
+        except BaseException:
+            tmp_link.unlink(missing_ok=True)
+            raise
         logger.info(f"Checkpoint committed: {ckpt_dir} (step={step})")
         self._register_committed(step, ckpt_dir)
         try:
             self._cleanup()
         except Exception as e:
             logger.warning(f"Could not prune old checkpoints after committing {ckpt_dir} ({e})")
+
+    def claim_dir(self) -> None:
+        """Make this run the owner of the checkpoint directory before it resumes or saves.
+
+        Rank 0 records the run in ``<dir>/.owner`` (see ``claim_checkpoint_dir``), and
+        every rank raises when that fails, so two live runs never share the directory.
+        Every rank must call this.
+        """
+        claims: list[str] = []
+        error: BaseException | None = None
+        if self._rank == 0:
+            error = _attempt(lambda: claims.append(claim_checkpoint_dir(self.base_dir)))
+        self.agree(error, "Checkpoint directory claim")
+        self._claim = claims[0] if claims else None
+
+    def release_dir(self) -> None:
+        """Mark released the ``<dir>/.owner`` record that this rank's ``claim_dir`` wrote."""
+        if self._claim is not None:
+            release_checkpoint_dir(self.base_dir, self._claim)
+            self._claim = None
 
     def _drain_pending_finalize(
         self, overwriting: Path | None = None, error: BaseException | None = None
@@ -1670,7 +1761,8 @@ class CheckpointManager:
 
         ``extra["vlm_freeze"]``, when present, is recorded in ``metadata.json`` as given:
         ``canonical_freeze_meta`` has already sorted and deduplicated it, so the comparison
-        on load does not depend on order.
+        on load does not depend on order. ``extra["plugins"]``, when present, is recorded
+        there too, for ``load`` to compare before reading any state.
 
         ``per_rank`` is the envelope ``save()`` gathered from every rank; omitting it writes
         a legacy train state carrying rank 0's loader/RNG state only.
@@ -1685,8 +1777,9 @@ class CheckpointManager:
         )
         torch.save(train_state, ckpt_dir / _TRAIN_STATE_FILE)
         meta: dict[str, Any] = {"step": step, "tokens_seen": tokens_seen}
-        if extra is not None and "vlm_freeze" in extra:
-            meta["vlm_freeze"] = extra["vlm_freeze"]
+        for key in ("vlm_freeze", "plugins"):
+            if extra is not None and key in extra:
+                meta[key] = extra[key]
         text = self._sidecar_text(meta)
         with self._sidecar_lock:
             _replace_file(ckpt_dir / _METADATA_FILE, text)
@@ -1760,6 +1853,7 @@ class CheckpointManager:
         fresh_if_unheld: Iterable[str] = (),
         warm_start: bool = False,
         exact_resume: bool = False,
+        plugins_expected: list[str] | None = None,
     ) -> tuple[int, int, dict[str, Any]]:
         """Load a checkpoint and restore all state.
 
@@ -1818,6 +1912,10 @@ class CheckpointManager:
                 (see ``_agreed_load_dir``); an exact resume that reads DCP shards falls back,
                 when not every stage directory there holds them all, to the newest
                 ``step_N`` beside it whose does. Any other load takes its checkpoint as is.
+            plugins_expected: The run's ``plugins`` list, compared with the one the
+                checkpoint's ``metadata.json`` records before any state is read (see
+                ``_check_plugins``). Every rank must pass the same value. A weights-only
+                warm start, which reads no train state, is not compared.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
@@ -1831,8 +1929,9 @@ class CheckpointManager:
                 ``"train_state"`` outside ``["optimizer", "train_state"]``, or is that
                 pair with ``exact_resume``, raised before the path is resolved; the
                 checkpoint was saved under another weight-decay scope, LR multipliers or
-                patterns of their modules (see ``__init__``); or, on an exact resume, its
-                per-rank state does not fit this run's topology and
+                patterns of their modules (see ``__init__``), or with another ``plugins``
+                list (see ``plugins_expected``); or, on an exact resume, its per-rank state
+                does not fit this run's topology and
                 ``checkpoint.ignore_rank_state_mismatch`` is off (see ``exact_resume``).
             RuntimeError: The saved optimizer state does not fit this run's optimizers, as
                 when a name in ``fresh_if_unheld`` with neither saved state nor a
@@ -1865,7 +1964,7 @@ class CheckpointManager:
             requested = path if path is not None else self.config.load_path
             if requested:
                 raise FileNotFoundError(f"Checkpoint not found: {requested}")
-            logger.info("No checkpoint found — starting from scratch")
+            logger.info("No checkpoint found; starting from scratch")
             self._restored_extra = {}
             return 0, 0, {}
 
@@ -1913,12 +2012,17 @@ class CheckpointManager:
                         )
                         if getattr(self.config, "ignore_freeze_mismatch", False):
                             logger.warning(
-                                msg + " — proceeding because checkpoint.ignore_freeze_mismatch=True"
+                                msg + "; proceeding because checkpoint.ignore_freeze_mismatch=True"
                             )
                         else:
                             raise ValueError(
                                 msg + " (set checkpoint.ignore_freeze_mismatch=true to override)"
                             )
+
+        metadata: _MetadataOutcome | None = None
+        if plugins_expected is not None and load_train_state:
+            metadata = self._broadcast_metadata(ckpt_dir)
+            self._check_plugins(metadata, ckpt_dir, plugins_expected)
 
         dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
 
@@ -1929,16 +2033,18 @@ class CheckpointManager:
         saved_keys, restored_on_any_rank = (
             self._read_saved_keys(dcp_dir) if load_optim else ({}, False)
         )
-        metadata: _MetadataOutcome | None = None
         saved_modules: list[str | None] | None = None
+        lr_checked = False
         if restored_on_any_rank and (
             self._weight_decay_scope is not None or self._lr_multipliers is not None
         ):
-            metadata = self._broadcast_metadata(ckpt_dir)
+            if metadata is None:
+                metadata = self._broadcast_metadata(ckpt_dir)
             if self._weight_decay_scope is not None:
                 self._check_weight_decay_scope(metadata, ckpt_dir)
             if self._lr_multipliers is not None:
                 saved_modules = self._check_lr_multipliers(metadata, ckpt_dir)
+                lr_checked = True
         fresh_optimizer = load_optim and not _holds_optimizer(saved_keys)
         if fresh_optimizer:
             load_optim = False
@@ -1952,8 +2058,17 @@ class CheckpointManager:
             if load_optim and train_state_exists
             else []
         )
+        derived: dict[str, Any] = {}
         if load_model:
             dcp_state["model"] = get_model_state_dict(self.model)
+            if derived_buffer_owners(self.model):
+                model_keys = saved_keys if load_optim else _dcp_keys(dcp_dir)
+                derived = drop_derived_model_keys(dcp_state["model"], self.model, model_keys)
+            if derived:
+                logger.info(
+                    f"{dcp_dir} predates {len(derived)} derived buffers, such as "
+                    f"{next(iter(derived))}; they start from the loaded state"
+                )
         check_error: BaseException | None = None
         left_out: set[str] = set()
         template_groups: list[list[str]] = []
@@ -2044,7 +2159,9 @@ class CheckpointManager:
                 for index, group in unsaved_groups:
                     loaded_groups.insert(index, group)
             if load_model:
-                set_model_state_dict(self.model, dcp_state["model"])
+                set_model_state_dict(self.model, {**dcp_state["model"], **derived})
+                if derived:
+                    derive_buffers(self.model, derived)
             if load_optim:
                 set_optimizer_state_dict(
                     self.model, optimizers, optim_state_dict=dcp_state["optimizer"]
@@ -2071,11 +2188,13 @@ class CheckpointManager:
             train_state = self._broadcast_train_state(train_state_path)
             if (
                 self._lr_multipliers is not None
-                and metadata is None
+                and not lr_checked
                 and scheduler is not None
                 and "scheduler" in train_state
             ):
-                self._check_lr_multipliers(self._broadcast_metadata(ckpt_dir), ckpt_dir)
+                if metadata is None:
+                    metadata = self._broadcast_metadata(ckpt_dir)
+                self._check_lr_multipliers(metadata, ckpt_dir)
             held_position = "dataloader" in train_state
             carried = False
             if exact_resume:
@@ -2229,6 +2348,54 @@ class CheckpointManager:
         if dist.is_initialized():
             dist.broadcast_object_list(outcome, src=0)
         return outcome[0]
+
+    def _check_plugins(
+        self, metadata: _MetadataOutcome, ckpt_dir: Path, expected: list[str]
+    ) -> None:
+        """Refuse a checkpoint saved with a ``plugins`` list other than ``expected``.
+
+        A plugin can register a component the model is built from, so another list can
+        build another model from the same TOML, and DCP loads a model whose parameter names
+        are a subset of the saved ones without an error. The lists compare in order, each
+        module counted once, since importing a module again does nothing. ``metadata`` is
+        what ``_broadcast_metadata`` returned on every rank, so every rank raises or goes
+        on together, and rank 0 alone warns. A checkpoint whose ``metadata.json`` records
+        no list, or cannot be read, is not compared.
+
+        Raises:
+            ValueError: The lists differ and ``checkpoint.ignore_plugins_mismatch`` is off.
+        """
+        meta, error = metadata
+        saved = None if meta is None else meta.get("plugins")
+        if not isinstance(saved, list) or not all(isinstance(p, str) for p in saved):
+            if self._rank == 0:
+                if meta is None:
+                    reason = error
+                elif saved is None:
+                    reason = f"its {_METADATA_FILE} records no plugins list"
+                else:
+                    reason = f"its {_METADATA_FILE} records plugins = {saved!r}"
+                logger.warning(
+                    f"plugins = {list(expected)!r} is not compared with {ckpt_dir}: {reason}"
+                )
+            return
+        if list(dict.fromkeys(saved)) == list(dict.fromkeys(expected)):
+            return
+        message = (
+            f"{ckpt_dir} was saved with plugins = {saved!r}, but this run sets plugins = "
+            f"{list(expected)!r}: a plugin can register a component the model is built from, "
+            "and a model whose parameters are a subset of the saved ones loads without an error."
+        )
+        if self.config.ignore_plugins_mismatch:
+            if self._rank == 0:
+                logger.warning(
+                    f"{message} Going on, since checkpoint.ignore_plugins_mismatch is set"
+                )
+            return
+        raise ValueError(
+            f"{message} Set plugins as the checkpoint has them, or, if the plugins that differ "
+            "build no part of the model, set checkpoint.ignore_plugins_mismatch = true."
+        )
 
     def _check_weight_decay_scope(self, metadata: _MetadataOutcome, ckpt_dir: Path) -> None:
         """Refuse a checkpoint saved under a weight-decay scope other than this manager's.

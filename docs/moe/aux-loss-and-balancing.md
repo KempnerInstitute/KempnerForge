@@ -64,41 +64,78 @@ Lower (0.001) under-regularizes — collapse risk on long runs.
 
 ## Sigmoid router — bias-based balancing
 
-The `sigmoid_topk` router holds a learnable `expert_bias` parameter
-that's *added* to logits before sigmoid, and a buffer `expert_ema`
-holding running utilization:
+The `sigmoid_topk` router holds an `expert_bias` parameter that is
+*added* to logits before sigmoid, a buffer `expert_ema` holding running
+utilization, and a buffer `pending_counts` that each training forward
+adds its expert counts to:
 
 ```python
-# kempnerforge/model/router.py — SigmoidTopKRouter.__init__
-self.expert_bias = nn.Parameter(torch.zeros(num_experts))
+# kempnerforge/model/router.py: SigmoidTopKRouter.__init__
+self.expert_bias = nn.Parameter(torch.zeros(num_experts), requires_grad=False)
 self.register_buffer("expert_ema", torch.ones(num_experts) / num_experts)
+self.register_buffer(
+    "pending_counts", torch.zeros(num_experts, dtype=torch.long), persistent=False
+)
 ```
 
-Inside forward (training only):
+The optimizer never trains `expert_bias`: `requires_grad=False` keeps it
+out of every optimizer group, and `freeze_params` never unfreezes it. It
+is a parameter so that it is checkpointed with the model and sharded with
+its module under FSDP2.
+
+Right after each optimizer step, the training loop calls
+`Transformer.balance_routers()`. One all-reduce sums every router's
+pending counts over the step's micro-batches and all ranks, and each
+router balances from its share:
 
 ```python
-# kempnerforge/model/router.py — SigmoidTopKRouter.forward (trimmed)
-utilization = tokens_per_expert / (num_tokens * self.top_k + 1e-8)
-self.expert_ema.lerp_(utilization, 1.0 - self.ema_decay)   # ema_decay = 0.99
-
-with torch.no_grad():
-    target = 1.0 / self.num_experts
-    self.expert_bias.add_(effective_rate * (target - self.expert_ema))
+# kempnerforge/model/router.py: SigmoidTopKRouter.balance (trimmed)
+ema.lerp_(counts / counts.sum(), 1.0 - self.ema_decay)   # ema_decay = 0.99
+bias.add_(self._effective_bias_rate() * (1.0 / self.num_experts - ema))
 ```
 
 Two moving parts:
 
-- **`expert_ema`** — exponential moving average of per-expert fraction
-  of tokens. `ema_decay = 0.99` means each step contributes 1% of the
-  current batch to the smoothed estimate.
-- **`expert_bias`** — incremented by `effective_rate · (target − ema)`.
-  Under-utilized experts (`ema < target`) get a positive nudge →
-  higher logits → more tokens next step. Over-utilized experts get a
+- **`expert_ema`**: exponential moving average of each expert's share of
+  the step's routed tokens. `ema_decay = 0.99` means each optimizer step
+  contributes 1% of its utilization to the smoothed estimate; with
+  gradient accumulation, one step's counts cover all its micro-batches.
+- **`expert_bias`**: incremented by `effective_rate · (target − ema)`.
+  Under-utilized experts (`ema < target`) get a positive nudge, so
+  higher logits and more tokens next step; over-utilized experts get a
   negative nudge.
 
-The bias update is inside `torch.no_grad()` — the optimizer **does not
-touch it**, even though it's an `nn.Parameter`. It's a parameter only
-for DCP checkpointing and to keep it on the right device.
+The update runs on FP32 masters of the EMA and the bias, so that bf16
+storage does not round the small moves away, and `expert_ema` and
+`expert_bias` are rounded from them. The masters are buffers that hold
+the FP32 values as int32 bit patterns (`fp32_ema_bits` and
+`fp32_bias_bits`), so casting the model to bf16 leaves them exact and a
+resumed run continues from them; a checkpoint written before they
+existed starts them from its `expert_ema` and `expert_bias`. Under FSDP2
+the update lands on each rank's shard of the bias. Utilization is each
+expert's share of
+the summed counts, so tensor-parallel ranks, which route the same
+tokens, cancel out. A step skipped for a NaN loss drops its counts, and
+an eval forward counts nothing.
+
+A checkpoint from a version that trained `expert_bias` still loads, and
+its optimizer moments for the bias are left out. The exception is a run
+whose `optimizer.lr_multipliers` gave the routers' biases an optimizer
+group of their own: the load refuses that group layout. To continue
+from its weights with a fresh optimizer, set `checkpoint.load_path` to
+it and `checkpoint.exclude_from_loading = ["optimizer"]`, with a
+`checkpoint.dir` that holds no checkpoint yet (auto-resume from a
+`checkpoint.dir` loads everything).
+
+Three of these are KempnerForge's choices rather than the published
+defaults. DeepSeek-V3 (section 2.1.2) and the auxiliary-loss-free
+balancing paper (Algorithm 1) move each bias by a fixed step toward the
+mean load, `b += u · sign(e)`, where KempnerForge moves it in proportion
+to the EMA's shortfall. Both papers add the bias to the affinity scores
+after the sigmoid, where KempnerForge adds it to the logits before the
+sigmoid. And in both papers the bias only picks the experts, while the
+gating weights come from the scores without it; KempnerForge weights
+the selected experts by the biased scores.
 
 ### Bias adjustment
 

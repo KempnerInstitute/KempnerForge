@@ -161,7 +161,7 @@ class ShutdownHandler:
         sig = signal.Signals(signum)
         self._shutdown_requested = True
         self._signal_received = sig
-        logger.warning(f"Received {sig.name} — requesting graceful shutdown")
+        logger.warning(f"Received {sig.name}; requesting graceful shutdown")
         self._start_timer()
 
     def _start_timer(self) -> None:
@@ -176,7 +176,7 @@ class ShutdownHandler:
         """Force-exit the process if graceful shutdown takes too long."""
         import os
 
-        logger.error(f"Graceful shutdown timed out after {self._timeout_sec}s — forcing exit")
+        logger.error(f"Graceful shutdown timed out after {self._timeout_sec}s; forcing exit")
         os._exit(1)
 
     def _cancel_timer(self) -> None:

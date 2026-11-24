@@ -291,7 +291,10 @@
             "get_moe_router_z_loss()",
             "get_expert_counts()",
             "get_mot_expert_counts()",
-            "set_moe_step(step, max_steps)"
+            "set_moe_step(step, max_steps)",
+            "balance_routers() (one all-reduce of every sigmoid router's pending counts, then balance; every rank calls it after optimizer.step)",
+            "detach_router_losses() (detaches every router's aux_loss and z_loss once the loss holds them)",
+            "discard_router_counts()"
           ]
         }
       },
@@ -643,16 +646,29 @@
             "forward(x)"
           ]
         },
+        "Recomputing": {
+          "purpose": "Context of an activation-checkpoint recompute: routers compute as in the forward but set no attribute and count no token; enters the selective-checkpoint context inside; re-enterable",
+          "methods": [
+            "__enter__()",
+            "__exit__(*exc)"
+          ]
+        },
         "SigmoidTopKRouter": {
-          "purpose": "DeepSeek-V3 style sigmoid router with learnable bias, adaptive scheduling, sequence aux loss",
+          "purpose": "DeepSeek-V3 style sigmoid router: expert_bias frozen to the optimizer (always_frozen), balanced once per optimizer step from pending_counts; adaptive scheduling, sequence aux loss",
           "properties": [
             "aux_loss",
-            "expert_counts"
+            "expert_counts",
+            "pending_counts",
+            "fp32_ema_bits, fp32_bias_bits (FP32 masters held as int32 bits; derived_buffers)"
           ],
           "methods": [
             "forward(x)",
+            "balance(counts) (moves the EMA and the bias from a step's summed counts on the FP32 masters; updates the FSDP2 shard in place)",
             "set_step(step, max_steps)",
-            "_effective_bias_rate()"
+            "_effective_bias_rate()",
+            "_masters() (FP32 views of the master bit buffers)",
+            "_load_from_state_dict(...) (derives absent masters from expert_ema and expert_bias)",
+            "derive_buffers(names) (starts the named masters from the loaded expert_ema and expert_bias; gathers an FSDP2 shard)"
           ]
         }
       },
@@ -665,7 +681,11 @@
         "tests/unit/test_router.py::TestSigmoidSequenceAuxLoss",
         "tests/unit/test_router.py::TestSigmoidBiasSchedule",
         "tests/unit/test_moe.py::TestSigmoidTopKRouter",
-        "tests/unit/test_moe.py::TestSigmoidMoEIntegration"
+        "tests/unit/test_moe.py::TestSigmoidMoEIntegration",
+        "tests/unit/test_router_balance.py",
+        "tests/distributed/test_router_balance.py",
+        "tests/unit/test_activation_checkpointing.py::TestRecomputing",
+        "tests/unit/test_activation_checkpointing.py::TestMoERecompute"
       ]
     },
     "kempnerforge/model/generate.py": {
@@ -821,7 +841,7 @@
         "canonical_freeze_meta(specs) -> list[dict]",
         "effective_freeze(step, base_specs, schedule, valid_modules) -> list[FreezeSpec]",
         "freeze_meta_at_step(step, config) -> list[dict]",
-        "trainable_during_run(model, config) -> set[str] (names of the parameters that train at some step: after the build freeze, each FreezeStage, or a resume)",
+        "trainable_during_run(model, config) -> set[str] (names of the parameters that train at some step: after the build freeze, each FreezeStage, or a resume; never a parameter its module names in always_frozen)",
         "trainable_for_the_run(model, config) -> Iterator[list[str]] (context manager: those parameters require grad while the optimizer is built or a checkpoint loaded)"
       ],
       "tested_by": [
@@ -1177,6 +1197,8 @@
         "apply_ac(model, mode) -> int",
         "_ac_blocks(model) -> list[tuple[nn.ModuleDict, str]]",
         "_is_checkpointed(module) -> bool",
+        "_routing_contexts() -> (forward, recompute) contexts (the recompute takes the forward's aten.topk outputs and runs as a Recomputing)",
+        "_RoutingCheckpointWrapper (CheckpointWrapper of a block holding an MoEMLP under full AC; runs eagerly under torch.compile)",
         "apply_float8(model, enable_fsdp_float8_all_gather)",
         "_keep_tied_head(model, filter_fn) -> filter (keeps an output head tied to the token embedding out of Float8 conversion)",
         "apply_fsdp2(model, device_mesh, mp_policy, reshard_after_forward) (text-only path; shares _fsdp_wrap_transformer_blocks with VLM)",
@@ -1202,6 +1224,9 @@
         "tests/unit/test_activation_checkpointing.py::TestCheckpointingTakesEffect",
         "tests/unit/test_activation_checkpointing.py::TestLogging",
         "tests/unit/test_activation_checkpointing.py::TestUnderFsdp2",
+        "tests/unit/test_activation_checkpointing.py::TestMoERecompute",
+        "tests/distributed/test_ac_moe_recompute.py",
+        "tests/integration/test_compile.py::TestCompiledMoECheckpointing",
         "tests/unit/test_unfreeze_fsdp.py",
         "tests/distributed/test_freeze_schedule_fsdp.py"
       ]
@@ -1327,18 +1352,21 @@
             "wait()",
             "flush_pending_save()",
             "peek_saved_step(path)",
-            "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected, fresh_if_unheld, warm_start, exact_resume)",
+            "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected, fresh_if_unheld, warm_start, exact_resume, plugins_expected)",
             "_per_rank_view(train_state) -> (view, carried) (on an exact resume, this rank's own envelope entry over the single-copy keys; a mismatch refuses unless ignore_rank_state_mismatch, and a checkpoint with no envelope restores rank 0's copy unless that flag is set)",
             "_resume_past_mismatch(view, envelope, error) -> (view, carried) (with ignore_rank_state_mismatch: a changed topology keeps the saved data position if the envelope is sound where it was saved, rank 0's or for a stream on the saved data-parallel size its own data-parallel rank's, else drops it; never restores RNG)",
             "_resume_without_rank_state(train_state) -> (view, carried) (with ignore_rank_state_mismatch, a checkpoint with no per-rank state resumes as if the topology changed: rank 0's data position kept, its RNG dropped)",
             "_read_saved_keys(dcp_dir) -> (keys, restored_on_any_rank) (this rank's DCP keys; with a scope or multipliers an all-reduce on the gloo group tells every rank whether any rank's index holds optimizer state)",
             "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope, multipliers and group-layout checks all decide from it)",
+            "_check_plugins(metadata, ckpt_dir, expected) (every rank refuses another plugins list before any state is read, unless checkpoint.ignore_plugins_mismatch)",
             "_broadcast_train_state(path) -> dict (rank 0 reads train_state.pt and broadcasts the state or why it could not; rank 0 re-raises its error, every other rank raises a RuntimeError naming it)",
             "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
             "_check_lr_multipliers(metadata, ckpt_dir) -> saved group modules | None (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
             "_present_experts(dcp_state, load_from, saved_keys) (EP experts placed among all of them before DCP; a load refuses a checkpoint of fewer experts than the model; the ranks agree before DCP)",
             "apply_dataloader_state(dataloader) (every rank checks the position and the ranks share their verdicts before any rank applies it; a position some rank cannot place raises DataPositionError on every rank on a resume and starts the data fresh on every rank, with a warning, on a warm start or a carried position; a carried position goes only to a StatefulDataLoader or StreamingDataLoader)",
             "_position_refusals(dataloader, state) -> (refusals, world) (each rank's check_state verdict, gathered on every rank on the gloo group; a check that fails another way raises on every rank)",
+            "claim_dir() (rank 0 claims <dir>/.owner through claim_checkpoint_dir; every rank agrees on the outcome)",
+            "release_dir() (marks the <dir>/.owner record this rank's claim_dir wrote released, at a clean exit)",
             "restored_extra (property: the extra keys the last load restored)",
             "_resolve_load_path(path)",
             "_agreed_load_dir(path, fall_back) -> Path | None (every load: rank 0 resolves the checkpoint, on an exact resume that reads shards takes the newest step_N beside it that every stage saved when that one is not, and broadcasts its choice or its error)",
@@ -1354,6 +1382,9 @@
         "_recorded_lr_multipliers(meta, metadata_path) -> dict (none recorded means empty)",
         "_recorded_lr_layout(meta, metadata_path) -> (patterns, group_modules) (lr_module_patterns, and lr_group_modules: the module of each optimizer param group, recorded without PP)",
         "_check_saved_param_groups(optim_state, saved_keys, where, groups_vary, saved_modules) (refuses another group count, a missing setting, a module key where this run has none, or another module at a position per the recorded lr_group_modules)",
+        "derived_buffer_owners(model) -> dict (state-dict key of each buffer a module lists in derived_buffers -> (module, buffer name))",
+        "drop_derived_model_keys(model_state, model, saved_keys) -> dict (takes out of a load template the derived buffers its checkpoint lacks; put back before set_model_state_dict)",
+        "derive_buffers(model, keys) (the owner of each derived buffer at keys recomputes it from its loaded state)",
         "_fit_saved_optimizer(optim_state, owners, fixed, left_out, saved_keys, where, groups_vary, saved_modules) -> taken groups (checks the saved state kinds, takes the groups the save kept none of, drops legacy group keys, then checks the remaining groups; when none can be taken, the group check speaks before the generic mismatch error)",
         "_params_the_save_left_out(fqns, saved_keys, layout) -> set[str] (named parameters with neither saved optimizer state nor a never-stepped record, compared by global expert names under expert parallelism)",
         "_restore_left_out(optim_state, template_groups, left_out, where) (empty state for them, in the saved group of their group's other parameters, every EP rank's experts included, or an empty saved group in its place; refuses a name the saved groups list; load() agrees on its outcome across ranks)"
@@ -1362,6 +1393,10 @@
         "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",
         "tests/unit/test_checkpoint.py::TestOptimizerChecksAcrossStages",
         "tests/unit/test_lr_multipliers.py::TestResume",
+        "tests/unit/test_router_balance.py::TestCheckpointsThatTrainedTheBias",
+        "tests/unit/test_router_balance.py::TestManagerResume",
+        "tests/unit/test_router_balance.py::TestDerivedBufferOwners",
+        "tests/unit/test_convert_checkpoint.py::TestSigmoidRouterMasters",
         "tests/unit/test_lr_multipliers.py::TestLayoutChange",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
@@ -1414,6 +1449,7 @@
         }
       },
       "functions": [
+        "state_dict_name(name) -> str (a module name without the AC and torch.compile wrappers, as get_model_state_dict names entries)",
         "moe_layers(model) -> Iterator[(state-dict name, MoEMLP)]",
         "expert_layout(model) -> ExpertLayout | None (None without expert parallelism)",
         "check_saved_experts(model, saved, where) (refuses a checkpoint holding fewer experts than the model, as one saved with ep > 1 before #202 does)"
@@ -1422,6 +1458,25 @@
         "tests/unit/test_expert_layout.py",
         "tests/unit/test_ep_checkpoint.py",
         "tests/distributed/test_ep.py::TestEPCheckpoint"
+      ]
+    },
+    "kempnerforge/checkpoint/ownership.py": {
+      "classes": {
+        "CheckpointDirInUseError": {
+          "purpose": "Another run that is alive, or not known to have ended, owns the checkpoint directory"
+        }
+      },
+      "functions": [
+        "claim_checkpoint_dir(directory) -> str (records this run in <dir>/.owner, linked into place; replaces this process's earlier record; replaces a record of a run that has ended through _take_over, then reads it back; refuses a live or uncheckable owner; returns the claim id; one claim or release at a time per process)",
+        "_take_over(path, held, tmp, me) -> (bool, Path | None) (only the claimer that links .owner.<held claim>.takeover replaces path, after checking it still holds held, by renaming a link of tmp named for its own claim; tokens whose claimers have ended are taken over level by level; tokens removed afterward)",
+        "release_checkpoint_dir(directory, claim) (marks the record of that claim released through _take_over; never removes .owner; an error is logged)",
+        "this_run() -> dict (claim id, SLURM cluster, job or array element, requeue count, host, pid, a random id of the process, new in a forked child, which also gets a free lock, pid namespace inode, since)",
+        "_alive(owner, me) -> bool | None (a released record has ended; so has an earlier attempt of this job; another run in this job, or outside SLURM, by its pid on its own host and in its pid namespace, both known; any other job by squeue without SQUEUE_* filters)"
+      ],
+      "tested_by": [
+        "tests/unit/test_checkpoint_ownership.py",
+        "tests/distributed/test_checkpoint_ownership.py",
+        "tests/unit/test_train_entry.py::TestRunTraining"
       ]
     },
     "kempnerforge/metrics/tracker.py": {
@@ -1861,6 +1916,18 @@
         ],
         "count": 22
       },
+      "tests/unit/test_router_balance.py": {
+        "classes": [
+          "TestFrozenBias(2)",
+          "TestBalance(5)",
+          "TestBalanceRouters(3)",
+          "TestCheckpointsThatTrainedTheBias(4)",
+          "TestManagerResume(2)",
+          "TestDerivedBufferOwners(1)",
+          "TestFSDP2(1)"
+        ],
+        "count": 18
+      },
       "tests/unit/test_optimizer.py": {
         "classes": [
           "TestNewtonSchulz(5)",
@@ -1893,9 +1960,10 @@
           "TestBuildHFConfig(4)",
           "TestMoEKFtoHFKeyMapping(5)",
           "TestMoEHFtoKFKeyMapping(5)",
-          "TestMoERoundTrip(1)"
+          "TestMoERoundTrip(1)",
+          "TestSigmoidRouterMasters(3)"
         ],
-        "count": 29
+        "count": 32
       },
       "tests/unit/test_ep_checkpoint.py": {
         "classes": [
@@ -2087,10 +2155,10 @@
           "TestCanonicalFreezeMeta(4)",
           "TestEffectiveFreeze(7)",
           "TestTrainableDuringRun(9)",
-          "TestTrainableForTheRun(4)"
+          "TestTrainableForTheRun(5)"
         ],
         "note": "Also module-level functions: a module the build froze trains once a stage unfreezes it, under each registered optimizer (4), and apply_freeze_specs reaches the module a compiled model wraps (1)",
-        "count": 38
+        "count": 39
       },
       "tests/unit/test_unfreeze_fsdp.py": {
         "classes": [
@@ -2124,6 +2192,18 @@
           "TestManagerLoadRejectsForeignCheckpoint(1)"
         ],
         "count": 5
+      },
+      "tests/unit/test_checkpoint_ownership.py": {
+        "classes": [
+          "TestThisRun(7)",
+          "TestClaim(37)",
+          "TestOneProcess(2)",
+          "TestClaimersInProcesses(1)",
+          "TestRelease(6)",
+          "TestManager(5)",
+          "TestLatestLink(2)"
+        ],
+        "count": 60
       },
       "tests/unit/test_collective_timeouts.py": {
         "classes": [
@@ -2177,9 +2257,10 @@
       },
       "tests/integration/test_compile.py": {
         "classes": [
-          "TestCompileCorrectness(3)"
+          "TestCompileCorrectness(3)",
+          "TestCompiledMoECheckpointing(1)"
         ],
-        "count": 3
+        "count": 4
       },
       "tests/integration/test_vlm_train_step.py": {
         "classes": [
@@ -2249,6 +2330,11 @@
       "tests/distributed/test_checkpoint.py": {
         "note": "Distributed checkpoint save/load"
       },
+      "tests/distributed/test_checkpoint_ownership.py": {
+        "classes": [
+          "TestClaimOnEveryRank(2)"
+        ]
+      },
       "tests/distributed/test_e2e_training.py": {
         "note": "Multi-GPU training smoke"
       },
@@ -2257,6 +2343,12 @@
       },
       "tests/distributed/test_ep.py": {
         "note": "Expert parallelism, and an EP checkpoint round trip on four GPUs"
+      },
+      "tests/distributed/test_router_balance.py": {
+        "note": "Sigmoid router balancing on four GPUs under FSDP2 (even and uneven shards), HSDP, TP and EP: one all-reduce, the reference rule, the same bias on every rank, which the next forward routes with; a resume from a checkpoint without the FP32 masters, eager and compiled; and saved masters resumed exactly on another mesh (FSDP2 to HSDP)"
+      },
+      "tests/distributed/test_ac_moe_recompute.py": {
+        "note": "Full activation checkpointing of MoE blocks on four GPUs (FSDP2, HSDP, TP, EP; text and MoT; both routers; fp32 and bf16): trains like none, and the recompute replaces no router attribute and counts no token twice"
       },
       "tests/distributed/test_optimizer_distributed.py": {
         "note": "Lion, Schedule-Free AdamW, optimizer-scheduler compat under FSDP2"

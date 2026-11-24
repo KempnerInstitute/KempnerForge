@@ -1374,7 +1374,7 @@ class TestInitWeights:
             model = Transformer(config)
         model.to_empty(device="cpu")
         for tensor in (*model.parameters(), *model.buffers()):
-            tensor.detach().fill_(float("nan"))
+            tensor.detach().fill_(float("nan") if tensor.is_floating_point() else -1)
         model.init_weights_and_freqs()
 
         for name, param in model.named_parameters():

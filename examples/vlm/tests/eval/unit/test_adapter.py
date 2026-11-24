@@ -9,11 +9,13 @@ real checkpoint, no network. Real-package fidelity is pinned by the gated contra
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Iterator
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 from lmms_adapter import (
     KempnerForgeVLM,
     _build_model,
@@ -45,6 +47,7 @@ from kempnerforge.data.vlm_dataset import (
     pil_to_tensor,
     tile_image,
 )
+from kempnerforge.model.router import SigmoidTopKRouter
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 
 DEVICE = torch.device("cpu")
@@ -714,6 +717,34 @@ class TestLoadWeights:
         missing = tmp_path / "no_such_checkpoint"
         with pytest.raises(FileNotFoundError, match="does not exist"):
             _load_weights(job, str(missing), torch.device("cpu"), torch.float32)
+
+    def test_a_sigmoid_checkpoint_without_the_fp32_masters_loads(self, tmp_path, tiny_vlm_configs):
+        """The masters a checkpoint saved before them predates start from the loaded EMA and
+        bias, instead of failing on their missing keys."""
+        mc, vc, ac, lc = tiny_vlm_configs
+        moe = dataclasses.replace(mc, num_experts=4, moe_top_k=2, moe_router="sigmoid_topk")
+        job = JobConfig(
+            model=moe, vision_encoder=vc, adapter=ac, vlm=lc, data=DataConfig(tokenizer_path="mock")
+        )
+        model = _build_model(job, torch.device("cpu"), torch.float32)
+        ema = torch.tensor([0.125, 0.25, 0.25, 0.375])
+        saved = []
+        for router in (m for m in model.modules() if isinstance(m, SigmoidTopKRouter)):
+            with torch.no_grad():
+                router.expert_ema.copy_(ema)
+                router.expert_bias.add_(torch.arange(4.0) / 8)
+            saved.append(router.expert_bias.detach().clone())
+            for name in router.derived_buffers:
+                router._buffers.pop(name)
+        dcp.save({"model": model.state_dict()}, checkpoint_id=str(tmp_path))
+        loaded = _load_weights(job, str(tmp_path), torch.device("cpu"), torch.float32)
+        routers = [m for m in loaded.modules() if isinstance(m, SigmoidTopKRouter)]
+        assert len(routers) == len(saved) > 0
+        for router, bias in zip(routers, saved, strict=True):
+            masters = router._masters()
+            assert torch.equal(router.expert_bias.detach(), bias)
+            assert torch.equal(masters[1], bias.float())
+            assert torch.equal(masters[0], ema)
 
 
 @pytest.fixture

@@ -19,8 +19,9 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Iterable
+from contextlib import AbstractContextManager
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.distributed._composable.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
@@ -31,13 +32,16 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
+from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
 from kempnerforge.config.registry import registry
 from kempnerforge.config.schema import ActivationCheckpointing
 from kempnerforge.config.training import FP8_DIM_MULTIPLE
 from kempnerforge.model.attention import Attention
 from kempnerforge.model.cross_attention import CrossAttention
+from kempnerforge.model.moe import MoEMLP
 from kempnerforge.model.mot import MoTAttention
+from kempnerforge.model.router import Recomputing
 from kempnerforge.model.transformer import Transformer
 
 if TYPE_CHECKING:
@@ -162,6 +166,31 @@ def _is_checkpointed(module: torch.nn.Module) -> bool:
     return any(isinstance(m, CheckpointWrapper) for m in module.modules())
 
 
+def _routing_contexts() -> tuple[AbstractContextManager[Any], AbstractContextManager[Any]]:
+    """The forward and recompute contexts of a checkpointed block that routes tokens.
+
+    The recompute takes the forward's ``torch.topk`` outputs instead of computing them
+    again, so it routes every token as the forward did even where a GPU computes the
+    scores a little differently, and runs as a ``Recomputing``, so the routers leave
+    their attributes and counts as the forward set them (see ``Recomputing``).
+    """
+    forward, recompute = create_selective_checkpoint_contexts([torch.ops.aten.topk.default])
+    return forward, Recomputing(recompute)
+
+
+class _RoutingCheckpointWrapper(CheckpointWrapper):
+    """The ``CheckpointWrapper`` of a block that routes tokens, run eagerly under compile.
+
+    The selective-checkpoint context of ``_routing_contexts`` sees only the ops that run
+    eagerly, and the recompute in the backward runs eagerly, so the forward does too.
+    """
+
+    @torch.compiler.disable
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the wrapped block under activation checkpointing."""
+        return super().forward(*args, **kwargs)
+
+
 def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpointing | str) -> int:
     """Apply activation checkpointing to the model's blocks.
 
@@ -182,6 +211,12 @@ def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpoin
             checkpoints the ``Attention``, ``MoTAttention`` and
             ``CrossAttention`` modules inside each block (balanced trade-off)
             and warns, naming the class, about a block that holds none of them.
+            Under ``full``, a block that holds an ``MoEMLP`` keeps its routers'
+            top-k outputs for the recompute, which leaves the routers' state as
+            the forward set it, and runs eagerly under ``torch.compile`` (see
+            ``_routing_contexts``). Its recompute uses those outputs up, so the
+            graph through it takes one backward: a second, after
+            ``backward(retain_graph=True)``, raises.
 
     Returns:
         The number of modules this call wrapped.
@@ -191,13 +226,19 @@ def apply_ac(model: Transformer | PipelineStageModule, mode: ActivationCheckpoin
         return 0
 
     wrapper_fn = partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+    routing_fn = partial(
+        _RoutingCheckpointWrapper,
+        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+        context_fn=_routing_contexts,
+    )
     blocks = _ac_blocks(model)
     wrapped: dict[str, int] = {}
     for container, key in blocks:
         if _is_checkpointed(container[key]):
             continue
         if mode == ActivationCheckpointing.full:
-            container[key] = wrapper_fn(container[key])
+            routes = any(isinstance(m, MoEMLP) for m in container[key].modules())
+            container[key] = (routing_fn if routes else wrapper_fn)(container[key])
         else:
             apply_activation_checkpointing(
                 container[key],
@@ -455,7 +496,7 @@ def apply_fsdp2(
             int = rate-limit the number of concurrent all-gathers.
     """
     if not has_dp_mesh(device_mesh):
-        logger.info("No DP dimensions in mesh — skipping FSDP2")
+        logger.info("No DP dimensions in mesh; skipping FSDP2")
         return
 
     dp_mesh = get_dp_mesh(device_mesh)
