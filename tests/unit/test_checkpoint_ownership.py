@@ -188,6 +188,18 @@ class TestThisRun:
         monkeypatch.setattr(ownership, "_PID_NAMESPACE", str(tmp_path / "missing"))
         assert this_run()["pid_ns"] is None
 
+    def test_the_fork_hook_gives_a_new_id_and_a_free_lock(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The hook runs in a forked child; called here, its effect is checked in-process."""
+        monkeypatch.setattr(ownership, "_process_id", ownership._process_id)
+        monkeypatch.setattr(ownership, "_LOCK", ownership._LOCK)
+        before, held = this_run()["process"], ownership._LOCK
+        with held:
+            ownership._after_fork_in_child()
+            assert this_run()["process"] != before
+            assert ownership._LOCK is not held and not ownership._LOCK.locked()
+
     def test_a_process_keeps_its_id_and_a_forked_child_gets_its_own(self) -> None:
         mine = this_run()["process"]
         assert re.fullmatch(r"[0-9a-f]{32}", mine) and this_run()["process"] == mine
@@ -369,6 +381,21 @@ class TestClaim:
         _write_owner(tmp_path, slurm_job="456", slurm_restart=0)
         with pytest.raises(CheckpointDirInUseError, match="cannot tell"):
             claim_checkpoint_dir(tmp_path)
+
+    def test_a_pid_this_user_may_not_signal_is_alive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """os.kill refuses to signal another user's process, which therefore runs."""
+
+        def refuse(pid: int, sig: int) -> None:
+            raise PermissionError(pid)
+
+        path = _write_owner(tmp_path, host=socket.gethostname(), pid=12345)
+        monkeypatch.setattr(ownership.os, "kill", refuse)
+        with pytest.raises(CheckpointDirInUseError, match="still running"):
+            claim_checkpoint_dir(tmp_path)
+        monkeypatch.undo()
+        assert _owner(path)["pid"] == 12345
 
     def test_a_run_outside_slurm_is_alive_while_its_pid_runs(self, tmp_path: Path) -> None:
         path = _write_owner(tmp_path, host=socket.gethostname(), pid=os.getppid())

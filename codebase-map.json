@@ -2024,15 +2024,15 @@
       },
       "tests/unit/test_checkpoint_ownership.py": {
         "classes": [
-          "TestThisRun(6)",
-          "TestClaim(36)",
+          "TestThisRun(7)",
+          "TestClaim(37)",
           "TestOneProcess(2)",
           "TestClaimersInProcesses(1)",
           "TestRelease(6)",
           "TestManager(5)",
           "TestLatestLink(2)"
         ],
-        "count": 58
+        "count": 60
       },
       "tests/unit/test_collective_timeouts.py": {
         "classes": [
