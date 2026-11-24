@@ -589,6 +589,29 @@ class TestTrainableForTheRun:
         with trainable_for_the_run(_Compiled(model), config):
             assert all(p.requires_grad for p in model.parameters())
 
+    @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+    def test_a_parameter_its_module_keeps_frozen_stays_out(self, compiled):
+        """The sigmoid router names expert_bias in always_frozen, so a stage that unfreezes
+        the router's module leaves the bias out of the run and of the optimizer."""
+        from kempnerforge.model.router import SigmoidTopKRouter
+
+        model = nn.Module()
+        model.transformer = nn.Module()
+        model.transformer.router = SigmoidTopKRouter(dim=8, num_experts=4, top_k=2)
+        target = torch.compile(model, backend="eager") if compiled else model
+        config = VLMConfig(
+            freeze=[FreezeSpec("transformer")],
+            freeze_schedule=[FreezeStage(5, (FreezeSpec("transformer", False),))],
+        )
+        apply_freeze_specs(target, config.freeze, config.module_patterns)
+        router = model.transformer.router
+        assert "transformer.router.expert_bias" not in trainable_during_run(model, config)
+        with trainable_for_the_run(target, config) as unfrozen:
+            optimizer = build_optimizer(target, OptimizerConfig(fused=False))
+            assert router.gate.weight.requires_grad and not router.expert_bias.requires_grad
+            assert not any(name.endswith("expert_bias") for name in unfrozen)
+        assert id(router.expert_bias) not in _held(optimizer)
+
 
 def _held(optimizer: torch.optim.Optimizer) -> set[int]:
     """Ids of the parameters an optimizer holds, with a Muon optimizer's AdamW fallback."""

@@ -215,6 +215,7 @@ class TestMoESigmoidTrainStep:
         model.set_moe_step(0, 100)
         with torch.no_grad():
             model(tokens)
+        model.balance_routers()
         for layer in model.layers.values():
             if isinstance(layer.mlp, MoEMLP):
                 delta_early = (layer.mlp.router.expert_bias.data - bias_before).abs().max().item()
@@ -223,6 +224,7 @@ class TestMoESigmoidTrainStep:
         model.set_moe_step(99, 100)
         with torch.no_grad():
             model(tokens)
+        model.balance_routers()
         for layer in model.layers.values():
             if isinstance(layer.mlp, MoEMLP):
                 delta_late = (layer.mlp.router.expert_bias.data - bias_before).abs().max().item()

@@ -24,9 +24,10 @@ for micro_step in range(grad_accum_steps):       ── maybe_no_sync sets
     └─ (loss / grad_accum_steps).backward()       ── gradient accumulation
 
 grad_norm = clip_grad_norm_(model, grad_clip_norm)
-if NaN: zero_grad, maybe stop, skip the update; still run scheduler.step(),
-        freeze stages / phases and the shutdown check
-optimizer.step() ; scheduler.step() ; optimizer.zero_grad()
+if NaN: drop the routers' counts, zero_grad, maybe stop, skip the update;
+        still run scheduler.step(), freeze stages / phases and the shutdown check
+optimizer.step() ; [MoE] model.balance_routers()
+scheduler.step() ; optimizer.zero_grad()
 
 tracker.end_step(step, loss, grad_norm, lr, tokens_in_step)
 hook_runner.on_step_end(StepContext(...))
@@ -171,6 +172,7 @@ After the microbatch loop:
 grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
 
 if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
+    _route_balance(session, step_ran=False)  # drops the sigmoid routers' counts
     optimizer.zero_grad()
     if nan_detector.should_rollback:
         break
@@ -184,6 +186,7 @@ if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
     continue                                 # no update, token count, metrics or hooks
 
 optimizer.step()
+_route_balance(session, step_ran=True)       # sigmoid routers balance (MoE)
 scheduler.step()
 if phase_lr_scale != 1.0:
     for pg in optimizer.param_groups: pg["lr"] *= phase_lr_scale

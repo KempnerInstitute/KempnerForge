@@ -35,6 +35,7 @@ from kempnerforge.distributed.utils import (
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.mfu import vision_flops_per_image
 from kempnerforge.metrics.tracker import MetricsTracker
+from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import inner_transformer
 from kempnerforge.profiling.profiler import print_profiler_summary
 from kempnerforge.resilience.health import NaNDetector, check_nccl_health, params_are_finite
@@ -248,12 +249,18 @@ def clip_grads(model: torch.nn.Module, max_norm: float, pp_group: Any = None) ->
 
 
 def add_moe_losses(loss: torch.Tensor, model: torch.nn.Module, mc: Any) -> torch.Tensor:
-    """MoE auxiliary + router z-loss terms (only called when ``mc.is_moe``)."""
+    """MoE auxiliary + router z-loss terms (only called when ``mc.is_moe``).
+
+    The routers' losses are then detached (see ``Transformer.detach_router_losses``).
+    """
     aux_loss = inner_transformer(model).get_moe_aux_loss()  # type: ignore[attr-defined]
     loss = loss + mc.moe_aux_loss_weight * aux_loss
     if mc.moe_router_z_loss_weight > 0:
         z = inner_transformer(model).get_moe_router_z_loss()  # type: ignore[attr-defined]
         loss = loss + mc.moe_router_z_loss_weight * z
+    transformer = inner_transformer(model)
+    if isinstance(transformer, Transformer):
+        transformer.detach_router_losses()
     return loss
 
 
@@ -498,6 +505,21 @@ def _mark_rows_dynamic(*tensors: Any) -> None:
     for tensor in tensors:
         if isinstance(tensor, torch.Tensor):
             maybe_mark_dynamic(tensor, 0)
+
+
+def _route_balance(session: TrainingSession, *, step_ran: bool) -> None:
+    """Balance the sigmoid routers after an optimizer step, or drop the counts of one skipped.
+
+    Every rank calls this at the same point, since balancing all-reduces the routers'
+    expert counts (see ``Transformer.balance_routers``).
+    """
+    transformer = inner_transformer(session.model)
+    if not session.config.model.is_moe or not isinstance(transformer, Transformer):
+        return
+    if step_ran:
+        transformer.balance_routers()
+    else:
+        transformer.discard_router_counts()
 
 
 def _batch_counts(
@@ -996,6 +1018,7 @@ def run_training_loop(
             )
 
             if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
+                _route_balance(session, step_ran=False)
                 optimizer.zero_grad()
                 if session.nan_detector.should_rollback:
                     logger.error("Too many consecutive NaNs — stopping")
@@ -1012,6 +1035,7 @@ def run_training_loop(
             applied_lr = optimizer.param_groups[0]["lr"]
             applied_module_lrs = module_learning_rates(optimizer)
             optimizer.step()
+            _route_balance(session, step_ran=True)
             _advance_lr_schedule(session)
 
             optimizer.zero_grad()

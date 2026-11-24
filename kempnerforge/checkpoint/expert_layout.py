@@ -39,15 +39,22 @@ def _join(*parts: str) -> str:
     return ".".join(part for part in parts if part)
 
 
+def state_dict_name(name: str) -> str:
+    """A module's ``name`` without the activation-checkpoint and ``torch.compile`` wrappers.
+
+    ``get_model_state_dict`` leaves them out of the names of its entries.
+    """
+    return ".".join(part for part in name.split(".") if part not in _WRAPPERS)
+
+
 def moe_layers(model: torch.nn.Module) -> Iterator[tuple[str, MoEMLP]]:
     """Each ``MoEMLP`` in ``model`` with the name its state-dict entries start with.
 
-    The name is empty when ``model`` is itself the ``MoEMLP``. It leaves out the
-    activation-checkpoint and ``torch.compile`` wrappers, as ``get_model_state_dict`` does.
+    The name is empty when ``model`` is itself the ``MoEMLP`` (see ``state_dict_name``).
     """
     for name, module in model.named_modules():
         if isinstance(module, MoEMLP):
-            yield ".".join(part for part in name.split(".") if part not in _WRAPPERS), module
+            yield state_dict_name(name), module
 
 
 def expert_layout(model: torch.nn.Module) -> ExpertLayout | None:

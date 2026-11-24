@@ -25,8 +25,10 @@ from convert_checkpoint import (
     main,
 )
 
+from kempnerforge.checkpoint.manager import derive_buffers, derived_buffer_owners
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.model.router import SigmoidTopKRouter
 from kempnerforge.model.transformer import Transformer
 
 
@@ -858,12 +860,17 @@ class TestExportDtypePrecedence:
 
 
 def _random_dcp(path: Path, model_config: ModelConfig, std: float = 1.0) -> Transformer:
-    """Save a model whose every weight, norms included, is drawn at random; return it."""
+    """Save a model whose every weight, norms included, is drawn at random; return it.
+
+    Buffers derived from the weights, such as the sigmoid router's FP32 masters, are
+    derived again from the drawn ones, as a trained model keeps them.
+    """
     model = Transformer(model_config)
     generator = torch.Generator().manual_seed(0)
     with torch.no_grad():
         for param in model.parameters():
             param.normal_(std=std, generator=generator)
+    derive_buffers(model, derived_buffer_owners(model))
     dcp.save({"model": model.state_dict()}, checkpoint_id=str(path))
     return model
 
@@ -1156,3 +1163,87 @@ class TestLlamaExport:
         back = _read_back(tmp_path / "hf", tmp_path / "back", config)
         for name, tensor in source.state_dict().items():
             assert torch.equal(back[name], tensor), name
+
+
+class TestSigmoidRouterMasters:
+    """The sigmoid router's FP32 masters stay out of the export and are derived on import.
+
+    Mixtral routes with softmax top-k, so these exports turn the architecture check off,
+    as a round trip through hf-to-dcp does.
+    """
+
+    CONFIG = ModelConfig(
+        dim=32,
+        n_layers=2,
+        n_heads=2,
+        vocab_size=64,
+        max_seq_len=16,
+        num_experts=4,
+        moe_top_k=2,
+        moe_router="sigmoid_topk",
+    )
+
+    def _save(self, path: Path, *, with_masters: bool) -> list[SigmoidTopKRouter]:
+        """Save a model whose routers balanced from random counts; return its routers."""
+        model = Transformer(self.CONFIG)
+        routers = [m for m in model.modules() if isinstance(m, SigmoidTopKRouter)]
+        generator = torch.Generator().manual_seed(0)
+        for router in routers:
+            router.balance(torch.randint(1, 50, (self.CONFIG.num_experts,), generator=generator))
+        state = model.state_dict()
+        if not with_masters:
+            state = {k: v for k, v in state.items() if not k.endswith("_bits")}
+        dcp.save({"model": state}, checkpoint_id=str(path))
+        return routers
+
+    def _assert_exported(self, hf_dir: Path, routers: list[SigmoidTopKRouter]) -> None:
+        weights = load_file(hf_dir / "model.safetensors")
+        assert not [k for k in weights if k.endswith("_bits")]
+        for i, router in enumerate(routers):
+            assert torch.equal(weights[f"model.layers.{i}.mlp.expert_bias"], router.expert_bias)
+            assert torch.equal(
+                weights[f"model.layers.{i}.mlp.router.expert_ema"], router.expert_ema
+            )
+
+    def test_the_masters_are_not_exported(self, tmp_path):
+        routers = self._save(tmp_path / "dcp", with_masters=True)
+        dcp_to_hf(
+            str(tmp_path / "dcp"),
+            str(tmp_path / "hf"),
+            self.CONFIG,
+            dtype=torch.float32,
+            check_architecture=False,
+        )
+        self._assert_exported(tmp_path / "hf", routers)
+
+    def test_a_checkpoint_saved_before_the_masters_exports(self, tmp_path):
+        routers = self._save(tmp_path / "dcp", with_masters=False)
+        dcp_to_hf(
+            str(tmp_path / "dcp"),
+            str(tmp_path / "hf"),
+            self.CONFIG,
+            dtype=torch.float32,
+            check_architecture=False,
+        )
+        self._assert_exported(tmp_path / "hf", routers)
+
+    def test_an_import_derives_the_masters_from_the_bias_and_the_ema(self, tmp_path, caplog):
+        routers = self._save(tmp_path / "dcp", with_masters=True)
+        dcp_to_hf(
+            str(tmp_path / "dcp"),
+            str(tmp_path / "hf"),
+            self.CONFIG,
+            dtype=torch.float32,
+            check_architecture=False,
+        )
+        with caplog.at_level(logging.WARNING):
+            hf_to_dcp(str(tmp_path / "hf"), str(tmp_path / "back"), self.CONFIG)
+        assert "Missing" not in caplog.text
+        model = Transformer(self.CONFIG)
+        state = {"model": model.state_dict()}
+        dcp.load(state, checkpoint_id=str(tmp_path / "back"))
+        model.load_state_dict(state["model"])
+        loaded = [m for m in model.modules() if isinstance(m, SigmoidTopKRouter)]
+        for router, source in zip(loaded, routers, strict=True):
+            for got, want in zip(router._masters(), source._masters(), strict=True):
+                assert torch.equal(got, want)

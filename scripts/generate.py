@@ -35,6 +35,7 @@ import torch
 import torch.distributed.checkpoint as dcp
 
 from kempnerforge.checkpoint.expert_layout import check_saved_experts
+from kempnerforge.checkpoint.manager import drop_derived_model_keys
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.registry import registry
 from kempnerforge.model.generate import generate
@@ -45,7 +46,9 @@ def _load_model(config, device, dtype):
 
     A checkpoint whose MoE layers hold fewer experts than the model, as one saved with
     expert parallelism before each rank's experts were saved under their global index,
-    is refused (see ``check_saved_experts``).
+    is refused (see ``check_saved_experts``). A checkpoint that predates a derived
+    buffer, such as the sigmoid router's FP32 masters, loads with the buffer derived
+    from the loaded state (see ``drop_derived_model_keys``).
     """
     model_builder = registry.get_model(config.model.model_type)
     model = model_builder(config.model).to(device=device, dtype=dtype)
@@ -60,6 +63,7 @@ def _load_model(config, device, dtype):
         saved = dcp.FileSystemReader(str(ckpt_path)).read_metadata().state_dict_metadata
         check_saved_experts(model, saved, ckpt_path)
         state_dict = {"model": model.state_dict()}
+        drop_derived_model_keys(state_dict["model"], model, saved)
         dcp.load(state_dict, checkpoint_id=str(ckpt_path))
         model.load_state_dict(state_dict["model"])
         print(f"Loaded checkpoint: {ckpt_path}")

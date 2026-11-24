@@ -4420,6 +4420,66 @@ class TestMoELossComposition:
         assert session.model.moe_steps == [(7, session.config.train.max_steps)]
 
 
+def _sigmoid_moe_session(**train_kwargs):
+    """A session around a real sigmoid-router MoE ``Transformer`` on CPU."""
+    from kempnerforge.model.transformer import Transformer
+
+    config = _moe_config(**train_kwargs)
+    config.model.moe_router = "sigmoid_topk"
+    torch.manual_seed(0)
+    model = Transformer(config.model)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(trainable, lr=0.05)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _s: 1.0)
+    return make_session(config, model=model, optimizer=optimizer, scheduler=scheduler)
+
+
+class TestRouterBalancing:
+    """The loop balances the sigmoid routers once per optimizer step (#571)."""
+
+    def test_routers_balance_once_per_optimizer_step(self, monkeypatch):
+        from kempnerforge.model.router import SigmoidTopKRouter
+        from kempnerforge.model.transformer import Transformer
+
+        session = _sigmoid_moe_session(max_steps=3, grad_accum_steps=2)
+        balance, calls, events = Transformer.balance_routers, [], []
+
+        def counted(model):
+            events.append("balance")
+            calls.append([int(r.pending_counts.sum()) for r in routers])
+            balance(model)
+
+        def logged(name, step):
+            def run(*args, **kwargs):
+                events.append(name)
+                return step(*args, **kwargs)
+
+            return run
+
+        monkeypatch.setattr(Transformer, "balance_routers", counted)
+        monkeypatch.setattr(session.optimizer, "step", logged("optimizer", session.optimizer.step))
+        monkeypatch.setattr(session.scheduler, "step", logged("scheduler", session.scheduler.step))
+        routers = [m for m in session.model.modules() if isinstance(m, SigmoidTopKRouter)]
+        emas = [router.expert_ema.clone() for router in routers]
+        run_training_loop(session)
+        tc = session.config.train
+        per_step = 2 * tc.batch_size * tc.seq_len * session.config.model.moe_top_k
+        assert calls == [[per_step] * len(routers)] * 3
+        assert events == ["optimizer", "balance", "scheduler"] * 3
+        assert all(not router.pending_counts.any() for router in routers)
+        assert all(not torch.equal(r.expert_ema, e) for r, e in zip(routers, emas, strict=True))
+
+    def test_a_step_skipped_for_a_nan_loss_drops_its_counts(self, monkeypatch):
+        from kempnerforge.model.router import SigmoidTopKRouter
+
+        session = _sigmoid_moe_session(max_steps=1)
+        monkeypatch.setattr(session.nan_detector, "check_loss", lambda *_a, **_k: False)
+        run_training_loop(session)
+        for router in (m for m in session.model.modules() if isinstance(m, SigmoidTopKRouter)):
+            assert not router.pending_counts.any()
+            assert torch.equal(router.expert_ema, torch.full((4,), 0.25))
+
+
 class TestMoEMetrics:
     def _run_one_step(self, model, config):
         session = make_session(config, model=model)
