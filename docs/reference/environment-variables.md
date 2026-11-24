@@ -37,7 +37,7 @@ The SLURM launch helpers
 ([`scripts/slurm/multinode.sh`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/slurm/multinode.sh),
 [`_run_training.sh`](https://github.com/KempnerInstitute/KempnerForge/blob/main/scripts/slurm/_run_training.sh))
 export both before `srun` so every rank agrees. `init_distributed()`
-only fills in missing values — it never overwrites.
+only fills in missing values; it never overwrites.
 
 ## NCCL / Gloo (auto-set by `_set_nccl_env()`)
 
@@ -49,20 +49,20 @@ interface (`ls /sys/class/net | grep '^ib'`) and populates defaults:
 | `NCCL_SOCKET_IFNAME` | detected IB interface (e.g. `ib0`) | NCCL bootstrap transport |
 | `GLOO_SOCKET_IFNAME` | same as above | Gloo (used by DCP async checkpoint coordination) |
 | `NCCL_IB_DISABLE` | `0` | Keep InfiniBand RDMA enabled |
-| `NCCL_NET_GDR_LEVEL` | `2` | GPUDirect RDMA level — enables GPU→NIC DMA |
+| `NCCL_NET_GDR_LEVEL` | `2` | GPUDirect RDMA level: enables GPU→NIC DMA |
 
 All four use `setdefault`, so anything you export before launch wins.
 The launch scripts also set `NCCL_IB_GID_INDEX=3`, which NCCL reads and
 the Python code does not. There is no `NCCL_TIMEOUT` setting: neither NCCL
 nor PyTorch reads that variable. `distributed.nccl_timeout_sec` sets the
-default process group's timeout; the groups `init_device_mesh` creates
-for other mesh dimensions keep PyTorch's 30-minute default.
+timeout of the default process group and of the group of every mesh
+dimension.
 
 ## SLURM metadata (resilience)
 
 Read by `get_slurm_context()` and `running_under_slurm()` in
 [`kempnerforge/resilience/elastic.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py).
-Purely informational — used to populate logs and decide whether a job
+Purely informational: used to populate logs and decide whether a job
 is a restart.
 
 | Variable | Purpose |
@@ -139,12 +139,12 @@ not by any Python module:
 
 ## See also
 
-- [SLURM launch scripts](https://github.com/KempnerInstitute/KempnerForge/tree/main/scripts/slurm)
-  — how `multinode.sh`, `_run_training.sh`, and friends assemble these
+- [SLURM launch scripts](https://github.com/KempnerInstitute/KempnerForge/tree/main/scripts/slurm):
+  how `multinode.sh`, `_run_training.sh`, and friends assemble these
   variables end-to-end.
-- [Architecture § One-slide overview](../architecture/index.md) —
+- [Architecture § One-slide overview](../architecture/index.md):
   where `RANK`/`LOCAL_RANK`/`WORLD_SIZE` feed into the mesh
   construction.
-- [Benchmarks § MoE Expert Parallelism](benchmarks.md#moe-expert-parallelism)
-  — where `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is
+- [Benchmarks § MoE Expert Parallelism](benchmarks.md#moe-expert-parallelism):
+  where `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is
   load-bearing.

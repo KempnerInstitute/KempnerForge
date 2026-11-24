@@ -173,19 +173,19 @@ The [documentation site](../docs/index.md) is the canonical reference. Key entry
 
 ## MoE engineering roadmap
 
-Core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, FSDP2 compatibility, and FP8 are complete and validated at multi-node scale. Remaining work toward DeepSeek-V3 production quality:
+Core MoE, Expert Parallelism, DeepSeekMoE, grouped GEMM, and FSDP2 compatibility are complete and validated at multi-node scale. FP8 training is complete for FSDP runs and tested on one node; it does not run with tensor parallelism. Remaining work toward DeepSeek-V3 production quality:
 
 | Feature | Status | Impact |
 |---------|:------:|--------|
 | Router improvements (sequence aux loss, gradient scaling, adaptive bias) | **Done** | Training quality |
-| FP8 mixed precision | **Done** | 2x compute throughput |
+| FP8 mixed precision (FSDP, no TP) | **Done** | 2x compute throughput |
 | Pipeline parallelism for MoE (PP+EP+TP composition) | Blocked | Required for 100B+ |
 | Communication-computation overlap (async EP dispatch) | Planned | 15-30% throughput |
 | Node-limited expert routing (bounded cross-node traffic) | Planned | Scale to 64+ GPUs |
 | Multi-token prediction (MTP) | Planned | 10-15% sample efficiency |
 | Large-scale EP (hierarchical all-to-all, 256+ experts) | Planned | 1000+ GPU scale |
 
-> Pipeline parallelism runs dense models with the 1F1B or GPipe schedule; 4-GPU end-to-end tests train and resume PP=4, PP=2 with FSDP=2, and PP=2 with TP=2; tied embeddings, VLMs and MoE are rejected with PP at config validation time. MoE data-dependent routing is incompatible with static pipeline stage splitting, so use FSDP, TP, or EP for MoE models.
+> Pipeline parallelism runs dense models with the 1F1B or GPipe schedule; 4-GPU end-to-end tests train and resume PP=4, PP=2 with FSDP=2, and PP=2 with TP=2; tied embeddings, VLMs and MoE are rejected with PP at config validation time. MoE data-dependent routing is incompatible with static pipeline stage splitting, so use FSDP, TP, or EP for MoE models (FSDP alone for MoT, which runs neither TP nor EP).
 
 ## Project structure
 

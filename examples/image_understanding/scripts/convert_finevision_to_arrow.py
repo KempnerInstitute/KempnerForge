@@ -13,7 +13,9 @@ convert leaves no temp files, the other files go on, and the failures are listed
 at the end with a non-zero exit. ``index`` merges a fully converted subset's
 sidecars into ``<subset>/index.npz``, refusing a subset with a file not converted
 or whose source changed size since its conversion; for a sidecar without image
-counts it reads them from the Arrow file.
+counts, or for every sidecar with ``--recount-images``, it counts them from the
+Arrow file and writes them into the sidecar. Only the entries with image bytes
+count, so a blank or null entry does not.
 
     uv run python examples/image_understanding/scripts/convert_finevision_to_arrow.py convert \\
         --src /path/to/FineVision --dst /path/to/FineVision-arrow --procs 8
@@ -29,6 +31,7 @@ import random
 import socket
 import sys
 import time
+import uuid
 from collections.abc import Callable
 from multiprocessing import Pool
 from pathlib import Path
@@ -88,12 +91,25 @@ def keep_flags(texts: pa.Array) -> np.ndarray:
 
 
 def image_counts(batch: pa.RecordBatch) -> np.ndarray:
-    """How many images each row holds; a batch without an images column holds none."""
+    """How many images each row holds: the entries of its images list with image bytes.
+
+    A blank entry, ``{"bytes": None, "path": None}``, and a null entry hold none, as the
+    reader leaves them out. A batch without an images column holds none.
+    """
     names = batch.schema.names
     if "images" not in names or pa.types.is_null(batch.schema.field("images").type):
         return np.zeros(batch.num_rows, dtype=np.int16)
-    lengths = batch.column("images").value_lengths().fill_null(0)
-    return lengths.to_numpy(zero_copy_only=False).astype(np.int16)
+    images = batch.column("images")
+    values = images.values
+    holds = values.is_valid().to_numpy(zero_copy_only=False)
+    if pa.types.is_struct(values.type) and values.type.get_field_index("bytes") >= 0:
+        holds &= values.field("bytes").is_valid().to_numpy(zero_copy_only=False)
+    else:
+        holds[:] = False
+    running = np.concatenate([[0], np.cumsum(holds, dtype=np.int64)])
+    offsets = images.offsets.to_numpy(zero_copy_only=False)
+    counts = running[offsets[1:]] - running[offsets[:-1]]
+    return (counts * images.is_valid().to_numpy(zero_copy_only=False)).astype(np.int16)
 
 
 def convert_file(
@@ -269,14 +285,30 @@ def convert(args: argparse.Namespace) -> None:
         sys.exit(f"{len(failures)} files failed to convert")
 
 
+def _write_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
+    """Replace ``path`` with ``arrays`` through a temp file of this writer's own.
+
+    The temp file is named for this host, process and call, so concurrent index runs
+    never share one, and a failed write removes only its own.
+    """
+    tag = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex}"
+    tmp = path.with_name(f"{path.stem}.{tag}.tmp.npz")
+    try:
+        np.savez(tmp, **arrays)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _file_image_counts(arrow_file: Path) -> np.ndarray:
     reader = pa.ipc.open_file(pa.memory_map(str(arrow_file), "r"))
     counts = [image_counts(reader.get_batch(i)) for i in range(reader.num_record_batches)]
     return np.concatenate(counts) if counts else np.zeros(0, dtype=np.int16)
 
 
-def _subset_index(job: tuple[Path, Path, str]) -> str:
-    src, dst, subset = job
+def _subset_index(job: tuple[Path, Path, str, bool]) -> str:
+    src, dst, subset, recount = job
     sources = source_files(src, subset)
     if not sources:
         return f"{subset}: no train-*.parquet files under {src / subset}"
@@ -296,19 +328,20 @@ def _subset_index(job: tuple[Path, Path, str]) -> str:
             "remove their .meta.npz and convert again"
         )
     for meta, arrow in zip(metas, arrows, strict=True):
-        if "num_images" not in meta:
+        if recount or "num_images" not in meta:
             meta["num_images"] = _file_image_counts(arrow)
-    tmp = dst / subset / "index.tmp.npz"
-    np.savez(
-        tmp,
-        files=np.asarray([a.name for a in arrows]),
-        file_batches=np.asarray([len(m["batch_rows"]) for m in metas], dtype=np.int64),
-        batch_rows=np.concatenate([m["batch_rows"] for m in metas]),
-        keep=np.concatenate([m["keep"] for m in metas]),
-        num_images=np.concatenate([m["num_images"] for m in metas]),
-        **{name: np.concatenate([m[name] for m in metas]) for name in RATING_COLUMNS},
+            _write_npz(meta_path(arrow), meta)
+    _write_npz(
+        dst / subset / "index.npz",
+        {
+            "files": np.asarray([a.name for a in arrows]),
+            "file_batches": np.asarray([len(m["batch_rows"]) for m in metas], dtype=np.int64),
+            "batch_rows": np.concatenate([m["batch_rows"] for m in metas]),
+            "keep": np.concatenate([m["keep"] for m in metas]),
+            "num_images": np.concatenate([m["num_images"] for m in metas]),
+            **{name: np.concatenate([m[name] for m in metas]) for name in RATING_COLUMNS},
+        },
     )
-    os.replace(tmp, dst / subset / "index.npz")
     return ""
 
 
@@ -316,7 +349,11 @@ def index(args: argparse.Namespace) -> None:
     chosen = args.subsets or subsets(args.src)
     with Pool(args.procs) as pool:
         problems = [
-            p for p in pool.imap(_subset_index, [(args.src, args.dst, s) for s in chosen]) if p
+            p
+            for p in pool.imap(
+                _subset_index, [(args.src, args.dst, s, args.recount_images) for s in chosen]
+            )
+            if p
         ]
     for problem in problems:
         print(problem, file=sys.stderr)
@@ -333,6 +370,12 @@ def main() -> None:
     parser.add_argument("--procs", type=int, default=2)
     parser.add_argument("--subsets", nargs="*", help="only these subsets (default: all)")
     parser.add_argument("--stale-claim-hours", type=float, default=6.0)
+    parser.add_argument(
+        "--recount-images",
+        action="store_true",
+        help="index: count every file's images from its Arrow file again and store them in "
+        "its sidecar, as for a subset converted when blank and null image entries counted",
+    )
     args = parser.parse_args()
     {"convert": convert, "index": index}[args.command](args)
 

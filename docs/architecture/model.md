@@ -141,6 +141,13 @@ silent-incorrectness risk. Keep them module-level.
 math via a context manager. `"auto"` lets PyTorch pick. Cached multi-token
 appends use `causal_lower_right` without a dense mask or kernel fallback,
 so a pinned flash backend stays enabled.
+The CUDA flash kernel takes no dense mask, so under `"flash"` a forward
+that passes one to SDPA on CUDA (packed documents, padded frames,
+attention groups) raises a `ValueError`, and the training setup refuses
+the configs that build one (see
+[Validation rules](../configuration/validation-rules.md#flash-attention-and-masked-runs)).
+Capturing attention weights computes attention without SDPA and is not
+affected.
 
 ## MLP
 
@@ -189,7 +196,12 @@ statistic from overflowing in bf16 for long sequences.
 
 When `ModelConfig.tie_embeddings=True` (and both layers exist), the head
 shares its weight with the embedding via `OutputHead.tie_weights(emb)`
-(`self.proj.weight = emb.embedding.weight`).
+(`self.proj.weight = emb.embedding.weight`). A meta-device build, which
+tensor parallelism uses, loses the tie in `to_empty()`, which gives each
+module a parameter of its own, unless FSDP2 wraps the model first, as on
+a mesh with a data-parallel dimension: its DTensor parameters are swapped
+in place. `init_weights_and_freqs()` ties the two again when needed,
+before it initializes the shared weight once.
 
 ## TransformerBlock
 
@@ -231,7 +243,8 @@ raises).
 Extra helpers on `Transformer`:
 
 - `init_weights_and_freqs()`: called after `model.to_empty(device=...)`
-  to fill parameter values after meta-device materialization
+  to fill parameter values after meta-device materialization, first
+  tying a tied output head to the embedding again
 - `set_moe_step(step, max_steps)`: forwards the current step to every
   `SigmoidTopKRouter`, each MoT modality's included, for the adaptive
   bias schedule

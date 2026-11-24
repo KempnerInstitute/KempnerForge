@@ -32,7 +32,8 @@ token_dtype          = "uint32"     # .bin dtype; "" reads metadata.yaml, not da
 ```
 
 Every `interval` steps, the training loop pauses the optimizer,
-switches the model to eval mode, iterates `steps` batches of held-out
+switches the model to eval mode (and, under `schedule_free_adamw`, to
+the averaged weights `x`), iterates `steps` batches of held-out
 data, and logs `eval/loss` and `eval/perplexity` through
 [`MetricsTracker.log_eval`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/tracker.py).
 The stdout backend renders one compact line per call:
@@ -40,6 +41,9 @@ The stdout backend renders one compact line per call:
 ```
 2026-11-04 14:03:12.345 [rank 0] INFO     [step 500] eval/loss=3.8200 | eval/perplexity=45.6000
 ```
+
+Each data-parallel rank evaluates `steps` batches of its own share of
+the eval set, and `eval/loss` is the mean over those ranks.
 
 The eval dataloader is a plain `DataLoader` with a `DistributedSampler`
 (not `StatefulDataLoader`). It's deterministic because it doesn't
