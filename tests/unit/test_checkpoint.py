@@ -34,6 +34,7 @@ from kempnerforge.config.schema import (
 )
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.optimizer import Muon, _should_decay, build_optimizer
+from tests.gloo_ranks import gloo_group, spawn
 
 
 class TestRNGState:
@@ -698,6 +699,12 @@ def _mock_dcp_load(monkeypatch):
         "kempnerforge.checkpoint.manager.dcp.FileSystemReader", MagicMock(return_value=reader)
     )
     monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+
+
+def _listing(directory: Path) -> list[str]:
+    """The names in ``directory``, without the ``.nfs*`` entries an NFS client keeps for a
+    replaced or removed file that is still open, until its last reference closes."""
+    return sorted(p.name for p in directory.iterdir() if not p.name.startswith(".nfs"))
 
 
 def _make_mock_mgr(
@@ -1721,7 +1728,12 @@ class TestSaveCheckpointRegistration:
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
         assert len(warnings) == 1 and "<unprintable Unprintable>" in warnings[0]
 
-    def test_record_amends_one_record_atomically_through_a_temp_file(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("nfs_held", [False, True], ids=["local", "nfs-held"])
+    def test_record_amends_one_record_atomically_through_a_temp_file(
+        self, tmp_path, monkeypatch, nfs_held
+    ):
+        """With ``nfs-held`` the replace keeps the old sidecar under a ``.nfs`` name, as an NFS
+        client does while that file is still open; the listing leaves that entry out."""
         _, registrar = self._registered(tmp_path, monkeypatch, {"mlflow": {"model_name": "m"}})
         sidecar = tmp_path / "step_1" / "metadata.json"
         sidecar.chmod(0o640)
@@ -1730,6 +1742,8 @@ class TestSaveCheckpointRegistration:
 
         def spy(src, dst):
             replaced.append((Path(src), Path(dst), Path(src).read_text()))
+            if nfs_held:
+                os.link(dst, Path(dst).with_name(".nfs000000000000000200000002"))
             replace(src, dst)
 
         monkeypatch.setattr(os, "replace", spy)
@@ -1743,7 +1757,7 @@ class TestSaveCheckpointRegistration:
         }
         assert sidecar.read_text() == text == json.dumps(expected, indent=2)
         assert stat.S_IMODE(sidecar.stat().st_mode) == 0o640
-        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+        assert _listing(sidecar.parent) == [
             "metadata.json",
             "train_state.pt",
         ]
@@ -1783,7 +1797,7 @@ class TestSaveCheckpointRegistration:
         warnings = self._log(monkeypatch, "warning")
         registrar.records[0]("mlflow", {"model_id": "m-1"})
         assert sidecar.read_bytes() == before
-        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+        assert _listing(sidecar.parent) == [
             "metadata.json",
             "train_state.pt",
         ]
@@ -1804,7 +1818,7 @@ class TestSaveCheckpointRegistration:
         with pytest.raises(OSError, match="disk full"):
             mgr.save(step=1, tokens_seen=16)
         assert sidecar.read_bytes() == before
-        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+        assert _listing(sidecar.parent) == [
             "metadata.json",
             "train_state.pt",
         ]
@@ -4643,32 +4657,14 @@ class TestResumeWithoutTrainState:
         assert not missing_train_state(path)
 
 
-def _free_port() -> int:
-    """An unused local TCP port for a gloo rendezvous."""
-    import socket
-
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _load_with_a_stale_view(rank: int, world: int, port: int, ckpt_dir: str, stale: int) -> None:
     """Save on every rank, then load while rank ``stale`` cannot see ``train_state.pt``."""
     from datetime import timedelta
     from unittest.mock import patch
 
-    import torch.distributed as dist
-
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         torch.manual_seed(0)
         model = torch.nn.Linear(4, 4)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -4688,8 +4684,6 @@ def _load_with_a_stale_view(rank: int, world: int, port: int, ckpt_dir: str, sta
                     manager.load()
             else:
                 assert manager.load() == (3, 30, {})
-    finally:
-        dist.destroy_process_group()
 
 
 class TestResumeWithoutTrainStateAcrossRanks:
@@ -4698,9 +4692,7 @@ class TestResumeWithoutTrainStateAcrossRanks:
     @pytest.mark.parametrize("stale", [0, 1], ids=["rank_0_sees_none", "rank_1_sees_none"])
     def test_every_rank_follows_rank_zero(self, tmp_path, stale):
         """No rank raises alone and leaves the others waiting in a collective."""
-        import torch.multiprocessing as mp
-
-        mp.spawn(_load_with_a_stale_view, args=(2, _free_port(), str(tmp_path), stale), nprocs=2)
+        spawn(_load_with_a_stale_view, 2, str(tmp_path), stale)
 
 
 class _Unprintable(Exception):
@@ -4724,14 +4716,7 @@ def _load_an_unreadable_train_state(
     from kempnerforge.checkpoint import manager as mgr_mod
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=60),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=60)):
         torch.manual_seed(0)
         model = torch.nn.Linear(4, 4)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -4768,8 +4753,6 @@ def _load_an_unreadable_train_state(
         ):
             manager.load()
         assert time.monotonic() - start < 20
-    finally:
-        dist.destroy_process_group()
 
 
 class TestUnreadableTrainStateAcrossRanks:
@@ -4778,11 +4761,7 @@ class TestUnreadableTrainStateAcrossRanks:
     @pytest.mark.parametrize("how", ["torn", "foreign", "unprintable"])
     def test_every_rank_raises_rank_zeros_error(self, tmp_path, how):
         """Rank 0 raises its own error; rank 1 names it, instead of waiting for the timeout."""
-        import torch.multiprocessing as mp
-
-        mp.spawn(
-            _load_an_unreadable_train_state, args=(2, _free_port(), str(tmp_path), how), nprocs=2
-        )
+        spawn(_load_an_unreadable_train_state, 2, str(tmp_path), how)
 
 
 def _refuse_on_one_stage(
@@ -4795,14 +4774,7 @@ def _refuse_on_one_stage(
 
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         stages = [dist.new_group([r]) for r in range(world)]
 
         def manager(optimizer_name: str) -> tuple[torch.nn.Module, CheckpointManager]:
@@ -4837,8 +4809,6 @@ def _refuse_on_one_stage(
         with pytest.raises(RuntimeError, match=expected):
             loader.load()
         assert torch.equal(model.weight, before), "a refused load changed the model"
-    finally:
-        dist.destroy_process_group()
 
 
 def _resume_with_a_torn_stage(rank: int, world: int, port: int, ckpt_dir: str, case: str) -> None:
@@ -4860,14 +4830,7 @@ def _resume_with_a_torn_stage(rank: int, world: int, port: int, ckpt_dir: str, c
 
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         stages = [dist.new_group([r]) for r in range(world)]
 
         def manager() -> tuple[torch.nn.Module, CheckpointManager]:
@@ -4930,8 +4893,6 @@ def _resume_with_a_torn_stage(rank: int, world: int, port: int, ckpt_dir: str, c
         }.get(case, (10, 100, at_10))
         assert (step, tokens) == expected[:2], f"rank {rank} resumed step {step}"
         assert torch.equal(model.weight, expected[2]), f"rank {rank} loaded another step's weights"
-    finally:
-        dist.destroy_process_group()
 
 
 class TestTornStageAcrossRanks:
@@ -4950,9 +4911,7 @@ class TestTornStageAcrossRanks:
     )
     def test_every_stage_resumes_the_same_step(self, tmp_path, case):
         """No stage loads a step another stage does not, whatever its own view."""
-        import torch.multiprocessing as mp
-
-        mp.spawn(_resume_with_a_torn_stage, args=(2, _free_port(), str(tmp_path), case), nprocs=2)
+        spawn(_resume_with_a_torn_stage, 2, str(tmp_path), case)
 
 
 def _load_with_a_blind_rank(rank: int, world: int, port: int, ckpt_dir: str, case: str) -> None:
@@ -4964,14 +4923,7 @@ def _load_with_a_blind_rank(rank: int, world: int, port: int, ckpt_dir: str, cas
 
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         torch.manual_seed(0)
         model = torch.nn.Linear(4, 4)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -5004,8 +4956,6 @@ def _load_with_a_blind_rank(rank: int, world: int, port: int, ckpt_dir: str, cas
         expected = (0, 0) if case == "weights_only" else (5, 50)
         assert (step, tokens) == expected, f"rank {rank} loaded step {step}"
         assert torch.equal(model.weight, saved), f"rank {rank} did not load the saved weights"
-    finally:
-        dist.destroy_process_group()
 
 
 class TestBlindRankLoadsWhatRankZeroResolves:
@@ -5014,9 +4964,7 @@ class TestBlindRankLoadsWhatRankZeroResolves:
 
     @pytest.mark.parametrize("case", ["warm_start", "weights_only", "named_path", "bare_latest"])
     def test_every_rank_loads_the_checkpoint(self, tmp_path, case):
-        import torch.multiprocessing as mp
-
-        mp.spawn(_load_with_a_blind_rank, args=(2, _free_port(), str(tmp_path), case), nprocs=2)
+        spawn(_load_with_a_blind_rank, 2, str(tmp_path), case)
 
 
 class TestOptimizerChecksAcrossStages:
@@ -5026,17 +4974,11 @@ class TestOptimizerChecksAcrossStages:
     @pytest.mark.parametrize("refusing", [0, 1], ids=["stage_0_refuses", "stage_1_refuses"])
     def test_every_rank_refuses_when_one_stage_does(self, tmp_path, refusing, scope):
         """No rank goes on to load while another has refused, whatever the manager records."""
-        import torch.multiprocessing as mp
-
-        args = (2, _free_port(), str(tmp_path), refusing, scope)
-        mp.spawn(_refuse_on_one_stage, args=args, nprocs=2)
+        spawn(_refuse_on_one_stage, 2, str(tmp_path), refusing, scope)
 
     def test_a_stage_without_saved_optimizer_state_resumes_with_the_others(self, tmp_path):
         """A stage whose checkpoint holds no optimizer state still meets the other stages."""
-        import torch.multiprocessing as mp
-
-        args = (2, _free_port(), str(tmp_path))
-        mp.spawn(_resume_with_one_stage_unstepped, args=args, nprocs=2)
+        spawn(_resume_with_one_stage_unstepped, 2, str(tmp_path))
 
 
 def _resume_with_one_stage_unstepped(rank: int, world: int, port: int, ckpt_dir: str) -> None:
@@ -5051,14 +4993,7 @@ def _resume_with_one_stage_unstepped(rank: int, world: int, port: int, ckpt_dir:
 
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         stages = [dist.new_group([r]) for r in range(world)]
 
         def manager(seed: int, step: bool):
@@ -5090,8 +5025,6 @@ def _resume_with_one_stage_unstepped(rank: int, world: int, port: int, ckpt_dir:
             )
         else:
             assert not resumed_optimizer.state
-    finally:
-        dist.destroy_process_group()
 
 
 def _assert_same_state_dict(expected, actual, where="state_dict"):

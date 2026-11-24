@@ -6,11 +6,19 @@ on:
     paths:
       - "examples/vlm/**"
       - "examples/image_understanding/**"
+      - "kempnerforge/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/ci-example.yml"
   pull_request:
     branches: [main]
     paths:
       - "examples/vlm/**"
       - "examples/image_understanding/**"
+      - "kempnerforge/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/ci-example.yml"
   workflow_dispatch:
 
 permissions:
@@ -18,8 +26,9 @@ permissions:
   pull-requests: read
 
 jobs:
-  # Per-example gate, so touching one example does not run another's tests. Each
-  # new example adds one output + filter here and one job below.
+  # Per-example gate, so touching one example does not run another's tests, while a
+  # change to kempnerforge/, pyproject.toml, uv.lock or this workflow runs them all.
+  # Each new example adds one output + filter here and one job below.
   changes:
     runs-on: ubuntu-latest
     outputs:
@@ -31,9 +40,16 @@ jobs:
         id: filter
         with:
           filters: |
+            core: &core
+              - "kempnerforge/**"
+              - "pyproject.toml"
+              - "uv.lock"
+              - ".github/workflows/ci-example.yml"
             vlm:
+              - *core
               - "examples/vlm/**"
             image_understanding:
+              - *core
               - "examples/image_understanding/**"
 
   vlm-tests:

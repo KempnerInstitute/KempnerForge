@@ -11,7 +11,6 @@ feed ``(B, 3, H, W)`` pixels; video-shaped runs build with ``frames_per_clip = 2
 from __future__ import annotations
 
 import json
-import socket
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Literal
@@ -19,7 +18,6 @@ from typing import Any, Literal
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
 from torch._dynamo.utils import counters
 from torch.distributed._composable.fsdp import FSDPModule
@@ -38,6 +36,7 @@ from kempnerforge.distributed.parallel import (
 )
 from kempnerforge.model.vision import VisionEncoder
 from kempnerforge.model.vlm import VLMWrapper
+from tests.gloo_ranks import gloo_group, spawn
 
 IMAGE_SIZE = 32
 PATCH = 8
@@ -90,12 +89,6 @@ def conv_encoder() -> Iterator[str]:
     registry.register("vision_encoder", CONV, _build_conv)
     yield CONV
     registry._get_store("vision_encoder").pop(CONV)
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 @pytest.fixture(scope="module")
@@ -569,10 +562,7 @@ def _parameter_free_summary(wrapper: VLMWrapper) -> dict[str, Any]:
 
 def _check_fsdp(rank: int, world: int, port: int, out: str) -> None:
     """Build every FSDP2 case on two gloo ranks and write what rank 0 sees to ``out``."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         registry.register("vision_encoder", CONV, _build_conv)
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
         results: dict[str, Any] = {}
@@ -609,14 +599,12 @@ def _check_fsdp(rank: int, world: int, port: int, out: str) -> None:
         }
         if rank == 0:
             Path(out).write_text(json.dumps(results))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.fixture(scope="module")
 def fsdp_results(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     out = tmp_path_factory.mktemp("fsdp_precision") / "results.json"
-    mp.spawn(_check_fsdp, args=(2, _free_port(), str(out)), nprocs=2)
+    spawn(_check_fsdp, 2, str(out))
     return json.loads(out.read_text())
 
 
