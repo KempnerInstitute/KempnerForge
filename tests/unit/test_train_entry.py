@@ -547,19 +547,26 @@ class TestVlmTextTokenGuard:
 
 
 class TestCheckpointExtra:
-    def test_empty_without_phases_or_run_ids(self):
-        assert checkpoint_extra(make_config(), 5, PhaseState()) == {}
+    def test_only_the_plugins_list_without_phases_or_run_ids(self):
+        assert checkpoint_extra(make_config(), 5, PhaseState()) == {"plugins": []}
+
+    def test_records_a_copy_of_the_plugins_list(self):
+        config = make_config()
+        config.plugins = ["pkg.components"]
+        extra = checkpoint_extra(config, 5, PhaseState())
+        assert extra["plugins"] == ["pkg.components"]
+        assert extra["plugins"] is not config.plugins
 
     def test_includes_phase_index_when_phases_configured(self):
         phases = PhaseState(phases=[TrainingPhase(start_step=1)], next_idx=1)
-        assert checkpoint_extra(make_config(), 5, phases) == {"phase_idx": 1}
+        assert checkpoint_extra(make_config(), 5, phases) == {"phase_idx": 1, "plugins": []}
 
     def test_includes_metrics_run_ids(self):
         config = make_config()
         config.metrics.wandb_run_id = "wid"
         config.metrics.mlflow_run_id = "mid"
         extra = checkpoint_extra(config, 5, PhaseState())
-        assert extra == {"wandb_run_id": "wid", "mlflow_run_id": "mid"}
+        assert extra == {"wandb_run_id": "wid", "mlflow_run_id": "mid", "plugins": []}
 
     def test_includes_vlm_freeze_metadata(self, tiny_vlm_configs):
         mc, vision, adapter, vlm = tiny_vlm_configs
@@ -1123,7 +1130,7 @@ class TestNanSkippedStep:
         monkeypatch.setattr(ckpt, "save", save)
         step, tokens_seen = run_training_loop(session)
         assert step == 2
-        assert ckpt.saves == [(2, tokens_seen, {})]
+        assert ckpt.saves == [(2, tokens_seen, {"plugins": []})]
         assert ckpt.waits == 1
         assert epochs == [2]
         assert handler.finished is False
@@ -1165,7 +1172,7 @@ class TestNanSkippedStep:
         monkeypatch.setattr(ckpt, "save", save)
         step, tokens_seen = run_training_loop(session)
         assert step == 2
-        assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1})]
+        assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1, "plugins": []})]
         assert loaders == [session.data.dataloader]
         assert loaders[0] is not None
 
@@ -2719,6 +2726,22 @@ class TestRestoreCheckpoint:
         assert config.metrics.wandb_run_id == "W1"
         assert config.metrics.mlflow_run_id == "M1"
         assert config.metrics.mlflow_tags == {}
+
+    @pytest.mark.parametrize("load_path", [False, True], ids=["resume", "warm_start"])
+    def test_the_load_compares_the_runs_plugins_list(self, monkeypatch, tmp_path, load_path):
+        """restore_checkpoint hands the manager a copy of the run's plugins list to compare
+        before it reads any state."""
+        import kempnerforge.training.entry as entry
+
+        resume = None if load_path else tmp_path / "step_7"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: resume)
+        config = make_config()
+        config.plugins = ["pkg.big"]
+        config.checkpoint.load_path = str(tmp_path / "step_7") if load_path else None
+        mgr = FakeResumeManager()
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.load_kwargs["plugins_expected"] == ["pkg.big"]
+        assert mgr.load_kwargs["plugins_expected"] is not config.plugins
 
     def test_absent_run_ids_do_not_clobber_existing_ones(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
@@ -5451,8 +5474,8 @@ class TestFreezeStageFence:
         monkeypatch.setattr(session.checkpointer, "save", save)
         run_training_loop(session)
         assert order == ["flush", "freeze", "save"]
-        meta = freeze_meta_at_step(2, session.config.vlm)
-        assert saved == [(2, {"documents_seen": 2, "vlm_freeze": meta})]
+        freeze = freeze_meta_at_step(2, session.config.vlm)
+        assert saved == [(2, {"plugins": [], "documents_seen": 2, "vlm_freeze": freeze})]
 
 
 class TestBatchStreamGuard:

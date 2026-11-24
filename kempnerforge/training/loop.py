@@ -687,10 +687,12 @@ def checkpoint_extra(
     """Metadata saved alongside every checkpoint so a resume is exact.
 
     ``vlm_freeze`` reflects the post-transition state when a FreezeStage
-    has fired (see ``freeze_meta_at_step``). ``documents_seen``, when given,
-    is saved for the resumed run to count on from.
+    has fired (see ``freeze_meta_at_step``). ``plugins`` is the run's plugins
+    list, which a resume compares with its own (see ``restore_checkpoint``).
+    ``documents_seen``, when given, is saved for the resumed run to count on from.
     """
     extra: dict = {"phase_idx": phases.next_idx} if phases.phases else {}
+    extra["plugins"] = list(config.plugins)
     if documents_seen is not None:
         extra["documents_seen"] = documents_seen
     if config.metrics.wandb_run_id:

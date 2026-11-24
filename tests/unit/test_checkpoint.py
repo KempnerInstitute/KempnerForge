@@ -700,7 +700,9 @@ def _mock_dcp_load(monkeypatch):
     monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
 
 
-def _make_mock_mgr(tmp_path, monkeypatch, *, ignore_freeze_mismatch=False):
+def _make_mock_mgr(
+    tmp_path, monkeypatch, *, ignore_freeze_mismatch=False, ignore_plugins_mismatch=False
+):
     """Build a CheckpointManager with DCP calls mocked out (no distributed)."""
     from unittest.mock import MagicMock
 
@@ -709,7 +711,10 @@ def _make_mock_mgr(tmp_path, monkeypatch, *, ignore_freeze_mismatch=False):
     model = torch.nn.Linear(4, 4)
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
     config = CheckpointConfig(
-        dir=str(tmp_path), keep_last_n=5, ignore_freeze_mismatch=ignore_freeze_mismatch
+        dir=str(tmp_path),
+        keep_last_n=5,
+        ignore_freeze_mismatch=ignore_freeze_mismatch,
+        ignore_plugins_mismatch=ignore_plugins_mismatch,
     )
     mgr = CheckpointManager(config, model, opt)
     monkeypatch.setattr(mgr._async_ckpt, "save", MagicMock())
@@ -2154,6 +2159,160 @@ class TestLoadVLMFreezeCompare:
             mgr2.load(path=str(tmp_path / "step_1"), vlm_freeze_expected=mismatched)
         assert "cross-arch" in str(exc_info.value)
         assert "future_arch" in str(exc_info.value)
+
+
+def _manager_warnings(call):
+    """Run ``call`` and return its result and the warnings the checkpoint manager logged."""
+    import logging
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    target = logging.getLogger("kempnerforge.checkpoint.manager")
+    capture = _Capture(level=logging.WARNING)
+    target.addHandler(capture)
+    try:
+        result = call()
+    finally:
+        target.removeHandler(capture)
+    return result, [record.getMessage() for record in records]
+
+
+class TestPluginsRecord:
+    """The plugins list is recorded in metadata.json and compared before any state is read."""
+
+    @staticmethod
+    def _saved(tmp_path, monkeypatch, plugins):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=1, extra=None if plugins is None else {"plugins": plugins})
+        return tmp_path / "step_1"
+
+    def test_save_records_the_plugins_list(self, tmp_path, monkeypatch):
+        path = self._saved(tmp_path, monkeypatch, ["pkg.a"])
+        assert json.loads((path / "metadata.json").read_text())["plugins"] == ["pkg.a"]
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [([], ["pkg.big"]), (["pkg.big"], []), (["pkg.a", "pkg.b"], ["pkg.b", "pkg.a"])],
+        ids=["added", "removed", "reordered"],
+    )
+    def test_another_list_is_refused_before_any_state_is_read(
+        self, tmp_path, monkeypatch, saved, current
+    ):
+        """A plugin can register a component the model is built from, or override another's
+        names, so the lists compare in order, and the refusal comes before DCP reads."""
+        from kempnerforge.checkpoint import manager as mgr_mod
+
+        path = self._saved(tmp_path, monkeypatch, saved)
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match=r"was saved with plugins = .*\. Set plugins as"):
+            mgr.load(path=str(path), plugins_expected=current)
+        mgr_mod.dcp.FileSystemReader.assert_not_called()
+        mgr_mod.dcp.load.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [
+            ([], []),
+            (["pkg.a"], ["pkg.a", "pkg.a"]),
+            (["pkg.a", "pkg.b", "pkg.a"], ["pkg.a", "pkg.b"]),
+        ],
+        ids=["empty", "repeated", "repeat-saved"],
+    )
+    def test_the_same_modules_in_the_same_order_load(self, tmp_path, monkeypatch, saved, current):
+        """A module listed again is imported once, so a repeat does not change the list."""
+        path = self._saved(tmp_path, monkeypatch, saved)
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        assert mgr.load(path=str(path), plugins_expected=current)[0] == 1
+
+    @pytest.mark.parametrize(
+        ("record", "reason"),
+        [
+            (None, "records no plugins list"),
+            ("pkg.a", "records plugins = 'pkg.a'"),
+            ("unreadable", "cannot read"),
+        ],
+        ids=["none", "invalid", "unreadable"],
+    )
+    def test_a_checkpoint_without_a_valid_record_loads_with_one_warning(
+        self, tmp_path, monkeypatch, record, reason
+    ):
+        """A missing, invalid or unreadable record is not compared, and rank 0 alone warns,
+        once."""
+        path = self._saved(tmp_path, monkeypatch, None)
+        meta_path = path / "metadata.json"
+        if record == "unreadable":
+            meta_path.write_text("{")
+        elif record is not None:
+            meta_path.write_text(
+                json.dumps({**json.loads(meta_path.read_text()), "plugins": record})
+            )
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        (step, _, _), warnings = _manager_warnings(
+            lambda: mgr.load(path=str(path), plugins_expected=["pkg.a"])
+        )
+        assert step == 1
+        skipped = [w for w in warnings if "is not compared" in w]
+        assert len(skipped) == 1 and reason in skipped[0]
+        mgr._rank = 1
+        _, quiet = _manager_warnings(
+            lambda: mgr._check_plugins(mgr._broadcast_metadata(path), path, ["pkg.a"])
+        )
+        assert quiet == []
+
+    def test_ignore_plugins_mismatch_loads_with_a_warning(self, tmp_path, monkeypatch):
+        path = self._saved(tmp_path, monkeypatch, ["pkg.big"])
+        mgr = _make_mock_mgr(tmp_path, monkeypatch, ignore_plugins_mismatch=True)
+        (step, _, _), warnings = _manager_warnings(
+            lambda: mgr.load(path=str(path), plugins_expected=[])
+        )
+        assert step == 1
+        assert any("checkpoint.ignore_plugins_mismatch is set" in w for w in warnings)
+
+    @pytest.mark.parametrize("expected", [None, ["pkg.other"]], ids=["not-given", "weights-only"])
+    def test_no_list_or_a_weights_only_load_is_not_compared(self, tmp_path, monkeypatch, expected):
+        path = self._saved(tmp_path, monkeypatch, ["pkg.big"])
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        exclude = ["optimizer", "train_state"] if expected is not None else None
+        _, warnings = _manager_warnings(
+            lambda: mgr.load(path=str(path), exclude_keys=exclude, plugins_expected=expected)
+        )
+        assert not any("plugins" in w for w in warnings)
+
+    def test_every_rank_decides_from_rank_zeros_read(self, tmp_path, monkeypatch):
+        """A rank other than 0 does not read metadata.json: it refuses from the record rank 0
+        broadcast, and under ignore_plugins_mismatch it goes on without a warning of its own."""
+        from kempnerforge.checkpoint import manager as mgr_mod
+
+        path = self._saved(tmp_path, monkeypatch, ["pkg.big"])
+        record = (json.loads((path / "metadata.json").read_text()), None)
+
+        def broadcast(objects, src):
+            if isinstance(objects[0], dict) and objects[0].keys() == {"dir", "error"}:
+                objects[0] = {"dir": str(path.resolve()), "error": None}
+            else:
+                objects[0] = record
+
+        reads = []
+
+        def unread(ckpt_dir):
+            reads.append(ckpt_dir)
+            raise AssertionError("only rank 0 reads metadata.json")
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        quiet = _make_mock_mgr(tmp_path, monkeypatch, ignore_plugins_mismatch=True)
+        mgr._rank = quiet._rank = 1
+        monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(mgr_mod.dist, "broadcast_object_list", broadcast)
+        monkeypatch.setattr(mgr_mod, "_read_metadata", unread)
+        with pytest.raises(ValueError, match="was saved with plugins"):
+            mgr.load(path=str(path), plugins_expected=[])
+        assert reads == []
+        _, warnings = _manager_warnings(lambda: quiet._check_plugins(record, path, []))
+        assert warnings == []
 
 
 class TestAsyncLatestSymlinkSafety:
@@ -4990,9 +5149,8 @@ class TestScheduleFreeCheckpoint:
 
 class TestComponentSwapOnResume:
     def test_resume_into_a_different_component_is_rejected(self, tmp_path):
-        """The `plugins` list is not recorded in the checkpoint, so a resume
-        that builds a different component must fail the load rather than train
-        on a silently mismatched model."""
+        """A resume that builds a component with other parameter names fails the load
+        rather than training a mismatched model."""
         import pytest
         from torch.distributed.checkpoint.api import CheckpointException
 
@@ -5009,6 +5167,72 @@ class TestComponentSwapOnResume:
         opt2 = build_optimizer(resumed, OptimizerConfig(lr=1e-3, fused=False))
         with pytest.raises(CheckpointException, match="Missing key in checkpoint"):
             CheckpointManager(CheckpointConfig(dir=ckpt_dir), resumed, opt2).load()
+
+    def test_resume_into_a_subset_component_is_refused_by_the_plugins_list(
+        self, tmp_path, monkeypatch
+    ):
+        """A component whose parameter names are a subset of the saved ones loads silently,
+        so a resume with another plugins list is refused (#180)."""
+        import pytest
+
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.schema import JobConfig
+
+        class Big(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj1 = torch.nn.Linear(8, 8)
+                self.proj2 = torch.nn.Linear(8, 4)
+
+        class Small(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj1 = torch.nn.Linear(8, 8)
+
+        config = JobConfig(checkpoint=CheckpointConfig(dir=str(tmp_path / "ckpt")))
+        big = Big()
+        manager = CheckpointManager(config.checkpoint, big, torch.optim.AdamW(big.parameters()))
+        manager.save(step=7, extra={"plugins": ["pkg.big_components"]})
+        manager.wait()
+
+        small = Small()
+        resumed = CheckpointManager(config.checkpoint, small, torch.optim.AdamW(small.parameters()))
+        assert resumed.load()[0] == 7
+        with pytest.raises(ValueError, match="saved with plugins"):
+            entry.restore_checkpoint(config, small, None, resumed)
+        config.plugins = ["pkg.big_components"]
+        assert entry.restore_checkpoint(config, small, None, resumed) == (7, 0)
+
+    def test_resume_into_a_superset_component_is_refused_before_dcp_reads_it(self, tmp_path):
+        """DCP fails on a parameter the checkpoint lacks, so the plugins list is compared
+        first and the refusal names the lists instead of a missing key."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.schema import JobConfig
+
+        class Big(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj1 = torch.nn.Linear(8, 8)
+                self.proj2 = torch.nn.Linear(8, 4)
+
+        class Small(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj1 = torch.nn.Linear(8, 8)
+
+        config = JobConfig(checkpoint=CheckpointConfig(dir=str(tmp_path / "ckpt")))
+        small = Small()
+        manager = CheckpointManager(config.checkpoint, small, torch.optim.AdamW(small.parameters()))
+        manager.save(step=7, extra={"plugins": []})
+        manager.wait()
+
+        big = Big()
+        resumed = CheckpointManager(config.checkpoint, big, torch.optim.AdamW(big.parameters()))
+        config.plugins = ["pkg.big_components"]
+        with pytest.raises(ValueError, match=r"saved with plugins = \[\], but this run sets"):
+            entry.restore_checkpoint(config, big, None, resumed)
 
 
 WEIGHT_DECAY = 0.5

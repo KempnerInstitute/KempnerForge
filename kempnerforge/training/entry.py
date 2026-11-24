@@ -387,6 +387,9 @@ def restore_checkpoint(
     each enabled tracking backend opens a run of its own unless ``metrics.mlflow_run_id`` or
     ``metrics.wandb_run_id`` names one, and with MLflow on, rank 0 tags the new run with the
     checkpoint and the MLflow run that saved it (``_tag_warm_start_run``).
+
+    A checkpoint saved with another ``plugins`` list is refused before any state is read
+    (see ``CheckpointManager.load``'s ``plugins_expected``).
     """
     num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
@@ -424,6 +427,7 @@ def restore_checkpoint(
             vlm_freeze_expected=vlm_freeze_expected,
             fresh_if_unheld=unfrozen_later,
             exact_resume=resume_path is not None,
+            plugins_expected=list(config.plugins),
         )
     if resume_path is not None:
         if ckpt_extra_loaded.get("wandb_run_id"):
