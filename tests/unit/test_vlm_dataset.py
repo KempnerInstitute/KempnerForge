@@ -764,6 +764,14 @@ class TestVLMCollator:
             sample["pixel_values"] = torch.randn(5, 3, 32, 32)
         assert collator(samples)["pixel_values"].shape == (4, 5, 3, 32, 32)
 
+    def test_text_len_counts_each_rows_real_tokens(self):
+        """A sample's text_len, at most max_text_len; its length without one."""
+        collator = VLMCollator(pad_id=0, max_text_len=20)
+        short, long_, bare = self._sample(5), self._sample(20), self._sample(7)
+        short["text_len"] = torch.tensor(5)
+        long_["text_len"] = torch.tensor(30)
+        assert collator([short, long_, bare])["text_len"].tolist() == [5, 20, 20]
+
     def test_empty_batch_raises(self):
         collator = VLMCollator(pad_id=0, max_text_len=8)
         with pytest.raises(ValueError, match="empty batch"):
@@ -1053,6 +1061,70 @@ class TestTextOnlyRows:
     def test_a_list_of_nothing_is_text_only(self):
         ds = _dataset_over([{"image": [None, None], "caption": "a b"}])
         assert ds[0]["pixel_values"].shape == (0, 3, 16, 16)
+
+    def test_a_blank_image_entry_is_text_only(self):
+        """A stored struct whose fields are all null holds no image to decode."""
+        ds = _dataset_over([{"image": {"bytes": None, "path": None}, "caption": "a b"}])
+        assert ds[0]["pixel_values"].shape == (0, 3, 16, 16)
+
+    def test_a_blank_entry_beside_an_image_is_skipped(self):
+        blank = {"bytes": None, "path": None}
+        ds = _dataset_over([{"image": [blank, _make_image(8)], "caption": "a b"}], max_images=2)
+        assert ds[0]["pixel_values"].shape == (1, 3, 16, 16)
+
+    @pytest.mark.parametrize("as_list", [False, True])
+    def test_a_blank_entry_from_parquet_trains_as_text_only(self, tmp_path, monkeypatch, as_list):
+        """load_dataset keeps a blank entry of a parquet file. Its row is read without an
+        image, as it was counted, instead of failing in the Image feature."""
+        import io
+
+        import datasets
+        import pyarrow as pa
+        from datasets import Dataset, Features, Sequence, Value
+
+        buf = io.BytesIO()
+        _make_image(8).save(buf, format="PNG")
+        struct = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
+        real, blank = {"bytes": buf.getvalue(), "path": None}, {"bytes": None, "path": None}
+        if as_list:
+            image = pa.array([[real], [blank, real], [blank]], pa.list_(struct))
+            feature = Sequence(datasets.Image())
+        else:
+            image = pa.array([real, real, blank], struct)
+            feature = datasets.Image()
+        table = pa.table({"image": image, "caption": ["a photo", "a photo", "no photo"]})
+        features = Features({"image": feature, "caption": Value("string")})
+        path = str(tmp_path / "train.parquet")
+        Dataset(table).cast(features).to_parquet(path)
+        hub = datasets.load_dataset("parquet", data_files=path, split="train")
+        stored = hub.with_format("arrow")[:].column("image").to_pylist()[2]
+        assert stored == ([blank] if as_list else blank)
+        monkeypatch.setattr(datasets, "load_dataset", lambda *args, **kwargs: hub)
+        ds = HuggingFaceVLMDataset("some-org/some-dataset", max_text_len=8, **self._LOAD)
+        assert len(ds) == 3
+        assert ds.has_text_only_rows
+        assert [tuple(ds[i]["pixel_values"].shape) for i in range(3)] == [
+            (3, 224, 224),
+            (3, 224, 224),
+            (0, 3, 224, 224),
+        ]
+
+    def test_reading_and_counting_agree_on_every_entry(self):
+        """Each row yields as many images as _images_per_row counts for it."""
+        import pyarrow as pa
+        from datasets import Dataset
+
+        struct = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
+        real, blank = {"bytes": b"x", "path": None}, {"bytes": None, "path": None}
+        by_path = {"bytes": None, "path": "a.png"}
+        singles = pa.array([real, blank, None, by_path], struct)
+        lists = pa.array(
+            [[real, blank], [blank, None], [], None, [by_path, real, blank]], pa.list_(struct)
+        )
+        for column in (singles, lists):
+            rows = Dataset(pa.table({"image": column}))
+            read = [len(vlm_dataset._images_of(value)) for value in column.to_pylist()]
+            assert read == vlm_dataset._images_per_row(rows, "image").tolist()
 
     _LOAD = dict(split="train", image_field="image", text_field="caption", tokenizer_path="gpt2")
 

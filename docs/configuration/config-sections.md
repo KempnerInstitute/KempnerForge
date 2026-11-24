@@ -36,11 +36,11 @@ Owns the ten sub-configs and the cross-section `validate` method.
 | `checkpoint` | `CheckpointConfig` | DCP save cadence, retention, resume path |
 | `metrics` | `MetricsConfig` | logging cadence and backends |
 | `profiling` | `ProfilingConfig` | torch.profiler window and trace dir |
-| `plugins` | `list[str]` | module paths imported before the config is built, for their registry side effects — see [Registry](registry.md) |
+| `plugins` | `list[str]` | module paths imported before the config is built, for their registry side effects; see [Registry](registry.md) |
 
 `plugins` is a top-level key, not a section: `plugins = ["pkg.module"]`.
 
-## `[model]` — `ModelConfig`
+## `[model]`: `ModelConfig`
 
 Architecture hyperparameters and MoE knobs.
 [`kempnerforge/config/model.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/model.py).
@@ -57,16 +57,16 @@ Architecture hyperparameters and MoE knobs.
 | `vocab_size` | `int` | `32000` | embedding table size |
 | `ffn_dim_multiplier` | `float` | `1.0` | scales Llama-style `4·dim·(2/3)` hidden width |
 | `ffn_hidden_dim` | `int \| None` | `None` | hard-override the computed FFN width |
-| `norm_type` | `"rmsnorm" \| "layernorm"` | `"rmsnorm"` | registry key for norm builder |
+| `norm_type` | `"rmsnorm" \| "layernorm"` or a registered `norm` name | `"rmsnorm"` | registry key for norm builder |
 | `norm_eps` | `float` | `1e-5` | norm epsilon |
-| `activation` | `"silu" \| "gelu" \| "relu"` | `"silu"` | MLP activation (`silu` → SwiGLU) |
+| `activation` | `"silu" \| "gelu" \| "relu"` or a plugin's registered `mlp` name | `"silu"` | MLP activation (`silu` → SwiGLU); a plugin's `mlp` name selects that builder, but not with `num_experts > 0`; core's `swiglu`, `standard_gelu` and `standard_relu` are rejected in favor of `silu`, `gelu` and `relu` |
 | `max_seq_len` | `int` | `2048` | RoPE table length; `train.seq_len` must be ≤ this |
 | `rope_theta` | `float` | `10000.0` | RoPE frequency base |
 | `tie_embeddings` | `bool` | `False` | share embedding and output-head weight |
 | `qk_norm` | `bool` | `False` | RMSNorm over Q/K per head before RoPE |
 | `init_std` | `float` | `0.02` | weight-init std (GPT-2 / Llama convention) |
 | `model_type` | `str` | `"transformer"` | `model` registry key |
-| `sdpa_backend` | `str` | `"auto"` | one of `"auto"`, `"flash"`, `"efficient"`, `"cudnn"`, `"math"` |
+| `sdpa_backend` | `str` | `"auto"` | one of `"auto"`, `"flash"`, `"efficient"`, `"cudnn"`, `"math"`; `"flash"` takes no attention mask on CUDA, so training runs that build one are refused (see [Validation rules](validation-rules.md#flash-attention-and-masked-runs)) |
 | `attention_backend` | `str` | `"sdpa"` | `"sdpa"` or `"flex"`; `"flex"` routes packed batches (`data.pack_sequences`) through FlexAttention's block-sparse mask. Requires `train.seq_len ≥ 128` and `head_dim ≥ 16` |
 
 ### MoE (all defaults produce a dense model)
@@ -79,7 +79,7 @@ Architecture hyperparameters and MoE knobs.
 | `moe_router` | `str` | `"softmax_topk"` | `router` registry key |
 | `moe_shared_experts` | `int` | `0` | shared experts that always process every token |
 | `moe_aux_loss_weight` | `float` | `0.01` | coefficient in training loss |
-| `moe_capacity_factor` | `float` | `0.0` | `0` → no drop; `>0` → cap tokens/expert (typical `1.25`) |
+| `moe_capacity_factor` | `float` | `0.0` | `0` → no drop; `>0` → cap the routes per expert across its top-`k` slots (typical `1.25`) |
 | `moe_sequence_aux_loss_weight` | `float` | `0.0` | sequence-level balance loss (0 = off) |
 | `moe_gradient_scale` | `bool` | `False` | per-expert gradient normalization |
 | `moe_bias_schedule` | `str` | `"constant"` | `"constant"`, `"cosine_decay"`, `"linear_warmup"` |
@@ -88,9 +88,9 @@ Architecture hyperparameters and MoE knobs.
 | `moe_router_z_loss_weight` | `float` | `0.0` | router-logit z-loss coefficient (`0` = off) |
 
 Computed properties: `is_moe`, `head_dim`, `computed_ffn_hidden_dim`,
-`computed_expert_ffn_hidden_dim`, `num_params_estimate`.
+`computed_expert_ffn_hidden_dim`, `mlp_matrices`, `num_params_estimate`.
 
-## `[train]` — `TrainConfig`
+## `[train]`: `TrainConfig`
 
 Training-loop hyperparameters.
 [`kempnerforge/config/training.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/training.py).
@@ -106,20 +106,20 @@ Training-loop hyperparameters.
 | `data_seed` | `int \| None` | `None` | RNG seed for data and batch order; `None` → falls back to `seed` |
 | `compile_model` | `bool` | `True` | wrap the model with `torch.compile` |
 | `mixed_precision` | `"bf16" \| "fp32" \| "fp8"` | `"bf16"` | compute dtype, and the master-weight dtype unless `fp32_master_weights` is set; `"fp8"` computes in fp8, with bf16 masters unless `fp32_master_weights` is set; `"fp16"` is rejected (no loss scaling) |
-| `fp32_master_weights` | `bool` | `False` | keep parameters, gradients and optimizer state in fp32 and compute in `param_dtype` through FSDP2's mixed precision; without an FSDP2 wrap (1 GPU, a pp-only mesh) the forward runs under `torch.autocast`; rejected with `mixed_precision = "fp32"`, and for MoE on a single GPU — see [FSDP2 § fp32 master weights](../distributed/fsdp2.md#fp32-master-weights) |
+| `fp32_master_weights` | `bool` | `False` | keep parameters, gradients and optimizer state in fp32 and compute in `param_dtype` through FSDP2's mixed precision; without an FSDP2 wrap (1 GPU, a pp-only mesh) the forward runs under `torch.autocast`; rejected with `mixed_precision = "fp32"`, and for MoE on a single GPU; see [FSDP2 § fp32 master weights](../distributed/fsdp2.md#fp32-master-weights) |
 | `tf32` | `bool` | `False` | run fp32 matmuls (a frozen fp32 vision encoder, `mixed_precision = "fp32"`) on TF32 tensor cores via `torch.set_float32_matmul_precision("high")`, applied at startup by training and `scripts/eval.py`; this also covers the matmuls that run in fp32 on purpose in a bf16 run, so Muon's Newton–Schulz step moves to TF32 (still more precise than the bf16 that `torch.optim.Muon` uses); `False` leaves torch's setting as it is |
 | `activation_checkpointing` | `"none" \| "full" \| "selective"` | `"none"` | AC policy |
 | `loss_fn` | `str` | `"cross_entropy"` | `loss` registry key (or `"chunked_cross_entropy"`) |
 | `z_loss_weight` | `float` | `0.0` | logit-magnitude regularizer (PaLM uses `1e-4`) |
 | `ce_chunk_size` | `int` | `0` | chunk size for `chunked_cross_entropy` (`0` → auto 4096) |
-| `fp32_cross_entropy` | `bool` | `False` | compute `cross_entropy` / `chunked_cross_entropy` and their gradient in fp32 from bf16 logits, without an fp32 copy of the logits; rejected for any other `loss_fn` — see [Losses § fp32 cross-entropy](../training/losses.md#fp32-cross-entropy) |
+| `fp32_cross_entropy` | `bool` | `False` | compute `cross_entropy` / `chunked_cross_entropy` and their gradient in fp32 from bf16 logits, without an fp32 copy of the logits; rejected for any other `loss_fn`; see [Losses § fp32 cross-entropy](../training/losses.md#fp32-cross-entropy) |
 | `shutdown_timeout_sec` | `float` | `600.0` | seconds a rank has, from the start of its shutdown (the signal, or for a rank the vote stops, the vote), to finish the step in flight, write and flush the emergency checkpoint and tear down, before a forced exit (`0` = disabled); under SLURM it fires first only if shorter than the signal lead |
 | `nccl_health_check_interval` | `int` | `0` | NCCL liveness all-reduce every N steps (`0` = disabled) |
 
 Computed properties: `param_dtype` (compute dtype), `master_dtype` (storage dtype: fp32 with
 `fp32_master_weights`, otherwise `param_dtype`), `is_fp8`.
 
-## `[optimizer]` — `OptimizerConfig`
+## `[optimizer]`: `OptimizerConfig`
 
 Optimizer settings. `name` picks the registry builder; the other fields
 are shared (AdamW/Lion) or optimizer-specific.
@@ -144,14 +144,14 @@ are shared (AdamW/Lion) or optimizer-specific.
 | `weight_decay_scope` | `"exclude_norms_and_biases" \| "all"` | `"exclude_norms_and_biases"` | which parameters are decayed; `"all"` decays every parameter, as `torch.optim.AdamW` does by default. A resume that restores optimizer state saved under the other scope is refused |
 | `lr_multipliers` | `dict[str, float]` | `{}` | per-module learning rates: each `vlm.module_patterns` module listed trains at `lr` times its multiplier, in its own param groups (see [Optimizers § Per-module learning rates](../training/optimizers.md#per-module-learning-rates)). A resume that restores optimizer or scheduler state saved with other multipliers, or other patterns for their modules, is refused |
 
-## `[scheduler]` — `SchedulerConfig`
+## `[scheduler]`: `SchedulerConfig`
 
 LR schedule shape and warmup.
 [`kempnerforge/config/scheduler.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/scheduler.py).
 
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
-| `name` | `"cosine" \| "linear" \| "wsd" \| "constant" \| "rex" \| "none"` | `"cosine"` | `scheduler` registry key |
+| `name` | `"cosine" \| "linear" \| "wsd" \| "constant" \| "rex" \| "none"` or a registered `scheduler` name | `"cosine"` | `scheduler` registry key |
 | `warmup_steps` | `int` | `2000` | linear warmup length |
 | `warmup_start_factor` | `float` | `0.0` | LR factor the warmup starts from (torch `LinearLR` `start_factor`) |
 | `decay_steps` | `int \| None` | `None` | `None` → decay over remaining steps |
@@ -160,7 +160,7 @@ LR schedule shape and warmup.
 | `wsd_decay_type` | `"cosine" \| "linear" \| "sqrt"` | `"cosine"` | WSD cooldown shape |
 | `rex_alpha` | `float` | `1.0` | REX exponent: `(1 - t/T)^alpha` |
 
-## `[data]` — `DataConfig`
+## `[data]`: `DataConfig`
 
 Single dataset, HuggingFace source, or mixture; optional phase schedule.
 [`kempnerforge/config/data.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/data.py).
@@ -214,7 +214,7 @@ Either `path` or `hf_name` must be set per source.
 `phases[*].start_step` must be strictly increasing; `phases` and
 `anneal_start_step` are mutually exclusive.
 
-## `[eval]` — `EvalConfig`
+## `[eval]`: `EvalConfig`
 
 In-loop evaluation. Disabled by default.
 [`kempnerforge/config/eval.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/eval.py).
@@ -234,7 +234,7 @@ In-loop evaluation. Disabled by default.
 If `enabled=True`, at least one of `dataset_path` / `hf_dataset_name`
 must be set; `validate()` rejects the combination otherwise.
 
-## `[distributed]` — `DistributedConfig`
+## `[distributed]`: `DistributedConfig`
 
 Parallelism dimensions and NCCL settings.
 [`kempnerforge/config/distributed.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/distributed.py).
@@ -248,13 +248,13 @@ Parallelism dimensions and NCCL settings.
 | `pp_schedule` | `"1f1b" \| "gpipe" \| "interleaved_1f1b"` | `"1f1b"` | pipeline schedule |
 | `cp` | `int` | `1` | context parallel; reserved, not implemented, must be `1` (`cp > 1` is rejected at load) |
 | `ep` | `int` | `1` | expert parallel (MoE only) |
-| `nccl_timeout_sec` | `int` | `1800` | NCCL collective timeout |
+| `nccl_timeout_sec` | `int` | `1800` | Collective timeout, in seconds, of the default process group and every mesh group |
 | `backend` | `str` | `"cpu:gloo,cuda:nccl"` | `torch.distributed` backend mapping |
 
 The product `dp_replicate × dp_shard × tp × pp × cp × ep` must equal
 `world_size`. Methods: `validate_world_size(ws)`, `resolve(ws)`.
 
-## `[checkpoint]` — `CheckpointConfig`
+## `[checkpoint]`: `CheckpointConfig`
 
 DCP-based checkpointing.
 [`kempnerforge/config/checkpoint.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/checkpoint.py).
@@ -263,7 +263,7 @@ DCP-based checkpointing.
 |-------|------|---------|---------|
 | `dir` | `str` | `"checkpoints"` | root directory for `step_N/` + `latest` symlink |
 | `interval` | `int` | `1000` | save every N steps (outside any `dyn_ckpt_window`) |
-| `dyn_ckpt_window` | `DynamicCheckpointWindow \| None` | `None` | optional dense save phase — see [`[checkpoint.dyn_ckpt_window]`](#checkpointdyn_ckpt_window--dynamiccheckpointwindow) |
+| `dyn_ckpt_window` | `DynamicCheckpointWindow \| None` | `None` | optional dense save phase; see [`[checkpoint.dyn_ckpt_window]`](#checkpointdyn_ckpt_window-dynamiccheckpointwindow) |
 | `async_mode` | `"disabled" \| "async" \| "async_with_pinned_mem"` | `"disabled"` | DCP async-save mode |
 | `keep_last_n` | `int` | `3` | retain the most recent N checkpoints (`<= 0` keeps all); steps saved by `dyn_ckpt_window` are always kept |
 | `load_path` | `str \| None` | `None` | checkpoint for training to start from while `dir` holds none (a warm start); once `dir` has a checkpoint, auto-resume loads that instead and rank 0 warns that `load_path` is not used, unless it names that checkpoint. `scripts/eval.py` and `scripts/generate.py` load `load_path` first |
@@ -272,12 +272,12 @@ DCP-based checkpointing.
 | `ignore_freeze_mismatch` | `bool` | `False` | load a checkpoint whose VLM freeze metadata disagrees with the configured freeze specs, downgrading the error to a warning |
 | `ignore_rank_state_mismatch` | `bool` | `False` | resume when the saved per-rank dataloader/RNG state does not fit this run (changed world size or data-parallel layout, unreadable or incomplete envelope): discard that state on every rank with a warning instead of raising, so data order and random streams restart fresh while step, model, optimizer and scheduler continue (see [Resharding](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)) |
 
-### `[checkpoint.dyn_ckpt_window]` — `DynamicCheckpointWindow`
+### `[checkpoint.dyn_ckpt_window]`: `DynamicCheckpointWindow`
 
 Opt-in dense save phase. Inside `[start, stop]` a registered strategy decides
 which steps to save; outside the window the regular `interval` cadence applies.
 Steps saved by the strategy are exempt from `keep_last_n` retention, so a
-finite `keep_last_n` rotates only the later interval checkpoints — the dense
+finite `keep_last_n` rotates only the later interval checkpoints; the dense
 window checkpoints are never pruned. Useful for inspecting early-training
 dynamics at fine granularity.
 
@@ -290,7 +290,7 @@ dynamics at fine granularity.
 Example TOML:
 
 ```toml
-# Off by default — interval cadence only:
+# Off by default, interval cadence only:
 [checkpoint]
 interval = 1000
 keep_last_n = 3
@@ -312,7 +312,7 @@ A strategy is a `Callable[[DynamicCheckpointWindow, int], bool]` registered via
 [`kempnerforge/config/registry.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/registry.py)).
 The strategy receives the window and the current training step and returns
 `True` iff the step should be saved. The registry must be populated before
-config load — either by `kempnerforge` itself (the default `"power2"` is
+config load, either by `kempnerforge` itself (the default `"power2"` is
 registered in `kempnerforge/config/checkpoint.py`) or by an explicit `import`
 of the user's module.
 
@@ -320,7 +320,7 @@ of the user's module.
 |------|----------|
 | `"power2"` (default) | save at `start` and at every `start + 2^k` while `<= stop` (offset-based powers of two; tight near `start`, doubling thereafter) |
 
-## `[metrics]` — `MetricsConfig`
+## `[metrics]`: `MetricsConfig`
 
 Logging cadence and backend toggles. The backends are independent, so any combination can be
 enabled in one run config.
@@ -349,7 +349,7 @@ enabled in one run config.
 Credentials never go in config. The auth routes, the URI and experiment resolution, and the
 bounds on tracking calls are on the [MLflow backend](../metrics-and-profiling/mlflow.md) page.
 
-## `[profiling]` — `ProfilingConfig`
+## `[profiling]`: `ProfilingConfig`
 
 `torch.profiler` window.
 [`kempnerforge/config/profiling.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/profiling.py).
@@ -423,10 +423,10 @@ command line.
 
 ## Where to read next
 
-- [CLI overrides](cli-overrides.md) — reshape any of these fields from
+- [CLI overrides](cli-overrides.md): reshape any of these fields from
   the command line.
-- [Validation rules](validation-rules.md) — what `__post_init__` and
+- [Validation rules](validation-rules.md): what `__post_init__` and
   `validate(world_size)` enforce.
-- [Registry](registry.md) — how the string keys above
+- [Registry](registry.md): how the string keys above
   (`moe_router`, `norm_type`, `optimizer.name`, `scheduler.name`,
   `loss_fn`, `model_type`) resolve to builders.

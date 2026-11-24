@@ -185,3 +185,38 @@ class TestSigmoidBiasSchedule:
         delta_late = (router.expert_bias.data - bias_before_late).abs().max().item()
 
         assert delta_early > delta_late
+
+
+class TestEmptyInput:
+    """A layer that gets no tokens on a rank gives zero losses, not NaN, still connected to
+    every router weight, and leaves the sigmoid router's balancing state alone (#567)."""
+
+    def test_the_softmax_router_gives_zero_losses(self) -> None:
+        router = SoftmaxTopKRouter(dim=16, num_experts=4, top_k=2)
+        weights, indices = router(torch.randn(0, 16))
+        assert weights.shape == (0, 2) and indices.shape == (0, 2)
+        assert router.aux_loss.item() == 0 and router.z_loss.item() == 0
+        (router.aux_loss + router.z_loss).backward()
+        assert router.gate.weight.grad is not None
+        assert not torch.count_nonzero(router.gate.weight.grad)
+
+    def test_the_sigmoid_router_gives_zero_losses(self) -> None:
+        router = SigmoidTopKRouter(dim=16, num_experts=4, top_k=2, sequence_aux_loss_weight=0.1)
+        weights, indices = router(torch.randn(0, 16))
+        assert weights.shape == (0, 2) and indices.shape == (0, 2)
+        assert router.aux_loss.item() == 0 and router.z_loss.item() == 0
+        (router.aux_loss + router.z_loss).backward()
+        for param in (router.gate.weight, router.expert_bias):
+            assert param.grad is not None
+            assert not torch.count_nonzero(param.grad)
+
+    def test_the_sigmoid_router_does_not_count_an_empty_input_as_utilization(self) -> None:
+        router = SigmoidTopKRouter(dim=16, num_experts=4, top_k=2)
+        router.train()
+        router.expert_ema.copy_(torch.tensor([0.4, 0.3, 0.2, 0.1]))
+        with torch.no_grad():
+            router.expert_bias.copy_(torch.tensor([0.1, -0.2, 0.3, -0.4]))
+        ema, bias = router.expert_ema.clone(), router.expert_bias.detach().clone()
+        router(torch.randn(0, 16))
+        assert torch.equal(router.expert_ema, ema)
+        assert torch.equal(router.expert_bias.detach(), bias)

@@ -12,17 +12,22 @@ Application order when combining parallelisms:
   1. Build per-stage model via build_stage_module()
   2. Tensor parallelism (per stage, via apply_tensor_parallel) — must see raw blocks
   3. Activation checkpointing (per stage, via apply_ac)
-  4. FSDP2 (per stage, via apply_fsdp2 with reshard_after_forward=False)
+  4. FSDP2 (per stage, via apply_fsdp2)
 
 Note on FSDP reshard policy:
-  When using PP, set reshard_after_forward=False in apply_fsdp2 to avoid
-  per-microbatch all-gathers. PP schedules send multiple microbatches through
-  each stage, so keeping gathered params avoids redundant communication.
+  The training entry wraps each stage with apply_fsdp2's default,
+  reshard_after_forward=True. False would keep a stage's params gathered
+  across its microbatches and save the repeated all-gathers, but a unit left
+  gathered keeps what it gathered last: evaluation then needs
+  evaluation_point(optimizer, model), which reshards the model around the
+  schedule-free swap, or the next training step would see the averaged
+  weights x.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import cast
 
 import torch
@@ -67,7 +72,9 @@ def get_pp_size(device_mesh: DeviceMesh) -> int:
     return pp_mesh.size()
 
 
-def build_stage_group(device_mesh: DeviceMesh) -> dist.ProcessGroup:
+def build_stage_group(
+    device_mesh: DeviceMesh, timeout_sec: float | None = None
+) -> dist.ProcessGroup:
     """Create one process group per pipeline stage and return the one holding this rank.
 
     A stage's group holds every rank at the same ``pp`` coordinate of ``device_mesh``,
@@ -76,6 +83,11 @@ def build_stage_group(device_mesh: DeviceMesh) -> dist.ProcessGroup:
     ``torch.distributed.new_group``, which is collective over the default process group:
     every rank must call this at the same point.
 
+    Args:
+        device_mesh: The mesh, with a ``pp`` dimension.
+        timeout_sec: Collective timeout of the stage groups, ``distributed.nccl_timeout_sec``
+            in training. None leaves PyTorch's default.
+
     Raises:
         ValueError: ``device_mesh`` has no ``pp`` dimension.
     """
@@ -83,7 +95,10 @@ def build_stage_group(device_mesh: DeviceMesh) -> dist.ProcessGroup:
     if "pp" not in dim_names:
         raise ValueError(f"build_stage_group needs a 'pp' mesh dimension, got dims {dim_names}")
     stages = device_mesh.mesh.unbind(dim_names.index("pp"))
-    group, _ = dist.new_subgroups_by_enumeration([stage.flatten().tolist() for stage in stages])
+    group, _ = dist.new_subgroups_by_enumeration(
+        [stage.flatten().tolist() for stage in stages],
+        timeout=None if timeout_sec is None else timedelta(seconds=timeout_sec),
+    )
     return cast("dist.ProcessGroup", group)
 
 

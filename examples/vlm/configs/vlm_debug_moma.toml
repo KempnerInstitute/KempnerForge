@@ -3,8 +3,9 @@
 #
 # Mode: smoke.
 #
-# Runs end-to-end in <2 minutes on 1 GPU. Uses RandomVisionEncoder so no
-# HF download is needed. Shared Q/K/V/O self-attention + per-modality
+# Runs end-to-end in <2 minutes on 1 GPU. Uses RandomVisionEncoder, so no
+# encoder download; the dataset and the gpt2 tokenizer download from
+# Hugging Face on first use. Shared Q/K/V/O self-attention + per-modality
 # MoE FFN groups with expert-choice + Sigmoid routing (Lin et al. 2024,
 # arXiv:2407.21770). 2 text experts + 2 image experts at every layer.
 #
