@@ -177,6 +177,18 @@ class Attention(nn.Module):
                     f"(batch, 1, seq_len, cached + seq_len) mask over the {keys} keys "
                     "after this forward, or a BlockMask on an empty cache"
                 )
+        if (
+            isinstance(attn_mask, torch.Tensor)
+            and not self.capture_attention_weights
+            and self.sdpa_backend == "flash"
+            and x.is_cuda
+        ):
+            raise ValueError(
+                "model.sdpa_backend='flash' cannot run a forward with an attention mask, "
+                "as packed documents, padded frames or attention groups need: PyTorch's "
+                "FlashAttention kernel takes no mask on CUDA. Use another sdpa_backend, "
+                "such as 'auto'."
+            )
         if isinstance(attn_mask, BlockMask) and self.capture_attention_weights:
             raise NotImplementedError(
                 "capture_attention_weights requires attention_backend='sdpa'. "
@@ -221,13 +233,6 @@ class Attention(nn.Module):
             out, attn_weights = self._attention_with_weights(q, k, v, seq_len, attn_mask, kv_cache)
             self.last_attention_weights = attn_weights.detach().cpu()
         elif attn_mask is not None:
-            if self.sdpa_backend == "flash" and q.is_cuda:
-                raise ValueError(
-                    "model.sdpa_backend='flash' cannot run a forward with an attention mask, "
-                    "as packed documents, padded frames or attention groups need: PyTorch's "
-                    "FlashAttention kernel takes no mask on CUDA. Use another sdpa_backend, "
-                    "such as 'auto'."
-                )
             with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         elif seq_len > 1 and k.shape[2] > seq_len:

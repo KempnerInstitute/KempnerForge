@@ -202,6 +202,42 @@ class TestAttention:
         with pytest.raises(ValueError, match=match):
             attn(x, cos[:8], sin[:8], attn_mask=mask)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.parametrize("past", [0, 4])
+    def test_flash_refuses_a_cached_mask_on_cuda_before_writing_the_cache(self, past):
+        device = torch.device("cuda")
+        attn = Attention(dim=64, n_heads=4, n_kv_heads=2, sdpa_backend="flash")
+        attn = attn.to(device=device, dtype=torch.bfloat16)
+        cos, sin = precompute_rope_frequencies(16, 16, device=device)
+        cache = KVCache(
+            batch_size=1,
+            max_seq_len=16,
+            n_kv_heads=2,
+            head_dim=16,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        with torch.no_grad():
+            if past:
+                attn(
+                    torch.randn(1, past, 64, device=device, dtype=torch.bfloat16),
+                    cos[:past],
+                    sin[:past],
+                    kv_cache=cache,
+                )
+            before = (cache.k.clone(), cache.v.clone())
+            mask = torch.ones(1, 1, 3, past + 3, dtype=torch.bool, device=device)
+            with pytest.raises(ValueError, match="sdpa_backend='flash' cannot run"):
+                attn(
+                    torch.randn(1, 3, 64, device=device, dtype=torch.bfloat16),
+                    cos[past : past + 3],
+                    sin[past : past + 3],
+                    kv_cache=cache,
+                    attn_mask=mask,
+                )
+        assert cache.seq_len == past
+        assert torch.equal(cache.k, before[0]) and torch.equal(cache.v, before[1])
+
     def test_flash_runs_a_dense_mask_on_cpu(self):
         """PyTorch's CPU flash kernel takes the mask, so the refusal is for CUDA alone."""
         attn = Attention(dim=64, n_heads=4, n_kv_heads=2, sdpa_backend="flash")
