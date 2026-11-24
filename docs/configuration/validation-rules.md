@@ -4,7 +4,9 @@ Validation runs in two passes:
 
 1. **Per-dataclass `__post_init__`** — fires the moment the dataclass is
    instantiated (i.e. as soon as the TOML and CLI overrides land).
-   Checks fields that can be validated in isolation.
+   Checks fields that can be validated in isolation, and in `JobConfig`
+   the cross-section rules listed under
+   [`JobConfig.__post_init__`](#cross-section-rules-in-jobconfig__post_init__).
 2. **`JobConfig.validate(world_size)`** — called explicitly by the
    launchers
    ([`training/runtime.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/runtime.py),
@@ -49,7 +51,8 @@ File:
   on H200 / torch 2.11 while 128 and 256 are fine. That surfaces as a loud
   compile-time error, not silent corruption, so it is documented rather than
   guarded.
-- `attention_backend = "flex"` requires `train.seq_len ≥ 128`. Below that an
+- `attention_backend = "flex"` requires `train.seq_len ≥ 128`, checked by
+  `JobConfig` since it reads `[train]`. Below that an
   Inductor-compiled model silently leaks attention across document boundaries.
   Localized to Inductor codegen: the same model under `backend="eager"` or
   `backend="aot_eager"` is exact, as is the FlexAttention kernel on its own, and
@@ -241,6 +244,40 @@ File:
   (for example `--adapter.hidden_dim=0 --adapter.pre_norm=`); see
   [Config sections](config-sections.md#adapter-adapterconfig).
 
+## Cross-section rules in `JobConfig.__post_init__`
+
+File:
+[`kempnerforge/config/job.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/job.py).
+
+These run when `JobConfig` is built, with the per-dataclass checks:
+
+- `plugins` must be a list of module path strings.
+- `data.hf_max_images != 1` applies to VLM image runs only, not text runs
+  or `[video]`, and needs `vlm.arch = "joint_decoder"`. It is refused
+  with `train.mixed_precision = "fp8"` and, under
+  `attention_backend = "sdpa"`, with `model.sdpa_backend = "flash"`.
+- `[video]` needs a `[vlm]` section, and `vlm.tile_grid` must stay 0
+  with `[video]`.
+- `[vlm]` needs a `[vision_encoder]` section; a missing `[adapter]`
+  takes the defaults.
+- With `vision_encoder.num_tokens > 0`, `model.max_seq_len` must hold
+  the image tokens the residual stream carries plus `vlm.max_text_len`.
+  The image tokens count every image a document may hold
+  (`data.hf_max_images`, or one clip on a `[video]` run) and every view
+  of each (each frame of a clip, or each view of a tiled image) after
+  the adapter, and none under Cross-Attention, whose residual stream
+  carries text only.
+- On a VLM run, an HF-backed encoder (`siglip2`, `clip`) with
+  `feature_dim` or `num_tokens` above 0 logs a warning: the values
+  override the ones the encoder probes.
+- `data.pack_sequences` on a VLM run needs `vlm.arch = "joint_decoder"`
+  and takes neither `[video]` nor `train.mixed_precision = "fp8"`.
+- A nonempty `optimizer.lr_multipliers` needs a `[vlm]` section whose
+  `module_patterns` names every listed module (see
+  [`OptimizerConfig`](#optimizerconfig)).
+- `attention_backend = "flex"` needs `train.seq_len ≥ 128` (see
+  [`ModelConfig`](#modelconfig)).
+
 ## Cross-section rules — `JobConfig.validate(world_size)`
 
 File:
@@ -428,6 +465,43 @@ model.is_moe && train.compile_model  →  logger.warning(…)
 Routing produces data-dependent shapes that break `torch.compile`'s
 graph, so the loop logs a warning but still runs. Set
 `train.compile_model=false` for MoE runs.
+
+### Flash attention and masked runs
+
+```
+model.sdpa_backend == "flash" && (
+    data.pack_sequences && model.attention_backend == "sdpa" && a data source
+    || video && vlm.arch in {"joint_decoder", "mot", "moma"}
+             && the vlm section's class is not MoT
+)  →  ValueError
+```
+
+Checked by the training setup on CUDA, after the CLI overrides and
+before the process group starts
+(`JobConfig.check_flash_attention_masks`). Evaluation and generation
+are not checked at setup; on CUDA, a forward there that passes a dense
+mask to `Attention`, such as video evaluation's frame mask under
+Joint-Decoder or MoMa, raises the `ValueError` from
+`Attention.forward`. PyTorch's CUDA FlashAttention
+kernel takes no attention mask, and these runs build one: packed rows
+read from a dataset mask their documents from each other, and the padded
+frames of a video run are masked in self-attention, under
+`attention_backend = "flex"` too, which turns only document and group
+masks into a block mask. The modality strategy, which `vlm.arch` picks,
+masks frames in self-attention under Joint-Decoder, MoT and MoMa, while
+Cross-Attention masks them in its cross-attention layers only, and the
+attention the model builds, which the section's class picks, runs under
+the configured backend except under MoT, so a run counts only when both
+apply (`JobConfig.masks_frames_in_backend_attention`), as after a
+`--vlm.arch` override. Image runs whose documents can hold several
+images (`data.hf_max_images != 1`) are refused under `"sdpa"` when the
+config is built, and on CUDA a dataset with text-only rows on the
+single-image route (`data.pack_sequences = false` and
+`data.hf_max_images = 1`) is refused by the same test when the data
+pipeline is built, since only the dataset knows it has such rows. A
+forward that passes a dense mask to SDPA some other way on CUDA, such as
+attention groups from a collator of your own, raises a `ValueError` that
+names the setting instead of PyTorch's `No available kernel`.
 
 ## Example: a failing config and its error
 

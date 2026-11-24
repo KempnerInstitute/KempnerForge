@@ -57,11 +57,17 @@ def apply_matmul_precision(train: TrainConfig) -> None:
 
 
 def setup_distributed(config: JobConfig) -> RuntimeContext:
-    """Validate the config for the world size, then initialize the process group + device mesh."""
+    """Validate the config for the world size, then initialize the process group + device mesh.
+
+    On CUDA the config is also checked for masks the flash SDPA backend cannot take (see
+    ``JobConfig.check_flash_attention_masks``).
+    """
     rank, local_rank, world_size = get_world_info()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     config.validate(world_size)
+    if device.type == "cuda":
+        config.check_flash_attention_masks()
     device_mesh = init_distributed(config.distributed, seed=config.train.seed)
     apply_matmul_precision(config.train)
 

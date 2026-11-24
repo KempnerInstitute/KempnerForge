@@ -1003,6 +1003,42 @@ class TestFlushPendingSave:
         wait_mock.assert_called_once()
 
 
+class TestHasPendingSave:
+    """``has_pending_save`` tells the training loop whether a drain (its final ``wait()``, a
+    shutdown's ``wait()`` or a freeze stage's ``flush_pending_save()``) has anything to
+    drain, so it times only a drain that happens."""
+
+    @staticmethod
+    def _mgr(tmp_path, mode):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        return CheckpointManager(CheckpointConfig(dir=str(tmp_path), async_mode=mode), model, opt)
+
+    def test_an_async_save_is_pending_until_wait(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(
+            "kempnerforge.checkpoint.async_save.dcp.async_save", MagicMock(return_value=MagicMock())
+        )
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_)
+        assert not mgr.has_pending_save
+        mgr.save(step=1)
+        assert mgr.has_pending_save
+        mgr.wait()
+        assert not mgr.has_pending_save
+        assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
+
+    def test_a_synchronous_save_leaves_nothing_pending(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr("kempnerforge.checkpoint.async_save.dcp.save", MagicMock())
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.disabled)
+        mgr.save(step=1)
+        assert not mgr.has_pending_save
+
+
 class TestSaveVLMFreezeMetadata:
     def test_save_writes_vlm_freeze_to_metadata(self, tmp_path, monkeypatch):
         import json
@@ -2540,6 +2576,50 @@ class TestAsyncLatestSymlinkSafety:
             path=str(incomplete), exclude_keys=["model", "optimizer"], exact_resume=True
         )
         assert loaded[:2] == (20, 2000)
+
+    def test_a_named_symlink_is_loaded_at_the_target_rank_0_resolved(self, tmp_path, monkeypatch):
+        """A checkpoint.load_path that is a link loads the directory it named when rank 0
+        resolved it, even if the link moves before the files are read."""
+        self._build_ckpt(tmp_path, 5, complete=True)
+        moved_to = self._build_ckpt(tmp_path, 6, complete=True)
+        link = Path(tmp_path) / "pick"
+        link.symlink_to("step_5")
+
+        mgr = self._mgr(tmp_path / "new_run", AsyncCheckpointMode.async_pinned)
+        mgr.config.load_path = str(link)
+        _mock_dcp_load(monkeypatch)
+        agreed = mgr._agreed_load_dir
+
+        def agree_then_move(path, fall_back):
+            chosen = agreed(path, fall_back)
+            link.unlink()
+            link.symlink_to(moved_to.name)
+            return chosen
+
+        monkeypatch.setattr(mgr, "_agreed_load_dir", agree_then_move)
+        assert mgr.load()[:2] == (5, 500)
+
+    def test_a_fallback_that_is_a_link_is_loaded_at_its_target(self, tmp_path, monkeypatch):
+        """An exact resume falls back to the directory a step_N link pointed to when rank 0
+        resolved it, even if the link moves before the files are read."""
+        self._build_ckpt(tmp_path / "external", 5, complete=True)
+        moved_to = self._build_ckpt(tmp_path / "external", 6, complete=True)
+        incomplete = self._build_ckpt(tmp_path, 20, complete=False)
+        link = Path(tmp_path) / "step_10"
+        link.symlink_to(Path("external") / "step_5")
+
+        mgr = self._mgr(tmp_path, AsyncCheckpointMode.async_pinned)
+        _mock_dcp_load(monkeypatch)
+        agreed = mgr._agreed_load_dir
+
+        def agree_then_move(path, fall_back):
+            chosen = agreed(path, fall_back)
+            link.unlink()
+            link.symlink_to(Path("external") / moved_to.name)
+            return chosen
+
+        monkeypatch.setattr(mgr, "_agreed_load_dir", agree_then_move)
+        assert mgr.load(path=str(incomplete), exact_resume=True)[:2] == (5, 500)
 
     def test_a_load_that_is_not_a_resume_takes_latest_as_is(self, tmp_path, monkeypatch):
         """Without ``exact_resume`` the checkpoint ``latest`` names loads, torn or not."""
@@ -4184,6 +4264,70 @@ class TestTornStageAcrossRanks:
         mp.spawn(_resume_with_a_torn_stage, args=(2, _free_port(), str(tmp_path), case), nprocs=2)
 
 
+def _load_with_a_blind_rank(rank: int, world: int, port: int, ckpt_dir: str, case: str) -> None:
+    """Save step 5, then load it in ``case`` while rank 1 cannot see the checkpoint it names."""
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    import torch.distributed as dist
+
+    from kempnerforge.checkpoint.manager import CheckpointManager
+
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world,
+        init_method=f"tcp://127.0.0.1:{port}",
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        torch.manual_seed(0)
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        model(torch.ones(2, 4)).sum().backward()
+        optimizer.step()
+        CheckpointManager(CheckpointConfig(dir=ckpt_dir), model, optimizer).save(5, 50)
+        saved = model.weight.detach().clone()
+        dist.barrier()
+
+        step_5 = Path(ckpt_dir) / "step_5"
+        if case == "bare_latest":
+            config, hidden, kwargs = CheckpointConfig(dir=ckpt_dir), Path(ckpt_dir) / "latest", {}
+        elif case == "named_path":
+            config, hidden, kwargs = CheckpointConfig(dir=ckpt_dir), step_5, {"path": str(step_5)}
+        else:
+            config = CheckpointConfig(dir=str(Path(ckpt_dir) / "new_run"), load_path=str(step_5))
+            hidden = step_5
+            weights_only = {"exclude_keys": ["optimizer", "train_state"]}
+            kwargs = weights_only if case == "weights_only" else {}
+        with torch.no_grad():
+            model.weight.zero_()
+        loader = CheckpointManager(config, model, torch.optim.AdamW(model.parameters(), lr=1e-3))
+        exists = Path.exists
+
+        def view(path: Path) -> bool:
+            return False if rank == 1 and path == hidden else exists(path)
+
+        with patch.object(Path, "exists", view):
+            step, tokens, _ = loader.load(**kwargs)
+        expected = (0, 0) if case == "weights_only" else (5, 50)
+        assert (step, tokens) == expected, f"rank {rank} loaded step {step}"
+        assert torch.equal(model.weight, saved), f"rank {rank} did not load the saved weights"
+    finally:
+        dist.destroy_process_group()
+
+
+class TestBlindRankLoadsWhatRankZeroResolves:
+    """Every load takes the checkpoint rank 0 resolves, so a rank that cannot see it does not
+    fail alone or start from scratch while the others load."""
+
+    @pytest.mark.parametrize("case", ["warm_start", "weights_only", "named_path", "bare_latest"])
+    def test_every_rank_loads_the_checkpoint(self, tmp_path, case):
+        import torch.multiprocessing as mp
+
+        mp.spawn(_load_with_a_blind_rank, args=(2, _free_port(), str(tmp_path), case), nprocs=2)
+
+
 class TestOptimizerChecksAcrossStages:
     """Under pipeline parallelism each stage checks its own optimizer state, so they agree."""
 
@@ -4613,12 +4757,14 @@ class TestWeightDecayScopeOnResume:
         """Run ``manager`` as ``rank`` of two, with what the other rank reports scripted.
 
         ``holding`` and ``failing`` list the other ranks whose DCP index holds optimizer state
-        or could not be read; ``sent`` is what rank 0's broadcasts deliver to any other rank.
+        or could not be read; ``sent`` is what rank 0's other broadcasts deliver to any other rank,
+        and its broadcast of the checkpoint it resolved delivers the one the manager resolves.
         Returns the collectives issued, in order.
         """
         import kempnerforge.checkpoint.manager as mgr_mod
 
         calls: list[tuple] = []
+        resolved = manager._resolve_load_path(None)
 
         def all_reduce(flags, group=None):
             calls.append(("all_reduce", group, flags.tolist()))
@@ -4629,7 +4775,9 @@ class TestWeightDecayScopeOnResume:
 
         def broadcast_object_list(objects, src):
             calls.append(("broadcast", src, list(objects)))
-            if rank != 0:
+            if rank != 0 and isinstance(objects[0], dict) and objects[0].keys() == {"dir", "error"}:
+                objects[0] = {"dir": str(resolved), "error": None}
+            elif rank != 0:
                 objects[0] = sent
 
         monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
@@ -4640,6 +4788,14 @@ class TestWeightDecayScopeOnResume:
         manager._rank = rank
         manager._sync_group = "GLOO_GROUP"
         return calls
+
+    @staticmethod
+    def _past_the_path(calls: list[tuple]) -> list[tuple]:
+        """The collectives after the first, rank 0's broadcast of the checkpoint it resolved."""
+        kind, src, objects = calls[0]
+        assert (kind, src) == ("broadcast", 0), calls[0]
+        assert objects[0].keys() == {"dir", "error"}, calls[0]
+        return calls[1:]
 
     @staticmethod
     def _stop_at_the_model_load(monkeypatch):
@@ -4686,7 +4842,7 @@ class TestWeightDecayScopeOnResume:
                 manager.load()
         own = [[0, 0], [0, 0]]
         own[1][rank] = int(holds_here)
-        assert calls[0] == ("all_reduce", "GLOO_GROUP", own)
+        assert self._past_the_path(calls)[0] == ("all_reduce", "GLOO_GROUP", own)
         scope_broadcasts = [c for c in calls if c[0] == "broadcast" and isinstance(c[2][0], tuple)]
         assert len(scope_broadcasts) == int(holds_here or holds_elsewhere)
 
@@ -4700,7 +4856,7 @@ class TestWeightDecayScopeOnResume:
         calls = self._as_rank(monkeypatch, manager, 1)
         with pytest.raises(FileNotFoundError):
             manager.load(path=str(step_dir))
-        assert calls == [("all_reduce", "GLOO_GROUP", [[0, 1], [0, 0]])]
+        assert self._past_the_path(calls) == [("all_reduce", "GLOO_GROUP", [[0, 1], [0, 0]])]
 
     def test_a_single_process_raises_its_own_read_failure(self, tmp_path):
         """Without a process group a failed read of the DCP index raises as it is."""
@@ -4717,7 +4873,7 @@ class TestWeightDecayScopeOnResume:
         self._stop_at_the_model_load(monkeypatch)
         with pytest.raises(RuntimeError, match=r"on ranks \[1\]"):
             manager.load()
-        assert [c[0] for c in calls] == ["all_reduce"]
+        assert [c[0] for c in self._past_the_path(calls)] == ["all_reduce"]
 
     def test_a_manager_without_a_scope_neither_records_nor_checks(self, tmp_path):
         """Callers that do not pass a scope keep the previous behavior."""
@@ -4735,7 +4891,7 @@ class TestWeightDecayScopeOnResume:
         calls = self._as_rank(monkeypatch, manager, 0)
         with pytest.raises(ValueError, match="but this run uses"):
             manager.load()
-        assert calls == [
+        assert self._past_the_path(calls) == [
             ("all_reduce", "GLOO_GROUP", [[0, 0], [1, 0]]),
             ("broadcast", 0, [(meta, None)]),
         ]
@@ -4773,3 +4929,31 @@ class TestWeightDecayScopeOnResume:
         self._as_rank(monkeypatch, manager, 1, sent=(None, "rank 0 could not read it"))
         with pytest.raises(ValueError, match="rank 0 could not read it"):
             manager.load()
+
+
+class TestRestoredExtra:
+    """The manager records the extra keys its last load restored, for the caller to read."""
+
+    def test_a_load_records_the_extra_keys_it_restored(self, tmp_path):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        saver = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        assert saver.restored_extra == {}
+        saver.save(step=2, tokens_seen=8, extra={"documents_seen": 5})
+        loader = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        assert loader.load()[2]["documents_seen"] == 5
+        assert loader.restored_extra["documents_seen"] == 5
+        loader.restored_extra["documents_seen"] = 0
+        assert loader.restored_extra["documents_seen"] == 5
+
+    def test_a_load_that_finds_nothing_restores_no_extra(self, tmp_path):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = torch.nn.Linear(4, 4)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path / "none")), model, optimizer)
+        manager._restored_extra = {"documents_seen": 3}
+        assert manager.load() == (0, 0, {})
+        assert manager.restored_extra == {}

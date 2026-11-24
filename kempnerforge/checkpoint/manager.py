@@ -837,6 +837,7 @@ class CheckpointManager:
             raise ValueError(f"lr_multipliers needs module_patterns for {missing}")
         self._lr_module_patterns = {module: sorted(set(patterns[module])) for module in listed}
         self._pending_dataloader_state: dict[str, Any] | None = None
+        self._restored_extra: dict[str, Any] = {}
         self._pending_finalize: tuple[int, Path] | None = None
         self._inflight_dir: Path | None = None
         self._tracking_source: TrackingSource | None = None
@@ -1350,6 +1351,14 @@ class CheckpointManager:
         with self._sidecar_lock:
             _replace_file(ckpt_dir / _METADATA_FILE, text)
 
+    @property
+    def has_pending_save(self) -> bool:
+        """Whether ``wait()`` has an async save to drain or a ``latest`` commit to make.
+
+        Always False with synchronous saves, which commit inside ``save()``.
+        """
+        return self._async_ckpt.is_pending or self._pending_finalize is not None
+
     def wait(self) -> None:
         """Block until any pending async checkpoint save completes.
 
@@ -1444,11 +1453,10 @@ class CheckpointManager:
                 topology check. The weights-only ``exclude_keys`` pair reads no
                 train state: no rank restores loader/RNG state or enters the
                 train-state broadcasts or the layout gather, and with
-                ``exact_resume`` it raises. An exact resume loads the checkpoint rank 0
-                picks for every rank: the one it names, or, when the load reads DCP shards
-                and not every stage directory there holds them all, the newest ``step_N``
-                beside it whose does (see ``_agreed_resume_dir``). Any other load takes its
-                checkpoint as is.
+                ``exact_resume`` it raises. Every load takes the checkpoint rank 0 resolves
+                (see ``_agreed_load_dir``); an exact resume that reads DCP shards falls back,
+                when not every stage directory there holds them all, to the newest
+                ``step_N`` beside it whose does. Any other load takes its checkpoint as is.
 
         Returns:
             Tuple of (step, tokens_seen, extra) where extra contains any
@@ -1484,15 +1492,13 @@ class CheckpointManager:
         will_load_dcp = (
             exclude_keys is None or "model" not in exclude_keys or "optimizer" not in exclude_keys
         )
-        if exact_resume:
-            ckpt_dir = self._agreed_resume_dir(path, fall_back=will_load_dcp)
-        else:
-            ckpt_dir = self._resolve_load_path(path)
+        ckpt_dir = self._agreed_load_dir(path, fall_back=exact_resume and will_load_dcp)
         if ckpt_dir is None:
             requested = path if path is not None else self.config.load_path
             if requested:
                 raise FileNotFoundError(f"Checkpoint not found: {requested}")
             logger.info("No checkpoint found — starting from scratch")
+            self._restored_extra = {}
             return 0, 0, {}
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
@@ -1684,6 +1690,7 @@ class CheckpointManager:
             )
         elif fresh_optimizer:
             logger.info(f"{dcp_dir} holds no optimizer state; the optimizer starts fresh")
+        self._restored_extra = dict(extra)
         return step, tokens_seen, extra
 
     def _train_state_exists(self, path: Path) -> bool:
@@ -1889,6 +1896,14 @@ class CheckpointManager:
             f"since training auto-resumes from a checkpoint there in place of load_path."
         )
 
+    @property
+    def restored_extra(self) -> dict[str, Any]:
+        """The extra keys the last ``load()`` restored from ``train_state.pt``.
+
+        Empty before a load, and after one that restored no train state.
+        """
+        return dict(self._restored_extra)
+
     def apply_dataloader_state(self, dataloader: Any) -> None:
         """Apply any dataloader state stashed during load().
 
@@ -1931,15 +1946,15 @@ class CheckpointManager:
 
         return None
 
-    def _agreed_resume_dir(self, path: str | None, fall_back: bool) -> Path | None:
-        """Return the checkpoint rank 0 picks for an exact resume, on every rank.
+    def _agreed_load_dir(self, path: str | None, fall_back: bool) -> Path | None:
+        """Return the checkpoint rank 0 resolves for a load, on every rank.
 
-        Rank 0 resolves ``path`` (see ``_resolve_load_path``) and, with ``fall_back`` (the
-        load reads DCP shards), takes the newest ``step_N`` beside it whose every stage
-        directory holds them when that one's do not (see ``_newest_saved_beside``). It
-        broadcasts its choice, or why it could not make one, so every rank loads the same
-        checkpoint, or returns or raises together, whatever its own view of the filesystem.
-        Every rank must call this.
+        Rank 0 resolves ``path`` (see ``_resolve_load_path``), following symlinks, and, with
+        ``fall_back`` (an exact resume that reads DCP shards), takes the newest ``step_N``
+        beside it whose every stage directory holds them when that one's do not (see
+        ``_newest_saved_beside``). It broadcasts its choice, or why it could not make one, so
+        every rank loads the same directory, or returns or raises together, whatever its own
+        view of the filesystem. Every rank must call this.
 
         Raises:
             Exception: On rank 0, what resolving the checkpoint raised.
@@ -1950,8 +1965,10 @@ class CheckpointManager:
         if self._rank == 0 or not dist.is_initialized():
             try:
                 resolved = self._resolve_load_path(path)
+                if resolved is not None:
+                    resolved = resolved.resolve()
                 if resolved is not None and fall_back:
-                    resolved = self._newest_saved_beside(resolved)
+                    resolved = self._newest_saved_beside(resolved).resolve()
                 outcome[0] = {"dir": None if resolved is None else str(resolved), "error": None}
             except Exception as e:
                 error = e
@@ -1962,7 +1979,7 @@ class CheckpointManager:
             raise error
         chosen, reason = outcome[0]["dir"], outcome[0]["error"]
         if reason is not None:
-            raise RuntimeError(f"Rank 0 could not pick the checkpoint to resume: {reason}")
+            raise RuntimeError(f"Rank 0 could not pick the checkpoint to load: {reason}")
         return None if chosen is None else Path(chosen)
 
     @staticmethod
