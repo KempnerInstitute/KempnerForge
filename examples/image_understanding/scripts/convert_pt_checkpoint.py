@@ -9,8 +9,8 @@ MLP over pooled patches (``adapter.norm`` and ``adapter.proj.{0,2}``, or
 an untied ``text_head``. The target VLM is built from ``--config``, whose
 embeddings must be untied, and every one of its tensors is filled from the
 source; nothing is written unless each source tensor maps onto its own target
-tensor of the same shape and each target tensor is filled. The source's SigLIP attention-pooling head is
-dropped when the model has none. The result is one DCP that
+tensor of the same shape and each target tensor is filled. The source's SigLIP
+attention-pooling head is dropped when the model has none. The result is one DCP that
 ``[checkpoint].load_path`` warm-starts from with
 ``exclude_from_loading = ["optimizer", "train_state"]``.
 
