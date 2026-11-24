@@ -1522,10 +1522,10 @@ class CheckpointManager:
         logger.warning(
             f"Resuming on a changed topology because checkpoint.ignore_rank_state_mismatch="
             f"true: {reason}. Kept: the saved data position, which every rank resumes from "
-            f"where the loaders can place it on this layout, a stream from the position its "
-            f"own data-parallel rank saved. Dropped: every rank's saved RNG "
-            f"state, so the random streams restart from this run's seeds. Model, optimizer, "
-            f"scheduler and step resume."
+            f"where the loaders can place it on this layout, a stream on the saved "
+            f"data-parallel size from the position its own data-parallel rank saved. Dropped: "
+            f"every rank's saved RNG state, so the random streams restart from this run's "
+            f"seeds. Model, optimizer, scheduler and step resume."
         )
         return view, True
 
