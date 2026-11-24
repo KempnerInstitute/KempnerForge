@@ -592,15 +592,17 @@ def _resume_stream_job(
     layout: list[tuple[int, int]],
     lenient: bool,
     out: str,
+    warm: bool = False,
 ) -> None:
     """One rank of a gloo job that auto-resumes the stream checkpoint, as the training entry does.
 
     Rank ``r`` reads data-parallel part ``layout[r]`` of the stream in ``views[r]``,
     loads with ``exact_resume=True`` and ``lenient`` as
-    ``checkpoint.ignore_rank_state_mismatch``, then applies the position with
-    ``apply_dataloader_state``. It seeds its generators with ``555 + r`` just before the
-    load. Rank 0 writes every rank's report: the error the resume raised or the next 3
-    batches, the next random draw and the one the fresh seeds give, and the warnings.
+    ``checkpoint.ignore_rank_state_mismatch``, or with ``warm`` as a warm start
+    (``warm_start=True``), then applies the position with ``apply_dataloader_state``.
+    It seeds its generators with ``555 + r`` just before the load. Rank 0 writes every
+    rank's report: the error the resume raised or the next 3 batches, the next random
+    draw and the one the fresh seeds give, and the warnings.
     """
     _init_gloo(rank, world, port)
     warnings: list[str] = []
@@ -613,7 +615,10 @@ def _resume_stream_job(
         report: dict = {"fresh": _draw(), "error": None, "next": []}
         _seed_all(555 + rank)
         try:
-            manager.load(exact_resume=True)
+            if warm:
+                manager.load(warm_start=True)
+            else:
+                manager.load(exact_resume=True)
             manager.apply_dataloader_state(loader)
         except Exception as e:
             report["error"] = f"{type(e).__name__}: {e}"
@@ -646,9 +651,9 @@ def stream_checkpoint(uneven_corpus, tmp_path_factory) -> tuple[str, list[dict]]
     return str(root / "ckpt"), json.loads(Path(out).read_text())
 
 
-def _resume_streams(tmp_path, root, views, tokenizer, layout, lenient) -> list[dict]:
+def _resume_streams(tmp_path, root, views, tokenizer, layout, lenient, warm=False) -> list[dict]:
     out = str(tmp_path / "resumed.json")
-    args = (len(layout), _free_port(), root, views, tokenizer, layout, lenient, out)
+    args = (len(layout), _free_port(), root, views, tokenizer, layout, lenient, out, warm)
     mp.spawn(_resume_stream_job, args=args, nprocs=len(layout))
     return json.loads(Path(out).read_text())
 
@@ -727,6 +732,27 @@ def test_a_flag_resume_restarts_every_rank_when_one_rank_sees_a_file_at_another_
         restarted = [w for w in report["warnings"] if "does not carry over" in w]
         assert restarted and "source data files differ" in restarted[0], report["warnings"]
         assert "ranks [1]" in restarted[0], restarted[0]
+
+
+def test_a_warm_start_restarts_every_rank_when_one_rank_sees_a_file_at_another_size(
+    uneven_corpus, stream_checkpoint, tmp_path
+):
+    """A warm start on 2 ranks gives both rank 0's position, which only rank 1 cannot place.
+
+    Rank 1 reads a copy with one data file grown. The ranks agree before applying the
+    position: both start their parts of the stream at the first document, and the
+    warning names rank 1. A warm start restores rank 0's RNG state on every rank, so the
+    random streams are not checked.
+    """
+    data, tokenizer = (str(p) for p in uneven_corpus)
+    root, _ = stream_checkpoint
+    views = [data, _stale_copy(uneven_corpus, tmp_path / "stale")]
+    resumed = _resume_streams(tmp_path, root, views, tokenizer, [(0, 2), (1, 2)], False, True)
+    for rank, report in enumerate(resumed):
+        assert report["error"] is None, report["error"]
+        assert report["next"] == _fresh_batches(views[rank], tokenizer, (rank, 2)), f"rank {rank}"
+        restarted = [w for w in report["warnings"] if "warm start's data position" in w]
+        assert restarted and "on ranks [1]" in restarted[0], report["warnings"]
 
 
 def test_without_the_flag_a_file_one_rank_sees_at_another_size_stops_every_rank(
