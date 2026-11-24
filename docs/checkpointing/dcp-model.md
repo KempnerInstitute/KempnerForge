@@ -3,9 +3,10 @@
 KempnerForge uses
 [`torch.distributed.checkpoint`](https://pytorch.org/docs/stable/distributed.checkpoint.html)
 (DCP) to save and load model and optimizer state. DCP is designed
-for sharded state — each rank writes only its local slice, the
-reader automatically reshards into whatever parallelism the loader
-has. No "rank 0 gathers everything" step.
+for sharded state: each rank writes only its local slice, and the
+reader reshards into whatever parallelism the loader has, except a
+change of `pp` (see [Resharding § PP](resharding.md#pp-the-one-special-case)).
+No "rank 0 gathers everything" step.
 
 Entry point:
 [`CheckpointManager.save()`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/manager.py)

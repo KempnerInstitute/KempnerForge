@@ -47,9 +47,10 @@ layers. For Llama-3 8B (32 layers) with `pp=3`: stage 0 and 1 get
 
 The layer keys in `PipelineStageModule.layers` match the full
 `Transformer` — stage 1 has keys `"11", "12", ..."21"`, not
-`"0", "1", ...`. This keeps the DCP checkpoint layout
-consistent across PP sizes, so you can checkpoint from a `pp=4` run
-and resume with `pp=2`.
+`"0", "1", ...`. Each stage still saves and loads only its own
+`pp{N}/` subdirectory, so a checkpoint resumes only at the `pp` it was
+saved with (see
+[Resharding § PP](../checkpointing/resharding.md#pp-the-one-special-case)).
 
 ## Application order with PP
 
@@ -210,7 +211,8 @@ and [JobConfig](../configuration/validation-rules.md)):
   reconcile. See [Tie embeddings vs pipeline parallel](../configuration/validation-rules.md#tie-embeddings-vs-pipeline-parallel).
 - `pp > 1` with MoE (`num_experts > 0`) is rejected by
   `JobConfig.validate`: MoE routing is data-dependent and incompatible
-  with pipeline stage splitting, so use FSDP, TP, or EP for MoE models.
+  with pipeline stage splitting, so use FSDP, TP, or EP for MoE models
+  (FSDP alone for MoT, which runs neither TP nor EP).
   See [Validation rules](../configuration/validation-rules.md) (the
   **MoE + PP** section).
 

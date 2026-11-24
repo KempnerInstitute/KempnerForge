@@ -171,9 +171,9 @@ Usage:
 
 ```bash
 uv run torchrun --nproc_per_node=4 scripts/eval.py configs/train/7b.toml \
-    --checkpoint.load_path /path/to/checkpoint \
-    --eval.dataset_path /path/to/eval_tokens \
-    --eval.steps 200
+    --checkpoint.load_path=/path/to/checkpoint \
+    --eval.dataset_path=/path/to/eval_tokens \
+    --eval.steps=200
 ```
 
 The stdout-final JSON line (`{"step": ..., "tokens_seen": ...,
