@@ -117,11 +117,12 @@ def resolve_resume_path(
       1. ``{checkpoint_dir}/latest`` symlink
       2. Most recent ``step_N`` directory *whose save completed*
 
-    ``CheckpointManager`` only ever points ``latest`` at a complete checkpoint,
-    so (1) needs no further test; one that lost files since is returned as is,
-    and the load reports it. The ``step_N`` fallback has no such guarantee:
-    an interrupted save leaves a directory that exists but holds no ``.metadata``,
-    and resuming into it fails in ``dcp.load`` with "metadata is None". A save
+    ``CheckpointManager`` points ``latest`` only at a checkpoint every stage has
+    saved, but it can lose files afterwards, so its DCP shards are checked like a
+    ``step_N``'s: when not every stage's are durable, a warning names it and the
+    scan below picks the checkpoint to resume. An interrupted save leaves a
+    ``step_N`` that exists but holds no ``.metadata``, and resuming into it fails
+    in ``dcp.load`` with "metadata is None". A save
     that stopped after its DCP shards and before ``train_state.pt`` leaves
     optimizer state without the step, LR schedule and data position that go with
     it, which ``CheckpointManager.load`` refuses. Skipping both kinds turns an
@@ -154,9 +155,13 @@ def resolve_resume_path(
     latest = base / "latest"
     if latest.exists():
         resolved = latest.resolve()
-        if resolved.exists():
+        if _dcp_durable(resolved, num_stages):
             logger.info(f"Auto-resume: found latest checkpoint at {resolved}")
             return resolved
+        logger.warning(
+            f"Auto-resume: skipping latest -> {resolved}: not every stage's DCP shards "
+            f"there are durable; looking for the newest step_N whose save completed"
+        )
 
     from kempnerforge.checkpoint.manager import missing_train_state
 

@@ -443,8 +443,10 @@ class TestHuggingFaceDatasetPacking:
         mock_tokenizer.eos_token_id = 0
         mock_tokenizer.encode = lambda text, **kwargs: [ord(c) for c in text]
 
+        from datasets import Dataset as HFDataset
+
         with (
-            patch("datasets.load_dataset", return_value=documents),
+            patch("datasets.load_dataset", return_value=HFDataset.from_list(documents)),
             patch("transformers.AutoTokenizer.from_pretrained", return_value=mock_tokenizer),
         ):
             ds = HuggingFaceDataset(

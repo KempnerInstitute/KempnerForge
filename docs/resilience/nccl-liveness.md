@@ -82,7 +82,7 @@ nccl_health_check_interval = 500   # every 500 steps
 
 500 is a reasonable starting point: once every few minutes of
 wall-clock, adds one extra all-reduce to that step. Setting it to 1
-would sync every step — not useful because the gradient all-reduce in
+would sync every step, which is not useful because the gradient all-reduce in
 the same step would already have failed.
 
 ## Timeouts
@@ -99,18 +99,24 @@ so the process group cannot be used afterward; `check_nccl_health`
 returns `False` and the loop stops.
 
 `distributed.nccl_timeout_sec` (default 1800 s; many shipped configs set
-600 or 1200) is the timeout of the default process group, which
-`init_distributed()` passes to `dist.init_process_group`. It also covers
-a one-dimensional mesh, such as plain FSDP, which reuses the default
-group. The groups `init_device_mesh` creates for the other dimensions
-(TP, PP, EP, HSDP, and FSDP on a multi-dimensional mesh) get PyTorch's
-default instead, 30 minutes for the default `cpu:gloo,cuda:nccl`
-backend. `init_distributed()` also sets `TORCH_NCCL_ASYNC_ERROR_HANDLING=1`
+600 or 1200) is the collective timeout of the process groups a run
+creates. `init_distributed()` passes it to `dist.init_process_group` and
+to `init_device_mesh` for the groups of each mesh dimension (TP, PP, EP,
+HSDP, and FSDP on a multi-dimensional mesh), which would otherwise get
+PyTorch's 30-minute default for the default `cpu:gloo,cuda:nccl`
+backend. With that backend, a dimension as wide as the world uses the
+default group itself.
+The groups get it when they are created, so under
+`TORCH_DISTRIBUTED_DEBUG=DETAIL` the check the debug wrapper runs before
+each collective is bounded by it too.
+The checkpoint manager's gloo group, the pipeline stage groups and the
+loop's control group get it too. Groups torch creates on its own, such
+as FSDP2's post-forward groups when `reshard_after_forward` is an int,
+keep PyTorch's default. `init_distributed()` also sets `TORCH_NCCL_ASYNC_ERROR_HANDLING=1`
 when it is unset (and warns if you set it to `0`), so an NCCL collective
 that runs past its group's timeout aborts the communicator and stops the
-process instead of hanging. Lowering `distributed.nccl_timeout_sec`
-detects a hang faster only on the default group. An `NCCL_TIMEOUT`
-environment variable changes nothing: neither NCCL nor PyTorch reads it.
+process instead of hanging. An `NCCL_TIMEOUT` environment variable
+changes nothing: neither NCCL nor PyTorch reads it.
 
 `ShutdownHandler`'s forced-exit timer also stops a graceful shutdown that
 stalls; see [SLURM preemption](slurm-preemption.md).
@@ -128,7 +134,7 @@ Most common causes of `check_nccl_health() == False`:
   rare but not zero on InfiniBand. NCCL retries internally; repeated
   failures mean the fabric degraded.
 - **Out-of-band process kill.** User ran `scancel` on one rank only.
-  Don't do this — use `scancel --signal=USR1` instead so
+  Don't do this; use `scancel --signal=USR1` instead so
   `ShutdownHandler` cleans up.
 
 ## Manual use
@@ -138,20 +144,20 @@ from kempnerforge.resilience import check_nccl_health
 
 # After a suspected partial failure
 if not check_nccl_health():
-    logger.error("NCCL unhealthy — aborting")
+    logger.error("NCCL unhealthy, aborting")
     sys.exit(1)
 ```
 
-No-op if `dist.is_initialized()` is False — returns True so calling
+No-op if `dist.is_initialized()` is False: it returns True so calling
 code doesn't need to special-case single-process runs.
 
 ## See also
 
-- [GPU health](gpu-health.md) — per-device checks; NCCL liveness tests
+- [GPU health](gpu-health.md): per-device checks; NCCL liveness tests
   the *group* instead.
-- [SLURM preemption](slurm-preemption.md) — the forced-exit timer
+- [SLURM preemption](slurm-preemption.md): the forced-exit timer
   provides the ultimate bound on how long a hang can live.
-- [Distributed § DeviceMesh](../distributed/device-mesh.md) — where
+- [Distributed § DeviceMesh](../distributed/device-mesh.md): where
   the NCCL process groups come from.
-- [Configuration § `[train]`](../configuration/config-sections.md) —
+- [Configuration § `[train]`](../configuration/config-sections.md):
   `nccl_health_check_interval` and `shutdown_timeout_sec`.

@@ -3,8 +3,8 @@
 After routing, each token has a `top_k` list of expert indices and
 weights. The dispatch layer has to:
 
-1. Optionally cap how many tokens each expert can receive
-   (`capacity_factor`).
+1. Optionally drop the tokens past each expert's capacity
+   (`capacity_factor`) by zeroing their routing weights.
 2. Actually run each expert on its assigned tokens — either in a
    Python loop (sequential) or via one batched `torch._grouped_mm`
    call (grouped GEMM).
@@ -20,18 +20,18 @@ Capacity and dispatch both live in
 moe_capacity_factor = 0.0   # 0 = no cap, >0 = cap per expert
 ```
 
-With `capacity_factor > 0`, each expert can only accept a bounded
-number of tokens per forward:
+With `capacity_factor > 0`, each expert keeps a bounded number of
+tokens per forward:
 
 ```python
 # kempnerforge/model/moe.py — _apply_capacity
 capacity = max(1, ceil(num_tokens * top_k / num_experts * capacity_factor))
 ```
 
-At `capacity_factor = 1.0`, each expert gets exactly the average load.
-At `1.25`, each expert gets 25% headroom above the average — the
-canonical Switch Transformer setting. At `0.0` (default), there is
-no cap: every token goes to its top-`k` choices regardless of load.
+At `capacity_factor = 1.0`, `capacity` is the average number of routes
+per expert, and at `1.25` it is 25% above that average, rounded up and
+at least 1 in both cases; an expert can get fewer. At `0.0` (default), there is no cap: every token goes to its
+top-`k` choices regardless of load.
 
 ### Drop policy
 
@@ -49,29 +49,34 @@ for e in range(num_experts):
 "First `capacity` routes win": an expert keeps the first `capacity`
 routes to it across all top-`k` slots, in token order, so an earlier
 token's second choice is kept ahead of a later token's first choice.
-Later routes get dropped. If a token's *only* chosen expert is
-overloaded, the token contributes nothing to the MoE output — but
-the residual connection still carries it through unchanged:
+Later routes get dropped. If every expert a token chose drops it,
+its routed experts contribute nothing to the MoE output (shared
+experts, when the layer has them, still run), and the residual
+connection carries it through:
 
 ```python
 # kempnerforge/model/transformer.py — TransformerBlock.forward
 x = x + self.mlp(self.mlp_norm(x))   # MoE output + residual
 ```
 
-So a dropped token is not an error — it passes through the layer
-as if it skipped the MLP entirely.
+So a dropped token is not an error: it passes through the layer
+as if it skipped the routed experts.
 
 ### When to use capacity
 
-**With EP**: sometimes necessary. All-to-all buffers are sized for
-the *worst-case* token distribution. Without a cap, one rank can
-overflow its dispatch buffer when many tokens happen to prefer
-experts on that rank. A capacity factor of 1.25 bounds the buffer
-size predictably.
+A cap changes which expert outputs count, not how much work runs.
+Dropped routes keep their expert indices, so the local path still
+computes them and the EP all-to-all still sends and computes them,
+and the zero weight discards their output. A cap saves no compute,
+memory or communication.
 
-**Without EP**: usually leave at 0. All experts live on the same
-rank and the sequential/grouped path handles any distribution.
-Setting a cap just costs throughput.
+**With EP**: no fixed-size buffer overflows without a cap.
+`ep_dispatch_and_compute` exchanges the token counts first and sizes
+each receive buffer to the count it gets, dropped routes included, so
+a rank that many routes pick receives more rows.
+
+Leave it at 0, with or without EP, unless you want the drops
+themselves, e.g. to match a baseline trained with capacity.
 
 **Caveats**: the inner loop is O(num_experts × top_k) Python and
 non-vectorized. At `num_experts = 64 × top_k = 8 = 512` Python
@@ -123,16 +128,31 @@ tests exercise this exact dispatch.
 Fallback when grouped GEMM can't run:
 
 ```python
-# kempnerforge/model/moe.py — MoEMLP._local_forward (trimmed)
+# kempnerforge/model/moe.py: MoEMLP._local_forward (trimmed)
+idle = []
 for i in range(self.num_experts):
     mask = (indices == i).any(dim=-1)
     if not mask.any():
+        idle.extend(self.experts[i].parameters())
         continue
     expert_input   = x_flat[mask]
     expert_output  = self.experts[i](expert_input)
     weight_for_i   = (weights * (indices == i).float()).sum(dim=-1)
     output[mask]  += weight_for_i[mask].unsqueeze(-1) * expert_output
+output = self._keep_in_graph(output, idle)   # output + sum(p.sum() for p in idle) * 0
 ```
+
+An expert that gets no tokens still gets a gradient, zero, from that
+last term. FSDP2 reduce-scatters only the parameters that have a
+gradient, so an expert idle on one rank but used on another would
+otherwise make the ranks' reduce-scatters differ in size: a hang over
+NCCL, a size mismatch over gloo. Packed experts always get one, since
+any expert that runs uses the packed tensors. A layer that gets no
+tokens at all, on either path, returns an empty output that carries the
+same term for every expert weight and for the routing weights, so the
+router's weights get a gradient too. Expert parallelism keeps its own
+version; see
+[Unused-expert kludge](../distributed/expert-parallelism.md#unused-expert-kludge).
 
 One kernel launch per expert (or more, per matmul). Fine for
 `num_experts ≤ 8`, painful at 32+.
@@ -221,9 +241,9 @@ else:
     output = self._local_forward(x_flat, weights, indices)
 ```
 
-The capacity factor still applies before this branch — the `weights`
+The capacity factor still applies before this branch: the `weights`
 tensor handed to `ep_dispatch_and_compute` has dropped-token weights
-already zeroed. See
+already zeroed, and those tokens are dispatched with the rest. See
 [Expert parallelism § Dispatch / combine flow](../distributed/expert-parallelism.md#dispatch--combine-flow)
 for the all-to-all mechanics.
 

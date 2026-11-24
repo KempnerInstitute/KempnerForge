@@ -191,7 +191,7 @@ def build_checkpoint_manager(
         from kempnerforge.distributed.pipeline_parallel import build_stage_group
 
         ckpt_pp_rank = pipeline.rank
-        ckpt_pg = build_stage_group(device_mesh)
+        ckpt_pg = build_stage_group(device_mesh, config.distributed.nccl_timeout_sec)
     return CheckpointManager(
         config.checkpoint,
         model,
@@ -202,6 +202,7 @@ def build_checkpoint_manager(
         weight_decay_scope=config.optimizer.weight_decay_scope,
         lr_multipliers=config.optimizer.lr_multipliers,
         module_patterns=config.vlm.module_patterns if config.vlm is not None else None,
+        group_timeout_sec=config.distributed.nccl_timeout_sec,
     )
 
 
@@ -230,6 +231,33 @@ def _mot_text_warm_start(
     agree(error, f"MoT warm-start: reading {vlm_cfg.mot_warm_start_path}")
     mot_warm_start_from_text_stack(inner_transformer(model), source)
     logger.info(f"MoT warm-start: copied dense block weights from {vlm_cfg.mot_warm_start_path}")
+
+
+def _resume_path_on_rank_zero(checkpoint_dir: str, num_stages: int | None) -> Path | None:
+    """``resolve_resume_path`` on rank 0, broadcast to every rank with any error it raised.
+
+    Only rank 0 looks at the checkpoint tree, so every rank resumes the same checkpoint, and a
+    rank 0 that cannot read the tree leaves no rank waiting in the broadcast.
+
+    Raises:
+        Exception: On rank 0, what resolving the checkpoint raised.
+        RuntimeError: On every other rank, naming rank 0's error.
+    """
+    outcome: list[dict[str, str | None]] = [{"path": None, "error": None}]
+    error: Exception | None = None
+    if dist.get_rank() == 0:
+        try:
+            found = resolve_resume_path(checkpoint_dir, num_stages)
+            outcome = [{"path": str(found) if found else None, "error": None}]
+        except Exception as e:
+            error = e
+            outcome = [{"path": None, "error": f"{type(e).__name__}: {e}"}]
+    dist.broadcast_object_list(outcome, src=0)
+    if error is not None:
+        raise error
+    if outcome[0]["error"] is not None:
+        raise RuntimeError(f"Rank 0 could not find the checkpoint to resume: {outcome[0]['error']}")
+    return Path(outcome[0]["path"]) if outcome[0]["path"] else None
 
 
 def _unused_load_path_message(config: JobConfig, resume_path: Path) -> str:
@@ -349,13 +377,7 @@ def restore_checkpoint(
     """
     num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
-        chosen = [
-            str(resolve_resume_path(config.checkpoint.dir, num_stages) or "")
-            if dist.get_rank() == 0
-            else ""
-        ]
-        dist.broadcast_object_list(chosen, src=0)
-        resume_path = Path(chosen[0]) if chosen[0] else None
+        resume_path = _resume_path_on_rank_zero(config.checkpoint.dir, num_stages)
     else:
         resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
     vlm_cfg = config.vlm
@@ -492,6 +514,7 @@ def run_training(
             eval_dataloader=eval_dataloader,
             profiler=prof,
             autocast_dtype=amp_dtype,
+            documents_seen=ckpt_mgr.restored_extra.get("documents_seen"),
         )
 
         run_training_loop(session, step=step, tokens_seen=tokens_seen)

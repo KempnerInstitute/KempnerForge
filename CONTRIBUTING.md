@@ -310,7 +310,7 @@ tests/
 
 ## Where to Contribute
 
-- **Examples (`examples/<name>/`) are the place for most new work:** an experiment's configs, its own `train.py`, data-preparation and conversion scripts, evaluation, and any custom components it registers through the config's `plugins` list, as long as a plain-string config field selects them; the enum-backed selectors (the scheduler name, the model norm and activation) accept only their built-in values. Keep each example self-contained, with its own README and tests.
+- **Examples (`examples/<name>/`) are the place for most new work:** an experiment's configs, its own `train.py`, data-preparation and conversion scripts, evaluation, and any custom components it registers through the config's `plugins` list, as long as a config field selects them by name; the enum-backed selectors (the scheduler name, the model norm and activation) accept a registered name as well as their built-in values. Keep each example self-contained, with its own README and tests.
 - **Core (`kempnerforge/`) takes only general building blocks that any model can use:** an optimizer, a scheduler, a norm, router or MLP, a parallelism axis, or a general model option. A new building block enters through the registry or a general config field, and every code change in core, bug fixes included, comes with tests. Core contains no reference to `examples/`; example modules reach it only through the `plugins` list the config names. Anything that goes into core needs a PR labeled `core`, and it is merged only after the KempnerForge team approves it.
 - **When in doubt, start in an example.** Move something into core once a second, unrelated use needs it.
 
@@ -323,7 +323,7 @@ tests/
 3. Add validation in `__post_init__` if the field has constraints.
 4. If it needs to be in `schema.py` re-exports, add it there.
 5. Add unit tests in `tests/unit/test_config.py`: default value, valid values, rejection of invalid values.
-6. Cross-section validation (e.g., "MoE + PP is not supported") goes in `JobConfig.validate(world_size)` in `kempnerforge/config/job.py`.
+6. Cross-section validation goes in `kempnerforge/config/job.py`: `JobConfig.__post_init__` runs when the config loads (e.g., the video and VLM packing checks), and `JobConfig.validate(world_size)` runs at launch, once the world size is known (e.g., "MoE + PP is not supported").
 
 ### New model component
 
@@ -396,7 +396,7 @@ uv run python scripts/train.py configs/train/debug.toml \
 Config rules:
 - New fields must default to disabled/off so existing configs keep working.
 - Validate in `__post_init__` — fail fast with a clear `ValueError`.
-- Cross-section validation (e.g., "EP requires MoE") goes in `JobConfig.validate(world_size)`.
+- Cross-section validation goes in `JobConfig.__post_init__`, which runs when the config loads (e.g., the video and VLM packing checks), or in `JobConfig.validate(world_size)`, which runs at launch (e.g., "EP requires MoE").
 
 ## Writing Docs
 
