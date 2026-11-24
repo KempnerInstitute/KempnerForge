@@ -719,6 +719,22 @@ class TestMoTMoEAccessors:
             assert isinstance(router, SigmoidTopKRouter)
             assert (router._step, router._max_steps) == (42, 1000)
 
+    def test_balance_routers_balances_each_modality_router_from_its_own_counts(self):
+        """Each router's counts are its modality's: 2 rows of 8 image or 16 text tokens, top-2."""
+        transformer = _mot_moe(router="sigmoid_topk")
+        routers = [(modality, mlp.router) for _, modality, mlp in _modality_routers(transformer)]
+        assert len(routers) == 4
+        before = []
+        for modality, router in routers:
+            assert isinstance(router, SigmoidTopKRouter)
+            assert int(router.pending_counts.sum()) == 2 * (8 if modality == "image" else 16) * 2
+            before.append((router.pending_counts.clone(), router.expert_ema.clone()))
+        transformer.balance_routers()
+        for (_, router), (counts, ema) in zip(routers, before, strict=True):
+            want = ema.double().lerp(counts.double() / counts.sum(), 1.0 - router.ema_decay)
+            assert torch.allclose(router.expert_ema.double(), want, atol=1e-7)
+            assert not router.pending_counts.any()
+
     def test_mot_expert_counts_are_per_layer_and_modality(self):
         """Each router counts its own tokens: 2 rows of 8 image or 16 text tokens, top-2."""
         transformer = _mot_moe()

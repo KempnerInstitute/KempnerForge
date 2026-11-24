@@ -35,6 +35,7 @@ from kempnerforge.distributed.utils import (
 from kempnerforge.metrics.logger import get_logger
 from kempnerforge.metrics.mfu import vision_flops_per_image
 from kempnerforge.metrics.tracker import MetricsTracker
+from kempnerforge.model.transformer import Transformer
 from kempnerforge.model.vlm import inner_transformer
 from kempnerforge.profiling.profiler import print_profiler_summary
 from kempnerforge.resilience.health import NaNDetector, check_nccl_health, params_are_finite
@@ -248,12 +249,18 @@ def clip_grads(model: torch.nn.Module, max_norm: float, pp_group: Any = None) ->
 
 
 def add_moe_losses(loss: torch.Tensor, model: torch.nn.Module, mc: Any) -> torch.Tensor:
-    """MoE auxiliary + router z-loss terms (only called when ``mc.is_moe``)."""
+    """MoE auxiliary + router z-loss terms (only called when ``mc.is_moe``).
+
+    The routers' losses are then detached (see ``Transformer.detach_router_losses``).
+    """
     aux_loss = inner_transformer(model).get_moe_aux_loss()  # type: ignore[attr-defined]
     loss = loss + mc.moe_aux_loss_weight * aux_loss
     if mc.moe_router_z_loss_weight > 0:
         z = inner_transformer(model).get_moe_router_z_loss()  # type: ignore[attr-defined]
         loss = loss + mc.moe_router_z_loss_weight * z
+    transformer = inner_transformer(model)
+    if isinstance(transformer, Transformer):
+        transformer.detach_router_losses()
     return loss
 
 
@@ -500,6 +507,21 @@ def _mark_rows_dynamic(*tensors: Any) -> None:
             maybe_mark_dynamic(tensor, 0)
 
 
+def _route_balance(session: TrainingSession, *, step_ran: bool) -> None:
+    """Balance the sigmoid routers after an optimizer step, or drop the counts of one skipped.
+
+    Every rank calls this at the same point, since balancing all-reduces the routers'
+    expert counts (see ``Transformer.balance_routers``).
+    """
+    transformer = inner_transformer(session.model)
+    if not session.config.model.is_moe or not isinstance(transformer, Transformer):
+        return
+    if step_ran:
+        transformer.balance_routers()
+    else:
+        transformer.discard_router_counts()
+
+
 def _batch_counts(
     batch: dict[str, Any], image_positions: int, tokens_per_image: int | None = None
 ) -> tuple[int, int, int | None, int]:
@@ -665,10 +687,12 @@ def checkpoint_extra(
     """Metadata saved alongside every checkpoint so a resume is exact.
 
     ``vlm_freeze`` reflects the post-transition state when a FreezeStage
-    has fired (see ``freeze_meta_at_step``). ``documents_seen``, when given,
-    is saved for the resumed run to count on from.
+    has fired (see ``freeze_meta_at_step``). ``plugins`` is the run's plugins
+    list, which a resume compares with its own (see ``restore_checkpoint``).
+    ``documents_seen``, when given, is saved for the resumed run to count on from.
     """
     extra: dict = {"phase_idx": phases.next_idx} if phases.phases else {}
+    extra["plugins"] = list(config.plugins)
     if documents_seen is not None:
         extra["documents_seen"] = documents_seen
     if config.metrics.wandb_run_id:
@@ -808,7 +832,9 @@ def _apply_stage_specs(
 def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     """FreezeStage hook: apply any stage whose start_step matches this boundary.
 
-    Each stage goes through ``_apply_stage_specs``.
+    Each stage goes through ``_apply_stage_specs``, and the model is then put in
+    training mode again, which puts a vision encoder the stages froze in eval mode and
+    one they unfroze back in training mode (see ``VLMWrapper.train``).
 
     Async-save fence: drain any in-flight save FIRST so that its
     metadata.json — which records the pre-transition spec — lands before we
@@ -831,6 +857,7 @@ def _apply_freeze_stages(session: TrainingSession, step: int) -> None:
     for stage in pending_stages:
         flipped = _apply_stage_specs(session.model, stage.specs, vlm_cfg.module_patterns)
         logger.info(f"FreezeStage at step={step}: applied {flipped}")
+    session.model.train()
 
 
 def _apply_step_transitions(session: TrainingSession, step: int) -> None:
@@ -901,7 +928,7 @@ def _shutdown_if_requested(
             "neither become `latest` nor count toward `checkpoint.keep_last_n`"
         )
     else:
-        logger.warning(f"Shutdown requested at step {step} — saving emergency checkpoint")
+        logger.warning(f"Shutdown requested at step {step}; saving emergency checkpoint")
         with _logged_time(session.tracker, "checkpoint/save_sec", step):
             ckpt_mgr.save(
                 step=step,
@@ -993,9 +1020,10 @@ def run_training_loop(
             )
 
             if not session.nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
+                _route_balance(session, step_ran=False)
                 optimizer.zero_grad()
                 if session.nan_detector.should_rollback:
-                    logger.error("Too many consecutive NaNs — stopping")
+                    logger.error("Too many consecutive NaNs; stopping")
                     break
                 _advance_lr_schedule(session)
                 step += 1
@@ -1009,6 +1037,7 @@ def run_training_loop(
             applied_lr = optimizer.param_groups[0]["lr"]
             applied_module_lrs = module_learning_rates(optimizer)
             optimizer.step()
+            _route_balance(session, step_ran=True)
             _advance_lr_schedule(session)
 
             optimizer.zero_grad()
@@ -1053,7 +1082,7 @@ def run_training_loop(
                 and step % tc.nccl_health_check_interval == 0
                 and any_rank(not check_nccl_health(), session.control_group)
             ):
-                logger.error(f"NCCL health check failed at step {step} — stopping")
+                logger.error(f"NCCL health check failed at step {step}; stopping")
                 nccl_failed_at = step
                 break
 

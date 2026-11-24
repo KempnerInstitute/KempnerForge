@@ -37,7 +37,7 @@ relying on attribute fallthrough on ``VLMWrapper``.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Protocol
+from typing import Protocol, Self
 
 import torch
 import torch.nn as nn
@@ -490,6 +490,8 @@ class VLMWrapper(nn.Module):
     head runs on the text positions, so the logits and the returned labels
     are ``(1, M, ...)`` over those tokens. ``attention_group_ids`` travel to
     ``Transformer.forward`` like ``doc_ids``.
+
+    ``train`` keeps a vision encoder whose parameters are all frozen in eval mode.
     """
 
     def __init__(
@@ -510,6 +512,20 @@ class VLMWrapper(nn.Module):
     @property
     def num_image_tokens(self) -> int:
         return self.strategy.num_image_tokens(self)
+
+    def train(self, mode: bool = True) -> Self:
+        """Set training mode, keeping a vision encoder whose parameters are all frozen in eval.
+
+        Eval mode turns off the frozen encoder's mode-dependent randomness, such as dropout
+        and drop path, and stops its BatchNorm running statistics from updating, whether
+        ``vlm.freeze``, a ``FreezeStage`` or a resume froze it. An encoder with a parameter
+        that trains, or with none, follows ``mode``.
+        """
+        super().train(mode)
+        params = list(self.vision_encoder.parameters())
+        if mode and params and not any(p.requires_grad for p in params):
+            self.vision_encoder.eval()
+        return self
 
     def forward(
         self,
