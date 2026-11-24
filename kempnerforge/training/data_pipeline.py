@@ -379,8 +379,24 @@ class DataFn(Protocol):
     """Builds the training data pipeline; ``build_data_pipeline`` is the default."""
 
     def __call__(
-        self, config: JobConfig, runtime: RuntimeContext, *, tokens_per_image: int | None = None
-    ) -> DataPipeline: ...
+        self,
+        config: JobConfig,
+        runtime: RuntimeContext,
+        /,
+        *,
+        tokens_per_image: int | None = None,
+    ) -> DataPipeline:
+        """The pipeline this rank trains on.
+
+        The builder shards its own loader over the data-parallel ranks and
+        returns the ``dp_rank`` and ``dp_size`` it used, which must be
+        ``get_dp_info(runtime.device_mesh)``: the loop scales token counts by
+        ``dp_size``, and ``run_training`` refuses any other pair. Annealing
+        phases need ``mixture_dataset``, ``mixture_sampler`` and
+        ``mixture_weights``, and a resume restores the loader's position only
+        if it has ``state_dict`` and ``load_state_dict``.
+        """
+        ...
 
 
 def build_data_pipeline(
