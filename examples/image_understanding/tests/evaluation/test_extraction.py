@@ -278,19 +278,32 @@ class TestAnswerExtractor:
         assert extract("what?", context) == "42"
         assert model.calls == 1 + len(encoding.overflowing)
 
-    def test_a_question_too_long_for_a_window_is_refused(self, spiece_model: Path) -> None:
+    def test_a_pair_that_cannot_be_cut_into_windows_is_refused(self, spiece_model: Path) -> None:
         length = WINDOW_STRIDE + 40
         extract, model = _extractor(spiece_model, {}, {}, max_length=length)
-        room = length - 3 - WINDOW_STRIDE
-        assert extract(" ".join(["a"] * (room - 1)), "a cat") == "a"
+        limit = length - 3 - WINDOW_STRIDE
+        long_context = " ".join(["a"] * 300)
+        assert extract(" ".join(["a"] * (limit - 1)), long_context) == " a"
+        assert extract(" ".join(["a"] * (limit - 2)) + " </s>", long_context) == " a"
+        assert extract(" ".join(["a"] * limit), "a cat") == "a"
         calls = model.calls
-        with pytest.raises(ValueError, match=f"the question is {room} tokens.*at most {room - 1}"):
-            extract(" ".join(["a"] * room), "a cat")
-        with pytest.raises(ValueError, match=f"the question is {room} tokens"):
-            extract(" ".join(["a"] * room), " ".join(["a"] * 300))
+        with pytest.raises(
+            ValueError, match=f"the question is {limit} tokens.*at most {limit - 1}"
+        ):
+            extract(" ".join(["a"] * limit), long_context)
         with pytest.raises(ValueError, match=f"the question is {length + 50} tokens"):
             extract(" ".join(["a"] * (length + 50)), "a cat")
         assert model.calls == calls
+
+    def test_checking_a_pair_leaves_the_windows_as_they_were(self, spiece_model: Path) -> None:
+        length = WINDOW_STRIDE + 40
+        tokenizer = bigbird_tokenizer(spiece_model, length)
+        truncation = tokenizer.truncation
+        extraction._check_pair(tokenizer, "what?", " ".join(["a"] * 300))
+        assert tokenizer.truncation == truncation
+        with pytest.raises(ValueError):
+            extraction._check_pair(tokenizer, " ".join(["a"] * length), " ".join(["a"] * 300))
+        assert tokenizer.truncation == truncation
 
     @pytest.mark.parametrize("context", [" ", "\n", " \t\n "])
     def test_a_context_without_a_token_gives_no_answer(

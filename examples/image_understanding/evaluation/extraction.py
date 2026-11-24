@@ -210,20 +210,30 @@ def _characters(window: Encoding, first: int, last: int) -> tuple[int, int]:
     return window.offsets[first][0], window.offsets[last][1]
 
 
-def _check_question(tokenizer: Tokenizer, counter: Tokenizer, question: str) -> None:
-    """Refuses a question that leaves a window of ``tokenizer`` no more context than its stride.
+def _check_pair(tokenizer: Tokenizer, question: str, context: str) -> None:
+    """Refuses a pair that ``tokenizer`` cannot cut into windows, on which it would abort.
 
-    ``tokenizer`` aborts on such a pair rather than raising an error, so the
-    question is counted first, by ``counter``, a copy that does not truncate.
+    A pair longer than a window is cut into windows that hold the question and
+    overlap by the stride, which needs a question shorter than a window's length
+    less the pair's special tokens and the stride; a pair that fits one window
+    is not cut. ``tokenizer`` aborts on the rest rather than raising an error.
+    The texts are counted with its truncation off, which is then restored.
     """
     truncation: Any = tokenizer.truncation
     processor: Any = tokenizer.post_processor
     room = truncation["max_length"] - processor.num_special_tokens_to_add(True)
-    tokens = len(counter.encode(question, add_special_tokens=False).ids)
-    if tokens >= room - truncation["stride"]:
+    limit = room - truncation["stride"]
+    tokenizer.no_truncation()
+    try:
+        question_tokens = len(tokenizer.encode(question, add_special_tokens=False).ids)
+        context_tokens = len(tokenizer.encode(context, add_special_tokens=False).ids)
+    finally:
+        tokenizer.enable_truncation(**truncation)
+    if question_tokens >= limit and question_tokens + context_tokens > room:
         raise ValueError(
-            f"the question is {tokens} tokens, and a window of the answer extractor takes "
-            f"at most {room - truncation['stride'] - 1} so that its context overlaps"
+            f"the question is {question_tokens} tokens, so the context cannot be cut into "
+            f"windows of the answer extractor beside it; a longer context needs a question "
+            f"of at most {limit - 1}"
         )
 
 
@@ -259,9 +269,10 @@ class AnswerExtractor:
     raises is tried again by the next call. Calling the extractor returns the
     span of ``context`` that answers ``question``, as described in this module,
     or ``""`` when the context holds no token (only whitespace), where the
-    pipeline finds no answer at all. A question too long for a window to hold it
-    with more context than the stride (more than 3,964 tokens for BigBird) is
-    refused with ``ValueError``.
+    pipeline finds no answer at all. A pair the tokenizer cannot cut into
+    windows, a question over 3,964 tokens for BigBird with a context that does
+    not fit one window beside it, raises ``ValueError`` where the tokenizer would
+    abort.
 
     Raises:
         ValueError: ``device`` is refused by ``check_extractor_device``.
@@ -270,16 +281,12 @@ class AnswerExtractor:
     def __init__(self, device: str, load: Callable[[torch.device], SpanModel]) -> None:
         self.device = check_extractor_device(device)
         self._load = load
-        self._loaded: tuple[SpanModel, Tokenizer] | None = None
+        self._loaded: SpanModel | None = None
 
-    def _span_model(self) -> tuple[SpanModel, Tokenizer]:
-        """The loaded model, with a copy of its tokenizer that counts without truncating."""
+    def _span_model(self) -> SpanModel:
         if self._loaded is None:
             started = time.perf_counter()
-            span_model = self._load(self.device)
-            counter = type(span_model.tokenizer).from_str(span_model.tokenizer.to_str())
-            counter.no_truncation()
-            self._loaded = span_model, counter
+            self._loaded = self._load(self.device)
             logger.info(
                 f"Loaded the answer extractor on {self.device} in "
                 f"{time.perf_counter() - started:.1f} s"
@@ -303,13 +310,13 @@ class AnswerExtractor:
         """The span of ``context`` that answers ``question``.
 
         Raises:
-            ValueError: ``question`` or ``context`` is empty, or ``question`` is
-                too long for a window.
+            ValueError: ``question`` or ``context`` is empty, or the pair cannot
+                be cut into windows.
         """
         if not question or not context:
             raise ValueError("an answer is read from a non-empty context for a non-empty question")
-        span_model, counter = self._span_model()
-        _check_question(span_model.tokenizer, counter, question)
+        span_model = self._span_model()
+        _check_pair(span_model.tokenizer, question, context)
         encoding = span_model.tokenizer.encode(question, context)
         windows: Sequence[Encoding] = [encoding, *encoding.overflowing]
         totals: dict[str, float] = {}

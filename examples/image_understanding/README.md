@@ -662,8 +662,9 @@ the scorers of their answers.
     (`EXTRACTOR_MODEL`, `EXTRACTOR_REVISION` and `EXTRACTOR_FILES` in
     `extraction.py`). Each rank loads the model from them when one of its rows
     first needs it, as each rank scores its own rows; a reply needing no
-    extraction loads nothing. A question over 3,964 tokens, which leaves a window
-    no more context than its stride, is refused (testmini's longest query is 281).
+    extraction loads nothing. Where the tokenizer would abort, on a question over
+    3,964 tokens with a reply too long to fit one window beside it, the extractor
+    raises an error instead (testmini's longest query is 281 tokens).
     transformers 5 has
     no question-answering pipeline, so `extraction.py` reads the span as the
     transformers 4 pipeline the recipe calls does, with the same tokenizer, built
