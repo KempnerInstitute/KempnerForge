@@ -15,7 +15,9 @@ config.validate(world_size=1)
 
 `validate(world_size)` enforces cross-section rules that a single
 dataclass can't check on its own (e.g. parallelism factors × world size,
-`tie_embeddings` vs PP, FP8 vs TP, MoE vs PP).
+`tie_embeddings` vs PP, FP8 vs TP, MoE vs PP). `JobConfig.__post_init__`
+checks others when the config loads (e.g. `[video]` needs `[vlm]`, and the
+limits of VLM packing).
 
 ## Layering
 
@@ -45,8 +47,8 @@ registry
 - **[CLI overrides](cli-overrides.md)** — dotted-path syntax, booleans,
   lists, nested dataclasses.
 - **[Validation rules](validation-rules.md)** — per-dataclass
-  `__post_init__` checks plus `JobConfig.validate(world_size)`
-  cross-section rules.
+  `__post_init__` checks plus the cross-section rules of
+  `JobConfig.__post_init__` and `JobConfig.validate(world_size)`.
 - **[Registry](registry.md)** — the seven component categories
   (`model`, `optimizer`, `scheduler`, `loss`, `norm`, `router`,
   `mlp`) and how to plug a new builder in.
