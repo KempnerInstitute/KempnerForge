@@ -41,6 +41,15 @@ import torch.nn as nn
 from kempnerforge.config.vlm import FreezeSpec, FreezeStage, VLMConfig
 
 
+def _always_frozen(model: nn.Module) -> set[int]:
+    """The ids of the parameters that a module of ``model`` names in ``always_frozen``."""
+    return {
+        id(getattr(module, name))
+        for module in model.modules()
+        for name in getattr(module, "always_frozen", ())
+    }
+
+
 def freeze_params(
     model: nn.Module,
     patterns: Iterable[str],
@@ -60,11 +69,7 @@ def freeze_params(
     if not pats:
         return 0
     target_requires_grad = not frozen
-    stay_frozen = {
-        id(getattr(module, name))
-        for module in model.modules()
-        for name in getattr(module, "always_frozen", ())
-    }
+    stay_frozen = _always_frozen(model)
     n = 0
     for name, param in getattr(model, "_orig_mod", model).named_parameters():
         if target_requires_grad and id(param) in stay_frozen:
@@ -186,7 +191,8 @@ def trainable_during_run(model: nn.Module, config: VLMConfig) -> set[str]:
     """Return the names of the parameters of ``model`` that train at some step of a run.
 
     Covers the build freeze, each ``FreezeStage`` from its ``start_step``, and the freeze a
-    resume applies at any step. ``model`` is not changed.
+    resume applies at any step. A parameter that its module names in ``always_frozen`` never
+    trains, so it is left out. ``model`` is not changed.
 
     Args:
         model: The model, with each parameter's ``requires_grad`` as built.
@@ -213,7 +219,12 @@ def trainable_during_run(model: nn.Module, config: VLMConfig) -> set[str]:
         )
         trainable.update(name for name, on in running.items() if on)
         trainable.update(name for name, on in resumed.items() if on)
-    return trainable
+    stay_frozen = _always_frozen(model)
+    return {
+        name
+        for name, param in model.named_parameters()
+        if name in trainable and id(param) not in stay_frozen
+    }
 
 
 @contextlib.contextmanager

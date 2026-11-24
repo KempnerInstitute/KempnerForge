@@ -837,7 +837,7 @@
         "canonical_freeze_meta(specs) -> list[dict]",
         "effective_freeze(step, base_specs, schedule, valid_modules) -> list[FreezeSpec]",
         "freeze_meta_at_step(step, config) -> list[dict]",
-        "trainable_during_run(model, config) -> set[str] (names of the parameters that train at some step: after the build freeze, each FreezeStage, or a resume)",
+        "trainable_during_run(model, config) -> set[str] (names of the parameters that train at some step: after the build freeze, each FreezeStage, or a resume; never a parameter its module names in always_frozen)",
         "trainable_for_the_run(model, config) -> Iterator[list[str]] (context manager: those parameters require grad while the optimizer is built or a checkpoint loaded)"
       ],
       "tested_by": [
@@ -1830,12 +1830,12 @@
           "TestFrozenBias(2)",
           "TestBalance(5)",
           "TestBalanceRouters(3)",
-          "TestCheckpointsThatTrainedTheBias(3)",
+          "TestCheckpointsThatTrainedTheBias(4)",
           "TestManagerResume(2)",
           "TestDerivedBufferOwners(1)",
           "TestFSDP2(1)"
         ],
-        "count": 17
+        "count": 18
       },
       "tests/unit/test_optimizer.py": {
         "classes": [
@@ -2057,10 +2057,10 @@
           "TestCanonicalFreezeMeta(4)",
           "TestEffectiveFreeze(7)",
           "TestTrainableDuringRun(9)",
-          "TestTrainableForTheRun(4)"
+          "TestTrainableForTheRun(5)"
         ],
         "note": "Also module-level functions: a module the build froze trains once a stage unfreezes it, under each registered optimizer (4), and apply_freeze_specs reaches the module a compiled model wraps (1)",
-        "count": 38
+        "count": 39
       },
       "tests/unit/test_unfreeze_fsdp.py": {
         "classes": [

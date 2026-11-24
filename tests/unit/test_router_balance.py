@@ -250,6 +250,52 @@ class TestCheckpointsThatTrainedTheBias:
         manager.load(exclude_keys=["optimizer"])
         assert torch.equal(_routers(model)[0].expert_bias.detach(), saved)
 
+    def test_a_schedule_free_resume_keeps_the_bias_its_master_starts_from(
+        self, tmp_path: Path
+    ) -> None:
+        """A schedule_free_adamw checkpoint that trained the bias and predates the masters
+        loads with the bias frozen and equal to its derived master, also when a stage later
+        unfreezes the router's module: the optimizer holds no state for the bias to move it
+        back to its training point."""
+        from kempnerforge.config.vlm import FreezeSpec, FreezeStage, VLMConfig
+        from kempnerforge.training.freeze import apply_freeze_specs, trainable_for_the_run
+
+        def build() -> torch.nn.Module:
+            model = torch.nn.Module()
+            model.transformer = torch.nn.Module()
+            model.transformer.router = SigmoidTopKRouter(dim=8, num_experts=4, top_k=2)
+            model.transformer.later = torch.nn.Linear(8, 8)
+            return model
+
+        schedule_free = OptimizerConfig(name="schedule_free_adamw", lr=0.01, fused=False)
+        source = build()
+        source.transformer.router.expert_bias.requires_grad_(True)
+        optimizer = build_optimizer(source, schedule_free)
+        for _ in range(3):
+            sum(p.sum() for p in source.parameters()).backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        for name in source.transformer.router.derived_buffers:
+            source.transformer.router._buffers.pop(name)
+        writer = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), source, optimizer)
+        writer.save(step=7)
+        writer.wait()
+
+        resumed = build()
+        config = VLMConfig(
+            freeze=[FreezeSpec("transformer")],
+            freeze_schedule=[FreezeStage(5, (FreezeSpec("transformer", False),))],
+        )
+        apply_freeze_specs(resumed, config.freeze, config.module_patterns)
+        with trainable_for_the_run(resumed, config):
+            resumed_optimizer = build_optimizer(resumed, schedule_free)
+        reader = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), resumed, resumed_optimizer)
+        with trainable_for_the_run(resumed, config) as unfrozen:
+            reader.load(fresh_if_unheld=unfrozen)
+        router = resumed.transformer.router
+        assert not router.expert_bias.requires_grad
+        assert torch.equal(router._masters()[1], router.expert_bias)
+
     def test_generate_loads_it_with_the_masters_derived(self, tmp_path: Path) -> None:
         """scripts/generate.py starts the masters from the loaded EMA and bias, as the manager
         does, instead of failing on the keys the checkpoint predates."""
