@@ -196,6 +196,22 @@ class TestBigBirdTokenizer:
         tokenizer = bigbird_tokenizer(spiece_model, TOKENS)
         assert "<sep_0>" in tokenizer.encode("what?", "a<sep_0>b").tokens
 
+    @pytest.mark.parametrize(
+        ("context", "pieces"),
+        [
+            ("a </s>", ["\u2581a", "</s>"]),
+            ("a  </s>", ["\u2581a", "</s>"]),
+            ("a <pad>", ["\u2581a", "<pad>"]),
+            ("</s> a", ["</s>", "\u2581a"]),
+        ],
+    )
+    def test_a_control_piece_is_matched_before_the_text_is_normalized(
+        self, spiece_model: Path, context: str, pieces: list[str]
+    ) -> None:
+        tokenizer = bigbird_tokenizer(spiece_model, TOKENS)
+        tokens = tokenizer.encode("what?", context).tokens
+        assert tokens[tokens.index("[SEP]") + 1 : -1] == pieces
+
     def test_a_long_context_is_cut_into_overlapping_windows(self, spiece_model: Path) -> None:
         length = WINDOW_STRIDE + 40
         tokenizer = bigbird_tokenizer(spiece_model, length)

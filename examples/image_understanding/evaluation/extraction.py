@@ -41,6 +41,7 @@ CANDIDATE_SPANS = 12
 WINDOW_STRIDE = 128
 MASKED_LOGIT = -10000.0
 CONTEXT = 1
+CONTROL_PIECE = 3
 USER_DEFINED_PIECE = 4
 PIECE_MARK = "\u2581"
 
@@ -67,12 +68,13 @@ def bigbird_tokenizer(spiece_model: Path, max_length: int) -> Tokenizer:
 
     The pieces and their scores make a Unigram model; trailing whitespace is
     stripped and runs of spaces become one piece marker before the text is split
-    at spaces. The user-defined pieces are matched whole, the special tokens are
-    added as BigBird declares them, and a pair is laid out as ``[CLS] question
-    [SEP] context [SEP]``. A pair longer than ``max_length`` tokens is cut into
-    windows that overlap by ``WINDOW_STRIDE`` tokens, the context truncated from
-    the left. The file is read with ``protobuf``, so the ``sentencepiece`` package
-    is not needed.
+    at spaces. The control and user-defined pieces are matched whole in the text
+    before it is normalized, the control ones as special tokens, as transformers
+    4 registers them; the special tokens are then added as BigBird declares them,
+    and a pair is laid out as ``[CLS] question [SEP] context [SEP]``. A pair
+    longer than ``max_length`` tokens is cut into windows that overlap by
+    ``WINDOW_STRIDE`` tokens, the context truncated from the left. The file is
+    read with ``protobuf``, so the ``sentencepiece`` package is not needed.
     """
     from tokenizers import AddedToken, Regex, Tokenizer, normalizers, pre_tokenizers, processors
     from tokenizers.models import Unigram
@@ -96,9 +98,9 @@ def bigbird_tokenizer(spiece_model: Path, max_length: int) -> Tokenizer:
     )
     tokenizer.add_tokens(
         [
-            AddedToken(piece.piece, normalized=False, special=False)
+            AddedToken(piece.piece, normalized=False, special=piece.type == CONTROL_PIECE)
             for piece in proto.pieces
-            if piece.type == USER_DEFINED_PIECE
+            if piece.type in (CONTROL_PIECE, USER_DEFINED_PIECE)
         ]
     )
     tokenizer.add_special_tokens(
