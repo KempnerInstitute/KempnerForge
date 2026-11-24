@@ -5,7 +5,8 @@ Parses argv, loads the config, and hands off to the core training scaffold.
 The VLM step body still lives in core, so ``run_training`` selects it from
 ``config.is_vlm``; when it moves out here it becomes a ``step_fn=`` argument.
 ``--mixture=<file>`` trains on the packed mixture of image-text sources the file
-describes (``mixture.py``) instead of the ``[data]`` source.
+describes (``mixture.py``) instead of the ``[data]`` source; the file and the run
+are checked before training starts.
 
 Periodic evaluation is off by default. With ``--eval-tasks``, ``--eval-command`` and
 ``--eval-output`` every checkpoint the run saves is evaluated: the command is a template
@@ -37,8 +38,9 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
 
-from mixture import mixture_data_fn
+from mixture import check_run, mixture_data_fn
 
 from kempnerforge.config.loader import load_config
 from kempnerforge.training import run_training
@@ -78,17 +80,24 @@ def _parse_args(argv: list[str]) -> tuple[argparse.ArgumentParser, argparse.Name
     return parser, args, overrides
 
 
+def _mixture_options(config: Any, mixtures: list[str]) -> dict[str, Any]:
+    """``run_training``'s ``data_fn`` for the mixture given, the file and the run checked first."""
+    if not mixtures:
+        return {}
+    check_run(config)
+    return {"data_fn": mixture_data_fn(mixtures[0])}
+
+
 def main() -> None:
     mixtures = [arg[len(MIXTURE_FLAG) :] for arg in sys.argv[1:] if arg.startswith(MIXTURE_FLAG)]
     args = [arg for arg in sys.argv[1:] if not arg.startswith(MIXTURE_FLAG)]
     if not args or len(mixtures) > 1:
         print("Usage: train.py <config.toml> [--mixture=<mixture.toml>] [--section.key=value ...]")
         sys.exit(1)
-    options = {"data_fn": mixture_data_fn(mixtures[0])} if mixtures else {}
-
     arguments = args[1:]
     if not any(argument.startswith(EVAL_FLAG_PREFIX) for argument in arguments):
-        run_training(load_config(args[0], cli_args=arguments), **options)
+        config = load_config(args[0], cli_args=arguments)
+        run_training(config, **_mixture_options(config, mixtures))
         return
 
     parser, parsed, overrides = _parse_args(arguments)
@@ -101,6 +110,7 @@ def main() -> None:
     absent = [flag for flag, value in flags.items() if value is None]
     if absent:
         parser.error(f"periodic evaluation also needs {' and '.join(absent)}")
+    options = _mixture_options(config, mixtures)
 
     from evaluation.checkpoint import check_supported
     from evaluation.periodic import PeriodicEvaluation, PeriodicEvaluationHook

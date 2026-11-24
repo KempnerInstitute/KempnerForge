@@ -116,6 +116,16 @@ class TestConversion:
         _run("index", "--src", str(root / "parquet"), "--dst", str(root / "arrow"))
         assert np.load(subset / "index.npz")["num_images"].tolist() == [1, 2, 1, 1, 1]
 
+    def test_index_recomputes_keep_flags_of_an_earlier_rule(self, subset: Path) -> None:
+        for meta in subset.glob("*.meta.npz"):
+            arrays = dict(np.load(meta))
+            del arrays["keep_rule"]
+            arrays["keep"] = np.zeros_like(arrays["keep"])
+            np.savez(meta, **arrays)
+        root = subset.parents[1]
+        _run("index", "--src", str(root / "parquet"), "--dst", str(root / "arrow"))
+        assert np.load(subset / "index.npz")["keep"].tolist() == [True, True, False, True, True]
+
     def test_an_empty_row_group_keeps_its_batch(self, tmp_path: Path) -> None:
         src, dst = tmp_path / "parquet", tmp_path / "arrow"
         _write_parquet(
@@ -344,6 +354,27 @@ class TestConversion:
 
 
 class TestFineVisionArrow:
+    def test_multi_image_rows_render_with_the_default_renderer(
+        self, subset: Path, tokenizer: Any
+    ) -> None:
+        reader = FineVisionArrow(subset)
+        renderer = ChatRenderer(tokenizer, max_text_len=None, image_size=8, answer_only=True)
+        dataset = RenderedDataset(reader, renderer)
+        samples = [dataset[i] for i in range(len(dataset))]
+        assert [s["pixel_values"].shape[0] for s in samples] == [1, 2, 1, 1]
+        assert len({tuple(s["input_ids"].tolist()) for s in samples}) == 4
+        assert dataset.skipped == 0
+
+    def test_a_renderer_capped_below_the_reader_is_refused(
+        self, subset: Path, tokenizer: Any
+    ) -> None:
+        renderer = ChatRenderer(
+            tokenizer, max_text_len=None, image_size=8, answer_only=True, max_images=1
+        )
+        with pytest.raises(ValueError, match="max_images=1"):
+            RenderedDataset(FineVisionArrow(subset), renderer)
+        assert len(RenderedDataset(FineVisionArrow(subset, max_images=1), renderer)) == 3
+
     def test_reads_kept_rows_across_files_and_batches(self, subset: Path) -> None:
         reader = FineVisionArrow(subset, max_images=None)
         assert len(reader) == 4

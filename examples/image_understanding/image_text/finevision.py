@@ -57,7 +57,8 @@ class FineVisionArrow(Dataset):
     kept, a missing user message or reply read as empty text; a row with a null
     turn, or whose image does not decode or holds no bytes, is passed over for the
     next row, up to ``max_attempts`` in a row, and ``skipped`` counts them. At most
-    ``max_open_files`` Arrow files stay mapped per process.
+    ``max_open_files`` Arrow files stay mapped per process. ``max_images`` holds
+    the most images a kept row can bring (``None`` for any number).
     """
 
     def __init__(
@@ -84,6 +85,7 @@ class FineVisionArrow(Dataset):
             raise ValueError("text_only keeps the rows without images; min_images must be 0")
         self.subset_dir = Path(subset_dir)
         self.text_only = text_only
+        self.max_images = 0 if text_only else max_images
         self.max_attempts = check_max_attempts(max_attempts)
         self.max_open_files = max_open_files
         self._skips = SkipLog()

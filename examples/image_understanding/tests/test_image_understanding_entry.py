@@ -68,11 +68,44 @@ def test_a_mixture_supplies_the_data_pipeline(
     seen: dict[str, Any] = {}
     monkeypatch.setattr(module, "run_training", _record(seen))
     monkeypatch.setattr(module, "mixture_data_fn", lambda path: ("data_fn", path))
+    monkeypatch.setattr(module, "check_run", lambda config: seen.update(checked=config))
     argv = ["train.py", str(config_path), "--mixture=mix.toml", "--train.max_steps=2"]
     monkeypatch.setattr(sys, "argv", argv)
     module.main()
     assert seen["data_fn"] == ("data_fn", "mix.toml")
     assert seen["config"].train.max_steps == 2
+    assert seen["checked"] is seen["config"]
+
+
+@pytest.mark.parametrize(
+    ("run", "mixture", "message"),
+    [
+        (
+            "[vlm]\narch = 'joint_decoder'\n[data]\npack_sequences = true\n"
+            "[train]\nbatch_size = 2\n",
+            "[[source]]\nreader = 'vqav2'\nannotation_file = 'a'\nimage_root = 'b'\n",
+            "batch_size = 1",
+        ),
+        (
+            "[vlm]\narch = 'joint_decoder'\n[data]\npack_sequences = true\n"
+            "[train]\nbatch_size = 1\n",
+            "[packng]\nview_groups = true\n[[source]]\nreader = 'vqav2'\n",
+            "unknown mixture table",
+        ),
+    ],
+)
+def test_a_mixture_run_is_checked_before_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run: str, mixture: str, message: str
+) -> None:
+    config_path = tmp_path / "run.toml"
+    config_path.write_text("[vision_encoder]\ntype = 'random'\n" + run)
+    mixture_path = tmp_path / "mix.toml"
+    mixture_path.write_text(mixture)
+    module = _load_entry_point()
+    monkeypatch.setattr(module, "run_training", lambda *a, **k: pytest.fail("training started"))
+    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path), f"--mixture={mixture_path}"])
+    with pytest.raises(ValueError, match=message):
+        module.main()
 
 
 @pytest.mark.parametrize(
@@ -152,6 +185,7 @@ def test_the_mixture_reaches_training_and_each_evaluation(
     config_path.write_text(VLM_CONFIG)
     module = _load_entry_point()
     monkeypatch.setattr(module, "mixture_data_fn", lambda path: ("data_fn", path))
+    monkeypatch.setattr(module, "check_run", lambda config: None)
     monkeypatch.chdir(tmp_path)
     seen = _run_main(
         module,
