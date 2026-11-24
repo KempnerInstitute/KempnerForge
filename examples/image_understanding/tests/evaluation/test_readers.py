@@ -2,14 +2,30 @@
 
 from __future__ import annotations
 
+import io
 import json
+import re
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from evaluation.readers import gsm8k, mmlu, pixmo_count_eval, pixmo_points_eval
+import torch
+from evaluation import extraction, readers
+from evaluation.extraction import AnswerExtractor
+from evaluation.readers import (
+    MATHVISTA_COLUMNS,
+    MathVistaRows,
+    gsm8k,
+    mathvista,
+    mmlu,
+    pixmo_count_eval,
+    pixmo_points_eval,
+)
+from evaluation.scorers import MathVistaReference
 from evaluation.tasks import build_reader, load_tasks
 from image_text.testbed import aokvqa
 from PIL import Image
@@ -123,3 +139,174 @@ def test_the_board_tasks_load_from_a_task_file(points_file: Path, tmp_path: Path
     pointing, arithmetic = load_tasks(path)
     assert len(build_reader(pointing)) == 2
     assert len(build_reader(arithmetic)) == 1
+
+
+def _png() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 6), (10, 200, 10)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _extract(question: str, reply: str) -> str:
+    return reply
+
+
+MATHVISTA_PROBLEMS: list[dict[str, Any]] = [
+    {
+        "pid": "1",
+        "query": "Hint: pick an option.\nQuestion: Which fraction?\nChoices:\n(A) 3/11\n(B) 8/11",
+        "answer": "8/11",
+        "question_type": "multi_choice",
+        "answer_type": "text",
+        "choices": ["3/11", "8/11"],
+        "precision": None,
+    },
+    {
+        "pid": "2",
+        "query": "Hint: answer with an integer.\nQuestion: How many cats?",
+        "answer": "3",
+        "question_type": "free_form",
+        "answer_type": "integer",
+        "choices": None,
+        "precision": None,
+    },
+    {
+        "pid": "3",
+        "query": "Hint: two decimal places.\nQuestion: How long is it?",
+        "answer": "1.25",
+        "question_type": "free_form",
+        "answer_type": "float",
+        "choices": None,
+        "precision": 2.0,
+    },
+]
+
+
+def _changed(row: int, **fields: Any) -> list[dict[str, Any]]:
+    """``MATHVISTA_PROBLEMS`` with ``fields`` of problem ``row`` changed."""
+    problems = [dict(problem) for problem in MATHVISTA_PROBLEMS]
+    problems[row].update(fields)
+    return problems
+
+
+class TestMathVista:
+    def test_a_row_asks_its_query_of_its_image(self, write_mathvista: Callable[..., Path]) -> None:
+        reader = MathVistaRows(write_mathvista(MATHVISTA_PROBLEMS), lambda: _extract)
+        assert len(reader) == 3
+        for row, problem in enumerate(MATHVISTA_PROBLEMS):
+            document = reader[row]
+            assert document.images[0].size == (8 + row, 6)
+            assert document.images[0].mode == "RGB"
+            assert document.turns[0].user == problem["query"]
+            assert document.turns[0].answers == (problem["answer"],)
+
+    def test_the_reference_is_the_problem_with_the_extractor(
+        self, write_mathvista: Callable[..., Path]
+    ) -> None:
+        reader = MathVistaRows(write_mathvista(MATHVISTA_PROBLEMS), lambda: _extract)
+        assert reader.reference(0) == MathVistaReference(
+            answer="8/11",
+            query=MATHVISTA_PROBLEMS[0]["query"],
+            question_type="multi_choice",
+            answer_type="text",
+            extract=_extract,
+            choices=("3/11", "8/11"),
+        )
+        assert (reader.reference(1).choices, reader.reference(1).precision) == ((), None)
+        assert reader.reference(2).precision == 2
+        assert isinstance(reader.reference(2).precision, int)
+
+    @pytest.mark.parametrize("row", [-1, 3])
+    def test_a_row_outside_the_split_is_refused(
+        self, write_mathvista: Callable[..., Path], row: int
+    ) -> None:
+        reader = MathVistaRows(write_mathvista(MATHVISTA_PROBLEMS), lambda: _extract)
+        with pytest.raises(IndexError, match=f"index {row} is out of range for 3 rows"):
+            reader.read_with_index(row)
+
+    def test_the_rows_are_checked_with_a_stand_in_that_never_extracts(self) -> None:
+        with pytest.raises(RuntimeError, match="once the split is checked"):
+            readers._unset_extractor("what?", "a cat")
+
+    @pytest.mark.parametrize("broken", [{"bytes": b"not an image", "path": "0.png"}, None])
+    def test_a_row_whose_image_cannot_be_used_is_passed_over(
+        self, write_mathvista: Callable[..., Path], broken: dict[str, Any] | None
+    ) -> None:
+        image = {"bytes": _png(), "path": "1.png"}
+        path = write_mathvista(MATHVISTA_PROBLEMS, images=[broken, image, image])
+        reader = MathVistaRows(path, lambda: _extract)
+        assert reader.read_with_index(0)[0] == 1
+        assert reader.skipped == 1
+
+    @pytest.mark.parametrize("column", MATHVISTA_COLUMNS)
+    def test_a_file_without_a_column_is_refused(
+        self, write_mathvista: Callable[..., Path], column: str
+    ) -> None:
+        path = write_mathvista(MATHVISTA_PROBLEMS)
+        pq.write_table(pq.read_table(path).drop_columns([column]), path)
+        with pytest.raises(ValueError, match=re.escape(f"has no ['{column}'] column")):
+            MathVistaRows(path, lambda: _extract)
+
+    @pytest.mark.parametrize(
+        ("problems", "error"),
+        [
+            (_changed(1, answer=""), "problem 2: answer must be a non-blank string"),
+            (_changed(2, answer_type="fraction"), "problem 3: answer_type must be one of"),
+            (_changed(2, precision=None), "problem 3: a float answer needs a precision"),
+            (_changed(2, precision=float("nan")), "problem 3: "),
+            (_changed(0, answer="1/2"), "problem 1: the answer '1/2' is not one of"),
+        ],
+    )
+    def test_a_problem_that_could_never_be_scored_is_refused_by_its_pid(
+        self, write_mathvista: Callable[..., Path], problems: list[dict[str, Any]], error: str
+    ) -> None:
+        path = write_mathvista(problems)
+        with pytest.raises(ValueError, match=error):
+            MathVistaRows(path, lambda: _extract)
+
+    def test_a_split_that_is_refused_makes_no_extractor(
+        self, write_mathvista: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        made: list[str] = []
+        path = write_mathvista(_changed(1, answer=""))
+        with pytest.raises(ValueError, match="problem 2"):
+            MathVistaRows(path, lambda: made.append("made") or _extract)
+        monkeypatch.setattr(extraction, "fetch_bigbird", lambda: made.append("fetched") or tmp_path)
+        with pytest.raises(ValueError, match="problem 2"):
+            mathvista(path, extractor_device="cpu")
+        assert made == []
+
+    def test_the_factory_gives_each_row_an_extractor_on_the_device(
+        self, write_mathvista: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        fetched: list[Path] = []
+        monkeypatch.setattr(
+            extraction, "fetch_bigbird", lambda: fetched.append(tmp_path) or tmp_path
+        )
+        reader = mathvista(write_mathvista(MATHVISTA_PROBLEMS), extractor_device="cpu")
+        assert fetched == [tmp_path]
+        extract = reader.reference(0).extract
+        assert isinstance(extract, AnswerExtractor) and extract.device == torch.device("cpu")
+        assert all(reader.reference(row).extract is extract for row in range(len(reader)))
+
+    def test_a_device_torch_cannot_read_is_refused_when_the_reader_is_built(
+        self, write_mathvista: Callable[..., Path]
+    ) -> None:
+        with pytest.raises(ValueError, match="extractor_device"):
+            mathvista(write_mathvista(MATHVISTA_PROBLEMS), extractor_device="gpu0")
+
+    def test_a_task_file_reads_the_split_from_its_own_directory(
+        self, write_mathvista: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(extraction, "fetch_bigbird", lambda: tmp_path)
+        write_mathvista(MATHVISTA_PROBLEMS, name="testmini.parquet")
+        path = tmp_path / "tasks.toml"
+        path.write_text(
+            '[[tasks]]\nname = "mathvista-testmini"\nreader = "mathvista"\n'
+            'scorer = "mathvista_accuracy"\nmax_new_tokens = 100\n[tasks.reader_args]\n'
+            'annotation_file = "testmini.parquet"\nextractor_device = "cpu"\n'
+        )
+        (task,) = load_tasks(path)
+        assert task.reader_args["annotation_file"] == str(tmp_path / "testmini.parquet")
+        reader = build_reader(task)
+        assert isinstance(reader, MathVistaRows) and len(reader) == 3

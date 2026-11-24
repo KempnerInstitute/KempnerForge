@@ -2,17 +2,21 @@
 
 The run is a word-level chat tokenizer saved to disk, a Joint-Decoder config
 with the random image encoder, a checkpoint of it and task files, so those
-tests need neither the hub nor a GPU.
+tests need neither the hub nor a GPU. No test loads the real answer extractor,
+which is downloaded on first use: one that tries fails.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 from PIL import Image
@@ -196,6 +200,58 @@ def write_task(tmp_path: Path) -> Callable[..., Path]:
             f"max_new_tokens = {max_new_tokens}\n\n[tasks.reader_args]\n"
             f'annotation_file = "{root / "annotations.json"}"\nimage_root = "{root}"\n'
         )
+        return path
+
+    return write
+
+
+@pytest.fixture(autouse=True)
+def no_extractor_download(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Makes fetching or loading the real answer extractor fail, so no test downloads it."""
+    from evaluation import extraction
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("the tests never fetch the real answer extractor; pass a stand-in")
+
+    monkeypatch.setattr(extraction, "fetch_bigbird", refuse)
+    monkeypatch.setattr(extraction, "load_bigbird", refuse)
+
+
+def _png_bytes(size: tuple[int, int], color: tuple[int, int, int] = (10, 200, 10)) -> bytes:
+    """An RGB image of ``size`` encoded as PNG."""
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+@pytest.fixture
+def write_mathvista(tmp_path: Path) -> Callable[..., Path]:
+    """Writes problems as a MathVista split's parquet file, an image in each row; returns it.
+
+    A problem is a mapping of the published fields but the image; ``images``
+    replaces the ``decoded_image`` entries, ``{"bytes": ..., "path": ...}`` or
+    ``None``, which are otherwise a PNG per row.
+    """
+
+    def write(
+        problems: Sequence[Mapping[str, Any]],
+        images: Sequence[Any] | None = None,
+        name: str = "testmini.parquet",
+    ) -> Path:
+        columns: dict[str, Any] = {
+            key: [problem[key] for problem in problems] for key in problems[0]
+        }
+        columns["question"] = [problem["query"] for problem in problems]
+        columns["decoded_image"] = (
+            list(images)
+            if images is not None
+            else [
+                {"bytes": _png_bytes((8 + row, 6)), "path": f"{row}.png"}
+                for row in range(len(problems))
+            ]
+        )
+        path = tmp_path / name
+        pq.write_table(pa.table(columns), path)
         return path
 
     return write

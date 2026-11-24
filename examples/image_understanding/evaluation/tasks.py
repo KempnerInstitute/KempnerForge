@@ -44,7 +44,7 @@ from typing import TYPE_CHECKING, Any, Union, get_args, get_origin, get_type_hin
 
 from image_text.testbed import aokvqa, chartqa, coco_captions, docvqa, textvqa, vqav2
 
-from .readers import gsm8k, mmlu, pixmo_count_eval, pixmo_points_eval
+from .readers import gsm8k, mathvista, mmlu, pixmo_count_eval, pixmo_points_eval
 from .scorers import SCORERS
 
 if TYPE_CHECKING:
@@ -56,6 +56,7 @@ READERS: dict[str, Callable[..., DocumentSource]] = {
     "coco_captions": coco_captions,
     "docvqa": docvqa,
     "gsm8k": gsm8k,
+    "mathvista": mathvista,
     "mmlu": mmlu,
     "pixmo_count_eval": pixmo_count_eval,
     "pixmo_points_eval": pixmo_points_eval,

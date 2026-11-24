@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 import torch
-from evaluation import evaluator
+from evaluation import evaluator, readers
 from evaluation.checkpoint import load_model
 from evaluation.evaluator import (
     PROMPT_TOO_LONG,
@@ -36,6 +36,7 @@ from evaluation.evaluator import (
     summarize,
     token_budgets,
 )
+from evaluation.extraction import AnswerExtractor
 from evaluation.generation import Generation, greedy_decode, stop_token_ids
 from evaluation.inputs import UnsupportedDocumentError, build_renderer, document_inputs
 from evaluation.scorers import SCORERS, Scorer, anls
@@ -103,6 +104,71 @@ def _decoder(run: Run) -> Decoder:
 def _batch_records(run: Run, tasks: Path, batch: range) -> list[dict[str, Any]]:
     (task,) = load_tasks(tasks)
     return evaluate_batch(_decoder(run), task, build_reader(task), batch)
+
+
+MATHVISTA_PROBLEMS: list[dict[str, Any]] = [
+    {
+        "pid": "1",
+        "query": "which color is it ?",
+        "answer": "blue",
+        "question_type": "multi_choice",
+        "answer_type": "text",
+        "choices": ["red", "blue"],
+        "precision": None,
+    },
+    {
+        "pid": "2",
+        "query": "how many ?",
+        "answer": "3",
+        "question_type": "free_form",
+        "answer_type": "integer",
+        "choices": None,
+        "precision": None,
+    },
+    {
+        "pid": "3",
+        "query": "how many ?",
+        "answer": "2",
+        "question_type": "free_form",
+        "answer_type": "integer",
+        "choices": None,
+        "precision": None,
+    },
+    {
+        "pid": "4",
+        "query": "is it a cat ?",
+        "answer": "no",
+        "question_type": "multi_choice",
+        "answer_type": "text",
+        "choices": ["yes", "no"],
+        "precision": None,
+    },
+]
+NUMBER_WORDS = {"one": "1", "two": "2", "three": "3"}
+
+
+def _mathvista_task(split: Path) -> Path:
+    path = split.with_suffix(".toml")
+    path.write_text(
+        '[[tasks]]\nname = "mathvista"\nreader = "mathvista"\nscorer = "mathvista_accuracy"\n'
+        f'max_new_tokens = 4\n\n[tasks.reader_args]\nannotation_file = "{split}"\n'
+    )
+    return path
+
+
+def _number_words(question: str, reply: str) -> str:
+    return NUMBER_WORDS.get(reply, reply)
+
+
+def _load_nowhere(device: torch.device) -> Any:
+    raise OSError("the extractor is not on this node")
+
+
+def _replies(run: Run, words: list[list[str]]) -> Callable[..., list[Generation]]:
+    """A stand-in for ``greedy_decode`` that gives row ``i`` of a batch the words ``words[i]``."""
+    tokenizer = build_renderer(run.config).tokenizer
+    ids = [tuple(tokenizer.convert_tokens_to_ids(reply)) for reply in words]
+    return lambda model, rows, **kwargs: [Generation(ids[i], True) for i in range(len(rows))]
 
 
 class _NamesItsRow(list):
@@ -455,6 +521,47 @@ class TestEvaluateBatch:
         task = EvalTask("referenced-task", "referenced", "seen", 2)
         evaluate_batch(_decoder(run), task, build_reader(task), range(2))
         assert seen == [["reference 0"], ["reference 1"]]
+
+    def test_a_mathvista_split_is_scored_against_its_problems(
+        self,
+        run: Run,
+        write_mathvista: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        asked: list[tuple[str, str]] = []
+
+        def extract(question: str, reply: str) -> str:
+            asked.append((question, reply))
+            return _number_words(question, reply)
+
+        monkeypatch.setattr(readers, "bigbird_extractor", lambda device: extract)
+        monkeypatch.setattr(
+            evaluator, "greedy_decode", _replies(run, [["blue"], ["three"], ["one"], []])
+        )
+        (task,) = load_tasks(_mathvista_task(write_mathvista(MATHVISTA_PROBLEMS)))
+        records = evaluate_batch(_decoder(run), task, build_reader(task), range(4))
+        assert [record["prediction"] for record in records] == ["blue", "three", "one", ""]
+        assert [record["score"] for record in records] == [1.0, 1.0, 0.0, 1.0]
+        assert [record["answers"] for record in records] == [["blue"], ["3"], ["2"], ["no"]]
+        assert asked == [("how many ?", "three"), ("how many ?", "one")]
+
+    def test_the_extractor_loads_only_when_a_reply_needs_it(
+        self,
+        run: Run,
+        write_mathvista: Callable[..., Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            readers, "bigbird_extractor", lambda device: AnswerExtractor(device, _load_nowhere)
+        )
+        (task,) = load_tasks(_mathvista_task(write_mathvista(MATHVISTA_PROBLEMS)))
+        reader, decoder = build_reader(task), _decoder(run)
+        monkeypatch.setattr(evaluator, "greedy_decode", _replies(run, [["blue"], []]))
+        records = evaluate_batch(decoder, task, reader, range(0, 4, 3))
+        assert [record["score"] for record in records] == [1.0, 1.0]
+        monkeypatch.setattr(evaluator, "greedy_decode", _replies(run, [["three"]]))
+        with pytest.raises(OSError, match="the extractor is not on this node"):
+            evaluate_batch(decoder, task, reader, range(1, 2))
 
     def test_a_missing_image_file_fails(self, run: Run, write_task: Callable[..., Path]) -> None:
         tasks = write_task(rows=2)
@@ -1202,7 +1309,20 @@ def _evaluate_on_rank(
     os.environ.update(RANK=str(rank), LOCAL_RANK="0", WORLD_SIZE=str(world))
     evaluator.publish_metrics = publish
     evaluator.init_distributed = start_group
-    if rank == broken_rank:
+    if broken == "extractor":
+        from transformers import AutoTokenizer
+
+        tokenizer_path = load_config(config, cli_args=[]).data.tokenizer_path
+        three = AutoTokenizer.from_pretrained(tokenizer_path).convert_tokens_to_ids("three")
+        evaluator.greedy_decode = lambda model, rows, **kwargs: [
+            Generation((three,), True) for _ in rows
+        ]
+        readers.bigbird_extractor = (
+            partial(AnswerExtractor, load=_load_nowhere)
+            if rank == broken_rank
+            else lambda device: _number_words
+        )
+    elif rank == broken_rank:
         if broken == "split":
             evaluator.build_reader = open_split
         else:
@@ -1316,6 +1436,20 @@ class TestSeveralRanks:
         assert first == "RuntimeError: Preparing the evaluation failed on ranks [1]"
         assert second == "OSError: the tokenizer is not on this node"
         assert not output.exists()
+        assert not list(output.parent.glob("published-*"))
+
+    def test_an_extractor_one_rank_cannot_load_fails_every_rank(
+        self, run: Run, write_mathvista: Callable[..., Path], tmp_path: Path
+    ) -> None:
+        """Rows 2 and 3 are rank 1's, and their replies need the extractor rank 1 cannot load."""
+        problem = MATHVISTA_PROBLEMS[1]
+        tasks = _mathvista_task(write_mathvista([{**problem, "pid": str(row)} for row in range(4)]))
+        output = tmp_path / "ranks" / "results"
+        output.parent.mkdir()
+        first, second = _spawn_ranks(2, run, tasks, output, broken_rank=1, broken="extractor")
+        assert first == "RuntimeError: Evaluating task 'mathvista' failed on ranks [1]"
+        assert second == "OSError: the extractor is not on this node"
+        assert not (output / "results.json").exists()
         assert not list(output.parent.glob("published-*"))
 
     def test_a_marker_rank_zero_cannot_remove_fails_every_rank(
