@@ -6,9 +6,12 @@ that run at the checkpoint's step in a single ``log_batch`` request, linked to t
 checkpoint's logged model when the entry names one. Inputs are fully validated before
 anything is sent, but MLflow's ``log_batch`` permits partial writes, so a request that
 fails server side may still have stored some points. The publisher never starts, ends,
-or edits a run, never writes the sidecar, and keeps no state of its own, so several
-publishers can write to one run at once and the tracking server arbitrates. The call
-blocks on the server under MLflow's own HTTP timeout and retry settings, and
+or edits a run, never writes the sidecar, and keeps no state of its own. Several
+publishers can write to one run at once only through a tracking server, which arbitrates
+them; MLflow's on-disk file store has no server to do so, so two processes creating the
+same new metric directory can make one fail with an ``MlflowException`` and lose the rest
+of its batch. Use a SQLite store or a tracking server for concurrent publishes to one run.
+The call blocks on the server under MLflow's own HTTP timeout and retry settings, and
 authentication is whatever the MLflow client finds in the environment. It is an offline
 tool: call it from one process, never from the training step.
 
