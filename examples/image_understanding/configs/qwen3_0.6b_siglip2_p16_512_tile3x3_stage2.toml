@@ -81,7 +81,7 @@ dir = "path-to-output-dir"
 load_path = "path-to-converted-stage-1-checkpoint"
 exclude_from_loading = ["optimizer", "train_state"]
 interval = 1000
-keep_last_n = 0
+keep_last_n = 3
 
 [metrics]
 log_interval = 20

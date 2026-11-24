@@ -205,6 +205,29 @@ class TestChatRenderer:
         first = "" if kind == "qa" else "A1.<|im_end|>"
         assert _trained_text(tokenizer, sample) == first + last
 
+    def test_a_think_block_whose_reply_is_cut_away_is_refused(self, tokenizer: Any) -> None:
+        ids = _renderer(tokenizer, max_text_len=None).token_ids(_qa(), ["a cat"])
+        opened = ids.index(tokenizer.convert_tokens_to_ids("<think>"))
+        reply = ids.index(tokenizer.convert_tokens_to_ids("</think>")) + 2
+        for max_text_len in range(opened + 2, reply + 2):
+            renderer = _renderer(tokenizer, max_text_len=max_text_len, train_reply_prefix=True)
+            with pytest.raises(UnrenderableDocumentError, match="trains no tokens"):
+                renderer.render(_qa(), ["a cat"])
+        renderer = _renderer(tokenizer, max_text_len=reply + 2, train_reply_prefix=True)
+        sample = renderer.render(_qa(), ["a cat"])
+        assert _trained_text(tokenizer, sample) == "<think>\n\n</think>\n\na<|im_end|>"
+
+    def test_a_cut_inside_the_last_think_block_trains_the_turns_before(
+        self, tokenizer: Any
+    ) -> None:
+        answers = ["A1.", "A2."]
+        ids = _renderer(tokenizer, max_text_len=None).token_ids(_conversation(), answers)
+        closed = tokenizer.convert_tokens_to_ids("</think>")
+        last = max(i for i, token in enumerate(ids) if token == closed)
+        renderer = _renderer(tokenizer, max_text_len=last + 2, train_reply_prefix=True)
+        sample = renderer.render(_conversation(), answers)
+        assert _trained_text(tokenizer, sample) == "A1.<|im_end|>"
+
     @pytest.mark.parametrize("reply", ["x</think>y", "<think>x", "a<|im_end|>b", "<|im_start|>"])
     @pytest.mark.parametrize("kind", ["qa", "conversation"])
     def test_a_reply_carrying_template_text_is_refused(
@@ -215,7 +238,7 @@ class TestChatRenderer:
             _renderer(tokenizer).render(doc, answers)
 
     def test_pixel_values_are_square_and_normalized(self, tokenizer: Any) -> None:
-        pixels = _renderer(tokenizer).render(_qa(), ["a cat"])["pixel_values"]
+        pixels = _renderer(tokenizer, max_images=1).render(_qa(), ["a cat"])["pixel_values"]
         assert pixels.shape == (3, 16, 16)
         assert torch.allclose(pixels[0], torch.ones(16, 16))
         assert torch.allclose(pixels[1:], -torch.ones(2, 16, 16))
@@ -223,8 +246,8 @@ class TestChatRenderer:
     def test_documents_over_max_images_are_refused(self, tokenizer: Any) -> None:
         doc = Document(images=(_image(), _image()), turns=(Turn("Compare.", ("Same.",)),))
         with pytest.raises(UnrenderableDocumentError, match="2 images, over max_images=1"):
-            _renderer(tokenizer).render(doc, ["Same."])
-        dataset = RenderedDataset([doc, _qa()], _renderer(tokenizer))
+            _renderer(tokenizer, max_images=1).render(doc, ["Same."])
+        dataset = RenderedDataset([doc, _qa()], _renderer(tokenizer, max_images=1))
         assert _trained_text(tokenizer, dataset[0]) == "a cat<|im_end|>"
         assert dataset.skipped == 1
 
@@ -255,7 +278,7 @@ class TestChatRenderer:
     def test_mixed_samples_batch_with_the_core_collators(self, tokenizer: Any) -> None:
         text_only = Document(images=(), turns=(Turn("Hi?", ("Hello.",)),))
         two = Document(images=(_image(), _image()), turns=(Turn("Compare.", ("Same.",)),))
-        single = _renderer(tokenizer)
+        single = _renderer(tokenizer, max_images=1)
         batch = VLMCollator(single.pad_id, 64)(
             [single.render(_qa(), ["a cat"]), single.render(text_only, ["Hello."])]
         )

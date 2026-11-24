@@ -65,7 +65,8 @@ samples `VLMCollator` batches.
   answer for single-turn rows, the full template for conversations) and trains only
   the assistant replies when `answer_only` (with `train_reply_prefix`, also what
   the template writes between the assistant header and a reply, such as an empty
-  think block); `max_images` sets how many images a document may bring.
+  think block, for each reply the text budget keeps part of); `max_images` caps
+  how many images a document may bring (no cap by default).
   `RenderedDataset` draws one reference
   answer per turn from a seed and the row index, so a resume draws the same answers,
   and passes over a document the renderer refuses (replies that are all empty, or
@@ -84,10 +85,12 @@ samples `VLMCollator` batches.
 
 The renderer resizes each image square to `image_size`, or with `tile_grid` cuts
 it into views as `vlm.tile_grid` does. A sample has the core dataset's shapes, so
-`VLMCollator` and `PackedVLMCollator` batch it: one image by default, up to
-`max_images` images (every image with `None`) concatenated, or none for a
-text-only document, and `text_len` counts its real tokens. A document with more
-images than `max_images` is passed over. `max_text_len=None` keeps the whole text
+`VLMCollator` and `PackedVLMCollator` batch it: every image of a document
+concatenated by default (`max_images=None`), at most `max_images` of them, a
+single image with `max_images=1`, or none for a text-only document, and
+`text_len` counts its real tokens. A document with more images than
+`max_images` is passed over, and `RenderedDataset` refuses a reader that keeps
+rows with more images than its renderer takes. `max_text_len=None` keeps the whole text
 unpadded, for packing. PixMo-Count stores its points in pixels; they are
 converted to percent of the image, the unit the other PixMo sources use. A
 counting answer lists its points before the count, so a row with many points
@@ -103,7 +106,9 @@ a row, and the rows without images as text-only documents, so a `text_*` subset
 reads as is; `min_images=1` leaves out the text-only rows, and `text_only` keeps
 only them without reading the image column. A row is kept when its conversation
 holds a turn and the last turn has a reply; every turn is read, a missing user
-message or reply as empty text.
+message or reply as empty text. `index` recomputes the keep flags of a file
+converted under an earlier keep rule, so a copy converted before needs only
+`index` run again.
 
 Convert FineVision once; any number of `convert` processes can share the work,
 a file that fails to convert is listed at the end without stopping the others,
@@ -130,7 +135,11 @@ counted in `oversize`. Text-only documents pack beside image documents. With
 each image view attend to each other in both directions, while attention stays
 causal across views and text and never crosses documents. Passes
 follow one another without end, and `state_dict` records where the next row
-starts, so a resume packs the same rows. Render for it with `max_text_len=None`
+starts, so a resume packs the same rows. Each pass seeds its loader workers from
+its own generator, so iterating leaves the global random state alone, and
+`in_order=False` is refused. The workers ignore SIGTERM, so outside the training
+loop, whose `BatchStream.close` shuts them down, call `close()` in a `finally`
+block: an open loader with workers blocks the interpreter at exit. Render for it with `max_text_len=None`
 and `max_images=None`, so documents are neither cut nor capped and `seq_len`
 alone bounds them.
 
@@ -332,7 +341,14 @@ uv run python examples/vlm/scripts/convert_hf_backbone.py \
     --hf-dir Qwen/Qwen3-0.6B \
     --config examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_stage1.toml \
     --out /your/backbone/checkpoint
-uv run torchrun --nnodes=4 --nproc_per_node=4 examples/image_understanding/train.py \
+```
+
+The run takes 4 nodes of 4 GPUs. Launch it the way `scripts/slurm/multinode.sh`
+does, with one task per GPU and that script's `MASTER_ADDR`, `MASTER_PORT` and
+NCCL settings, running the example's entry point:
+
+```bash
+srun --kill-on-bad-exit=1 uv run python examples/image_understanding/train.py \
     examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_stage1.toml \
     --mixture=examples/image_understanding/mixtures/stage1_datacomp.toml \
     --checkpoint.load_path=/your/backbone/checkpoint --checkpoint.dir=/your/stage1/dir
@@ -366,19 +382,40 @@ prompt starts with a space (`lead_space`), and each view's tokens attend to each
 other in both directions (`view_groups`).
 
 The run starts from the last stage-1 checkpoint, `/your/stage1/dir/step_50000`,
-as weights alone. A stage-1 checkpoint saved as one `.pt` state dict is written
-as a DCP for this config first:
+as weights alone (the preset excludes `optimizer` and `train_state` from loading),
+writing to a fresh `checkpoint.dir`; see the launch below. A stage-1 checkpoint
+saved as one `.pt` state dict is written as a DCP for this config first. On the
+cluster such a checkpoint is
+`/n/holystore01/LABS/kempner_project_d/Lab/checkpoints/cross-modal/init/dcpacked-s1-50k-p16-512-k2mlp.pt`,
+step 50,000 of a stage-1 run with this preset's encoder (SigLIP2 so400m/16 at
+512 px) and connector (2 × 2 pooling into the RMS-normed GELU MLP). The converter
+reads either name of the connector's tensors (`adapter.norm` and
+`adapter.proj.{0,2}`, or `adapter.model.ln_q` and `adapter.model.mlp.{0,2}`); a
+checkpoint of another encoder, such as SigLIP so400m/14 at 224 px, is refused on
+its shapes.
 
 ```bash
 uv run python examples/image_understanding/scripts/convert_pt_checkpoint.py \
-    --checkpoint path-to-stage-1.pt \
+    --checkpoint /n/holystore01/LABS/kempner_project_d/Lab/checkpoints/cross-modal/init/dcpacked-s1-50k-p16-512-k2mlp.pt \
     --config examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml \
     --out /your/init/checkpoint
-uv run torchrun --nnodes=4 --nproc_per_node=4 examples/image_understanding/train.py \
+```
+
+The run takes 4 nodes of 4 GPUs, launched as stage 1 is. From the last stage-1
+checkpoint:
+
+```bash
+srun --kill-on-bad-exit=1 uv run python examples/image_understanding/train.py \
     examples/image_understanding/configs/qwen3_0.6b_siglip2_p16_512_tile3x3_stage2.toml \
     --mixture=examples/image_understanding/mixtures/stage2_testbed_finevision_pixmo_text.toml \
-    --checkpoint.load_path=/your/init/checkpoint --checkpoint.dir=/your/run/dir
+    --checkpoint.load_path=/your/stage1/dir/step_50000 --checkpoint.dir=/your/stage2/dir
 ```
+
+From a converted `.pt`, pass `--checkpoint.load_path=/your/init/checkpoint` instead.
+
+The mixture file and the run's settings for it (`[vlm]`, `data.pack_sequences`,
+`train.batch_size = 1`) are checked before training starts. The run saves every
+1000 steps and keeps the last three checkpoints.
 
 ## Evaluation tasks and scorers
 

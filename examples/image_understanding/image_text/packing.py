@@ -63,6 +63,17 @@ def pack_documents(
     return batch
 
 
+def _shut_down(iterator: Any) -> None:
+    """Shut down a ``DataLoader`` iterator's workers, killing any that do not exit."""
+    if iterator is None or not hasattr(iterator, "_shutdown_workers"):
+        return
+    iterator._shutdown_workers()
+    for worker in getattr(iterator, "_workers", ()):
+        if worker.is_alive():
+            worker.kill()
+            worker.join(timeout=5)
+
+
 def _note_oversize(count: int, size: int, seq_len: int) -> int:
     """``count`` plus the document of ``size`` positions passed over, the first one logged."""
     if count == 0:
@@ -86,9 +97,14 @@ class PackedLoader:
     documents until the next one would overflow it, and that document opens the next
     row. Each batch is ``pack_vlm_samples`` over one row's documents. A document
     longer than ``seq_len`` is passed over and counted in ``oversize``, the first
-    one logged. With ``view_groups`` each batch also carries
-    ``attention_group_ids``, one group per image view's tokens and ``-1`` elsewhere,
-    so the tokens of a view attend to each other in both directions. Passes follow
+    one logged. The ``DataLoader`` of a pass is seeded by its own generator, drawn
+    from ``seed``, ``rank``, the pass and its start, so starting it leaves the
+    global random state alone; ``in_order=False`` is refused, as a resume needs the
+    documents in order. The workers ignore SIGTERM, so ``close`` shuts them down
+    when done, as the training loop's ``BatchStream.close`` does. With
+    ``view_groups`` each batch also carries ``attention_group_ids``, one group per
+    image view's tokens and ``-1`` elsewhere, so the tokens of a view attend to each
+    other in both directions. Passes follow
     one another without end, so every rank draws as many batches as training asks
     for. ``state_dict`` holds the pass and the position in it of the next row's
     first document, so a resume packs the same rows a run without the interruption
@@ -114,9 +130,18 @@ class PackedLoader:
             raise ValueError(f"rank {rank} is outside world_size {world_size}")
         if not isinstance(dataset, Sized) or len(dataset) < world_size:
             raise ValueError(f"the dataset needs at least {world_size} samples, one per rank")
-        for name in ("batch_size", "sampler", "shuffle", "batch_sampler", "collate_fn"):
+        for name in (
+            "batch_size",
+            "sampler",
+            "shuffle",
+            "batch_sampler",
+            "collate_fn",
+            "generator",
+        ):
             if name in options:
                 raise ValueError(f"PackedLoader sets {name} itself")
+        if options.get("in_order", True) is not True:
+            raise ValueError("PackedLoader needs in_order=True to resume at its recorded position")
         self.dataset = dataset
         self.seq_len = seq_len
         self.tokens_per_image = tokens_per_image
@@ -147,10 +172,12 @@ class PackedLoader:
         )
 
     def _documents(self, pass_index: int, start: int) -> Iterator[dict[str, torch.Tensor]]:
+        draw = np.random.default_rng([self.seed, self.rank, pass_index, start]).integers(2**62)
         loader = DataLoader(
             self.dataset,
             batch_size=None,
             sampler=_Order(self.order(pass_index)[start:]),
+            generator=torch.Generator().manual_seed(int(draw)),
             **self.options,
         )
         self._iterator = iter(loader)
@@ -181,6 +208,11 @@ class PackedLoader:
             if not packed and start == 0:
                 raise RuntimeError(f"pass {pass_index} packed no document for rank {self.rank}")
 
+    def close(self) -> None:
+        """Shut the loader workers down; an open loader with workers blocks interpreter exit."""
+        iterator, self._iterator = self._iterator, None
+        _shut_down(iterator)
+
     def state_dict(self) -> dict[str, Any]:
         return {"pass": self._pass, "start": self._start, "oversize": self.oversize}
 
@@ -201,7 +233,10 @@ class PackedStreamLoader:
     position is recorded once it is placed in a row, after the rows before it are
     handed out, so ``state_dict`` resumes at the first document of the next row.
     The loader workers start afresh from the recorded positions on each ``iter``,
-    so ``persistent_workers`` is refused.
+    so ``persistent_workers`` is refused; ``close`` shuts them down. A stream that
+    ends yields its last, partly filled row; one that ends before any document
+    fits, or passes over ``max_oversize_run`` documents in a row, raises
+    ``RuntimeError``, as nothing it holds fits ``seq_len``.
     """
 
     def __init__(
@@ -212,14 +247,15 @@ class PackedStreamLoader:
         tokens_per_image: int,
         pad_id: int,
         view_groups: bool = False,
+        max_oversize_run: int = 10_000,
         **options: Any,
     ) -> None:
         if not isinstance(stream, IterableDataset):
             raise TypeError(
                 f"PackedStreamLoader needs an IterableDataset, got {type(stream).__name__}"
             )
-        if seq_len <= 0 or tokens_per_image <= 0:
-            raise ValueError("seq_len and tokens_per_image must be positive")
+        if seq_len <= 0 or tokens_per_image <= 0 or max_oversize_run <= 0:
+            raise ValueError("seq_len, tokens_per_image and max_oversize_run must be positive")
         for name in ("batch_size", "sampler", "shuffle", "batch_sampler", "collate_fn"):
             if name in options:
                 raise ValueError(f"PackedStreamLoader sets {name} itself")
@@ -232,20 +268,31 @@ class PackedStreamLoader:
         self.tokens_per_image = tokens_per_image
         self.pad_id = pad_id
         self.view_groups = view_groups
+        self.max_oversize_run = max_oversize_run
         self.options = {"worker_init_fn": ignore_shutdown_signals_in_worker, **options}
         self.oversize = 0
         self._iterator: Any = None
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        _shut_down(self._iterator)
         self._iterator = iter(DataLoader(self.stream, batch_size=None, **self.options))
         rows: list[dict[str, torch.Tensor]] = []
         fill = 0
+        placed = False
+        run = 0
         for position, sample in self._iterator:
             size = footprint(sample, self.tokens_per_image)
             if size > self.seq_len:
                 self.stream.advance(position)
                 self.oversize = _note_oversize(self.oversize, size, self.seq_len)
+                run += 1
+                if run >= self.max_oversize_run:
+                    raise RuntimeError(
+                        f"{run} documents in a row are longer than seq_len={self.seq_len}"
+                    )
                 continue
+            run = 0
+            placed = True
             if rows and fill + size > self.seq_len:
                 yield pack_documents(
                     rows,
@@ -258,6 +305,8 @@ class PackedStreamLoader:
             self.stream.advance(position)
             rows.append(sample)
             fill += size
+        if not placed:
+            raise RuntimeError(f"the stream ended before a document fit seq_len={self.seq_len}")
         if rows:
             yield pack_documents(
                 rows,
@@ -266,6 +315,11 @@ class PackedStreamLoader:
                 pad_id=self.pad_id,
                 view_groups=self.view_groups,
             )
+
+    def close(self) -> None:
+        """Shut the loader workers down; an open loader with workers blocks interpreter exit."""
+        iterator, self._iterator = self._iterator, None
+        _shut_down(iterator)
 
     def state_dict(self) -> dict[str, Any]:
         return {"stream": self.stream.state_dict(), "oversize": self.oversize}
