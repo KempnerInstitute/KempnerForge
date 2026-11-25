@@ -40,7 +40,11 @@ class DistributedSampler(Sampler[int]):
     """Deterministic distributed sampler with skip-ahead support.
 
     Partitions dataset indices across data-parallel ranks. Each rank
-    sees a unique, non-overlapping subset of the data.
+    sees a unique, non-overlapping subset of the data. Every epoch has
+    one global order, the same at any ``num_replicas``, and rank ``r``
+    reads positions ``r``, ``r + num_replicas``, ... of it, so a resume
+    position counted in that order (``set_position``) carries over to
+    another number of ranks.
 
     Args:
         dataset: Dataset to sample from.
@@ -82,6 +86,7 @@ class DistributedSampler(Sampler[int]):
 
         self._epoch = 0
         self._skip = 0
+        self._position = 0
 
     def set_epoch(self, epoch: int) -> None:
         """Set the epoch for deterministic re-shuffling."""
@@ -90,6 +95,24 @@ class DistributedSampler(Sampler[int]):
     def set_skip(self, skip: int) -> None:
         """Set number of samples to skip (for resumption after checkpoint)."""
         self._skip = skip
+        self._position = 0
+
+    def set_position(self, position: int) -> None:
+        """Start the next pass at sample ``position`` of the epoch's global order.
+
+        ``position`` counts the samples all ranks have read together, so it
+        means the same at any ``num_replicas``. Rank ``r`` starts at its first
+        sample at or after ``position``, and every rank yields
+        ``samples_after(position)`` samples, so the ranks stay in step and none
+        reads a sample before ``position`` again. Applies to the next pass only.
+        """
+        self._position = position
+        self._skip = 0
+
+    def samples_after(self, position: int) -> int:
+        """How many samples each rank yields in a pass that starts at ``position``."""
+        q, m = divmod(position, self.num_replicas)
+        return max(0, self.num_samples - q - (1 if m else 0))
 
     def __iter__(self):
         if self.shuffle:
@@ -108,7 +131,12 @@ class DistributedSampler(Sampler[int]):
         indices = indices[self.rank : self.total_size : self.num_replicas]
         assert len(indices) == self.num_samples
 
-        if self._skip > 0:
+        if self._position > 0:
+            q, m = divmod(self._position, self.num_replicas)
+            start = q + (1 if self.rank < m else 0)
+            indices = indices[start : start + self.samples_after(self._position)]
+            self._position = 0
+        elif self._skip > 0:
             indices = indices[self._skip :]
             self._skip = 0
 
@@ -137,7 +165,9 @@ class MixtureSampler(Sampler[int]):
     Each sub-dataset's indices are partitioned across ranks (like
     ``DistributedSampler``). The ``weights`` control what fraction of
     the epoch is drawn from each dataset — datasets with higher weight
-    are oversampled.
+    are oversampled. Each rank draws and shuffles its own list, so a
+    resume position is a count of this rank's samples and carries over
+    only to the same ``num_replicas``.
 
     Args:
         cumulative_sizes: ``[0, len(ds0), len(ds0)+len(ds1), ...]``

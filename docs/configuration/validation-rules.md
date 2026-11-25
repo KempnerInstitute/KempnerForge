@@ -75,8 +75,10 @@ File:
 File:
 [`kempnerforge/config/training.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/training.py).
 
-- `batch_size`, `seq_len`, `max_steps`, `grad_accum_steps` all positive.
+- `batch_size`, `seq_len`, `max_steps`, `grad_accum_steps`, `nan_max_consecutive` all positive.
 - `grad_clip_norm > 0`.
+- `nan_action ∈ {"warn", "skip", "raise"}`; the TOML and CLI loader rejects any other value
+  first, through the field's `Literal`.
 - `mixed_precision = "fp16"` is rejected, since there is no loss scaling; use `"bf16"`,
   or `"fp32"` on GPUs without bf16. A TOML that sets it fails to load everywhere,
   including `scripts/eval.py`, `generate.py` and `convert_checkpoint.py`, and a CLI
@@ -209,6 +211,20 @@ File:
 [`kempnerforge/config/profiling.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/profiling.py).
 
 - `end_step > start_step`.
+
+### `VLMConfig` freeze specs
+
+File:
+[`kempnerforge/config/vlm.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/vlm.py).
+
+- `freeze_schedule` start steps are strictly increasing.
+- Every `module` in `freeze` and in each `FreezeStage` is a module alias, a key of
+  `module_patterns`, or a parameter pattern, which holds a dot or one of `*?[`; a key
+  resolves as its alias first, dot or not. A bare word that is neither, such as a typo of
+  an alias, fails when the config loads. The check runs once the TOML is applied and again
+  once the CLI overrides land, so a name the TOML gets wrong must be fixed in the TOML.
+- The VLM build refuses a pattern in `freeze` or in a `FreezeStage` that matches no
+  parameter of the built model, and names it.
 
 ### `AdapterConfig`
 
@@ -413,21 +429,6 @@ batch's text tokens, a count that changes from batch to batch. With
 `data.hf_streaming`, the last batch of each pass over the stream can be
 short, so keep `train.seq_len` itself a multiple of 16 there.
 
-### Sigmoid MoE router + full activation checkpointing
-
-```
-model.is_moe && model.moe_router == "sigmoid_topk"
-    && train.activation_checkpointing == "full"  →  ValueError
-```
-
-The sigmoid router updates its expert bias in place in every training
-forward. Under `"full"` the backward replays each checkpointed block's
-forward, so the replay routes with a moved bias, can send tokens to other
-experts than the forward did, and then raises `CheckpointError`. Checked
-for every arch with MoE layers, text models included. Use
-`activation_checkpointing = "selective"`, which checkpoints attention only
-and leaves the MoE layers out of the replay.
-
 ### MoE + PP
 
 ```
@@ -455,6 +456,46 @@ When `distributed.ep > 1`:
 - `model.is_moe` must be `True` (the error reads
   `"ep > 1 requires an MoE model (num_experts > 0)"`).
 - `model.num_experts % distributed.ep == 0`.
+
+### Vision encoder weights
+
+```
+vlm set && vision_encoder.type in {"siglip2", "clip"} && vision_encoder.path == ""  →  ValueError
+```
+
+The Hugging Face encoders load a pretrained model from `vision_encoder.path`,
+a Hub id or a local directory, and the error asks for it. The check runs here,
+on the config after the CLI overrides, so a TOML can leave the path to
+`--vision_encoder.path`. The model's own config is read only when the model is
+built: with `vision_encoder.feature_dim = 0`, a model whose config has no
+`hidden_size` fails there, with an error that names `vision_encoder.path` and
+asks for `vision_encoder.feature_dim`, the width of the features its vision
+tower returns.
+
+### `[video]` and the `[data]` Hugging Face fields
+
+```
+video set && a data.hf_* field differs from its default  →  ValueError
+```
+
+A video run builds its dataset from `[video]`. From `[data]` it reads
+`tokenizer_path` and the loader settings (`num_workers`, `pin_memory`,
+`prefetch_factor`), so a Hugging Face field set there would be dropped
+silently. The error lists each such field, with the `[video]` field to set
+instead where there is one, and the defaults to put back:
+
+| `[data]` field | Set instead |
+|----------------|-------------|
+| `hf_dataset_name` | `video.data_root` and `video.dataset_name` |
+| `hf_dataset_split` | `video.split` |
+| `hf_dataset_prompt_field` | `video.prompt`, one instruction for every clip |
+| `hf_image_size` | `video.frame_size` |
+| `hf_dataset_config`, `hf_dataset_text_field`, `hf_dataset_image_field`, `hf_streaming` | no counterpart |
+
+The fields are compared with their defaults, so `hf_dataset_split = "train"`
+or `hf_image_size = 224` passes, and an empty `hf_dataset_name` or
+`hf_dataset_config` counts as unset like their default `None`.
+`data.hf_max_images` is refused with `[video]` when `JobConfig` is built.
 
 ### MoE + torch.compile — warning, not error
 

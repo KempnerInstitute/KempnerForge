@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import pytest
+import torch
 import torch.nn as nn
 
-from kempnerforge.config.vlm import DEFAULT_MODULE_PATTERNS, FreezeSpec
+from kempnerforge.config.optimizer import OptimizerConfig
+from kempnerforge.config.registry import registry
+from kempnerforge.config.vlm import DEFAULT_MODULE_PATTERNS, FreezeSpec, FreezeStage, VLMConfig
 from kempnerforge.training.freeze import (
     apply_freeze_specs,
     canonical_freeze_meta,
+    effective_freeze,
     freeze_params,
+    trainable_during_run,
+    trainable_for_the_run,
+    unmatched_patterns,
 )
+from kempnerforge.training.optimizer import build_optimizer
 
 
 class _MiniVLM(nn.Module):
@@ -224,3 +232,418 @@ class TestEffectiveFreeze:
         base = [FreezeSpec("anything", True)]
         out = effective_freeze(step=0, base=base, schedule=[], valid_modules=None)
         assert out == base
+
+
+class TestFreezeNames:
+    """A name is an alias or a parameter pattern on the build, save and resume paths (#514)."""
+
+    def test_validation_accepts_parameter_patterns(self):
+        from kempnerforge.config.vlm import FreezeStage
+        from kempnerforge.training.freeze import effective_freeze
+
+        base = [FreezeSpec("transformer", True), FreezeSpec("transformer.layers.1.*", False)]
+        stage = FreezeStage(
+            start_step=10,
+            specs=(FreezeSpec("vision_encoder.proj.bias", False), FreezeSpec("adapter*", True)),
+        )
+        out = effective_freeze(
+            step=20,
+            base=base,
+            schedule=[stage],
+            valid_modules={"vision_encoder", "adapter", "transformer"},
+        )
+        assert [s.module for s in out] == [
+            "transformer",
+            "transformer.layers.1.*",
+            "vision_encoder.proj.bias",
+            "adapter*",
+        ]
+
+    def test_freeze_meta_takes_a_raw_pattern_the_build_applies(self):
+        from kempnerforge.config.vlm import VLMConfig
+        from kempnerforge.training.freeze import freeze_meta_at_step
+
+        vlm = VLMConfig(
+            max_text_len=8,
+            freeze=[FreezeSpec("transformer"), FreezeSpec("transformer.layers.1.*", False)],
+        )
+        assert {"module": "transformer.layers.1.*", "frozen": False} in freeze_meta_at_step(1, vlm)
+
+    def test_a_bare_word_that_is_no_alias_is_refused_at_config_time(self):
+        from kempnerforge.config.vlm import VLMConfig
+
+        with pytest.raises(ValueError, match=r"\['vison_encoder'\], which are neither module"):
+            VLMConfig(freeze=[FreezeSpec("vison_encoder")])
+
+    def test_a_typo_in_a_stage_is_refused_at_config_time(self):
+        from kempnerforge.config.vlm import FreezeStage, VLMConfig
+
+        with pytest.raises(ValueError, match="adaptor"):
+            VLMConfig(freeze_schedule=[FreezeStage(5, (FreezeSpec("adaptor", True),))])
+
+    def test_patterns_and_custom_aliases_pass_config(self):
+        from kempnerforge.config.vlm import VLMConfig
+
+        patterns = {**DEFAULT_MODULE_PATTERNS, "enc0": ["vision_encoder.layers.0.*"]}
+        config = VLMConfig(
+            freeze=[
+                FreezeSpec("enc0"),
+                FreezeSpec("adapter.*"),
+                FreezeSpec("transformer.layers.[01].*", False),
+            ],
+            module_patterns=patterns,
+        )
+        assert [s.module for s in config.freeze] == [
+            "enc0",
+            "adapter.*",
+            "transformer.layers.[01].*",
+        ]
+
+    @pytest.mark.parametrize("name", ["transformer.layers", "adapter*", "adapte?", "adapte[r]"])
+    def test_each_pattern_marker_alone_makes_a_pattern(self, name):
+        from kempnerforge.config.vlm import VLMConfig, is_parameter_pattern
+        from kempnerforge.training.freeze import effective_freeze
+
+        assert is_parameter_pattern(name)
+        assert not is_parameter_pattern("adapter")
+        assert [s.module for s in VLMConfig(freeze=[FreezeSpec(name)]).freeze] == [name]
+        out = effective_freeze(
+            step=0, base=[FreezeSpec(name)], schedule=[], valid_modules={"adapter"}
+        )
+        assert [s.module for s in out] == [name]
+
+    def test_a_dotted_alias_resolves_as_its_alias(self, model):
+        from kempnerforge.config.vlm import VLMConfig
+
+        patterns = {**DEFAULT_MODULE_PATTERNS, "vision.tower": ["vision_encoder.*"]}
+        config = VLMConfig(freeze=[FreezeSpec("vision.tower")], module_patterns=patterns)
+        apply_freeze_specs(model, config.freeze, patterns)
+        assert not any(p.requires_grad for p in model.vision_encoder.parameters())
+        assert all(p.requires_grad for p in model.transformer.parameters())
+
+    def test_a_pattern_in_a_later_stage_counts_from_its_start(self):
+        from kempnerforge.config.vlm import FreezeStage, VLMConfig
+        from kempnerforge.training.freeze import freeze_meta_at_step
+
+        vlm = VLMConfig(
+            max_text_len=8,
+            freeze_schedule=[FreezeStage(5, (FreezeSpec("transformer.layers.1.*", True),))],
+        )
+        spec = {"module": "transformer.layers.1.*", "frozen": True}
+        assert spec not in freeze_meta_at_step(4, vlm)
+        assert spec in freeze_meta_at_step(5, vlm)
+
+    def test_a_typo_in_toml_fails_when_the_config_loads(self, tmp_path):
+        from kempnerforge.config.loader import load_config
+
+        path = tmp_path / "config.toml"
+        path.write_text('[vlm]\narch = "joint_decoder"\nfreeze = [{module = "adaptor"}]\n')
+        with pytest.raises(ValueError, match="adaptor"):
+            load_config(str(path), cli_args=[])
+
+
+def _masks(model: nn.Module) -> dict[str, bool]:
+    return {name: p.requires_grad for name, p in model.named_parameters()}
+
+
+class TestResumedFreezeOrder:
+    """A resume applies the freeze the uninterrupted run had at its step (#512)."""
+
+    @pytest.mark.parametrize(
+        ("base", "stages", "patterns"),
+        [
+            pytest.param(
+                [FreezeSpec("transformer"), FreezeSpec("transformer.1.*", False)],
+                [FreezeStage(4, (FreezeSpec("transformer"),))],
+                DEFAULT_MODULE_PATTERNS,
+                id="pattern_under_a_refrozen_alias",
+            ),
+            pytest.param(
+                [FreezeSpec("vision_encoder")],
+                [
+                    FreezeStage(2, (FreezeSpec("transformer"),)),
+                    FreezeStage(4, (FreezeSpec("top", False),)),
+                    FreezeStage(6, (FreezeSpec("transformer"),)),
+                ],
+                {**DEFAULT_MODULE_PATTERNS, "top": ["transformer.1.*"]},
+                id="custom_alias_of_issue_512",
+            ),
+        ],
+    )
+    def test_a_resume_at_each_step_matches_the_run(self, base, stages, patterns):
+        live = _MiniVLM()
+        apply_freeze_specs(live, base, patterns)
+        for step in range(8):
+            for stage in stages:
+                if stage.start_step == step:
+                    apply_freeze_specs(live, stage.specs, patterns)
+            resumed = _MiniVLM()
+            apply_freeze_specs(resumed, base, patterns)
+            apply_freeze_specs(resumed, effective_freeze(step, base, stages), patterns)
+            assert _masks(resumed) == _masks(live), step
+        assert not any(v for k, v in _masks(live).items() if k.startswith("transformer.1."))
+
+    def test_a_key_written_again_moves_to_the_end(self):
+        base = [FreezeSpec("transformer"), FreezeSpec("transformer.1.*", False)]
+        stages = [FreezeStage(4, (FreezeSpec("transformer"),))]
+        assert [(s.module, s.frozen) for s in effective_freeze(4, base, stages)] == [
+            ("transformer.1.*", False),
+            ("transformer", True),
+        ]
+
+
+class TestUnmatchedPatterns:
+    def test_lists_only_patterns_that_match_nothing(self, model):
+        specs = [
+            FreezeSpec("vision_encoder"),
+            FreezeSpec("transformer.1.*"),
+            FreezeSpec("transfomer.*"),
+            FreezeSpec("adapter.bias", False),
+            FreezeSpec("transfomer.*", False),
+        ]
+        assert unmatched_patterns(model, specs, DEFAULT_MODULE_PATTERNS) == ["transfomer.*"]
+
+    def test_an_alias_without_parameters_is_not_checked(self):
+        empty = nn.Module()
+        empty.vision_encoder = nn.Module()
+        specs = [FreezeSpec("vision_encoder")]
+        assert unmatched_patterns(empty, specs, DEFAULT_MODULE_PATTERNS) == []
+
+
+def _build_vlm(vlm):
+    import torch
+
+    from kempnerforge.config.adapter import AdapterConfig
+    from kempnerforge.config.model import ModelConfig
+    from kempnerforge.config.vision import VisionEncoderConfig
+    from kempnerforge.distributed.parallel import build_parallel_model
+
+    return build_parallel_model(
+        ModelConfig(dim=32, n_layers=2, n_heads=2, n_kv_heads=2, vocab_size=64, max_seq_len=16),
+        torch.device("cpu"),
+        None,
+        vision_config=VisionEncoderConfig(type="random", feature_dim=16, num_tokens=4),
+        adapter_config=AdapterConfig(),
+        vlm_config=vlm,
+    )
+
+
+class TestBuildRefusesUnmatchedPatterns:
+    def test_a_misspelled_pattern_fails_the_build(self):
+        from kempnerforge.config.vlm import VLMConfig
+
+        vlm = VLMConfig(max_text_len=8, freeze=[FreezeSpec("transformer.layer.1.*", False)])
+        with pytest.raises(ValueError, match=r"\['transformer.layer.1.\*'\]"):
+            _build_vlm(vlm)
+
+    def test_a_misspelled_pattern_in_a_stage_fails_the_build(self):
+        from kempnerforge.config.vlm import VLMConfig
+
+        stage = FreezeStage(5, (FreezeSpec("transfomer.*", True),))
+        vlm = VLMConfig(max_text_len=8, freeze_schedule=[stage])
+        with pytest.raises(ValueError, match="transfomer"):
+            _build_vlm(vlm)
+
+    def test_matching_patterns_and_an_encoder_without_parameters_build(self):
+        from kempnerforge.config.vlm import VLMConfig
+
+        vlm = VLMConfig(
+            max_text_len=8,
+            freeze=[
+                FreezeSpec("vision_encoder"),
+                FreezeSpec("transformer"),
+                FreezeSpec("transformer.layers.1.*", False),
+            ],
+            freeze_schedule=[FreezeStage(5, (FreezeSpec("adapter.*", True),))],
+        )
+        model = _build_vlm(vlm)
+        masks = _masks(model)
+        assert all(v for k, v in masks.items() if k.startswith("transformer.layers.1."))
+        assert not any(v for k, v in masks.items() if k.startswith("transformer.layers.0."))
+
+
+_ENCODER = {"vision_encoder.0.weight", "vision_encoder.0.bias"}
+_ALL = {name for name, _ in _MiniVLM().named_parameters()}
+
+
+def _unfreeze_encoder_at(step: int) -> VLMConfig:
+    return VLMConfig(
+        freeze=[FreezeSpec("vision_encoder")],
+        freeze_schedule=[FreezeStage(step, (FreezeSpec("vision_encoder", False),))],
+    )
+
+
+class TestTrainableDuringRun:
+    def test_the_build_freeze_alone(self, model):
+        config = VLMConfig(freeze=[FreezeSpec("vision_encoder")])
+        assert trainable_during_run(model, config) == _ALL - _ENCODER
+
+    def test_a_stage_that_unfreezes_a_build_frozen_module_adds_it(self, model):
+        assert trainable_during_run(model, _unfreeze_encoder_at(5)) == _ALL
+
+    def test_a_module_that_trains_until_a_stage_freezes_it_counts(self, model):
+        config = VLMConfig(freeze=[], freeze_schedule=[FreezeStage(5, (FreezeSpec("adapter"),))])
+        assert trainable_during_run(model, config) == _ALL
+
+    def test_a_module_frozen_for_the_whole_run_stays_out(self, model):
+        config = VLMConfig(
+            freeze=[FreezeSpec("vision_encoder")],
+            freeze_schedule=[
+                FreezeStage(5, (FreezeSpec("adapter"),)),
+                FreezeStage(9, (FreezeSpec("adapter", False),)),
+            ],
+        )
+        assert trainable_during_run(model, config) == _ALL - _ENCODER
+
+    def test_the_trainable_part_of_a_partly_frozen_module_counts(self, model):
+        patterns = {**DEFAULT_MODULE_PATTERNS, "encoder_bias": ["vision_encoder.0.bias"]}
+        config = VLMConfig(
+            freeze=[FreezeSpec("vision_encoder"), FreezeSpec("encoder_bias", False)],
+            module_patterns=patterns,
+        )
+        assert trainable_during_run(model, config) == _ALL - {"vision_encoder.0.weight"}
+
+    def test_a_resume_past_a_stage_trains_no_parameter_the_run_keeps_frozen(self, model):
+        """The stage unfreezes the encoder's weight and then freezes the encoder, so the run
+        keeps the weight frozen, and a resume past the stage applies the specs in that order
+        too (#512)."""
+        patterns = {**DEFAULT_MODULE_PATTERNS, "encoder_weight": ["vision_encoder.0.weight"]}
+        config = VLMConfig(
+            freeze=[FreezeSpec("vision_encoder")],
+            freeze_schedule=[
+                FreezeStage(5, (FreezeSpec("encoder_weight", False), FreezeSpec("vision_encoder")))
+            ],
+            module_patterns=patterns,
+        )
+        assert trainable_during_run(model, config) == _ALL - _ENCODER
+
+    def test_a_resume_before_the_first_stage_trains_no_parameter_the_build_keeps_frozen(
+        self, model
+    ):
+        """The build applies the repeated encoder spec last, so the bias stays frozen, and a
+        resume before the stage applies the base specs in that order too (#512)."""
+        patterns = {**DEFAULT_MODULE_PATTERNS, "encoder_bias": ["vision_encoder.0.bias"]}
+        config = VLMConfig(
+            freeze=[
+                FreezeSpec("vision_encoder"),
+                FreezeSpec("encoder_bias", False),
+                FreezeSpec("vision_encoder"),
+            ],
+            freeze_schedule=[FreezeStage(5, (FreezeSpec("encoder_bias"),))],
+            module_patterns=patterns,
+        )
+        assert trainable_during_run(model, config) == _ALL - _ENCODER
+
+    def test_a_parameter_built_without_grad_and_never_unfrozen_stays_out(self, model):
+        model.adapter.bias.requires_grad_(False)
+        assert trainable_during_run(model, VLMConfig(freeze=[])) == _ALL - {"adapter.bias"}
+
+    def test_the_model_is_left_as_it_is(self, model):
+        trainable_during_run(model, _unfreeze_encoder_at(5))
+        assert all(p.requires_grad for p in model.parameters())
+
+
+def test_apply_freeze_specs_reaches_the_module_a_compiled_model_wraps(model):
+    compiled = torch.compile(model, backend="eager")
+    flipped = apply_freeze_specs(compiled, [FreezeSpec("vision_encoder")], DEFAULT_MODULE_PATTERNS)
+    assert flipped == {"vision_encoder": 72}
+    frozen = {name for name, p in model.named_parameters() if not p.requires_grad}
+    assert frozen == _ENCODER
+
+
+class _Compiled(nn.Module):
+    """Wraps a module under ``_orig_mod``, as ``torch.compile`` does."""
+
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self._orig_mod = module
+
+
+class TestTrainableForTheRun:
+    def test_marks_the_parameters_a_stage_unfreezes_and_restores_them(self, model):
+        config = _unfreeze_encoder_at(5)
+        apply_freeze_specs(model, config.freeze, config.module_patterns)
+        with trainable_for_the_run(model, config):
+            assert all(p.requires_grad for p in model.parameters())
+        frozen = {name for name, p in model.named_parameters() if not p.requires_grad}
+        assert frozen == _ENCODER
+
+    def test_restores_them_when_the_body_raises(self, model):
+        config = _unfreeze_encoder_at(5)
+        apply_freeze_specs(model, config.freeze, config.module_patterns)
+        with pytest.raises(RuntimeError, match="load failed"), trainable_for_the_run(model, config):
+            raise RuntimeError("load failed")
+        frozen = {name for name, p in model.named_parameters() if not p.requires_grad}
+        assert frozen == _ENCODER
+
+    def test_leaves_a_module_frozen_for_the_whole_run_frozen(self, model):
+        config = VLMConfig(freeze=[FreezeSpec("vision_encoder")])
+        apply_freeze_specs(model, config.freeze, config.module_patterns)
+        with trainable_for_the_run(model, config):
+            frozen = {name for name, p in model.named_parameters() if not p.requires_grad}
+        assert frozen == _ENCODER
+
+    def test_reads_a_compiled_model_through_the_module_it_wraps(self, model):
+        config = _unfreeze_encoder_at(5)
+        apply_freeze_specs(model, config.freeze, config.module_patterns)
+        with trainable_for_the_run(_Compiled(model), config):
+            assert all(p.requires_grad for p in model.parameters())
+
+    @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+    def test_a_parameter_its_module_keeps_frozen_stays_out(self, compiled):
+        """The sigmoid router names expert_bias in always_frozen, so a stage that unfreezes
+        the router's module leaves the bias out of the run and of the optimizer."""
+        from kempnerforge.model.router import SigmoidTopKRouter
+
+        model = nn.Module()
+        model.transformer = nn.Module()
+        model.transformer.router = SigmoidTopKRouter(dim=8, num_experts=4, top_k=2)
+        target = torch.compile(model, backend="eager") if compiled else model
+        config = VLMConfig(
+            freeze=[FreezeSpec("transformer")],
+            freeze_schedule=[FreezeStage(5, (FreezeSpec("transformer", False),))],
+        )
+        apply_freeze_specs(target, config.freeze, config.module_patterns)
+        router = model.transformer.router
+        assert "transformer.router.expert_bias" not in trainable_during_run(model, config)
+        with trainable_for_the_run(target, config) as unfrozen:
+            optimizer = build_optimizer(target, OptimizerConfig(fused=False))
+            assert router.gate.weight.requires_grad and not router.expert_bias.requires_grad
+            assert not any(name.endswith("expert_bias") for name in unfrozen)
+        assert id(router.expert_bias) not in _held(optimizer)
+
+
+def _held(optimizer: torch.optim.Optimizer) -> set[int]:
+    """Ids of the parameters an optimizer holds, with a Muon optimizer's AdamW fallback."""
+    inner = getattr(optimizer, "_adam", None)
+    optimizers = [optimizer] if inner is None else [optimizer, inner]
+    return {id(p) for opt in optimizers for group in opt.param_groups for p in group["params"]}
+
+
+@pytest.mark.parametrize("name", sorted(registry.list("optimizer")))
+def test_a_module_the_build_froze_trains_once_a_stage_unfreezes_it(model, name):
+    """The optimizer built under trainable_for_the_run holds the frozen encoder, leaves it
+    untouched while it has no gradient, weight decay included, and updates it once the
+    stage unfreezes it."""
+    torch.manual_seed(0)
+    config = _unfreeze_encoder_at(2)
+    apply_freeze_specs(model, config.freeze, config.module_patterns)
+    with trainable_for_the_run(model, config):
+        optimizer = build_optimizer(
+            model, OptimizerConfig(name=name, lr=1e-2, weight_decay=0.1, fused=False)
+        )
+    encoder = list(model.vision_encoder.parameters())
+    assert {id(p) for p in encoder} <= _held(optimizer)
+    before = [p.detach().clone() for p in encoder]
+
+    def step() -> None:
+        out = model.transformer(model.adapter(model.vision_encoder(torch.randn(4, 8))))
+        out.square().mean().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    step()
+    assert all(torch.equal(p, b) for p, b in zip(encoder, before, strict=True))
+    apply_freeze_specs(model, config.freeze_schedule[0].specs, config.module_patterns)
+    step()
+    assert not any(torch.equal(p, b) for p, b in zip(encoder, before, strict=True))

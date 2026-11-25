@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, get_args
 
 if TYPE_CHECKING:
     import torch
 
 FP32_CROSS_ENTROPY_LOSSES = ("cross_entropy", "chunked_cross_entropy")
+
+NaNAction = Literal["warn", "skip", "raise"]
+"""What ``NaNDetector`` does on a step whose loss or gradient norm is NaN/Inf."""
 
 FP8_DIM_MULTIPLE = 16
 """``torch._scaled_mm`` needs both dimensions of an FP8 weight to be multiples of this."""
@@ -34,6 +37,9 @@ class TrainConfig:
     ``"fp16"`` stays in the ``mixed_precision`` ``Literal`` only so the config loader
     passes it on to ``__post_init__``, which rejects it with the reason; without it the
     loader would fail first with a generic Literal error.
+
+    ``nan_action`` and ``nan_max_consecutive`` set the training loop's ``NaNDetector``:
+    its response to a NaN/Inf step, and how many in a row stop the loop.
     """
 
     batch_size: int = 8
@@ -54,6 +60,8 @@ class TrainConfig:
     fp32_cross_entropy: bool = False
     shutdown_timeout_sec: float = 600.0
     nccl_health_check_interval: int = 0
+    nan_action: NaNAction = "warn"
+    nan_max_consecutive: int = 10
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
@@ -78,6 +86,13 @@ class TrainConfig:
                 f"train.fp32_cross_entropy applies to {', '.join(FP32_CROSS_ENTROPY_LOSSES)}, "
                 f"not loss_fn={self.loss_fn!r}"
             )
+        if self.nan_action not in get_args(NaNAction):
+            raise ValueError(
+                f"nan_action must be one of {', '.join(get_args(NaNAction))} "
+                f"(got {self.nan_action!r})"
+            )
+        if self.nan_max_consecutive <= 0:
+            raise ValueError("nan_max_consecutive must be positive")
 
     @property
     def param_dtype(self) -> torch.dtype:

@@ -156,21 +156,19 @@ class AdapterConfig:
 
         Mirrors the built module's ``output_num_tokens`` so config-time
         sequence-length checks match the build-time/runtime token budget.
-        Projection adapters are the identity; pooling adapters apply the
-        shared ``pooled_token_count`` math. Non-positive inputs (e.g. the
-        ``num_tokens=0`` "infer at build time" sentinel) pass through.
+        The count is the one the ``output_num_tokens`` declaration the
+        adapter type registered with returns (see
+        ``registry.register_adapter``), which the pooling adapters make; an
+        adapter that declares none keeps the count, as the projection
+        adapters do. Non-positive inputs (e.g. the ``num_tokens=0`` "infer
+        at build time" sentinel) pass through.
         """
-        if num_input_tokens <= 0 or self.type not in self._pooling_types():
+        import kempnerforge.model.adapter  # noqa: F401, PLC0415
+
+        declared = registry.get_adapter_output_num_tokens(self.type)
+        if num_input_tokens <= 0 or declared is None:
             return num_input_tokens
-        from kempnerforge.model.adapter import pooled_token_count  # noqa: PLC0415
-
-        return pooled_token_count(num_input_tokens, self.pool_window)
-
-    @staticmethod
-    def _pooling_types() -> tuple[str, ...]:
-        from kempnerforge.model.adapter import POOLING_ADAPTER_TYPES  # noqa: PLC0415
-
-        return POOLING_ADAPTER_TYPES
+        return declared(self, num_input_tokens)
 
 
 def _keyword_fields(

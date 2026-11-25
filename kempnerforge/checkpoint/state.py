@@ -20,6 +20,14 @@ partition its loader read, or is None when the saving manager was not given it.
 The legacy single-copy ``"rng"``/``"dataloader"`` keys (always rank 0's) are
 still written beside the envelope, so readers that predate it keep loading,
 with their documented limitation that they restore rank 0's copy everywhere.
+
+An envelope saved on another world size or data-parallel layout is refused
+with ``RankStateMismatchError``. Its RNG captures cannot follow the change, but
+the data position a ``StatefulDataLoader`` saves with a ``DistributedSampler``
+is the same on every rank, and a stream's, which counts one data-parallel
+rank's part of the stream, fits that data-parallel rank on the saved
+data-parallel size, so ``saved_data_position`` reads them for a resume that
+continues anyway.
 """
 
 from __future__ import annotations
@@ -41,16 +49,30 @@ PER_RANK_VERSION = 1
 _RNG_STREAMS = ("python", "numpy", "torch_cpu")
 
 _MISMATCH_HINT = (
-    "set checkpoint.ignore_rank_state_mismatch=true to discard the saved "
-    "loader/RNG state and continue from model/optimizer/scheduler state "
-    "(data order and random streams restart fresh; model/optimizer "
-    "resharding is unaffected)"
+    "set checkpoint.ignore_rank_state_mismatch=true to resume anyway: model, "
+    "optimizer, scheduler and step continue, the saved data position carries "
+    "over where the loader can place it on this layout (otherwise the data "
+    "restarts), and the random streams restart fresh"
 )
 
 _GROUP_MODULES_KEY = "scheduler_group_modules"
 _PER_GROUP_KEYS = ("base_lrs", "_last_lr", "lr_lambdas")
 _PER_GROUP_RATE_KEYS = ("base_lrs", "_last_lr")
 _SAME_RATE_REL_TOL = 1e-9
+
+
+class RankStateMismatchError(ValueError):
+    """Per-rank state saved under another world size or data-parallel layout.
+
+    ``select_rank_state`` raises it on every rank alike. ``mismatch`` says what
+    changed, without the way out the message adds, for a warning when
+    ``checkpoint.ignore_rank_state_mismatch`` lets the resume go on. Every other
+    refusal of an envelope is a plain ``ValueError``.
+    """
+
+    def __init__(self, message: str, mismatch: str | None = None) -> None:
+        super().__init__(message)
+        self.mismatch = mismatch or message
 
 
 def get_rng_state() -> dict[str, Any]:
@@ -192,11 +214,14 @@ def _check_envelope(
     if not _is_int(saved_world) or saved_world < 1:
         raise ValueError(f"per-rank state envelope has invalid world_size {saved_world!r}")
     if saved_world != world_size:
-        raise ValueError(
+        mismatch = (
             f"checkpoint per-rank state was saved with world_size={saved_world} but "
-            f"this run has world_size={world_size}. Exact dataloader/RNG continuity "
-            f"exists only on the saved topology: resume with {saved_world} ranks, or "
-            f"{_MISMATCH_HINT}"
+            f"this run has world_size={world_size}"
+        )
+        raise RankStateMismatchError(
+            f"{mismatch}. Restoring each rank's own loader and RNG state needs the saved "
+            f"topology: resume with {saved_world} ranks, or {_MISMATCH_HINT}",
+            mismatch,
         )
 
     ranks = envelope["ranks"]
@@ -258,12 +283,16 @@ def _check_envelope(
             f"rank {r} saved {tuple(saved_layout[r])} now {data_parallel[r]}" for r in changed[:4]
         )
         more = f"; {len(changed) - 4} more" if len(changed) > 4 else ""
-        raise ValueError(
+        mismatch = (
             f"checkpoint per-rank state was saved under a different data-parallel "
             f"layout: {len(changed)} of {world_size} ranks now read another data "
-            f"partition, as (dp_rank, dp_size): {examples}{more}. A loader cursor is "
-            f"valid only on the partition it was saved on: resume with the saved "
-            f"data-parallel layout, or {_MISMATCH_HINT}"
+            f"partition, as (dp_rank, dp_size): {examples}{more}"
+        )
+        raise RankStateMismatchError(
+            f"{mismatch}. Restoring each rank's own loader and RNG state needs the "
+            f"partition it was saved on: resume with the saved data-parallel layout, "
+            f"or {_MISMATCH_HINT}",
+            mismatch,
         )
 
 
@@ -276,12 +305,12 @@ def select_rank_state(
     """Return ``rank``'s own payload from a per-rank envelope, or refuse.
 
     Refuses with ``ValueError`` rather than guessing when the envelope is
-    malformed or incomplete, written by a newer schema version, or saved
-    under a different world size or data-parallel layout: a loader/RNG
-    payload restored onto the wrong rank or data partition silently changes
-    the data order and random streams of the resumed run. The whole envelope
-    is checked before ``rank``'s entry is selected, so every rank reaches the
-    same verdict.
+    malformed or incomplete, or written by a newer schema version, and with
+    ``RankStateMismatchError`` when it was saved under a different world size
+    or data-parallel layout: a loader/RNG payload restored onto the wrong rank
+    or data partition silently changes the data order and random streams of
+    the resumed run. The whole envelope is checked before ``rank``'s entry is
+    selected, so every rank reaches the same verdict.
 
     Args:
         envelope: The broadcast ``per_rank`` envelope.
@@ -292,6 +321,45 @@ def select_rank_state(
     """
     _check_envelope(envelope, world_size, data_parallel)
     return envelope["ranks"][rank]
+
+
+def saved_data_position(
+    envelope: Any, data_parallel: tuple[int, int] | None = None
+) -> dict[str, Any] | None:
+    """The saved ``"dataloader"`` state a rank resumes from on another topology.
+
+    The position a ``StatefulDataLoader`` saves with a ``DistributedSampler``
+    counts the samples all data-parallel ranks consumed, the same on every
+    rank, and a mixture's counts one rank's samples, which every rank has
+    taken as many of, so rank 0's copy serves every rank of the new layout.
+    A stream's position counts one data-parallel rank's part of the stream,
+    and the parts differ in length, so a rank whose ``data_parallel``
+    coordinates, ``(dp_rank, dp_size)``, have the saved data-parallel size
+    gets the position its own data-parallel rank saved, found by the
+    ``data_parallel_rank`` the stream state records. Any other rank gets rank
+    0's, which the loader refuses on another data-parallel size. The loader's
+    ``load_state_dict`` raises ``DataPositionError`` for a position that does
+    not fit it, such as a mixture's on another data-parallel size. Returns
+    None when the saved loaders kept no state.
+
+    The envelope is checked against the world size and layout that saved it,
+    as ``select_rank_state`` checks it against this run's, so a malformed or
+    incomplete one raises ``ValueError`` on every rank alike.
+    """
+    saved_world = envelope.get("world_size") if isinstance(envelope, dict) else None
+    _check_envelope(envelope, saved_world if _is_int(saved_world) else 0, None)
+    ranks = envelope["ranks"]
+    first = ranks[0].get("dataloader")
+    if first is None or "stream" not in first or data_parallel is None:
+        return first
+    dp_rank, dp_size = data_parallel
+    for rank in sorted(ranks):
+        state = ranks[rank]["dataloader"]
+        stream = state.get("stream")
+        saved_size = stream.get("data_parallel_size") if isinstance(stream, dict) else None
+        if state.get("data_parallel_rank") == dp_rank and saved_size == dp_size:
+            return state
+    return first
 
 
 def _group_modules(scheduler: Any) -> list[str | None] | None:
@@ -459,6 +527,26 @@ def _module_peaks(scheduler: Any) -> dict[str | None, Any]:
     return peaks
 
 
+def _match_initial_lrs(scheduler: Any) -> None:
+    """Set each param group's ``initial_lr`` to the base rate the restored schedule runs it from.
+
+    Building an ``LRScheduler`` makes the two equal, but loading its state restores
+    ``base_lrs`` alone, so a group would keep the rate it was built at. Muon's AdamW fallback
+    takes its schedule's factor from that ``initial_lr``. A state with another number of base
+    rates than the optimizer has groups, which a scheduler other than ``LambdaLR`` loads as
+    saved, leaves them as they are.
+    """
+    base_lrs = getattr(scheduler, "base_lrs", None)
+    if not isinstance(scheduler, torch.optim.lr_scheduler.LRScheduler) or not isinstance(
+        base_lrs, list
+    ):
+        return
+    groups = scheduler.optimizer.param_groups
+    if len(base_lrs) == len(groups):
+        for group, base_lr in zip(groups, base_lrs, strict=True):
+            group["initial_lr"] = base_lr
+
+
 def build_train_state(
     step: int,
     tokens_seen: int,
@@ -523,7 +611,8 @@ def restore_train_state(
     Args:
         state: Training state dict (from build_train_state).
         scheduler: LR scheduler to restore. The saved schedule carries on in every param
-            group, peak included, whatever the rates the optimizer was built with. Its state is
+            group, peak included, whatever the rates the optimizer was built with, and each
+            group's ``initial_lr`` is set to the base rate it now runs from. Its state is
             laid out by module for groups other than those it was saved with (see
             ``build_train_state``): each group of a module the checkpoint holds resumes at that
             module's rates, and any other at the saved peak times its multiplier. Nothing is
@@ -563,6 +652,7 @@ def restore_train_state(
     if scheduler is not None and scheduler_state is not None:
         built = _module_peaks(scheduler)
         scheduler.load_state_dict(scheduler_state)
+        _match_initial_lrs(scheduler)
         peaks = _module_peaks(scheduler)
         if peaks:
             logger.info(

@@ -79,8 +79,9 @@ After the step body (either branch):
 ```python
 grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
 if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
+    _route_balance(session, step_ran=False)
     optimizer.zero_grad()
-    if nan_detector.should_rollback:
+    if nan_detector.rollback_recommended:
         break
     _advance_lr_schedule(session)
     step += 1
@@ -103,9 +104,8 @@ rank's experts (see
 [Gradient utilities § Under expert parallelism](gradient-utilities.md#under-expert-parallelism)).
 `NaNDetector.check_loss` returns `False` when the loss or the gradient norm is
 NaN / Inf on any rank; the loop then zeroes the gradients and skips the step.
-The detector escalates to `should_rollback` after `max_consecutive` bad steps
-in a row (`NaNDetector(max_consecutive=10)` in
-`kempnerforge/training/entry.py`; see
+The detector escalates to `rollback_recommended` after `max_consecutive` bad steps
+in a row (`train.nan_max_consecutive`, default 10; see
 [NaN detection](../resilience/nan-detection.md)).
 The gradient norm is checked because a finite loss can come with
 non-finite gradients: a micro-batch whose labels are all `-100` has an exact
@@ -116,7 +116,7 @@ the token count, metrics, hooks and every periodic tick below except the
 shutdown check, but the LR schedule advances, the freeze stages and data
 phases due at the new step are applied, and a pending shutdown writes
 the emergency checkpoint, if every rank's weights are finite, and stops
-the loop. The step that trips `should_rollback` stops before any of
+the loop. The step that trips `rollback_recommended` stops before any of
 that. See
 [NaN detection § What a skipped step still does](../resilience/nan-detection.md#what-a-skipped-step-still-does).
 
@@ -124,11 +124,18 @@ that. See
 
 ```python
 optimizer.step()
+_route_balance(session, step_ran=True)
 scheduler.step()
 if phase_lr_scale != 1.0:
     for pg in optimizer.param_groups: pg["lr"] *= phase_lr_scale
 optimizer.zero_grad()
 ```
+
+With MoE, `_route_balance` applies the sigmoid routers' balancing right
+after the update: one all-reduce sums their expert counts over the
+step's micro-batches and all ranks, so every rank runs it (see
+[Aux loss and balancing](../moe/aux-loss-and-balancing.md#sigmoid-router--bias-based-balancing)).
+A NaN-skipped step drops the counts instead.
 
 Phase LR scaling runs *after* the scheduler — it multiplies the base
 LR that `scheduler.step()` just computed. This lets a curriculum phase
@@ -256,8 +263,10 @@ in order, then hands a `TrainingSession` to `run_training_loop`:
    registry lookup (see [Optimizers](optimizers.md)).
 6. `build_scheduler(optimizer, config.scheduler, max_steps=tc.max_steps)` —
    warmup + decay LambdaLR (see [Schedulers](schedulers.md)).
-7. `build_checkpoint_manager(...)` + `restore_checkpoint(...)` —
-   auto-resume from the `latest` symlink.
+7. `build_checkpoint_manager(...)`, then `ckpt_mgr.claim_dir()`, which
+   makes the run the owner of `checkpoint.dir` (see
+   [Auto-resume § One run per checkpoint directory](../checkpointing/auto-resume.md#one-run-per-checkpoint-directory)),
+   then `restore_checkpoint(...)`, which resumes from the `latest` symlink.
 8. `MetricsTracker`, profiler, `build_data_pipeline`,
    `build_eval_dataloader`, `build_phase_state`, `HookRunner`.
 
@@ -278,6 +287,7 @@ if nccl_failed_at is not None:
     raise RuntimeError(...)            # an NCCL stop fails the run
 hook_runner.on_train_end(step, tokens_seen)
 tracker.close()
+ckpt_mgr.release_dir()
 destroy_distributed()
 shutdown_handler.finish()              # restore the handlers, cancel the timer
 ```

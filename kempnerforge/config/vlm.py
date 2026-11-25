@@ -46,13 +46,31 @@ DEFAULT_MODULE_PATTERNS: dict[str, list[str]] = {
 }
 
 
+def is_parameter_pattern(module: str) -> bool:
+    """Whether a ``FreezeSpec.module`` is spelled as a parameter pattern.
+
+    A pattern spells a parameter path or a glob, so it holds a dot or one of ``*?[``; a
+    bare word reads as a module alias. This looks at the spelling only: a name that is a
+    key of the module pattern map resolves as that alias first, dot or not.
+
+    Args:
+        module: The ``FreezeSpec.module`` to classify.
+
+    Returns:
+        True when ``module`` holds a dot or one of ``*?[``.
+    """
+    return any(char in module for char in ".*?[")
+
+
 @dataclass(frozen=True)
 class FreezeSpec:
     """A single freeze directive.
 
     ``module`` is an alias (key in a pattern map such as
     ``DEFAULT_MODULE_PATTERNS``) or a raw fnmatch pattern matching
-    fully-qualified parameter names.
+    fully-qualified parameter names, which holds a dot or one of ``*?[``
+    (see ``is_parameter_pattern``). ``VLMConfig`` refuses a bare word that
+    is not one of its aliases.
     """
 
     module: str
@@ -66,7 +84,9 @@ class FreezeStage:
     Used for staged training recipes where the trainable subset
     changes across training phases. The list of stages on
     ``VLMConfig`` is expected to be in strictly monotonic
-    ``start_step`` order.
+    ``start_step`` order. A stage can unfreeze a module that
+    ``VLMConfig.freeze`` froze at build; the module then trains from that
+    stage on, also after a resume.
     """
 
     start_step: int
@@ -97,7 +117,8 @@ class VLMConfig:
     - ``tile_global`` whether a tiled image's views start with the whole
       image; ignored when ``tile_grid`` is ``0``.
     - ``freeze`` static freeze specs applied once at build time.
-    - ``freeze_schedule`` step-boundary freeze transitions.
+    - ``freeze_schedule`` step-boundary freeze transitions; a stage may
+      unfreeze a module the build froze (see ``FreezeStage``).
     - ``module_patterns`` map of module alias (``"transformer"``,
       ``"vision_encoder"``, ``"adapter"``, plus arch-specific additions)
       to fnmatch pattern list.
@@ -136,6 +157,20 @@ class VLMConfig:
             steps = [s.start_step for s in self.freeze_schedule]
             if steps != sorted(steps) or len(steps) != len(set(steps)):
                 raise ValueError("vlm.freeze_schedule start_steps must be strictly monotonic")
+        specs = [*self.freeze, *(spec for stage in self.freeze_schedule for spec in stage.specs)]
+        unknown = sorted(
+            {
+                spec.module
+                for spec in specs
+                if spec.module not in self.module_patterns and not is_parameter_pattern(spec.module)
+            }
+        )
+        if unknown:
+            raise ValueError(
+                f"vlm.freeze and vlm.freeze_schedule name {unknown}, which are neither module "
+                f"aliases ({sorted(self.module_patterns)}) nor parameter patterns, which hold a "
+                "dot or one of *?["
+            )
 
     def residual_stream_image_tokens(self, num_tokens: int) -> int:
         """Number of image tokens this arch places in the residual stream.

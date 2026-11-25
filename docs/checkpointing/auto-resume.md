@@ -86,20 +86,33 @@ holds a complete save, it says so at ERROR level.
 ## Where it's called
 
 `training/entry.py::restore_checkpoint` calls this **once**, right after creating the
-`CheckpointManager`:
+`CheckpointManager`; with a process group, rank 0 calls it and broadcasts the
+path, or the error it raised, to every rank:
 
 ```python
 num_stages = config.distributed.pp if config.distributed.pp > 1 else None
-resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
+if dist.is_initialized():
+    resume_path = _resume_path_on_rank_zero(config.checkpoint.dir, num_stages)
+else:
+    resume_path = resolve_resume_path(config.checkpoint.dir, num_stages)
 step, tokens_seen = 0, 0
 if resume_path and config.checkpoint.load_path:
     logger.warning(...)  # rank 0, unless load_path is resume_path: load_path is not used
 if resume_path or config.checkpoint.load_path:
-    step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
-        path=str(resume_path) if resume_path else None,
-        scheduler=scheduler,
-        exact_resume=resume_path is not None,
+    warm_start_exclude = (
+        (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
     )
+    vlm_freeze_expected = ...  # VLM runs, unless a weights-only warm start
+    with _trainable_for_the_run(model, config) as unfrozen_later:
+        step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
+            path=str(resume_path) if resume_path else None,
+            scheduler=scheduler,
+            warm_start=resume_path is None,
+            exclude_keys=warm_start_exclude,
+            vlm_freeze_expected=vlm_freeze_expected,
+            fresh_if_unheld=unfrozen_later,
+            exact_resume=resume_path is not None,
+        )
     if resume_path:
         if ckpt_extra_loaded.get("wandb_run_id"):
             config.metrics.wandb_run_id = ckpt_extra_loaded["wandb_run_id"]
@@ -120,6 +133,38 @@ So two things can trigger a resume:
   and W&B runs, and its MLflow run is tagged with the checkpoint it
   started from ([MLflow § Run ID and resume](../metrics-and-profiling/mlflow.md#run-id-and-resume)).
 
+A warm start restores the saved data position where it carries over to
+the new run: a single pre-tokenized, eager Hugging Face or VLM dataset
+continues at the same sample on any data-parallel size. Where it cannot,
+as with a mixture or a streamed dataset on another data-parallel size, a
+switch of `data.hf_streaming`, a changed stream, or a checkpoint saved
+before the loader recorded its batch size on another data-parallel size,
+the warm start logs a warning that names the reason and every rank
+starts the data at its first sample. A resume from `checkpoint.dir`
+stops instead, on every rank. Every rank checks the position before any
+rank applies it and the ranks agree, so one rank whose view of the data
+differs, such as a stream's data file at another size, cannot leave the
+others resuming without it. A
+checkpoint with per-rank state refuses a resume onto another world size
+or data-parallel layout with a `RankStateMismatchError`, before any data
+position is applied; on the topology that saved it, a position that
+does not fit, after a switch of `data.hf_streaming` or a changed
+stream, raises `DataPositionError`. A checkpoint saved before per-rank
+state was recorded applies rank 0's position on every rank and raises
+`DataPositionError` where it cannot carry over. With
+`checkpoint.ignore_rank_state_mismatch` set, a resume onto another world
+size or layout, and any resume of a checkpoint saved before per-rank
+state was recorded, even on the topology that saved it, treats the data
+position as a warm start does, except that a stream on the saved
+data-parallel size resumes each data-parallel rank from the position it
+saved, and restarts the RNG streams. Per-rank
+state that is unreadable or incomplete even on the topology that saved
+it is the exception: the flag keeps no data position from it, so the
+data starts at its first sample. The flag does not cover a position
+that does not fit on the topology that saved per-rank state: it still
+raises `DataPositionError` (see
+[Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size)).
+
 If both are set, `resume_path` wins (auto-resume takes precedence
 over the static config). This is deliberate: SLURM requeues should
 always pick up where they left off, not re-load the initial
@@ -139,7 +184,9 @@ start restores rank 0's single copy on every rank on any topology, and
 a weights-only one (below) restores neither
 (see [Train state](train-state.md#per-rank-state-schema-v1)). To
 auto-resume onto a different topology anyway, set
-`checkpoint.ignore_rank_state_mismatch`: see
+`checkpoint.ignore_rank_state_mismatch`: the data position then carries
+over where the loader can place it on the new layout, and the RNG
+streams restart. See
 [Scaling a run to a different world size](resharding.md#scaling-a-run-to-a-different-world-size).
 
 A training checkpoint also holds `train_state.pt`, and `load_path` restores
@@ -165,7 +212,10 @@ start runs only when no checkpoint supplied the model, that is on a run
 with nothing to resume from or a warm start that excludes `"model"` and
 starts at step 0, and never on a resume. A weights-only warm start also skips the
 `metadata.json` probe for the freeze check, since the new run's own
-freeze applies.
+freeze applies, and the `plugins` comparison. Any other warm start, like
+a resume, compares the run's `plugins` list with the one `metadata.json`
+records before reading any state, and refuses another list unless
+`checkpoint.ignore_plugins_mismatch` is set.
 
 ## Symlink updates
 
@@ -174,21 +224,28 @@ Inside `CheckpointManager.save` (rank 0 only):
 ```python
 # manager.py
 latest = self._latest_link()                # <dir>/latest
-tmp_link = latest.with_suffix(".tmp")       # <dir>/latest.tmp
-tmp_link.unlink(missing_ok=True)
+tag = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex}"
+tmp_link = latest.with_name(f"{latest.name}.{tag}.tmp")
 tmp_link.symlink_to(ckpt_dir.name)          # relative link: "step_1000"
-tmp_link.rename(latest)                     # atomic rename
+try:
+    tmp_link.rename(latest)                 # atomic rename
+except BaseException:
+    tmp_link.unlink(missing_ok=True)
+    raise
 ```
 
-Two details that matter:
+Three details that matter:
 
-- **Relative target** — the symlink points at `step_1000`, not
+- **Relative target**: the symlink points at `step_1000`, not
   `/abs/path/checkpoints/step_1000`. Checkpoint directories stay
   portable when moved or bind-mounted.
-- **Atomic rename** — `tmp_link.rename(latest)` is a single atomic
+- **Atomic rename**: `tmp_link.rename(latest)` is a single atomic
   syscall (`rename(2)` on POSIX). Either the old symlink is still
-  there or the new one is — never a half-written state. Safe against
+  there or the new one is, never a half-written state. Safe against
   crashes mid-save.
+- **A temporary name of its own**: the new link is made under a name
+  of this host, process and call, so no other writer removes or
+  replaces it before the rename, and a rename that fails removes it.
 
 The symlink is updated **after** the DCP save completes (async save
 futures are resolved before the next save starts), so `latest` only
@@ -207,6 +264,77 @@ whose own part failed raises that error, and every other rank raises a
 for one that has already raised. Pruning runs only once `latest` has
 moved, so an error while pruning fails no rank (see
 [Retention cleanup](#retention-cleanup)).
+
+## One run per checkpoint directory
+
+Two live runs pointed at one `checkpoint.dir`, such as one config
+launched twice from the same working directory, would overwrite each
+other's checkpoints, prune each other's `step_*` directories and resume
+from each other's `latest`. So before a training run resumes or saves,
+rank 0 records it in `<checkpoint.dir>/.owner`, and every rank stops
+when that fails. The record holds a claim id of its own, a random id of
+the process, by which a process knows its own records, the host, pid,
+pid namespace and start time, and under SLURM the job (`SLURM_JOB_ID`, or
+`<SLURM_ARRAY_JOB_ID>_<SLURM_ARRAY_TASK_ID>` for a job array element),
+its cluster (`SLURM_CLUSTER_NAME`) and its requeue count
+(`SLURM_RESTART_COUNT`). A run finds one of these:
+
+- **No record**: the run claims the directory. The record is written to
+  a temporary file and linked into place, so it appears whole and only
+  one of two runs claiming at once creates it.
+- **A record this process wrote**: replaced, as when a run that raised
+  is followed by another in the same process, unless the process
+  released it; a released record goes through the token below.
+- **A record of a run that is still alive**: the run stops with an error
+  that names the owner.
+- **A released record**: replaced, as below but without a warning.
+- **A record of a run that has ended**: replaced, with a warning. Of two
+  runs that find it at once, only the one that creates
+  `.owner.<that record's claim id>.takeover` replaces it, and the other
+  then finds the new owner alive. The run renames a link of its own
+  temporary file, under a name only its claim uses, so a rename that NFS
+  replays finds nothing to move, and it reads the record back before it
+  counts the claim.
+- **A record of a run this process cannot check**: the run stops, and the
+  error names the file to remove if that run has ended.
+
+Whether the owner is alive depends on where it ran:
+
+- **An earlier attempt of this SLURM job**, the same job with another
+  requeue count, has ended: a requeued job goes back to pending before
+  it runs again.
+- **Another run in this SLURM job**, such as a second training in one
+  allocation, is alive while its pid runs. Only a process on its host
+  and in its pid namespace can check, since containers that share the
+  host name but not the pid namespace reuse pids, and a host where
+  `/proc` does not show the namespace cannot check at all.
+- **Another SLURM job** is alive until `squeue` lists it in a final
+  state, such as `COMPLETED`, `CANCELLED`, `FAILED` or `TIMEOUT`, or no
+  longer lists it. `squeue` runs without the `SQUEUE_*` and
+  `SLURM_CLUSTERS` settings that narrow what it lists, and a run outside
+  SLURM asks the owner's cluster by name. A job of another cluster than
+  the run's own, or one `squeue` cannot answer for, cannot be checked.
+- **A run outside SLURM** is alive while its pid runs. Only a process on
+  its host and in its pid namespace can check.
+
+A run that ends cleanly marks its record released, replacing it the
+same way with a released record; nothing removes `.owner`, so a removal
+NFS replays cannot remove a later run's record. An error marking it is
+logged, not raised. A run that crashes leaves its record, and the next
+run takes it over once the first has ended. A run that dies while it
+holds a `.takeover` file leaves that file, and the next run takes the
+file over the same way once that run has ended; while its run is alive,
+or cannot be checked, the next run stops with an error that names the
+file. Claims and releases in one process run one at a time. Scripts that
+only read checkpoints, such as `scripts/eval.py`, do not claim the
+directory.
+
+The protocol assumes that the filesystem applies each request once, and
+that a request from a process that has died is not applied after another
+process has taken the directory over. Local filesystems, NFSv4.1
+sessions and NFSv3 servers with a duplicate request cache give both; on
+a server that loses its reply cache, rare orderings could still admit
+two owners.
 
 ## Retention cleanup
 

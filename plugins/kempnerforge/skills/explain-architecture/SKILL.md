@@ -74,7 +74,7 @@ Walk the user through the path a single forward+backward pass takes. Use the out
 - `kempnerforge/metrics/tracker.py::MetricsTracker` collects per-step scalars with optional EMA smoothing, then dispatches to enabled backends (wandb, tensorboard).
 - `metrics/mfu.py` computes model FLOPs utilization from the model config and measured step time.
 - `metrics/memory.py` tracks peak GPU memory, with an optional snapshot export for pytorch.org/memory_viz.
-- `resilience/` owns signal handlers (SIGTERM/SIGUSR1 for SLURM preemption), NaN action policies, and GPU/NCCL liveness probes that run every N steps.
+- `resilience/` owns signal handlers (SIGTERM/SIGUSR1 for SLURM preemption), NaN action policies, an opt-in NCCL liveness probe that runs every N steps, and an on-demand GPU health check.
 
 ## Verification
 None. This skill is informational. Ask the user which subsystem they want to dig into, then point them at the specific files and classes listed above.

@@ -72,6 +72,11 @@ class KVCache:
         self.seq_len = end
         return self.k[:, :, :end], self.v[:, :, :end]
 
+    def keep_rows(self, rows: torch.Tensor) -> None:
+        """Keep only the batch rows ``rows``, in that order, e.g. to drop finished sequences."""
+        self.k = self.k[rows]
+        self.v = self.v[rows]
+
 
 class Attention(nn.Module):
     """Grouped-Query Attention with RoPE and SDPA."""
@@ -139,31 +144,50 @@ class Attention(nn.Module):
                 across the batch or (batch, seq_len, head_dim // 2) per row.
             rope_sin: RoPE sine frequencies, same shape as ``rope_cos``.
             kv_cache: Optional KV cache for incremental generation. The tokens
-                of this forward are appended to it, and each attends to every
-                cached key and to the appended keys up to its own position.
-                Mutually exclusive with ``attn_mask``: a cache grows the key
-                axis every step, so the mask would have to be rebuilt each
-                step rather than shared, and a decode step needs no mask at
-                all.
+                of this forward are appended to it, and without ``attn_mask``
+                each attends to every cached key and to the appended keys up
+                to its own position.
             attn_mask: The mask from
                 ``kempnerforge.model.masking.build_attention_mask``: a
                 FlexAttention ``BlockMask``, a dense bool tensor broadcastable
                 to (batch, n_heads, seq_len, seq_len) where ``True`` = attend,
-                or ``None`` for plain causal attention.
+                or ``None`` for plain causal attention. With ``kv_cache`` its
+                key axis covers the cached keys and the appended ones, so a
+                ``BlockMask``, which is square, needs an empty cache.
 
         Returns:
             Output tensor of shape (batch, seq_len, dim).
 
         Raises:
-            ValueError: If ``attn_mask`` is combined with ``kv_cache``, or a dense
-                ``attn_mask`` with ``sdpa_backend="flash"`` on CUDA.
+            ValueError: If ``attn_mask``'s key axis does not cover the keys
+                ``kv_cache`` holds after this forward, or a dense ``attn_mask``
+                comes with ``sdpa_backend="flash"`` on CUDA.
             NotImplementedError: If ``capture_attention_weights`` is set and
                 ``attn_mask`` is a ``BlockMask``.
         """
         if kv_cache is not None and attn_mask is not None:
+            keys = kv_cache.seq_len + x.shape[1]
+            if isinstance(attn_mask, BlockMask):
+                mask_keys = attn_mask.seq_lengths[1] if kv_cache.seq_len == 0 else -1
+            else:
+                mask_keys = attn_mask.shape[-1] if attn_mask.dim() == 4 else -1
+            if mask_keys != keys:
+                raise ValueError(
+                    f"attn_mask cannot be combined with kv_cache unless it is a "
+                    f"(batch, 1, seq_len, cached + seq_len) mask over the {keys} keys "
+                    "after this forward, or a BlockMask on an empty cache"
+                )
+        if (
+            isinstance(attn_mask, torch.Tensor)
+            and not self.capture_attention_weights
+            and self.sdpa_backend == "flash"
+            and x.is_cuda
+        ):
             raise ValueError(
-                "attn_mask (dense or BlockMask) cannot be combined with kv_cache; "
-                "visibility masks are training-only"
+                "model.sdpa_backend='flash' cannot run a forward with an attention mask, "
+                "as packed documents, padded frames or attention groups need: PyTorch's "
+                "FlashAttention kernel takes no mask on CUDA. Use another sdpa_backend, "
+                "such as 'auto'."
             )
         if isinstance(attn_mask, BlockMask) and self.capture_attention_weights:
             raise NotImplementedError(
@@ -209,13 +233,6 @@ class Attention(nn.Module):
             out, attn_weights = self._attention_with_weights(q, k, v, seq_len, attn_mask, kv_cache)
             self.last_attention_weights = attn_weights.detach().cpu()
         elif attn_mask is not None:
-            if self.sdpa_backend == "flash" and q.is_cuda:
-                raise ValueError(
-                    "model.sdpa_backend='flash' cannot run a forward with an attention mask, "
-                    "as packed documents, padded frames or attention groups need: PyTorch's "
-                    "FlashAttention kernel takes no mask on CUDA. Use another sdpa_backend, "
-                    "such as 'auto'."
-                )
             with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         elif seq_len > 1 and k.shape[2] > seq_len:

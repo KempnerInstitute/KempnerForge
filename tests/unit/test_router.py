@@ -177,11 +177,13 @@ class TestSigmoidBiasSchedule:
         router.set_step(0, 1000)
         bias_before_early = router.expert_bias.data.clone()
         router(torch.randn(64, 64))
+        router.balance(router.pending_counts.clone())
         delta_early = (router.expert_bias.data - bias_before_early).abs().max().item()
 
         router.set_step(990, 1000)
         bias_before_late = router.expert_bias.data.clone()
         router(torch.randn(64, 64))
+        router.balance(router.pending_counts.clone())
         delta_late = (router.expert_bias.data - bias_before_late).abs().max().item()
 
         assert delta_early > delta_late
@@ -206,9 +208,9 @@ class TestEmptyInput:
         assert weights.shape == (0, 2) and indices.shape == (0, 2)
         assert router.aux_loss.item() == 0 and router.z_loss.item() == 0
         (router.aux_loss + router.z_loss).backward()
-        for param in (router.gate.weight, router.expert_bias):
-            assert param.grad is not None
-            assert not torch.count_nonzero(param.grad)
+        assert router.gate.weight.grad is not None
+        assert not torch.count_nonzero(router.gate.weight.grad)
+        assert router.expert_bias.grad is None
 
     def test_the_sigmoid_router_does_not_count_an_empty_input_as_utilization(self) -> None:
         router = SigmoidTopKRouter(dim=16, num_experts=4, top_k=2)

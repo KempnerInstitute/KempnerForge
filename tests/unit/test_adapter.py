@@ -14,10 +14,14 @@ import torch.nn.functional as F
 
 import kempnerforge.model.adapter
 from kempnerforge.config.adapter import AdapterConfig
+from kempnerforge.config.job import JobConfig
 from kempnerforge.config.loader import load_config
+from kempnerforge.config.model import ModelConfig
 from kempnerforge.config.registry import registry
+from kempnerforge.config.training import TrainConfig
+from kempnerforge.config.vision import VisionEncoderConfig
+from kempnerforge.config.vlm import VLMConfig
 from kempnerforge.model.adapter import (
-    POOLING_ADAPTER_TYPES,
     AttentionalPoolAdapter,
     AvgPoolAdapter,
     LinearAdapter,
@@ -613,9 +617,13 @@ class TestPoolingAdapterRegistry:
         adapter = registry.get_adapter("attentional_pool")(in_dim=8, out_dim=4, pool_heads=2)
         assert isinstance(adapter, AttentionalPoolAdapter)
 
-    def test_pooling_types_constant_matches_registry(self):
-        for name in POOLING_ADAPTER_TYPES:
-            assert name in registry.list_adapters()
+    def test_only_the_pooling_adapters_declare_a_token_count(self):
+        """``AdapterConfig.output_num_tokens`` reads these declarations; the
+        projection adapters declare none and keep the count."""
+        for name in ("avgpool", "attentional_pool"):
+            assert callable(registry.get_adapter_output_num_tokens(name)), name
+        for name in ("mlp_2layer", "linear"):
+            assert registry.get_adapter_output_num_tokens(name) is None, name
 
 
 class TestAdapterConfigPooling:
@@ -659,11 +667,13 @@ class TestAdapterConfigPooling:
     @pytest.mark.parametrize(
         ("adapter_type", "fields"),
         [
+            ("mlp_2layer", {}),
+            ("linear", {}),
             ("avgpool", {}),
             ("avgpool", {"hidden_dim": 24, "pre_norm": "rmsnorm"}),
             ("attentional_pool", {"pool_heads": 4}),
         ],
-        ids=["avgpool", "avgpool-mlp-head", "attentional_pool"],
+        ids=["mlp_2layer", "linear", "avgpool", "avgpool-mlp-head", "attentional_pool"],
     )
     def test_config_count_matches_module_count(self, adapter_type, fields):
         """Config-time estimate must equal the built module's count so the
@@ -672,6 +682,76 @@ class TestAdapterConfigPooling:
         module = build_adapter(cfg, in_dim=32, out_dim=16)
         assert cfg.output_num_tokens(256) == module.output_num_tokens(256)
         assert module(torch.randn(1, 256, 32)).shape[1] == cfg.output_num_tokens(256)
+
+
+def _my_pool_builder(in_dim, out_dim, pool_window=2, **_):
+    return AvgPoolAdapter(in_dim, out_dim, pool_window=pool_window)
+
+
+def _pooled(config, num_input_tokens):
+    return pooled_token_count(num_input_tokens, config.pool_window)
+
+
+@pytest.fixture
+def pool_plugin():
+    """Register ``_my_pool_builder`` under throwaway names, removed after the test.
+
+    ``register(**declarations)`` passes the declarations to
+    ``registry.register_adapter`` and returns the name.
+    """
+    names: list[str] = []
+
+    def register(**declarations):
+        name = f"adapter_tokens_test_{len(names)}"
+        registry.register_adapter(name, **declarations)(_my_pool_builder)
+        names.append(name)
+        return name
+
+    yield register
+    for name in names:
+        registry.unregister("adapter", name)
+
+
+class TestAdapterOutputNumTokensDeclaration:
+    def test_a_declared_count_is_the_config_count(self, pool_plugin):
+        """A pooling adapter registered outside the built-ins counts like one."""
+        name = pool_plugin(output_num_tokens=_pooled)
+        cfg = AdapterConfig(type=name)
+        module = build_adapter(cfg, in_dim=32, out_dim=16)
+        assert cfg.output_num_tokens(256) == module.output_num_tokens(256) == 64
+
+    def test_the_declaration_reads_the_config(self, pool_plugin):
+        name = pool_plugin(output_num_tokens=_pooled)
+        assert AdapterConfig(type=name, pool_window=4).output_num_tokens(256) == 16
+
+    def test_the_vlm_length_checks_count_the_declared_tokens(self, pool_plugin):
+        """256 patch tokens pool to 64, which with 64 text tokens fit 128 positions."""
+        name = pool_plugin(output_num_tokens=_pooled)
+        config = JobConfig(
+            model=ModelConfig(max_seq_len=128),
+            train=TrainConfig(seq_len=128),
+            vision_encoder=VisionEncoderConfig(type="random", num_tokens=256, feature_dim=1152),
+            adapter=AdapterConfig(type=name),
+            vlm=VLMConfig(max_text_len=64),
+        )
+        config.validate(world_size=1)
+
+    def test_an_undeclared_adapter_keeps_the_count(self, pool_plugin):
+        name = pool_plugin()
+        assert registry.get_adapter_output_num_tokens(name) is None
+        assert AdapterConfig(type=name).output_num_tokens(256) == 256
+
+    def test_the_sentinel_passes_through_a_declaration(self, pool_plugin):
+        name = pool_plugin(output_num_tokens=_pooled)
+        assert AdapterConfig(type=name).output_num_tokens(0) == 0
+
+    def test_a_declaration_that_is_not_callable_is_rejected(self):
+        with pytest.raises(
+            TypeError,
+            match=r"output_num_tokens for adapter 'adapter_tokens_test_int' must be a callable",
+        ):
+            registry.register_adapter("adapter_tokens_test_int", output_num_tokens=64)
+        assert "adapter_tokens_test_int" not in registry.list_adapters()
 
 
 class TestBuildAdapterPooling:

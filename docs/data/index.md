@@ -73,10 +73,10 @@ sampler
 ## See also
 
 - [Checkpointing § Train state](../checkpointing/train-state.md#dataloader-state):
-  every checkpoint records the `StatefulDataLoader` position (the
-  memory-mapped, HF eager, mixture and VLM paths), and resume continues
-  from it rather than restarting the epoch. The streaming path's plain
-  `DataLoader` keeps no position and restarts.
+  every checkpoint records the data position, the `StatefulDataLoader`'s
+  on the memory-mapped, HF eager, mixture and VLM paths and the
+  `StreamingDataLoader`'s on the streaming path, and resume continues
+  from it rather than restarting the epoch or the stream.
 - [Training § Training loop](../training/training-loop.md) — where
   the dataloader is consumed step by step.
 - [Configuration § `[data]` — DataConfig](../configuration/config-sections.md) —

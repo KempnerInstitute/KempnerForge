@@ -291,7 +291,10 @@ class TestMoESigmoidFSDP:
         loss.backward()
 
         for name, p in model.named_parameters():
-            assert p.grad is not None, f"No gradient for {name}"
+            if p.requires_grad:
+                assert p.grad is not None, f"No gradient for {name}"
+            else:
+                assert name.endswith("router.expert_bias") and p.grad is None, name
 
     def test_sigmoid_fsdp_aux_loss_positive(self, distributed_env):
         """Sequence aux loss should be positive under FSDP with sigmoid router."""

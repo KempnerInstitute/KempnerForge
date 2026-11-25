@@ -1,4 +1,4 @@
-"""GPU health monitoring and NaN detection.
+"""GPU and NCCL health checks and NaN detection.
 
 Provides utilities for detecting common failures during training:
   - NaN/Inf in loss, gradients or parameters
@@ -9,6 +9,7 @@ Provides utilities for detecting common failures during training:
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -34,12 +35,19 @@ class NaNDetector:
     """Detects and tracks NaN/Inf values in loss and gradients.
 
     Supports three responses to NaN:
-      - ``"warn"``: Log a warning and continue.
-      - ``"skip"``: Skip the optimizer step (zero gradients).
+      - ``"warn"``: Log a warning and return False.
+      - ``"skip"``: The same; :meth:`check_loss`'s warning also says the optimizer
+        step is skipped.
       - ``"raise"``: Raise a ``RuntimeError``.
 
-    Once the consecutive NaN count reaches ``max_consecutive``, the detector
-    signals that a checkpoint rollback is recommended.
+    The training loop skips the optimizer step whenever a check returns False,
+    so there ``"warn"`` and ``"skip"`` behave the same; its action and
+    ``max_consecutive`` come from ``train.nan_action`` and
+    ``train.nan_max_consecutive``.
+
+    Once the consecutive NaN count reaches ``max_consecutive``,
+    :attr:`rollback_recommended` turns True. Nothing rolls back on its own: the
+    training loop stops on it, and a rollback to an earlier checkpoint is manual.
 
     Args:
         action: What to do when NaN is detected.
@@ -65,7 +73,9 @@ class NaNDetector:
 
         When running distributed, all-reduces a NaN flag so ALL ranks agree
         on whether to skip. Prevents rank desync where one rank sees NaN and
-        skips its optimizer step while others proceed normally.
+        skips its optimizer step while others proceed normally. The flag is on
+        the current CUDA device, or on the CPU when CUDA is unavailable, so a
+        gloo process group without CUDA reduces it as well.
 
         A finite loss does not guarantee finite gradients: a micro-batch whose
         labels are all masked has an exact zero cross-entropy loss whatever its
@@ -89,13 +99,7 @@ class NaNDetector:
         bad_loss = not _is_finite(loss)
         bad_grad_norm = grad_norm is not None and not _is_finite(grad_norm)
         local_nan = bad_loss or bad_grad_norm
-
-        if dist.is_initialized():
-            nan_flag = torch.tensor([1.0 if local_nan else 0.0], device="cuda")
-            dist.all_reduce(nan_flag)
-            any_nan = nan_flag.item() > 0
-        else:
-            any_nan = local_nan
+        any_nan = _any_rank_flagged(local_nan)
 
         if not any_nan:
             self.state.consecutive_nans = 0
@@ -126,7 +130,7 @@ class NaNDetector:
         if self.action == "raise":
             raise RuntimeError(msg)
         elif self.action == "skip":
-            logger.warning(f"{msg} — skipping optimizer step")
+            logger.warning(f"{msg}; skipping optimizer step")
         else:
             logger.warning(msg)
 
@@ -135,26 +139,64 @@ class NaNDetector:
     def check_gradients(self, model: torch.nn.Module, step: int) -> bool:
         """Check model gradients for NaN/Inf before optimizer step.
 
+        Each rank checks the gradients it holds (the local shard of a
+        ``DTensor``). When running distributed, one all-reduce of a flag, as in
+        :meth:`check_loss`, gives every rank the same verdict, so this is a
+        collective that every rank must call, and the ranks all skip the step or
+        all take it. Unlike :meth:`check_loss` it leaves :attr:`state` as it is.
+
         Args:
-            model: The model to check.
+            model: The model to check, or this rank's pipeline stage of it.
             step: Current training step.
 
         Returns:
-            True if all gradients are finite.
+            True if all gradients are finite on ALL ranks, False if any rank
+            holds a NaN/Inf gradient.
+
+        Raises:
+            RuntimeError: If action is "raise" and any rank holds a NaN/Inf gradient.
         """
+        bad_name: str | None = None
         for name, param in model.named_parameters():
-            if param.grad is not None and not torch.isfinite(param.grad).all():
-                msg = f"NaN/Inf gradient in {name} at step {step}"
-                if self.action == "raise":
-                    raise RuntimeError(msg)
-                logger.warning(msg)
-                return False
-        return True
+            grad = param.grad
+            if grad is None:
+                continue
+            local = grad.to_local() if isinstance(grad, DTensor) else grad
+            if not torch.isfinite(local).all():
+                bad_name = name
+                break
+        if not _any_rank_flagged(bad_name is not None):
+            return True
+        if bad_name is not None:
+            msg = f"NaN/Inf gradient in {bad_name} at step {step}"
+        else:
+            msg = f"NaN/Inf gradient detected on another rank at step {step}"
+        if self.action == "raise":
+            raise RuntimeError(msg)
+        logger.warning(msg)
+        return False
+
+    @property
+    def rollback_recommended(self) -> bool:
+        """Whether the consecutive NaN count has reached ``max_consecutive``.
+
+        It recommends a rollback and does none: the training loop stops on it
+        without a checkpoint, and the rollback to an earlier one is manual.
+        """
+        return self.state.consecutive_nans >= self.max_consecutive
 
     @property
     def should_rollback(self) -> bool:
-        """Whether consecutive NaN count suggests a checkpoint rollback."""
-        return self.state.consecutive_nans >= self.max_consecutive
+        """Deprecated alias of :attr:`rollback_recommended`.
+
+        Reading it emits a ``DeprecationWarning``.
+        """
+        warnings.warn(
+            "NaNDetector.should_rollback is deprecated; use rollback_recommended",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.rollback_recommended
 
     def reset(self) -> None:
         """Reset NaN tracking state (e.g., after a rollback)."""
@@ -267,6 +309,21 @@ def check_nccl_health(timeout_sec: float = 10.0) -> bool:
     except RuntimeError as e:
         logger.error(f"NCCL health check failed: {e}")
         return False
+
+
+def _any_rank_flagged(flag: bool) -> bool:
+    """Whether ``flag`` is True on any rank of the default process group.
+
+    When running distributed this is one all-reduce of a one-element flag, so
+    every rank must call it. The flag is on the current CUDA device when CUDA
+    is available, for NCCL, and on the CPU otherwise, for gloo.
+    """
+    if not dist.is_initialized():
+        return flag
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    reduced = torch.tensor([1.0 if flag else 0.0], device=device)
+    dist.all_reduce(reduced)
+    return reduced.item() > 0
 
 
 def _is_finite(value: float) -> bool:

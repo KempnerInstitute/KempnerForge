@@ -136,7 +136,7 @@ def apply_tensor_parallel(
 
     tp_mesh = get_tp_mesh(device_mesh)
     if tp_mesh is None:
-        logger.warning("No 'tp' dimension in DeviceMesh — skipping tensor parallelism")
+        logger.warning("No 'tp' dimension in DeviceMesh; skipping tensor parallelism")
         return
 
     config = getattr(model, "config", None)

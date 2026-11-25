@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import os
 import signal
-import socket
 import subprocess
 import sys
 import threading
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
@@ -34,21 +31,12 @@ from kempnerforge.resilience.signal_handler import (
     ShutdownHandler,
     ignore_shutdown_signals_in_worker,
 )
-
-
-def _free_port() -> int:
-    """An unused local TCP port for the gloo rendezvous."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+from tests.gloo_ranks import gloo_group, spawn
 
 
 def _check_ranks_agree(rank: int, world: int, port: int, nan_rank: int | None) -> None:
     """Only ``nan_rank`` holds a NaN, in its shard of a row-sharded weight."""
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
         weight = torch.zeros(2 * world, 3)
         if nan_rank is not None:
@@ -56,8 +44,41 @@ def _check_ranks_agree(rank: int, world: int, port: int, nan_rank: int | None) -
         model = torch.nn.Linear(3, 2 * world)
         model.weight = torch.nn.Parameter(distribute_tensor(weight, mesh, [Shard(0)]))
         assert params_are_finite(model, "cpu") is (nan_rank is None)
-    finally:
-        dist.destroy_process_group()
+
+
+def _check_loss_across_ranks(rank: int, world: int, port: int) -> None:
+    """Only rank 1 has a NaN loss, then a non-finite gradient norm; every rank fails both."""
+    with gloo_group(rank, world, port):
+        det = NaNDetector(action="warn")
+        assert det.check_loss(1.0, step=1) is True
+        assert det.check_loss(float("nan") if rank == 1 else 1.0, step=2) is False
+        assert det.check_loss(1.0, step=3, grad_norm=float("inf") if rank == 1 else 0.5) is False
+        assert det.state.consecutive_nans == 2
+        assert det.state.nan_steps == [2, 3]
+
+
+def _check_gradients_across_ranks(rank: int, world: int, port: int) -> None:
+    """Only rank 1 holds a NaN gradient, then in its shard of a sharded one; every rank fails."""
+    with gloo_group(rank, world, port):
+        det = NaNDetector(action="warn")
+        model = torch.nn.Linear(3, 2)
+        model.weight.grad = torch.zeros(2, 3)
+        assert det.check_gradients(model, step=1) is True
+        if rank == 1:
+            model.weight.grad[0, 0] = float("nan")
+        assert det.check_gradients(model, step=2) is False
+        with pytest.raises(RuntimeError, match="NaN/Inf gradient"):
+            NaNDetector(action="raise").check_gradients(model, step=3)
+
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
+        sharded = torch.nn.Linear(3, 2 * world)
+        sharded.weight = torch.nn.Parameter(
+            distribute_tensor(torch.zeros(2 * world, 3), mesh, [Shard(0)])
+        )
+        grad = torch.zeros(2 * world, 3)
+        grad[2] = float("nan")
+        sharded.weight.grad = distribute_tensor(grad, mesh, [Shard(0)])
+        assert det.check_gradients(sharded, step=4) is False
 
 
 _TRITON_COMPILE_CHILD = """
@@ -356,13 +377,21 @@ class TestNaNDetector:
         assert det.state.consecutive_nans == 0
         assert det.state.total_nans == 2
 
-    def test_should_rollback(self):
+    def test_rollback_recommended(self):
         det = NaNDetector(action="warn", max_consecutive=3)
         det.check_loss(float("nan"), step=1)
         det.check_loss(float("nan"), step=2)
-        assert not det.should_rollback
+        assert not det.rollback_recommended
         det.check_loss(float("nan"), step=3)
-        assert det.should_rollback
+        assert det.rollback_recommended
+
+    def test_should_rollback_is_a_deprecated_alias(self):
+        det = NaNDetector(action="warn", max_consecutive=1)
+        with pytest.warns(DeprecationWarning, match="use rollback_recommended"):
+            assert det.should_rollback is False
+        det.check_loss(float("nan"), step=1)
+        with pytest.warns(DeprecationWarning, match="use rollback_recommended"):
+            assert det.should_rollback is True
 
     def test_raise_action(self):
         det = NaNDetector(action="raise")
@@ -412,7 +441,7 @@ class TestNaNDetector:
         det = NaNDetector(action="warn", max_consecutive=2)
         det.check_loss(1.0, step=1, grad_norm=float("nan"))
         det.check_loss(1.0, step=2, grad_norm=float("nan"))
-        assert det.should_rollback
+        assert det.rollback_recommended
 
     def test_bad_grad_norm_raises_with_action_raise(self):
         det = NaNDetector(action="raise")
@@ -425,18 +454,10 @@ class TestNaNDetector:
     def _fake_world(monkeypatch, remote_bad: bool) -> list[float]:
         """Run check_loss as one rank of a world whose other rank is bad or not.
 
-        The flag tensor is made on the CPU instead of CUDA, and all_reduce adds the
-        other rank's flag; returns the local flag seen by each all_reduce call.
+        all_reduce adds the other rank's flag; returns the local flag seen by each
+        all_reduce call.
         """
         import kempnerforge.resilience.health as health
-
-        class _CpuTorch:
-            def __getattr__(self, name):
-                return getattr(torch, name)
-
-            @staticmethod
-            def tensor(data, device=None, **kwargs):
-                return torch.tensor(data, **kwargs)
 
         seen: list[float] = []
 
@@ -444,7 +465,6 @@ class TestNaNDetector:
             seen.append(flag.item())
             flag.add_(1.0 if remote_bad else 0.0)
 
-        monkeypatch.setattr(health, "torch", _CpuTorch())
         monkeypatch.setattr(health.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(health.dist, "all_reduce", all_reduce)
         return seen
@@ -471,6 +491,28 @@ class TestNaNDetector:
         with pytest.raises(RuntimeError, match="NaN/Inf gradient norm at step 1"):
             det.check_loss(1.0, step=1, grad_norm=float("inf"))
         assert seen == [1.0]
+
+    @pytest.mark.parametrize(("cuda", "device"), [(True, "cuda"), (False, "cpu")])
+    def test_the_flag_goes_on_cuda_only_when_cuda_is_available(self, monkeypatch, cuda, device):
+        """The flag is asked for on the device NCCL or gloo reduces, then made on the CPU."""
+        import kempnerforge.resilience.health as health
+
+        devices: list[str] = []
+
+        class _RecordingTorch:
+            def __getattr__(self, name):
+                return getattr(torch, name)
+
+            @staticmethod
+            def tensor(data, device=None, **kwargs):
+                devices.append(device)
+                return torch.tensor(data, **kwargs)
+
+        self._fake_world(monkeypatch, remote_bad=False)
+        monkeypatch.setattr(health, "torch", _RecordingTorch())
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+        assert NaNDetector(action="warn").check_loss(1.0, step=1) is True
+        assert devices == [device]
 
     def test_last_good_loss_tracked(self):
         det = NaNDetector(action="warn")
@@ -522,6 +564,22 @@ class TestNaNDetector:
             det.check_gradients(model, step=1)
 
 
+class TestNaNDetectorAcrossRanks:
+    """Two gloo ranks started with CUDA hidden, as on a CPU-only host."""
+
+    @pytest.fixture(autouse=True)
+    def _hide_cuda(self, monkeypatch):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+
+    def test_check_loss_reduces_its_flag_over_gloo(self):
+        """Rank 0's own values are finite, so only the all-reduce can fail its check."""
+        spawn(_check_loss_across_ranks, 2)
+
+    def test_check_gradients_gives_every_rank_the_same_verdict(self):
+        """Rank 0's own gradients are finite, so only the all-reduce can fail its check."""
+        spawn(_check_gradients_across_ranks, 2)
+
+
 class TestParamsAreFinite:
     def test_finite_parameters_pass(self):
         model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
@@ -537,7 +595,7 @@ class TestParamsAreFinite:
     @pytest.mark.parametrize("nan_rank", [None, 1], ids=["finite", "nan-on-rank-1"])
     def test_every_rank_gets_the_same_answer(self, nan_rank):
         """Rank 0's own shard is finite, so only the all-reduce can fail its check."""
-        mp.spawn(_check_ranks_agree, args=(2, _free_port(), nan_rank), nprocs=2)
+        spawn(_check_ranks_agree, 2, nan_rank)
 
 
 class TestGPUHealth:

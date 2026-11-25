@@ -11,9 +11,13 @@ Field summary:
   (see ``registry.register_vision_encoder``). Defaults to ``"random"``
   for tests; production configs set ``"siglip2"`` / ``"clip"`` etc.
 - ``path`` is the HF Hub id or local path passed to the encoder
-  builder. Empty string is accepted for stub encoders (``"random"``).
+  builder. Empty string is accepted for stub encoders (``"random"``);
+  ``JobConfig.validate`` refuses it for the HF-backed ``"siglip2"`` and
+  ``"clip"``.
 - ``feature_dim`` is the output feature dim of the encoder. ``0`` means
-  "infer from the encoder at build time".
+  "infer from the encoder at build time"; an HF-backed encoder reads its
+  model config's ``hidden_size``, and its build raises when that is
+  missing, asking for ``feature_dim``.
 - ``num_tokens`` is the number of image tokens the encoder produces per
   image. ``0`` means "infer at build time". When ``> 0`` it is cross-
   checked against ``model.max_seq_len`` at config time inside

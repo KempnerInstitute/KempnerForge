@@ -69,6 +69,7 @@ class TinyTextModel(nn.Module):
 
 class FakeCheckpointManager:
     def __init__(self) -> None:
+        self.ownership: list[str] = []
         self.saves: list[tuple[int, int, dict]] = []
         self.waits = 0
         self.flushes = 0
@@ -97,6 +98,12 @@ class FakeCheckpointManager:
     @property
     def saved_steps(self) -> list[int]:
         return [s for s, _, _ in self.saves]
+
+    def claim_dir(self) -> None:
+        self.ownership.append("claim")
+
+    def release_dir(self) -> None:
+        self.ownership.append("release")
 
 
 class FakeShutdownHandler:
@@ -540,19 +547,26 @@ class TestVlmTextTokenGuard:
 
 
 class TestCheckpointExtra:
-    def test_empty_without_phases_or_run_ids(self):
-        assert checkpoint_extra(make_config(), 5, PhaseState()) == {}
+    def test_only_the_plugins_list_without_phases_or_run_ids(self):
+        assert checkpoint_extra(make_config(), 5, PhaseState()) == {"plugins": []}
+
+    def test_records_a_copy_of_the_plugins_list(self):
+        config = make_config()
+        config.plugins = ["pkg.components"]
+        extra = checkpoint_extra(config, 5, PhaseState())
+        assert extra["plugins"] == ["pkg.components"]
+        assert extra["plugins"] is not config.plugins
 
     def test_includes_phase_index_when_phases_configured(self):
         phases = PhaseState(phases=[TrainingPhase(start_step=1)], next_idx=1)
-        assert checkpoint_extra(make_config(), 5, phases) == {"phase_idx": 1}
+        assert checkpoint_extra(make_config(), 5, phases) == {"phase_idx": 1, "plugins": []}
 
     def test_includes_metrics_run_ids(self):
         config = make_config()
         config.metrics.wandb_run_id = "wid"
         config.metrics.mlflow_run_id = "mid"
         extra = checkpoint_extra(config, 5, PhaseState())
-        assert extra == {"wandb_run_id": "wid", "mlflow_run_id": "mid"}
+        assert extra == {"wandb_run_id": "wid", "mlflow_run_id": "mid", "plugins": []}
 
     def test_includes_vlm_freeze_metadata(self, tiny_vlm_configs):
         mc, vision, adapter, vlm = tiny_vlm_configs
@@ -564,6 +578,22 @@ class TestCheckpointExtra:
             vlm=vlm,
         )
         assert "vlm_freeze" in checkpoint_extra(config, 3, PhaseState())
+
+    def test_vlm_freeze_metadata_takes_a_parameter_pattern(self, tiny_vlm_configs):
+        """A pattern the build applies goes into the metadata written after every step."""
+        from kempnerforge.config.vlm import FreezeSpec, VLMConfig
+
+        mc, vision, adapter, _ = tiny_vlm_configs
+        freeze = [FreezeSpec("transformer"), FreezeSpec("transformer.layers.1.*", False)]
+        config = JobConfig(
+            model=mc,
+            train=TrainConfig(batch_size=1, seq_len=64, max_steps=1),
+            vision_encoder=vision,
+            adapter=adapter,
+            vlm=VLMConfig(max_text_len=32, freeze=freeze),
+        )
+        meta = checkpoint_extra(config, 3, PhaseState())["vlm_freeze"]
+        assert {"module": "transformer.layers.1.*", "frozen": False} in meta
 
 
 def _mixture_pipeline() -> DataPipeline:
@@ -715,6 +745,31 @@ class TestRunTrainingLoop:
         assert step == 2
         assert ckpt.saves == []
         assert ckpt.waits == 1
+
+    def test_nan_stop_says_the_rollback_is_manual(self, monkeypatch, caplog):
+        """The stop's error gives the manual rollback, and the loop reads the new name."""
+        import logging
+        import warnings
+
+        config = make_config(max_steps=10)
+        session = make_session(
+            config,
+            loss_fn=lambda logits, labels: logits.sum() * float("nan"),
+            nan_detector=NaNDetector(action="warn", max_consecutive=3),
+        )
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        with (
+            caplog.at_level(logging.ERROR, logger="kempnerforge"),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            run_training_loop(session)
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "Too many consecutive NaNs at step 2" in errors[0]
+        assert "Nothing rolls back on its own" in errors[0]
+        assert "checkpoint.load_path" in errors[0]
+        assert not [w for w in caught if "should_rollback" in str(w.message)]
 
     def test_a_finite_loss_with_nan_gradients_skips_the_step(self):
         """NaN gradients under a finite loss never reach the optimizer."""
@@ -1116,7 +1171,7 @@ class TestNanSkippedStep:
         monkeypatch.setattr(ckpt, "save", save)
         step, tokens_seen = run_training_loop(session)
         assert step == 2
-        assert ckpt.saves == [(2, tokens_seen, {})]
+        assert ckpt.saves == [(2, tokens_seen, {"plugins": []})]
         assert ckpt.waits == 1
         assert epochs == [2]
         assert handler.finished is False
@@ -1158,7 +1213,7 @@ class TestNanSkippedStep:
         monkeypatch.setattr(ckpt, "save", save)
         step, tokens_seen = run_training_loop(session)
         assert step == 2
-        assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1})]
+        assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1, "plugins": []})]
         assert loaders == [session.data.dataloader]
         assert loaders[0] is not None
 
@@ -1313,6 +1368,31 @@ def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
 
 
 class TestRunTraining:
+    def test_the_optimizer_is_built_with_the_modules_a_stage_unfreezes(self, monkeypatch):
+        """The build froze the head and a stage unfreezes it, so run_training builds the
+        optimizer while the head requires grad, then leaves it frozen for the first step."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.freeze import apply_freeze_specs
+        from kempnerforge.training.loop import StepResult
+
+        config = _head_config(max_steps=1)
+        assert config.vlm is not None
+        model = TinyVlmModel()
+        apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+        _stub_entry(monkeypatch, model)
+        seen: list = []
+
+        def build_optimizer(m, _config, **_kwargs):
+            seen.append([p.requires_grad for p in m.proj.parameters()])
+            return torch.optim.SGD([p for p in m.parameters() if p.requires_grad], lr=0.05)
+
+        monkeypatch.setattr(entry, "build_optimizer", build_optimizer)
+        entry.run_training(
+            config, step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5, text_tokens=8)
+        )
+        assert seen == [[True, True]]
+        assert not any(p.requires_grad for p in model.proj.parameters())
+
     def test_packed_vlm_batches_train_through_run_training(self, monkeypatch):
         """run_training drives vlm_step over packed rows with a real wrapper."""
         import kempnerforge.training.entry as entry
@@ -1380,6 +1460,37 @@ class TestRunTraining:
         run_training(make_config(max_steps=3), step_fn=custom_step)
         assert seen == [0, 1, 2]
         assert torch.equal(before, model.out.weight)
+
+    @pytest.mark.parametrize(
+        ("train_kwargs", "expected"),
+        [({}, ("warn", 10)), ({"nan_action": "skip", "nan_max_consecutive": 2}, ("skip", 2))],
+        ids=["defaults", "configured"],
+    )
+    def test_the_nan_detector_follows_the_train_config(self, monkeypatch, train_kwargs, expected):
+        """Every step is NaN, so the run stops after ``nan_max_consecutive`` of them."""
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        _stub_entry(monkeypatch, TinyTextModel())
+        seen: list[tuple[int, str, int]] = []
+
+        def nan_step(session, step):
+            seen.append((step, session.nan_detector.action, session.nan_detector.max_consecutive))
+            return StepResult(loss=float("nan"), grad_norm=0.5)
+
+        run_training(make_config(max_steps=20, **train_kwargs), step_fn=nan_step)
+        assert seen == [(step, *expected) for step in range(expected[1])]
+
+    def test_nan_action_raise_in_the_config_fails_the_run(self, monkeypatch):
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        _stub_entry(monkeypatch, TinyTextModel())
+        with pytest.raises(RuntimeError, match="NaN/Inf loss at step 0"):
+            run_training(
+                make_config(max_steps=20, nan_action="raise"),
+                step_fn=lambda _session, _step: StepResult(loss=float("nan"), grad_norm=0.5),
+            )
 
     def test_a_resumed_run_counts_documents_on_from_the_checkpoint(self, monkeypatch):
         from kempnerforge.training.entry import run_training
@@ -1451,6 +1562,60 @@ class TestRunTraining:
         )
         assert destroys == [1]
         assert closes == [1, 1]
+
+    def test_the_checkpoint_dir_is_claimed_before_resuming_and_released_at_a_clean_exit(
+        self, monkeypatch
+    ):
+        """A run owns checkpoint.dir from before it resumes until it ends cleanly; a run that
+        raises keeps the claim, which a later run takes over once this one has ended (#353)."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        events = ckpt.ownership
+        monkeypatch.setattr(
+            entry, "restore_checkpoint", lambda *_a, **_k: events.append("restore") or (0, 0)
+        )
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: events.append("destroy"))
+
+        def boom(_session, _step):
+            raise RuntimeError("step blew up")
+
+        with pytest.raises(RuntimeError, match="step blew up"):
+            run_training(make_config(max_steps=2), step_fn=boom)
+        assert events == ["claim", "restore"]
+        events.clear()
+        run_training(
+            make_config(max_steps=2),
+            step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5),
+        )
+        assert events == ["claim", "restore", "release", "destroy"]
+
+    def test_the_teardown_runs_when_releasing_the_checkpoint_dir_fails(self, monkeypatch):
+        """The process group is destroyed and the handler retired even so (#353)."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        ckpt = _stub_entry(monkeypatch, TinyTextModel())
+        handler = FakeShutdownHandler()
+        monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: handler)
+        events = ckpt.ownership
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: events.append("destroy"))
+
+        def release_fails():
+            events.append("release")
+            raise RuntimeError("release failed")
+
+        monkeypatch.setattr(ckpt, "release_dir", release_fails)
+        with pytest.raises(RuntimeError, match="release failed"):
+            run_training(
+                make_config(max_steps=2),
+                step_fn=lambda _s, _i: StepResult(loss=1.0, grad_norm=0.5),
+            )
+        assert events == ["claim", "release", "destroy"]
+        assert handler.finished
 
     def test_finish_runs_after_the_emergency_flush_and_the_teardown(self, monkeypatch):
         """The handler and its timer outlive the last ``wait()`` and the teardown (#313)."""
@@ -2634,6 +2799,22 @@ class TestRestoreCheckpoint:
         assert config.metrics.mlflow_run_id == "M1"
         assert config.metrics.mlflow_tags == {}
 
+    @pytest.mark.parametrize("load_path", [False, True], ids=["resume", "warm_start"])
+    def test_the_load_compares_the_runs_plugins_list(self, monkeypatch, tmp_path, load_path):
+        """restore_checkpoint hands the manager a copy of the run's plugins list to compare
+        before it reads any state."""
+        import kempnerforge.training.entry as entry
+
+        resume = None if load_path else tmp_path / "step_7"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: resume)
+        config = make_config()
+        config.plugins = ["pkg.big"]
+        config.checkpoint.load_path = str(tmp_path / "step_7") if load_path else None
+        mgr = FakeResumeManager()
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        assert mgr.load_kwargs["plugins_expected"] == ["pkg.big"]
+        assert mgr.load_kwargs["plugins_expected"] is not config.plugins
+
     def test_absent_run_ids_do_not_clobber_existing_ones(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
 
@@ -2822,6 +3003,89 @@ class TestRestoreCheckpoint:
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
         assert mgr.peeked == [str(tmp_path / "s")]
         assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(11, config.vlm)
+
+    def test_vlm_resume_takes_parameter_patterns(self, monkeypatch, tmp_path):
+        """A resume compares and reapplies a freeze that names parameter patterns."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.config.vlm import FreezeSpec, FreezeStage
+        from kempnerforge.training.freeze import freeze_meta_at_step
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
+        applied: list = []
+        monkeypatch.setattr(
+            entry,
+            "apply_freeze_specs",
+            lambda m, specs, pat: applied.append([(s.module, s.frozen) for s in specs]),
+        )
+        config = _vlm_config(
+            freeze=[FreezeSpec("transformer"), FreezeSpec("transformer.layers.1.*", False)],
+            freeze_schedule=(FreezeStage(start_step=5, specs=(FreezeSpec("adapter.*", True),)),),
+        )
+        mgr = FakeResumeManager(step=9, saved_step=9)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        expected = mgr.load_kwargs["vlm_freeze_expected"]
+        assert expected == freeze_meta_at_step(9, config.vlm)
+        assert {"module": "adapter.*", "frozen": True} in expected
+        assert applied == [
+            [("transformer", True), ("transformer.layers.1.*", False), ("adapter.*", True)]
+        ]
+
+    def test_a_pattern_freeze_saves_and_resumes_with_its_masks(self, tiny_vlm_configs, tmp_path):
+        """A freeze that names parameter patterns saves, and a resume restores the weights,
+        the AdamW moments and every parameter's requires_grad as the save had them."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.vlm import FreezeSpec, FreezeStage, VLMConfig
+        from kempnerforge.model.vlm import build_vlm_wrapper
+        from kempnerforge.training.entry import restore_checkpoint
+        from kempnerforge.training.freeze import apply_freeze_specs, effective_freeze
+
+        mc, vision, adapter, _ = tiny_vlm_configs
+        vlm = VLMConfig(
+            max_text_len=32,
+            freeze=[FreezeSpec("transformer"), FreezeSpec("transformer.layers.1.*", False)],
+            freeze_schedule=(
+                FreezeStage(start_step=2, specs=(FreezeSpec("transformer.layers.0.*", True),)),
+            ),
+        )
+        config = JobConfig(
+            model=mc,
+            train=TrainConfig(batch_size=1, seq_len=64, max_steps=4),
+            vision_encoder=vision,
+            adapter=adapter,
+            vlm=vlm,
+            checkpoint=CheckpointConfig(dir=str(tmp_path / "ckpt")),
+        )
+
+        def build(seed: int) -> tuple[nn.Module, torch.optim.Optimizer]:
+            torch.manual_seed(seed)
+            model = build_vlm_wrapper(mc, vision, adapter, vlm)
+            apply_freeze_specs(model, vlm.freeze, vlm.module_patterns)
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            return model, torch.optim.AdamW(trainable, lr=1e-2)
+
+        model, optimizer = build(seed=0)
+        specs = effective_freeze(3, vlm.freeze, vlm.freeze_schedule)
+        apply_freeze_specs(model, specs, vlm.module_patterns)
+        sum(p.sum() for p in model.parameters() if p.requires_grad).backward()
+        optimizer.step()
+        masks = {name: p.requires_grad for name, p in model.named_parameters()}
+        assert all(v for k, v in masks.items() if k.startswith("transformer.layers.1."))
+        assert not any(v for k, v in masks.items() if k.startswith("transformer.layers.0."))
+        CheckpointManager(config.checkpoint, model, optimizer).save(
+            step=3, extra=checkpoint_extra(config, 3, PhaseState())
+        )
+
+        resumed, resumed_optimizer = build(seed=1)
+        manager = CheckpointManager(config.checkpoint, resumed, resumed_optimizer)
+        assert restore_checkpoint(config, resumed, None, manager)[0] == 3
+        assert {name: p.requires_grad for name, p in resumed.named_parameters()} == masks
+        pairs = zip(model.named_parameters(), resumed.parameters(), strict=True)
+        for (name, p), q in pairs:
+            assert torch.equal(p, q), name
+            if p.requires_grad:
+                for moment in ("exp_avg", "exp_avg_sq"):
+                    resumed_moment = resumed_optimizer.state[q][moment]
+                    assert torch.equal(optimizer.state[p][moment], resumed_moment), name
 
     def test_freeze_schedule_is_reapplied_at_the_resumed_step(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry
@@ -3436,6 +3700,7 @@ def _stub_loaders(monkeypatch, seen: dict):
         return _f
 
     monkeypatch.setattr(dp, "StatefulDataLoader", mk("stateful"))
+    monkeypatch.setattr(dp, "StreamingDataLoader", mk("streaming"))
     monkeypatch.setattr(dp, "TorchDataLoader", mk("torch_loader"))
     monkeypatch.setattr(dp, "DistributedSampler", mk("sampler"))
     monkeypatch.setattr(dp, "MixtureSampler", mk("mixture_sampler"))
@@ -3457,6 +3722,7 @@ class TestHfSourceBuilder:
         assert seen["sampler"]["kwargs"]["shuffle"] is True
 
     def test_streaming_path_shards_by_dp_rank_and_skips_the_sampler(self, monkeypatch):
+        """The stream is split by data-parallel rank and wrapped in the resumable loader."""
         seen: dict = {}
         dp = _stub_loaders(monkeypatch, seen)
         monkeypatch.setattr(dp, "get_dp_info", lambda _m: (2, 4))
@@ -3471,7 +3737,8 @@ class TestHfSourceBuilder:
         )
         data = dp.build_data_pipeline(config, _runtime())
 
-        assert data.dataloader == "torch_loader_OBJ"
+        assert data.dataloader == "streaming_OBJ"
+        assert seen["streaming"]["kwargs"]["batch_size"] == config.train.batch_size
         assert "sampler" not in seen
         assert (made["rank"], made["world_size"]) == (2, 4)
 
@@ -3980,6 +4247,13 @@ class TinyVlmModel(nn.Module):
         return self.proj(self.embed(input_ids)), labels
 
 
+class TracedOnceVlmModel(TinyVlmModel):
+    """``TinyVlmModel`` without the frame-mask record, so a compiled forward is traced once."""
+
+    def forward(self, pixel_values, input_ids, labels, frame_mask=None):
+        return self.proj(self.embed(input_ids)), labels
+
+
 class TestVlmStep:
     def _batch(self, with_mask=False):
         b = {
@@ -4287,6 +4561,66 @@ class TestMoELossComposition:
         session = make_session(_moe_config(), model=TinyMoEModel())
         session.step_fn(session, 7)
         assert session.model.moe_steps == [(7, session.config.train.max_steps)]
+
+
+def _sigmoid_moe_session(**train_kwargs):
+    """A session around a real sigmoid-router MoE ``Transformer`` on CPU."""
+    from kempnerforge.model.transformer import Transformer
+
+    config = _moe_config(**train_kwargs)
+    config.model.moe_router = "sigmoid_topk"
+    torch.manual_seed(0)
+    model = Transformer(config.model)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(trainable, lr=0.05)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _s: 1.0)
+    return make_session(config, model=model, optimizer=optimizer, scheduler=scheduler)
+
+
+class TestRouterBalancing:
+    """The loop balances the sigmoid routers once per optimizer step (#571)."""
+
+    def test_routers_balance_once_per_optimizer_step(self, monkeypatch):
+        from kempnerforge.model.router import SigmoidTopKRouter
+        from kempnerforge.model.transformer import Transformer
+
+        session = _sigmoid_moe_session(max_steps=3, grad_accum_steps=2)
+        balance, calls, events = Transformer.balance_routers, [], []
+
+        def counted(model):
+            events.append("balance")
+            calls.append([int(r.pending_counts.sum()) for r in routers])
+            balance(model)
+
+        def logged(name, step):
+            def run(*args, **kwargs):
+                events.append(name)
+                return step(*args, **kwargs)
+
+            return run
+
+        monkeypatch.setattr(Transformer, "balance_routers", counted)
+        monkeypatch.setattr(session.optimizer, "step", logged("optimizer", session.optimizer.step))
+        monkeypatch.setattr(session.scheduler, "step", logged("scheduler", session.scheduler.step))
+        routers = [m for m in session.model.modules() if isinstance(m, SigmoidTopKRouter)]
+        emas = [router.expert_ema.clone() for router in routers]
+        run_training_loop(session)
+        tc = session.config.train
+        per_step = 2 * tc.batch_size * tc.seq_len * session.config.model.moe_top_k
+        assert calls == [[per_step] * len(routers)] * 3
+        assert events == ["optimizer", "balance", "scheduler"] * 3
+        assert all(not router.pending_counts.any() for router in routers)
+        assert all(not torch.equal(r.expert_ema, e) for r, e in zip(routers, emas, strict=True))
+
+    def test_a_step_skipped_for_a_nan_loss_drops_its_counts(self, monkeypatch):
+        from kempnerforge.model.router import SigmoidTopKRouter
+
+        session = _sigmoid_moe_session(max_steps=1)
+        monkeypatch.setattr(session.nan_detector, "check_loss", lambda *_a, **_k: False)
+        run_training_loop(session)
+        for router in (m for m in session.model.modules() if isinstance(m, SigmoidTopKRouter)):
+            assert not router.pending_counts.any()
+            assert torch.equal(router.expert_ema, torch.full((4,), 0.25))
 
 
 class TestMoEMetrics:
@@ -4848,6 +5182,227 @@ class TestLoopPeriodicWork:
         assert phases.lr_scale == 0.5
 
 
+def _head_config(max_steps: int) -> JobConfig:
+    """A VLM config whose build freezes ``TinyVlmModel.proj``; a stage at step 2 unfreezes it."""
+    from kempnerforge.config.vlm import DEFAULT_MODULE_PATTERNS, FreezeSpec, FreezeStage
+
+    config = _vlm_config(
+        freeze=[FreezeSpec("head")],
+        freeze_schedule=(FreezeStage(start_step=2, specs=(FreezeSpec("head", False),)),),
+        module_patterns={**DEFAULT_MODULE_PATTERNS, "head": ["proj.*"]},
+    )
+    config.train.max_steps = max_steps
+    config.train.batch_size, config.train.seq_len = 2, 4
+    config.checkpoint.interval = 1000
+    config.optimizer.fused = False
+    return config
+
+
+def _built_with_a_frozen_head(
+    config: JobConfig, compiled: bool = False
+) -> tuple[Any, torch.optim.Optimizer]:
+    """Build the model, freeze it and compile it as the build does, and build the optimizer as
+    run_training does."""
+    import kempnerforge.training.entry as entry
+    from kempnerforge.training.freeze import apply_freeze_specs
+    from kempnerforge.training.optimizer import build_optimizer
+
+    assert config.vlm is not None
+    torch.manual_seed(0)
+    model: Any = TracedOnceVlmModel() if compiled else TinyVlmModel()
+    apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+    if compiled:
+        model = torch.compile(model, backend="aot_eager")
+    with entry._trainable_for_the_run(model, config):
+        optimizer = build_optimizer(model, config.optimizer)
+    return model, optimizer
+
+
+_VLM_BATCH = {
+    "pixel_values": torch.zeros(2, 3, 4, 4),
+    "input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
+    "labels": torch.tensor([[2, 3, 4, 5], [6, 7, 8, 9]]),
+}
+
+
+class TestUnfreezeAtAStage:
+    """A module the build froze trains once a FreezeStage unfreezes it."""
+
+    def _run(self, max_steps: int, compiled: bool = False) -> tuple[Any, list]:
+        config = _head_config(max_steps)
+        model, optimizer = _built_with_a_frozen_head(config, compiled)
+        initial = [p.detach().clone() for p in model.proj.parameters()]
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _s: 1.0)
+        session = make_session(
+            config,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            data=DataPipeline(dataloader=[_VLM_BATCH]),
+        )
+        session.step_fn = vlm_step
+        run_training_loop(session)
+        return model, initial
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    def test_the_module_is_untouched_until_the_stage(self, compiled):
+        model, initial = self._run(max_steps=2, compiled=compiled)
+        assert all(p.requires_grad for p in model.proj.parameters())
+        assert all(torch.equal(p, i) for p, i in zip(model.proj.parameters(), initial, strict=True))
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    def test_the_module_trains_after_the_stage(self, compiled):
+        model, initial = self._run(max_steps=3, compiled=compiled)
+        pairs = zip(model.proj.parameters(), initial, strict=True)
+        assert all(not torch.equal(p, i) for p, i in pairs)
+
+    def test_the_stage_refreshes_the_fsdp_dtypes_of_what_it_unfroze(self, monkeypatch):
+        import kempnerforge.training.loop as loop
+
+        refreshed: list = []
+        monkeypatch.setattr(loop, "refresh_fsdp_dtypes", lambda m, params: refreshed.append(params))
+        model, _ = self._run(max_steps=2)
+        assert [[id(p) for p in params] for params in refreshed] == [
+            [id(p) for p in model.proj.parameters()]
+        ]
+
+
+class TestResumePastAnUnfreezeStage:
+    """A resume keeps a module that a stage unfreezes in the optimizer, with its saved state."""
+
+    @pytest.mark.parametrize("compiled", [False, True])
+    @pytest.mark.parametrize("saved_step", [1, 3])
+    def test_the_resumed_optimizer_holds_the_module_and_its_state(
+        self, monkeypatch, tmp_path, saved_step, compiled
+    ):
+        """The stage after step 2 unfreezes the head the build froze. Saved at step 3, the head
+        resumes trainable with the AdamW moments it was saved with; saved at step 1, it resumes
+        frozen, held by the optimizer with no state."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.training.loop import _apply_stage_specs
+
+        config = _head_config(max_steps=4)
+        config.checkpoint.dir = str(tmp_path / "ckpt")
+        assert config.vlm is not None
+        model, optimizer = _built_with_a_frozen_head(config, compiled)
+        loss_fn = torch.nn.functional.cross_entropy
+        for step in range(1, saved_step + 1):
+            logits, labels = model(None, _VLM_BATCH["input_ids"], _VLM_BATCH["labels"])
+            loss_fn(logits.reshape(-1, VOCAB), labels.reshape(-1)).backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            if step == 2:
+                stage = config.vlm.freeze_schedule[0]
+                _apply_stage_specs(model, stage.specs, config.vlm.module_patterns)
+        CheckpointManager(config.checkpoint, model, optimizer).save(
+            step=saved_step, extra=checkpoint_extra(config, saved_step, PhaseState())
+        )
+
+        resumed, resumed_optimizer = _built_with_a_frozen_head(config, compiled)
+        saved = Path(config.checkpoint.dir) / f"step_{saved_step}"
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: saved)
+        manager = CheckpointManager(config.checkpoint, resumed, resumed_optimizer)
+        assert entry.restore_checkpoint(config, resumed, None, manager) == (saved_step, 0)
+
+        held = {id(p) for group in resumed_optimizer.param_groups for p in group["params"]}
+        for param, loaded in zip(model.proj.parameters(), resumed.proj.parameters(), strict=True):
+            assert id(loaded) in held
+            assert torch.equal(param, loaded)
+            assert loaded.requires_grad is (saved_step > 2)
+            if saved_step > 2:
+                for key in ("exp_avg", "exp_avg_sq"):
+                    saved_state = optimizer.state[param][key]
+                    assert torch.equal(resumed_optimizer.state[loaded][key], saved_state)
+            else:
+                assert not resumed_optimizer.state.get(loaded)
+
+
+class TestResumeACheckpointThatLeftTheModuleOut:
+    """A checkpoint whose optimizer did not hold the module a stage unfreezes resumes that
+    module with empty optimizer state and every other parameter with its saved state."""
+
+    @pytest.mark.parametrize(
+        ("saved_by", "saved_step"),
+        [("main", 1), ("main", 3), ("a_run_without_the_stage", 1)],
+    )
+    def test_the_module_resumes_without_state_and_trains_from_its_stage(
+        self, monkeypatch, tmp_path, saved_by, saved_step
+    ):
+        """main built its optimizer without the head the build froze, and so does a run with
+        no stage that unfreezes it. Resumed into a run whose stage after step 2 unfreezes the
+        head, the head is held with no state, the other parameters keep their saved moments,
+        and the head trains from its stage on. The run without the stage is read through
+        checkpoint.load_path into an empty checkpoint.dir."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.training.freeze import apply_freeze_specs
+        from kempnerforge.training.loop import _apply_stage_specs
+        from kempnerforge.training.optimizer import build_optimizer
+
+        config = _head_config(max_steps=4)
+        config.checkpoint.dir = str(tmp_path / "ckpt")
+        assert config.vlm is not None
+        stage = config.vlm.freeze_schedule[0]
+        saving_config = _head_config(max_steps=4)
+        saving_config.checkpoint.dir = config.checkpoint.dir
+        assert saving_config.vlm is not None
+        if saved_by == "main":
+            torch.manual_seed(0)
+            model = TinyVlmModel()
+            apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+            optimizer = build_optimizer(model, config.optimizer)
+        else:
+            saving_config.vlm.freeze_schedule = ()
+            model, optimizer = _built_with_a_frozen_head(saving_config)
+
+        def train_step(m: Any, opt: torch.optim.Optimizer) -> None:
+            logits, labels = m(None, _VLM_BATCH["input_ids"], _VLM_BATCH["labels"])
+            torch.nn.functional.cross_entropy(
+                logits.reshape(-1, VOCAB), labels.reshape(-1)
+            ).backward()
+            opt.step()
+            opt.zero_grad()
+
+        for step in range(1, saved_step + 1):
+            train_step(model, optimizer)
+            if step == 2:
+                _apply_stage_specs(model, stage.specs, config.vlm.module_patterns)
+        assert not any(optimizer.state.get(p) for p in model.proj.parameters())
+        CheckpointManager(saving_config.checkpoint, model, optimizer).save(
+            step=saved_step, extra=checkpoint_extra(saving_config, saved_step, PhaseState())
+        )
+
+        saved = Path(config.checkpoint.dir) / f"step_{saved_step}"
+        if saved_by == "main":
+            monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: saved)
+        else:
+            config.checkpoint.dir = str(tmp_path / "fresh")
+            config.checkpoint.load_path = str(saved)
+        resumed, resumed_optimizer = _built_with_a_frozen_head(config)
+        manager = CheckpointManager(config.checkpoint, resumed, resumed_optimizer)
+        assert entry.restore_checkpoint(config, resumed, None, manager) == (saved_step, 0)
+
+        held = {id(p) for group in resumed_optimizer.param_groups for p in group["params"]}
+        for p in resumed.proj.parameters():
+            assert id(p) in held and p.requires_grad is (saved_step > 2)
+            assert not resumed_optimizer.state.get(p)
+        pairs = zip(model.named_parameters(), resumed.parameters(), strict=True)
+        for (name, param), loaded in pairs:
+            assert torch.equal(param, loaded), name
+            for key, value in optimizer.state.get(param, {}).items():
+                assert torch.equal(resumed_optimizer.state[loaded][key], value), f"{name}.{key}"
+
+        initial = [p.detach().clone() for p in resumed.proj.parameters()]
+        for step in range(saved_step + 1, 4):
+            train_step(resumed, resumed_optimizer)
+            if step == 2:
+                _apply_stage_specs(resumed, stage.specs, config.vlm.module_patterns)
+        train_step(resumed, resumed_optimizer)
+        after = zip(resumed.proj.parameters(), initial, strict=True)
+        assert all(not torch.equal(p, i) for p, i in after)
+
+
 class TestCheckpointTiming:
     """Every save the loop makes logs ``checkpoint/save_sec`` and every drain that finds an
     async save pending logs ``checkpoint/wait_sec``; neither is part of ``step_time``, except
@@ -5077,8 +5632,8 @@ class TestFreezeStageFence:
         monkeypatch.setattr(session.checkpointer, "save", save)
         run_training_loop(session)
         assert order == ["flush", "freeze", "save"]
-        meta = freeze_meta_at_step(2, session.config.vlm)
-        assert saved == [(2, {"documents_seen": 2, "vlm_freeze": meta})]
+        freeze = freeze_meta_at_step(2, session.config.vlm)
+        assert saved == [(2, {"plugins": [], "documents_seen": 2, "vlm_freeze": freeze})]
 
 
 class TestBatchStreamGuard:

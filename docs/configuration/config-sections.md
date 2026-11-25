@@ -115,6 +115,8 @@ Training-loop hyperparameters.
 | `fp32_cross_entropy` | `bool` | `False` | compute `cross_entropy` / `chunked_cross_entropy` and their gradient in fp32 from bf16 logits, without an fp32 copy of the logits; rejected for any other `loss_fn`; see [Losses § fp32 cross-entropy](../training/losses.md#fp32-cross-entropy) |
 | `shutdown_timeout_sec` | `float` | `600.0` | seconds a rank has, from the start of its shutdown (the signal, or for a rank the vote stops, the vote), to finish the step in flight, write and flush the emergency checkpoint and tear down, before a forced exit (`0` = disabled); under SLURM it fires first only if shorter than the signal lead |
 | `nccl_health_check_interval` | `int` | `0` | NCCL liveness all-reduce every N steps (`0` = disabled) |
+| `nan_action` | `"warn" \| "skip" \| "raise"` | `"warn"` | what the NaN detector does on a step whose loss or gradient norm is NaN / Inf on any rank: `"warn"` and `"skip"` log a warning and the loop skips the step (the two differ only in the warning), `"raise"` raises `RuntimeError` on every rank; see [NaN detection](../resilience/nan-detection.md#three-actions) |
+| `nan_max_consecutive` | `int` | `10` | NaN / Inf steps in a row after which the loop stops, without a checkpoint, for a manual rollback; must be positive; see [NaN detection § Rollback recommendation](../resilience/nan-detection.md#rollback-recommendation) |
 
 Computed properties: `param_dtype` (compute dtype), `master_dtype` (storage dtype: fp32 with
 `fp32_master_weights`, otherwise `param_dtype`), `is_fp8`.
@@ -189,6 +191,10 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `phases` | `list[TrainingPhase]` | `[]` | multi-phase schedule with weight/LR transitions |
 | `anneal_start_step` | `int` | `0` | syntactic sugar for a common 2-phase annealing pattern (`0` = disabled) |
 | `anneal_weights` | `dict[str, float]` | `{}` | per-dataset weights applied at `anneal_start_step` |
+
+A `[video]` run builds its dataset from `[video]`, so every `hf_*` field keeps
+its default there; see
+[Validation rules](validation-rules.md#video-and-the-data-hugging-face-fields).
 
 ### `DatasetSource`
 
@@ -270,7 +276,8 @@ DCP-based checkpointing.
 | `export_dtype` | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype for HF exports via `scripts/convert_checkpoint.py dcp-to-hf` when its `--dtype` flag is not given; the flag wins and also takes `float16` (see [HuggingFace conversion](../checkpointing/hf-conversion.md#dtypes)) |
 | `exclude_from_loading` | `list[str]` | `[]` | state to skip when warm-starting from `load_path`: `"model"` and/or `"optimizer"`, or exactly `["optimizer", "train_state"]` for a weights-only warm start that loads the model alone and skips `train_state.pt` (step, scheduler, dataloader position, RNG) and the saved freeze comparison, so a new stage starts fresh from the weights; ignored on a resume, which always restores full state |
 | `ignore_freeze_mismatch` | `bool` | `False` | load a checkpoint whose VLM freeze metadata disagrees with the configured freeze specs, downgrading the error to a warning |
-| `ignore_rank_state_mismatch` | `bool` | `False` | resume when the saved per-rank dataloader/RNG state does not fit this run (changed world size or data-parallel layout, unreadable or incomplete envelope): discard that state on every rank with a warning instead of raising, so data order and random streams restart fresh while step, model, optimizer and scheduler continue (see [Resharding](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)) |
+| `ignore_rank_state_mismatch` | `bool` | `False` | resume when the saved per-rank dataloader/RNG state does not fit this run (changed world size or data-parallel layout, or an unreadable or incomplete envelope), with a warning instead of raising: step, model, optimizer and scheduler continue and the random streams restart fresh. On a changed world size or layout every rank keeps the data position the saved rank 0 reached, or for a stream on the saved data-parallel size the one its own data-parallel rank saved, where the loaders can place it on the new layout, and otherwise every rank starts the data at its first sample; an unreadable or incomplete envelope restarts the data too. On the topology that saved a sound envelope the flag changes nothing: each rank restores its own state, and a position its loader cannot place, such as a changed stream, still raises `DataPositionError`. A checkpoint saved before per-rank state was recorded gives this check nothing to refuse: without the flag every rank restores rank 0's data position and RNG state, and with it the resume treats the topology as changed, even the one that saved it, keeping rank 0's data position by the rule above and restarting the random streams (see [Resharding](../checkpointing/resharding.md#scaling-a-run-to-a-different-world-size)) |
+| `ignore_plugins_mismatch` | `bool` | `False` | resume, or warm start with the train state, from a checkpoint saved with another `plugins` list, with a warning instead of raising; for plugins that build no part of the model (see [Registry](registry.md#the-plugins-config-key)) |
 
 ### `[checkpoint.dyn_ckpt_window]`: `DynamicCheckpointWindow`
 

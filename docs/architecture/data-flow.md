@@ -24,9 +24,10 @@ for micro_step in range(grad_accum_steps):       ── maybe_no_sync sets
     └─ (loss / grad_accum_steps).backward()       ── gradient accumulation
 
 grad_norm = clip_grad_norm_(model, grad_clip_norm)
-if NaN: zero_grad, maybe stop, skip the update; still run scheduler.step(),
-        freeze stages / phases and the shutdown check
-optimizer.step() ; scheduler.step() ; optimizer.zero_grad()
+if NaN: drop the routers' counts, zero_grad, maybe stop, skip the update;
+        still run scheduler.step(), freeze stages / phases and the shutdown check
+optimizer.step() ; [MoE] model.balance_routers()
+scheduler.step() ; optimizer.zero_grad()
 
 tracker.end_step(step, loss, grad_norm, lr, tokens_in_step)
 hook_runner.on_step_end(StepContext(...))
@@ -51,9 +52,10 @@ initializes the collaborators:
   preemption.
 - **`NaNDetector`** from
   [`kempnerforge.resilience.health`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/health.py)
-  — tracks consecutive NaN steps; `action="warn"` by default. After
-  `max_consecutive=10` in a row it sets `should_rollback` and the loop
-  stops; rolling back is manual.
+  — tracks consecutive NaN steps, with the action `train.nan_action`
+  (`"warn"` by default). After `train.nan_max_consecutive` (default 10) in
+  a row it sets `rollback_recommended` and the loop stops; rolling back is
+  manual.
 - **Loss function** from the registry (`"cross_entropy"` or
   `"chunked_cross_entropy"`).
 - **Model** via `build_parallel_model` — applies the full parallelism
@@ -62,6 +64,10 @@ initializes the collaborators:
 - **`CheckpointManager`** from
   [`kempnerforge.checkpoint.manager`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/checkpoint/manager.py)
   — owns DCP async save/load, latest-symlink, step_N directories.
+- **`ckpt_mgr.claim_dir()`**: rank 0 records the run in
+  `<checkpoint.dir>/.owner`, and every rank stops when another run that
+  is alive, or not known to have ended, owns the directory (see
+  [Auto-resume § One run per checkpoint directory](../checkpointing/auto-resume.md#one-run-per-checkpoint-directory)).
 - **`resolve_resume_path(config.checkpoint.dir)`** from
   [`kempnerforge.resilience.elastic`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/elastic.py)
   — follows the `latest` symlink or picks the newest `step_N` whose
@@ -71,10 +77,11 @@ initializes the collaborators:
 - **`MetricsTracker`** from
   [`kempnerforge.metrics.tracker`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/metrics/tracker.py)
   — per-step metrics + EMA smoothing + WandB / TensorBoard backends.
-- **Data pipeline** — `MemoryMappedDataset` or `MixtureDataset` or an
-  HF streaming / eager dataset (config dispatches), wrapped by
-  `DistributedSampler` or `MixtureSampler` and then by
-  `StatefulDataLoader` from
+- **Data pipeline**: `MemoryMappedDataset`, `MixtureDataset` or an
+  eager HF dataset (config dispatches), wrapped by `DistributedSampler`
+  or `MixtureSampler` and then by `StatefulDataLoader`; or an HF
+  streaming dataset, wrapped by `StreamingDataLoader` with no sampler.
+  Both loaders are in
   [`kempnerforge.data`](https://github.com/KempnerInstitute/KempnerForge/tree/main/kempnerforge/data).
 - **Eval dataloader and `torch.profiler`** (optional).
 - **Phase schedule** (optional) — for curriculum training, rebalances
@@ -171,8 +178,9 @@ After the microbatch loop:
 grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
 
 if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
+    _route_balance(session, step_ran=False)  # drops the sigmoid routers' counts
     optimizer.zero_grad()
-    if nan_detector.should_rollback:
+    if nan_detector.rollback_recommended:
         break
     _advance_lr_schedule(session)            # scheduler.step() + phase LR scaling
     step += 1
@@ -184,6 +192,7 @@ if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
     continue                                 # no update, token count, metrics or hooks
 
 optimizer.step()
+_route_balance(session, step_ran=True)       # sigmoid routers balance (MoE)
 scheduler.step()
 if phase_lr_scale != 1.0:
     for pg in optimizer.param_groups: pg["lr"] *= phase_lr_scale
@@ -197,7 +206,7 @@ expert parallelism it reads the EP group from the model and covers every
 rank's experts. The NaN detector returns `False` on a NaN/Inf loss or
 gradient norm, and the loop zeroes the grads.
 After `max_consecutive` NaN steps in a row the detector sets
-`should_rollback` and the loop stops; rolling back to an earlier
+`rollback_recommended` and the loop stops; rolling back to an earlier
 checkpoint is manual (see
 [NaN detection](../resilience/nan-detection.md#rollback-recommendation)).
 
@@ -296,6 +305,8 @@ After the loop exits:
 - `ckpt_mgr.wait()` drains the last async save.
 - `hook_runner.on_train_end(step, tokens_seen)`.
 - `tracker.close()` flushes WandB / TB.
+- `ckpt_mgr.release_dir()` marks the run's `.owner` record released, on a
+  clean finish.
 - `destroy_distributed()` tears down the process group.
 - `shutdown_handler.finish()`, last, restores the signal handlers and
   cancels the forced-exit timer, so both cover the flush and the teardown.

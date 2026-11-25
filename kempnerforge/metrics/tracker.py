@@ -385,7 +385,7 @@ class WandBBackend(_LoggingBackend):
             self._config.wandb_run_id = self._run.id
             logger.info(f"WandB initialized: {self._run.url}")
         except ImportError:
-            logger.warning("wandb not installed — disabling WandB backend")
+            logger.warning("wandb not installed; disabling WandB backend")
             self._run = False
         except Exception as e:
             logger.warning(f"WandB init failed: {e}")
@@ -450,7 +450,7 @@ class TensorBoardBackend(_LoggingBackend):
             self._writer = SummaryWriter(log_dir=self._config.tensorboard_dir)
             logger.info(f"TensorBoard writer → {self._config.tensorboard_dir}")
         except ImportError:
-            logger.warning("tensorboard not installed — disabling TensorBoard backend")
+            logger.warning("tensorboard not installed; disabling TensorBoard backend")
             self._writer = False
 
     def log(self, metrics: dict[str, float], step: int) -> None:

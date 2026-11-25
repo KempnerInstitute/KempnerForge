@@ -28,7 +28,9 @@
             "list_vlm_configs()",
             "register_modality_strategy(name)",
             "get_modality_strategy(name)",
-            "list_modality_strategies()"
+            "list_modality_strategies()",
+            "register_adapter(name, accepts=None, output_num_tokens=None) (output_num_tokens(config, n) -> the adapter's token count, which AdapterConfig.output_num_tokens returns for the config-time sequence-length checks)",
+            "get_adapter_output_num_tokens(name)"
           ]
         }
       },
@@ -36,7 +38,8 @@
         "registry: Registry"
       ],
       "tested_by": [
-        "tests/unit/test_config.py::TestRegistry"
+        "tests/unit/test_config.py::TestRegistry",
+        "tests/unit/test_adapter.py::TestAdapterOutputNumTokensDeclaration"
       ]
     },
     "kempnerforge/config/schema.py": {
@@ -79,7 +82,7 @@
       ],
       "classes": {
         "TrainConfig": {
-          "purpose": "Training hyperparameters (steps, batch, seq_len, precision, loss, grad accum)",
+          "purpose": "Training hyperparameters (steps, batch, seq_len, precision, loss, grad accum, NaN detector action and threshold)",
           "properties": [
             "param_dtype",
             "is_fp8"
@@ -192,14 +195,16 @@
         "tests/unit/test_mixing.py::TestDataConfigMixing",
         "tests/unit/test_annealing.py::TestTrainingPhase",
         "tests/unit/test_annealing.py::TestDataConfigPhases",
-        "tests/unit/test_fp8.py::TestFP8Config"
+        "tests/unit/test_fp8.py::TestFP8Config",
+        "tests/unit/test_vision_config.py::TestHFEncoderPath",
+        "tests/unit/test_video_config.py::TestJobConfigVideoWiring"
       ]
     },
     "kempnerforge/config/vlm.py": {
       "purpose": "VLM (vision-language model) configuration. Discriminated union over `arch`: joint_decoder | cross_attention | mot. Each subclass registered via @registry.register_vlm_config",
       "classes": {
         "FreezeSpec": {
-          "purpose": "Single freeze directive (module alias or fnmatch pattern, frozen flag). Consumed by training/freeze.py"
+          "purpose": "Single freeze directive (module alias or fnmatch pattern, frozen flag; a pattern holds a dot or one of *?[, see is_parameter_pattern, and VLMConfig refuses a bare word that is no alias). Consumed by training/freeze.py"
         },
         "FreezeStage": {
           "purpose": "Step-boundary freeze transition (start_step + tuple of FreezeSpecs). Strictly monotonic in start_step"
@@ -233,6 +238,9 @@
           ]
         }
       },
+      "functions": [
+        "is_parameter_pattern(module) -> bool"
+      ],
       "globals": [
         "DEFAULT_MODULE_PATTERNS"
       ],
@@ -247,16 +255,19 @@
         "tests/unit/test_vlm_config.py::TestCrossAttentionResolvedHeads",
         "tests/unit/test_vlm_config.py::TestMoTConfig",
         "tests/unit/test_vlm_config.py::TestModalityStrategyRegistry",
-        "tests/unit/test_vlm_config.py::TestModelConfigWithVLM"
+        "tests/unit/test_vlm_config.py::TestModelConfigWithVLM",
+        "tests/unit/test_freeze.py::TestFreezeNames"
       ]
     },
     "kempnerforge/config/loader.py": {
       "functions": [
         "load_toml(path) -> dict",
         "load_config(config_path, cli_args) -> JobConfig",
-        "_parse_cli_overrides(args) -> dict",
+        "_parse_cli_overrides(args) -> dict (dotted paths build _DottedKeys)",
         "_apply_dict_to_dataclass(dc, data)",
-        "_coerce_value(field_type, value) (refuses a value that cannot stand for the type)",
+        "_with_dotted_keys(table, keys) -> dict (a dotted override's keys set on a dict-valued field's table, the rest kept)",
+        "_dict_field_value(raw, current) -> dict (a dotted override merges into current, a literal replaces it)",
+        "_coerce_value(field_type, value) (refuses a value that cannot stand for the type; a dict's values take its value type)",
         "_coerce_bool(value) -> bool (a bool, 0 or 1, or a true/false spelling; else ValueError)",
         "_coerce_number(field_type, value) (an int or float from a number or numeric string; refuses bools and fractional ints)",
         "_coerce_field(dc_type, name, hint, raw) (_coerce_value whose errors name dc_type.name)",
@@ -266,6 +277,7 @@
         "tests/unit/test_config.py::TestTomlLoading",
         "tests/unit/test_config.py::TestCliOverrides",
         "tests/unit/test_config.py::TestCliParsing",
+        "tests/unit/test_config.py::TestDottedDictOverrides",
         "tests/unit/test_config.py::TestScalarCoercion",
         "tests/unit/test_mixing.py::TestMixingTomlLoading",
         "tests/unit/test_annealing.py::TestAnnealingTomlLoading"
@@ -288,7 +300,10 @@
             "get_moe_router_z_loss()",
             "get_expert_counts()",
             "get_mot_expert_counts()",
-            "set_moe_step(step, max_steps)"
+            "set_moe_step(step, max_steps)",
+            "balance_routers() (one all-reduce of every sigmoid router's pending counts, then balance; every rank calls it after optimizer.step)",
+            "detach_router_losses() (detaches every router's aux_loss and z_loss once the loss holds them)",
+            "discard_router_counts()"
           ]
         }
       },
@@ -384,7 +399,7 @@
           "purpose": "Test-stub vision encoder: deterministic random features by image_id hash. No download; used for VLM smokes"
         },
         "_HFVisionEncoder(VisionEncoder)": {
-          "purpose": "Wraps a HuggingFace vision model (SigLIP2 or CLIP). Optionally strips the [CLS] token. Stays in HF's loaded dtype; the adapter casts at the boundary"
+          "purpose": "Wraps a HuggingFace vision model (SigLIP2 or CLIP). Optionally strips the [CLS] token. Stays in HF's loaded dtype; the adapter casts at the boundary. feature_dim is the builder's, else the tower config's hidden_size; a config without one raises asking for vision_encoder.feature_dim"
         }
       },
       "registry": [
@@ -395,7 +410,8 @@
       "tested_by": [
         "tests/unit/test_vision.py::TestRandomVisionEncoder",
         "tests/unit/test_vision.py::TestHFEncoders",
-        "tests/unit/test_vision.py::TestVisionEncoderRegistry"
+        "tests/unit/test_vision.py::TestVisionEncoderRegistry",
+        "tests/unit/test_vision.py::TestHFVisionEncoderMocked"
       ]
     },
     "kempnerforge/model/vlm.py": {
@@ -426,7 +442,8 @@
         "VLMWrapper(nn.Module)": {
           "purpose": "VLM wrapper composing vision_encoder + adapter + transformer + strategy. Strategy is a plain Python object, not an nn.Module submodule",
           "methods": [
-            "forward(pixel_values, input_ids, labels, frame_mask, *, doc_ids, position_ids, attention_group_ids, image_rows, image_starts, image_tokens, text_rows, text_positions) -> (logits, labels)"
+            "forward(pixel_values, input_ids, labels, frame_mask, *, doc_ids, position_ids, attention_group_ids, image_rows, image_starts, image_tokens, text_rows, text_positions) -> (logits, labels)",
+            "train(mode=True) (keeps a vision encoder whose parameters are all frozen in eval mode)"
           ],
           "properties": [
             "num_image_tokens"
@@ -639,16 +656,29 @@
             "forward(x)"
           ]
         },
+        "Recomputing": {
+          "purpose": "Context of an activation-checkpoint recompute: routers compute as in the forward but set no attribute and count no token; enters the selective-checkpoint context inside; re-enterable",
+          "methods": [
+            "__enter__()",
+            "__exit__(*exc)"
+          ]
+        },
         "SigmoidTopKRouter": {
-          "purpose": "DeepSeek-V3 style sigmoid router with learnable bias, adaptive scheduling, sequence aux loss",
+          "purpose": "DeepSeek-V3 style sigmoid router: expert_bias frozen to the optimizer (always_frozen), balanced once per optimizer step from pending_counts; adaptive scheduling, sequence aux loss",
           "properties": [
             "aux_loss",
-            "expert_counts"
+            "expert_counts",
+            "pending_counts",
+            "fp32_ema_bits, fp32_bias_bits (FP32 masters held as int32 bits; derived_buffers)"
           ],
           "methods": [
             "forward(x)",
+            "balance(counts) (moves the EMA and the bias from a step's summed counts on the FP32 masters; updates the FSDP2 shard in place)",
             "set_step(step, max_steps)",
-            "_effective_bias_rate()"
+            "_effective_bias_rate()",
+            "_masters() (FP32 views of the master bit buffers)",
+            "_load_from_state_dict(...) (derives absent masters from expert_ema and expert_bias)",
+            "derive_buffers(names) (starts the named masters from the loaded expert_ema and expert_bias; gathers an FSDP2 shard)"
           ]
         }
       },
@@ -661,7 +691,11 @@
         "tests/unit/test_router.py::TestSigmoidSequenceAuxLoss",
         "tests/unit/test_router.py::TestSigmoidBiasSchedule",
         "tests/unit/test_moe.py::TestSigmoidTopKRouter",
-        "tests/unit/test_moe.py::TestSigmoidMoEIntegration"
+        "tests/unit/test_moe.py::TestSigmoidMoEIntegration",
+        "tests/unit/test_router_balance.py",
+        "tests/distributed/test_router_balance.py",
+        "tests/unit/test_activation_checkpointing.py::TestRecomputing",
+        "tests/unit/test_activation_checkpointing.py::TestMoERecompute"
       ]
     },
     "kempnerforge/model/generate.py": {
@@ -812,17 +846,26 @@
     "kempnerforge/training/freeze.py": {
       "purpose": "Freeze utilities: resolve module aliases / fnmatch patterns to parameter names, flip requires_grad, build canonical metadata for checkpoint validation, compute effective freeze at a given step from base specs + a freeze_schedule with start_step boundaries",
       "functions": [
-        "freeze_params(model, specs, module_patterns) -> dict",
+        "freeze_params(model, patterns, *, frozen=True) -> int (elements flipped)",
         "apply_freeze_specs(model, specs, module_patterns) -> dict",
         "canonical_freeze_meta(specs) -> list[dict]",
         "effective_freeze(step, base_specs, schedule, valid_modules) -> list[FreezeSpec]",
-        "freeze_meta_at_step(step, config) -> list[dict]"
+        "freeze_meta_at_step(step, config) -> list[dict]",
+        "unmatched_patterns(model, specs, pattern_map) -> list[str]",
+        "trainable_during_run(model, config) -> set[str] (names of the parameters that train at some step: after the build freeze, each FreezeStage, or a resume; never a parameter its module names in always_frozen)",
+        "trainable_for_the_run(model, config) -> Iterator[list[str]] (context manager: those parameters require grad while the optimizer is built or a checkpoint loaded)"
       ],
       "tested_by": [
         "tests/unit/test_freeze.py::TestFreezeParams",
         "tests/unit/test_freeze.py::TestApplyFreezeSpecs",
         "tests/unit/test_freeze.py::TestCanonicalFreezeMeta",
         "tests/unit/test_freeze.py::TestEffectiveFreeze",
+        "tests/unit/test_freeze.py::TestFreezeNames",
+        "tests/unit/test_freeze.py::TestResumedFreezeOrder",
+        "tests/unit/test_freeze.py::TestUnmatchedPatterns",
+        "tests/unit/test_freeze.py::TestBuildRefusesUnmatchedPatterns",
+        "tests/unit/test_freeze.py::TestTrainableDuringRun",
+        "tests/unit/test_freeze.py::TestTrainableForTheRun",
         "tests/integration/test_vlm_cross_attn.py::TestFreezeStageHook",
         "tests/integration/test_vlm_mot.py::TestFreezeStageHook",
         "tests/distributed/test_vlm_cross_attn_fsdp.py::TestFreezeStageUnderFsdp",
@@ -927,6 +970,7 @@
         "vlm_step(session, step) -> StepResult",
         "pipeline_step(session, step) -> StepResult",
         "checkpoint_extra(config, step, phases, documents_seen) -> dict",
+        "_apply_stage_specs(model, specs, pattern_map) -> dict (one FreezeStage: refreshes the FSDP2 dtypes of what it unfreezes and resets a compiled model when it unfreezes parameters)",
         "_batch_counts(batch, image_positions) -> (documents, image_tokens, text_tokens, encoder_images)",
         "_step_counts(session, result) -> (tokens, documents, encoder_images) over the DP ranks"
       ],
@@ -937,6 +981,8 @@
         "tests/unit/test_train_entry.py::TestMoEMetrics",
         "tests/unit/test_train_entry.py::TestSelectStepFn",
         "tests/unit/test_train_entry.py::TestCheckpointExtra",
+        "tests/unit/test_train_entry.py::TestUnfreezeAtAStage",
+        "tests/integration/test_freeze_schedule_compile.py",
         "tests/unit/test_train_entry.py::TestTokensCountTheBatch",
         "tests/unit/test_train_entry.py::TestVlmDataMetrics",
         "tests/unit/test_train_entry.py::TestCheckpointTiming",
@@ -953,11 +999,14 @@
         "run_training(config, step_fn=None, hooks=None)",
         "build_model(config, runtime, loss_fn) -> tuple[Module, PipelineBundle | None]",
         "build_checkpoint_manager(config, runtime, model, optimizer, pipeline) -> CheckpointManager",
-        "restore_checkpoint(config, model, scheduler, ckpt_mgr) -> tuple[int, int]"
+        "restore_checkpoint(config, model, scheduler, ckpt_mgr) -> tuple[int, int]",
+        "_trainable_for_the_run(model, config) (trainable_for_the_run for a VLM with a freeze schedule, else a context that changes nothing)"
       ],
       "tested_by": [
         "tests/unit/test_train_entry.py::TestRunTraining",
         "tests/unit/test_train_entry.py::TestBuildPhaseHelpers",
+        "tests/unit/test_train_entry.py::TestResumePastAnUnfreezeStage",
+        "tests/unit/test_train_entry.py::TestResumeACheckpointThatLeftTheModuleOut",
         "tests/unit/test_train_entry.py::TestStageChangeWarmStart",
         "tests/e2e/test_training_e2e.py",
         "tests/smoke/test_smoke.py"
@@ -986,9 +1035,12 @@
           ]
         },
         "StreamingHuggingFaceDataset": {
-          "purpose": "Streaming HuggingFace IterableDataset for large corpora",
+          "purpose": "Streaming HuggingFace IterableDataset for large corpora, split across data-parallel ranks with split_dataset_by_node",
           "methods": [
             "__iter__()",
+            "set_epoch(epoch)",
+            "stream_identity()",
+            "_source()",
             "state_dict()",
             "load_state_dict(state)",
             "_ensure_tokenizer()",
@@ -1016,6 +1068,7 @@
         "tests/unit/test_data.py::TestMemoryMappedDataset",
         "tests/unit/test_data.py::TestHuggingFaceDataset",
         "tests/unit/test_data.py::TestStreamingHuggingFaceDataset",
+        "tests/unit/test_streaming_resume.py",
         "tests/unit/test_packing.py::TestComputePackedOutput",
         "tests/unit/test_packing.py::TestMemoryMappedDatasetPacking",
         "tests/unit/test_packing.py::TestHuggingFaceDatasetPacking",
@@ -1024,19 +1077,41 @@
     },
     "kempnerforge/data/dataloader.py": {
       "classes": {
+        "DataPositionError": {
+          "purpose": "ValueError for a saved data position this loader cannot resume from; CheckpointManager shares every rank's verdict first, so every rank raises it together"
+        },
         "StatefulDataLoader": {
-          "purpose": "DataLoader wrapper with checkpoint/resume state tracking",
+          "purpose": "DataLoader wrapper with checkpoint/resume state tracking; with a DistributedSampler the position is global, so it resumes on another data-parallel size or batch size",
           "methods": [
             "__iter__()",
             "__next__()",
             "__len__()",
+            "_consumed()",
             "state_dict()",
+            "load_state_dict(state)",
+            "check_state(state) (raises the DataPositionError load_state_dict would, changing nothing)",
+            "_refusal(state, saved_replicas, global_order)",
+            "_warn_if_reordered(state, sampler_state)"
+          ]
+        },
+        "StreamingDataLoader": {
+          "purpose": "DataLoader over a StreamingHuggingFaceDataset that resumes by replaying the saved batch count, logging progress; refuses a stream whose source files, shard count or settings changed, and starts fresh workers when a pass restarts midway; each rank saves its own count with its data-parallel rank; a replay that runs off the end of the rank's part of the pass, and a later pass on another rank's count or one with no recorded rank, warn in every rank's log",
+          "methods": [
+            "__iter__()",
+            "_restart_workers()",
+            "_replay()",
+            "__next__()",
+            "_identity()",
+            "state_dict()",
+            "check_state(state) (raises the DataPositionError load_state_dict would, changing nothing; compares the stream as this rank sees it)",
             "load_state_dict(state)"
           ]
         }
       },
       "tested_by": [
-        "tests/unit/test_data.py::TestStatefulDataLoader"
+        "tests/unit/test_data.py::TestStatefulDataLoader",
+        "tests/unit/test_data_position.py",
+        "tests/unit/test_streaming_resume.py"
       ]
     },
     "kempnerforge/data/sampler.py": {
@@ -1046,6 +1121,8 @@
           "methods": [
             "set_epoch(epoch)",
             "set_skip(skip)",
+            "set_position(position)",
+            "samples_after(position)",
             "__iter__()",
             "__len__()",
             "state_dict()",
@@ -1067,6 +1144,7 @@
       },
       "tested_by": [
         "tests/unit/test_data.py::TestDistributedSampler",
+        "tests/unit/test_data_position.py",
         "tests/unit/test_mixing.py::TestMixtureSampler",
         "tests/unit/test_mixing.py::TestTemperatureScaling",
         "tests/unit/test_mixing.py::TestMixtureSamplerWithDataset",
@@ -1134,15 +1212,18 @@
         "apply_ac(model, mode) -> int",
         "_ac_blocks(model) -> list[tuple[nn.ModuleDict, str]]",
         "_is_checkpointed(module) -> bool",
+        "_routing_contexts() -> (forward, recompute) contexts (the recompute takes the forward's aten.topk outputs and runs as a Recomputing)",
+        "_RoutingCheckpointWrapper (CheckpointWrapper of a block holding an MoEMLP under full AC; runs eagerly under torch.compile)",
         "apply_float8(model, enable_fsdp_float8_all_gather)",
         "_keep_tied_head(model, filter_fn) -> filter (keeps an output head tied to the token embedding out of Float8 conversion)",
         "apply_fsdp2(model, device_mesh, mp_policy, reshard_after_forward) (text-only path; shares _fsdp_wrap_transformer_blocks with VLM)",
-        "_apply_fsdp_vlm(wrapper, device_mesh, mp_policy, reshard_after_forward) (VLM-aware FSDP: inner Transformer per-block + adapter + optional encoder wrap based on freeze)",
+        "_apply_fsdp_vlm(wrapper, device_mesh, mp_policy, reshard_after_forward) (VLM-aware FSDP: inner Transformer per-block + adapter + encoder wrap unless no step of the run trains it)",
         "_fsdp_wrap_transformer_blocks(transformer, dp_mesh, policy, reshard_after_forward) (EP-MoE-aware per-block FSDP wrap; iterates transformer.layers and transformer.cross_attention_layers)",
         "_has_ep_moe(module) -> bool",
         "has_dp_mesh(device_mesh) -> bool",
         "get_dp_mesh(device_mesh) -> DeviceMesh",
-        "default_mp_policy(param_dtype) -> MixedPrecisionPolicy"
+        "default_mp_policy(param_dtype) -> MixedPrecisionPolicy",
+        "refresh_fsdp_dtypes(model, params) (recomputes the reduction dtypes of the FSDP2 units that manage params; collective)"
       ],
       "tested_by": [
         "tests/distributed/test_fsdp.py::TestFSDP2",
@@ -1157,7 +1238,12 @@
         "tests/unit/test_activation_checkpointing.py::TestWhatGetsWrapped",
         "tests/unit/test_activation_checkpointing.py::TestCheckpointingTakesEffect",
         "tests/unit/test_activation_checkpointing.py::TestLogging",
-        "tests/unit/test_activation_checkpointing.py::TestUnderFsdp2"
+        "tests/unit/test_activation_checkpointing.py::TestUnderFsdp2",
+        "tests/unit/test_activation_checkpointing.py::TestMoERecompute",
+        "tests/distributed/test_ac_moe_recompute.py",
+        "tests/integration/test_compile.py::TestCompiledMoECheckpointing",
+        "tests/unit/test_unfreeze_fsdp.py",
+        "tests/distributed/test_freeze_schedule_fsdp.py"
       ]
     },
     "kempnerforge/distributed/tensor_parallel.py": {
@@ -1243,11 +1329,21 @@
       ]
     },
     "kempnerforge/checkpoint/state.py": {
+      "classes": {
+        "RankStateMismatchError": {
+          "purpose": "ValueError for per-rank state saved under another world size or data-parallel layout; every rank raises it together, mismatch holds what changed without the way out, and checkpoint.ignore_rank_state_mismatch resumes past it keeping the data position"
+        }
+      },
       "functions": [
         "get_rng_state() -> dict",
         "set_rng_state(state)",
-        "build_train_state(step, tokens_seen, scheduler, dataloader, extra) -> dict (records scheduler_group_modules when a param group names a module)",
-        "restore_train_state(state, scheduler, dataloader, lr_multipliers) -> (step, tokens_seen)",
+        "build_train_state(step, tokens_seen, scheduler, dataloader, extra, per_rank) -> dict (records scheduler_group_modules when a param group names a module, and the per-rank envelope under per_rank)",
+        "restore_train_state(state, scheduler, dataloader, lr_multipliers) -> (step, tokens_seen, extra)",
+        "capture_rank_state(dataloader) -> dict (this rank's RNG capture and loader state)",
+        "dp_coordinates(value) -> (dp_rank, dp_size) | None (a valid pair of ints with 0 <= dp_rank < dp_size, else None)",
+        "build_per_rank_envelope(entries, world_size, data_parallel) -> dict (versioned envelope of every rank's payload and the data-parallel layout)",
+        "select_rank_state(envelope, rank, world_size, data_parallel) -> dict (this rank's payload; ValueError for an unsound envelope, RankStateMismatchError for another world size or layout, the same verdict on every rank)",
+        "saved_data_position(envelope, data_parallel) -> dict | None (the saved loader state a rank resumes from on another topology, checked on the topology that saved it: rank 0's, or for a stream on the saved data-parallel size the one its own data-parallel rank saved)",
         "_scheduler_state_for(scheduler, saved, saved_modules, lr_multipliers) -> dict (lays a LambdaLR state out by module for other param groups; a module with no saved group runs at the saved peak times its multiplier)"
       ],
       "tested_by": [
@@ -1256,27 +1352,36 @@
         "tests/unit/test_checkpoint.py::TestRestoreTrainState",
         "tests/unit/test_lr_multipliers.py::TestSchedulerStateLayout",
         "tests/unit/test_lr_multipliers.py::TestLayoutChange",
-        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip"
+        "tests/integration/test_checkpoint_roundtrip.py::TestCheckpointRoundtrip",
+        "tests/unit/test_checkpoint_per_rank.py",
+        "tests/unit/test_data_position.py"
       ]
     },
     "kempnerforge/checkpoint/manager.py": {
       "classes": {
         "CheckpointManager": {
-          "purpose": "DCP-based distributed checkpoint save/load/cleanup manager. Cross-arch VLM freeze-metadata validation, rank-0-authoritative train_state existence broadcast (NFS/Lustre stat() race), ownership-gated train_state.pt load",
+          "purpose": "DCP-based distributed checkpoint save/load/cleanup manager. Cross-arch VLM freeze-metadata validation, rank-0-authoritative train_state existence broadcast (NFS/Lustre stat() race), ownership-gated train_state.pt load. Per-rank loader/RNG envelope: an exact resume restores each rank's own entry and refuses a changed world size or data-parallel layout on every rank; checkpoint.ignore_rank_state_mismatch resumes past the refusal, keeping the saved data position (rank 0's, or for a stream on the saved data-parallel size each data-parallel rank's own) where every rank's loader can place it, else restarting the data on every rank, and restarting the RNG streams",
           "methods": [
             "save(step, tokens_seen, scheduler, dataloader, extra)",
             "has_pending_save (property: an async save to drain or a latest commit to make)",
             "wait()",
             "flush_pending_save()",
             "peek_saved_step(path)",
-            "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected)",
+            "load(path, scheduler, dataloader, exclude_keys, vlm_freeze_expected, fresh_if_unheld, warm_start, exact_resume, plugins_expected)",
+            "_per_rank_view(train_state) -> (view, carried) (on an exact resume, this rank's own envelope entry over the single-copy keys; a mismatch refuses unless ignore_rank_state_mismatch, and a checkpoint with no envelope restores rank 0's copy unless that flag is set)",
+            "_resume_past_mismatch(view, envelope, error) -> (view, carried) (with ignore_rank_state_mismatch: a changed topology keeps the saved data position if the envelope is sound where it was saved, rank 0's or for a stream on the saved data-parallel size its own data-parallel rank's, else drops it; never restores RNG)",
+            "_resume_without_rank_state(train_state) -> (view, carried) (with ignore_rank_state_mismatch, a checkpoint with no per-rank state resumes as if the topology changed: rank 0's data position kept, its RNG dropped)",
             "_read_saved_keys(dcp_dir) -> (keys, restored_on_any_rank) (this rank's DCP keys; with a scope or multipliers an all-reduce on the gloo group tells every rank whether any rank's index holds optimizer state)",
             "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope, multipliers and group-layout checks all decide from it)",
+            "_check_plugins(metadata, ckpt_dir, expected) (every rank refuses another plugins list before any state is read, unless checkpoint.ignore_plugins_mismatch)",
             "_broadcast_train_state(path) -> dict (rank 0 reads train_state.pt and broadcasts the state or why it could not; rank 0 re-raises its error, every other rank raises a RuntimeError naming it)",
             "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
             "_check_lr_multipliers(metadata, ckpt_dir) -> saved group modules | None (every rank refuses other multipliers or patterns; a run without multipliers loads past an unreadable record with a warning; runs once per load, before loading optimizer state on any rank or before restoring a scheduler from train_state.pt)",
             "_present_experts(dcp_state, load_from, saved_keys) (EP experts placed among all of them before DCP; a load refuses a checkpoint of fewer experts than the model; the ranks agree before DCP)",
-            "apply_dataloader_state(dataloader)",
+            "apply_dataloader_state(dataloader) (every rank checks the position and the ranks share their verdicts before any rank applies it; a position some rank cannot place raises DataPositionError on every rank on a resume and starts the data fresh on every rank, with a warning, on a warm start or a carried position; a carried position goes only to a StatefulDataLoader or StreamingDataLoader)",
+            "_position_refusals(dataloader, state) -> (refusals, world) (each rank's check_state verdict, gathered on every rank on the gloo group; a check that fails another way raises on every rank)",
+            "claim_dir() (rank 0 claims <dir>/.owner through claim_checkpoint_dir; every rank agrees on the outcome)",
+            "release_dir() (marks the <dir>/.owner record this rank's claim_dir wrote released, at a clean exit)",
             "restored_extra (property: the extra keys the last load restored)",
             "_resolve_load_path(path)",
             "_agreed_load_dir(path, fall_back) -> Path | None (every load: rank 0 resolves the checkpoint, on an exact resume that reads shards takes the newest step_N beside it that every stage saved when that one is not, and broadcasts its choice or its error)",
@@ -1291,12 +1396,22 @@
         "_recorded_weight_decay_scope(meta, metadata_path) -> str (none recorded means exclude_norms_and_biases)",
         "_recorded_lr_multipliers(meta, metadata_path) -> dict (none recorded means empty)",
         "_recorded_lr_layout(meta, metadata_path) -> (patterns, group_modules) (lr_module_patterns, and lr_group_modules: the module of each optimizer param group, recorded without PP)",
-        "_check_saved_param_groups(optim_state, saved_keys, where, groups_vary, saved_modules) (refuses another group count, a missing setting, a module key where this run has none, or another module at a position per the recorded lr_group_modules)"
+        "_check_saved_param_groups(optim_state, saved_keys, where, groups_vary, saved_modules) (refuses another group count, a missing setting, a module key where this run has none, or another module at a position per the recorded lr_group_modules)",
+        "derived_buffer_owners(model) -> dict (state-dict key of each buffer a module lists in derived_buffers -> (module, buffer name))",
+        "drop_derived_model_keys(model_state, model, saved_keys) -> dict (takes out of a load template the derived buffers its checkpoint lacks; put back before set_model_state_dict)",
+        "derive_buffers(model, keys) (the owner of each derived buffer at keys recomputes it from its loaded state)",
+        "_fit_saved_optimizer(optim_state, owners, fixed, left_out, saved_keys, where, groups_vary, saved_modules, layout) -> taken groups (checks the saved state kinds, each EP expert under its global name, takes the groups the save kept none of, drops legacy group keys, then checks the remaining groups; when none can be taken, the group check speaks before the generic mismatch error)",
+        "_params_the_save_left_out(fqns, saved_keys, layout) -> set[str] (named parameters with neither saved optimizer state nor a never-stepped record, compared by global expert names under expert parallelism)",
+        "_restore_left_out(optim_state, template_groups, left_out, where) (empty state for them, in the saved group of their group's other parameters, every EP rank's experts included, or an empty saved group in its place; refuses a name the saved groups list; load() agrees on its outcome across ranks)"
       ],
       "tested_by": [
         "tests/unit/test_checkpoint.py::TestWeightDecayScopeOnResume",
         "tests/unit/test_checkpoint.py::TestOptimizerChecksAcrossStages",
         "tests/unit/test_lr_multipliers.py::TestResume",
+        "tests/unit/test_router_balance.py::TestCheckpointsThatTrainedTheBias",
+        "tests/unit/test_router_balance.py::TestManagerResume",
+        "tests/unit/test_router_balance.py::TestDerivedBufferOwners",
+        "tests/unit/test_convert_checkpoint.py::TestSigmoidRouterMasters",
         "tests/unit/test_lr_multipliers.py::TestLayoutChange",
         "tests/unit/test_checkpoint.py::TestCheckpointRetention",
         "tests/unit/test_checkpoint.py::TestFlushPendingSave",
@@ -1305,13 +1420,18 @@
         "tests/unit/test_checkpoint.py::TestSaveVLMFreezeMetadata",
         "tests/unit/test_checkpoint.py::TestLoadVLMFreezeCompare",
         "tests/unit/test_checkpoint.py::TestIntersectFreezeMetaByModule",
+        "tests/unit/test_checkpoint.py::TestFreshIfUnheld",
+        "tests/unit/test_checkpoint.py::TestMuonResume",
         "tests/unit/test_checkpoint_security.py::TestLoadTrainStateOwnershipGate",
         "tests/unit/test_checkpoint_security.py::TestManagerLoadRejectsForeignCheckpoint",
         "tests/unit/test_ep_checkpoint.py",
         "tests/unit/test_checkpoint.py::TestCheckpointManagerLoad",
         "tests/unit/test_checkpoint.py::TestScheduleFreeCheckpoint",
         "tests/unit/test_schedule_free_fsdp.py::TestScheduleFreeUnderFsdp2",
-        "tests/distributed/test_checkpoint.py"
+        "tests/distributed/test_checkpoint.py",
+        "tests/unit/test_checkpoint_per_rank.py",
+        "tests/unit/test_data_position.py",
+        "tests/unit/test_streaming_resume.py"
       ]
     },
     "kempnerforge/checkpoint/async_save.py": {
@@ -1337,11 +1457,14 @@
           "purpose": "Translates a DCP state dict between one EP rank's experts and all of them: unpacked experts under their global index, packed weights as views over the FSDP mesh and ep holding every expert's rows, with optimizer state and param-group lists to match",
           "methods": [
             "to_global(state) -> dict",
-            "to_local(state) -> dict"
+            "to_local(state) -> dict",
+            "global_names(names) -> list[str]",
+            "group_names(names) -> list[str]"
           ]
         }
       },
       "functions": [
+        "state_dict_name(name) -> str (a module name without the AC and torch.compile wrappers, as get_model_state_dict names entries)",
         "moe_layers(model) -> Iterator[(state-dict name, MoEMLP)]",
         "expert_layout(model) -> ExpertLayout | None (None without expert parallelism)",
         "check_saved_experts(model, saved, where) (refuses a checkpoint holding fewer experts than the model, as one saved with ep > 1 before #202 does)"
@@ -1350,6 +1473,25 @@
         "tests/unit/test_expert_layout.py",
         "tests/unit/test_ep_checkpoint.py",
         "tests/distributed/test_ep.py::TestEPCheckpoint"
+      ]
+    },
+    "kempnerforge/checkpoint/ownership.py": {
+      "classes": {
+        "CheckpointDirInUseError": {
+          "purpose": "Another run that is alive, or not known to have ended, owns the checkpoint directory"
+        }
+      },
+      "functions": [
+        "claim_checkpoint_dir(directory) -> str (records this run in <dir>/.owner, linked into place; replaces this process's earlier record; replaces a record of a run that has ended through _take_over, then reads it back; refuses a live or uncheckable owner; returns the claim id; one claim or release at a time per process)",
+        "_take_over(path, held, tmp, me) -> (bool, Path | None) (only the claimer that links .owner.<held claim>.takeover replaces path, after checking it still holds held, by renaming a link of tmp named for its own claim; tokens whose claimers have ended are taken over level by level; tokens removed afterward)",
+        "release_checkpoint_dir(directory, claim) (marks the record of that claim released through _take_over; never removes .owner; an error is logged)",
+        "this_run() -> dict (claim id, SLURM cluster, job or array element, requeue count, host, pid, a random id of the process, new in a forked child, which also gets a free lock, pid namespace inode, since)",
+        "_alive(owner, me) -> bool | None (a released record has ended; so has an earlier attempt of this job; another run in this job, or outside SLURM, by its pid on its own host and in its pid namespace, both known; any other job by squeue without SQUEUE_* filters)"
+      ],
+      "tested_by": [
+        "tests/unit/test_checkpoint_ownership.py",
+        "tests/distributed/test_checkpoint_ownership.py",
+        "tests/unit/test_train_entry.py::TestRunTraining"
       ]
     },
     "kempnerforge/metrics/tracker.py": {
@@ -1451,20 +1593,23 @@
     "kempnerforge/resilience/health.py": {
       "classes": {
         "NaNDetector": {
-          "purpose": "Detect and track NaN/Inf in loss and gradients with configurable actions",
+          "purpose": "Detect and track NaN/Inf in loss and gradients with configurable actions (train.nan_action, train.nan_max_consecutive)",
           "methods": [
-            "check_loss(loss, step)",
-            "check_grads(model, step)",
-            "should_recommend_rollback()"
+            "check_loss(loss, step, grad_norm=None) -> bool (collective: one all-reduce of a flag, on CUDA or, without CUDA, on the CPU)",
+            "check_gradients(model, step) -> bool (collective: each rank checks the gradients it holds, one all-reduce gives every rank the verdict)",
+            "rollback_recommended (property; should_rollback is its deprecated alias)",
+            "reset()"
           ]
         }
       },
       "functions": [
-        "check_gpu_health(device) -> bool",
-        "check_nccl_health(group, timeout_sec) -> bool"
+        "params_are_finite(model, device) -> bool (collective: one all-reduce of a flag on device)",
+        "check_gpu_health(device=0) -> dict[str, bool | str]",
+        "check_nccl_health(timeout_sec=10.0) -> bool"
       ],
       "tested_by": [
         "tests/unit/test_resilience.py::TestNaNDetector",
+        "tests/unit/test_resilience.py::TestNaNDetectorAcrossRanks",
         "tests/unit/test_resilience.py::TestGPUHealth",
         "tests/distributed/test_resilience.py::TestNCCLHealth",
         "tests/distributed/test_resilience.py::TestNaNDetectorDistributed"
@@ -1597,7 +1742,7 @@
       "tests/unit/test_config.py": {
         "classes": [
           "TestModelConfig(23)",
-          "TestTrainConfig(3)",
+          "TestTrainConfig(24)",
           "TestOptimizerConfig(6)",
           "TestDistributedConfig(6)",
           "TestCheckpointConfig(2)",
@@ -1611,9 +1756,10 @@
           "TestScalarCoercion(13)",
           "TestCliParsing(6)",
           "TestRegistry(12)",
-          "TestEvalConfig(7)"
+          "TestEvalConfig(7)",
+          "TestDottedDictOverrides(13)"
         ],
-        "count": 125
+        "count": 159
       },
       "tests/unit/test_training.py": {
         "classes": [
@@ -1630,9 +1776,10 @@
           "TestDistributedSampler(8)",
           "TestStatefulDataLoader(3)",
           "TestHuggingFaceDataset(6)",
-          "TestStreamingHuggingFaceDataset(6)"
+          "TestTextReadersReadOnlyTheText(2)",
+          "TestStreamingHuggingFaceDataset(8)"
         ],
-        "count": 32
+        "count": 36
       },
       "tests/unit/test_distributed.py": {
         "classes": [
@@ -1651,12 +1798,13 @@
       "tests/unit/test_resilience.py": {
         "classes": [
           "TestShutdownHandler(16)",
-          "TestNaNDetector(17)",
+          "TestNaNDetector(27)",
+          "TestNaNDetectorAcrossRanks(2)",
           "TestGPUHealth(2)",
           "TestSLURM(13)",
           "TestResumePathResolution(9)"
         ],
-        "count": 57
+        "count": 69
       },
       "tests/unit/test_shutdown_agreement.py": {
         "classes": [
@@ -1670,19 +1818,52 @@
           "TestRNGState(2)",
           "TestBuildTrainState(4)",
           "TestRestoreTrainState(5)",
-          "TestCheckpointRetention(2)",
+          "TestCheckpointRetention(9)",
           "TestAsyncCheckpointer(7)",
           "TestDataloaderStatePersistence(9)",
           "TestIntersectFreezeMetaByModule(4)",
           "TestPeekSavedStep(5)",
           "TestFlushPendingSave(1)",
           "TestSaveVLMFreezeMetadata(3)",
+          "TestSaveTrackingSidecar(24)",
+          "TestSaveCheckpointRegistration(39)",
+          "TestWeightsOnlyWarmStart(8)",
           "TestLoadVLMFreezeCompare(9)",
+          "TestAsyncLatestSymlinkSafety(22)",
+          "TestAFailedSaveCommitsNothing(11)",
+          "TestSyncBarrierGroup(6)",
+          "TestCheckpointManagerLoad(3)",
+          "TestResumeWithUnsteppedParameters(18)",
+          "TestFreshIfUnheld(9)",
+          "TestMuonResume(26)",
+          "TestSaveBeforeFirstStep(21)",
+          "TestResumeWithoutTrainState(12)",
+          "TestResumeWithoutTrainStateAcrossRanks(2)",
+          "TestOptimizerChecksAcrossStages(5)",
+          "TestCheckpointEveryOptimizer(8)",
+          "TestComponentSwapOnResume(1)",
+          "TestWeightDecayScopeOnResume(46)",
           "TestRestoredExtra(2)",
           "TestUnreadableTrainStateAcrossRanks(1)",
-          "TestTornStageAcrossRanks(1)"
+          "TestTornStageAcrossRanks(1)",
+          "TestOptimizerTypeChangeOnResume(6)"
         ],
-        "count": 54
+        "count": 329
+      },
+      "tests/unit/test_checkpoint_per_rank.py": {
+        "classes": [
+          "TestPerRankEnvelopeSchema(17)",
+          "TestEnvelopeValidatedBeforeSelection(6)",
+          "TestGatherMustCoverTheWorld(2)",
+          "TestAFailedCaptureFailsEveryRank(4)",
+          "TestFourRankSaveLoad(6)",
+          "TestLegacyAndTopology(10)",
+          "TestDataParallelLayout(12)",
+          "TestLoadsThatAreNotAResume(2)",
+          "TestWeightsOnlyWarmStart(3)",
+          "TestMidSaveInterruption(1)"
+        ],
+        "count": 63
       },
       "tests/unit/test_observability.py": {
         "classes": [
@@ -1722,9 +1903,9 @@
           "TestFp32CrossEntropy(8)",
           "TestZLoss(11)",
           "TestBuildLossFn(12)",
-          "TestAllMaskedBatch(3)"
+          "TestAllMaskedBatch(4)"
         ],
-        "count": 42
+        "count": 43
       },
       "tests/unit/test_moe.py": {
         "classes": [
@@ -1755,14 +1936,26 @@
         ],
         "count": 22
       },
+      "tests/unit/test_router_balance.py": {
+        "classes": [
+          "TestFrozenBias(2)",
+          "TestBalance(5)",
+          "TestBalanceRouters(3)",
+          "TestCheckpointsThatTrainedTheBias(4)",
+          "TestManagerResume(2)",
+          "TestDerivedBufferOwners(1)",
+          "TestFSDP2(1)"
+        ],
+        "count": 18
+      },
       "tests/unit/test_optimizer.py": {
         "classes": [
           "TestNewtonSchulz(5)",
-          "TestMuon(29)",
+          "TestMuon(31)",
           "TestMuonRouting(6)",
           "TestAdamW(2)"
         ],
-        "count": 42
+        "count": 44
       },
       "tests/unit/test_eval.py": {
         "classes": [
@@ -1787,9 +1980,10 @@
           "TestBuildHFConfig(4)",
           "TestMoEKFtoHFKeyMapping(5)",
           "TestMoEHFtoKFKeyMapping(5)",
-          "TestMoERoundTrip(1)"
+          "TestMoERoundTrip(1)",
+          "TestSigmoidRouterMasters(3)"
         ],
-        "count": 29
+        "count": 32
       },
       "tests/unit/test_ep_checkpoint.py": {
         "classes": [
@@ -1799,24 +1993,25 @@
           "TestPlacementCheck(1)",
           "TestFailureOnOneRank(1)",
           "TestResumeAtTheSameLayout(11)",
+          "TestExpertsTheSaveLeftOut(8)",
           "TestPerModuleLearningRates(2)",
           "TestLoadAtAnotherEP(18)",
           "TestUnfixedCheckpoint(8)",
           "TestExportFromAnEPCheckpoint(3)",
           "TestWithoutEP(2)"
         ],
-        "count": 61
+        "count": 69
       },
       "tests/unit/test_expert_layout.py": {
         "classes": [
           "TestMoELayers(2)",
-          "TestUnpackedNames(8)",
+          "TestUnpackedNames(9)",
           "TestPackedWithoutMesh(3)",
           "TestOlderTorch(1)",
           "TestCheckSavedExperts(6)",
           "TestRootLayer(5)"
         ],
-        "count": 25
+        "count": 26
       },
       "tests/unit/test_fp8.py": {
         "classes": [
@@ -1929,6 +2124,13 @@
         ],
         "count": 42
       },
+      "tests/unit/test_vlm_encoder_mode.py": {
+        "classes": [
+          "TestWrapperTrain(3)",
+          "TestTrainingLoop(3)"
+        ],
+        "count": 6
+      },
       "tests/unit/test_vlm_config.py": {
         "classes": [
           "TestVLMConfigValidation(9)",
@@ -1954,9 +2156,9 @@
           "TestRandomVisionEncoder(6)",
           "TestHFEncoders(1)",
           "TestVisionEncoderRegistry(3)",
-          "TestHFVisionEncoderMocked(5)"
+          "TestHFVisionEncoderMocked(11)"
         ],
-        "count": 15
+        "count": 21
       },
       "tests/unit/test_cross_attention.py": {
         "classes": [
@@ -1971,9 +2173,23 @@
           "TestFreezeParams(6)",
           "TestApplyFreezeSpecs(3)",
           "TestCanonicalFreezeMeta(4)",
-          "TestEffectiveFreeze(7)"
+          "TestEffectiveFreeze(7)",
+          "TestFreezeNames(12)",
+          "TestResumedFreezeOrder(3)",
+          "TestUnmatchedPatterns(2)",
+          "TestBuildRefusesUnmatchedPatterns(3)",
+          "TestTrainableDuringRun(9)",
+          "TestTrainableForTheRun(6)"
         ],
-        "count": 20
+        "note": "Also module-level functions: a module the build froze trains once a stage unfreezes it, under each registered optimizer (4), and apply_freeze_specs reaches the module a compiled model wraps (1)",
+        "count": 60
+      },
+      "tests/unit/test_unfreeze_fsdp.py": {
+        "classes": [
+          "TestUnfreezeUnderFSDP2(2)",
+          "TestEncoderMode(3)"
+        ],
+        "count": 5
       },
       "tests/unit/test_check_env.py": {
         "classes": [
@@ -2001,6 +2217,18 @@
         ],
         "count": 5
       },
+      "tests/unit/test_checkpoint_ownership.py": {
+        "classes": [
+          "TestThisRun(7)",
+          "TestClaim(37)",
+          "TestOneProcess(2)",
+          "TestClaimersInProcesses(1)",
+          "TestRelease(6)",
+          "TestManager(5)",
+          "TestLatestLink(2)"
+        ],
+        "count": 60
+      },
       "tests/unit/test_collective_timeouts.py": {
         "classes": [
           "TestNcclAsyncErrorHandlingEnvGuard(3)",
@@ -2017,6 +2245,14 @@
       "tests/unit/test_distributed_seed.py": {
         "note": "Module-level pytest functions: _set_seed seeds python/numpy/torch.cpu/torch.cuda; varies with pp_rank; consistent across dp ranks; covers checkpoint surface",
         "count": 4
+      },
+      "tests/unit/test_data_position.py": {
+        "note": "Module-level pytest functions (no Test* classes): the data position across data-parallel and batch size changes, the in-step clamp, mixture and legacy refusals, seed and dataset-length warnings, load_path warm starts through restore_checkpoint and load(dataloader=...), gloo CheckpointManager resume on another world size; gloo CheckpointManager auto-resume (exact_resume) saved on 4 ranks: on 2 ranks with ignore_rank_state_mismatch at the exact global position with fresh RNG, refused on every rank without it, a mixture restarting with a warning, and the saved layout restoring each rank's own state; check_state's verdicts",
+        "count": 23
+      },
+      "tests/unit/test_streaming_resume.py": {
+        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning on another rank's position, replay past a shorter part warning in every rank's log, mid-pass restart with workers, replay progress, check_state's verdicts; gloo CheckpointManager auto-resume with ignore_rank_state_mismatch of a stream saved as dp 2 x tp 2: each data-parallel rank's own position on the saved data-parallel size, a restart on every rank on another, a restart on every rank when one rank sees a data file at another size, every rank raising together without the flag, and every rank stopping when one rank's check fails another way; a warm start on 2 ranks restarting every rank when one rank sees a data file at another size",
+        "count": 21
       }
     },
     "integration": {
@@ -2033,6 +2269,10 @@
         ],
         "count": 5
       },
+      "tests/integration/test_freeze_schedule_compile.py": {
+        "note": "Module-level pytest function on one GPU: a module a freeze stage unfreezes trains after the stage in a model compiled with inductor, with compile_model on and off",
+        "count": 2
+      },
       "tests/integration/test_data_resumption.py": {
         "classes": [
           "TestDataResumption(4)"
@@ -2041,9 +2281,10 @@
       },
       "tests/integration/test_compile.py": {
         "classes": [
-          "TestCompileCorrectness(3)"
+          "TestCompileCorrectness(3)",
+          "TestCompiledMoECheckpointing(1)"
         ],
-        "count": 3
+        "count": 4
       },
       "tests/integration/test_vlm_train_step.py": {
         "classes": [
@@ -2091,6 +2332,11 @@
           "TestGetDpMesh(1)"
         ]
       },
+      "tests/distributed/test_freeze_schedule_fsdp.py": {
+        "classes": [
+          "TestFreezeScheduleUnderFSDP2(3)"
+        ]
+      },
       "tests/distributed/test_resilience.py": {
         "classes": [
           "TestNCCLHealth(2)",
@@ -2108,6 +2354,11 @@
       "tests/distributed/test_checkpoint.py": {
         "note": "Distributed checkpoint save/load"
       },
+      "tests/distributed/test_checkpoint_ownership.py": {
+        "classes": [
+          "TestClaimOnEveryRank(2)"
+        ]
+      },
       "tests/distributed/test_e2e_training.py": {
         "note": "Multi-GPU training smoke"
       },
@@ -2116,6 +2367,12 @@
       },
       "tests/distributed/test_ep.py": {
         "note": "Expert parallelism, and an EP checkpoint round trip on four GPUs"
+      },
+      "tests/distributed/test_router_balance.py": {
+        "note": "Sigmoid router balancing on four GPUs under FSDP2 (even and uneven shards), HSDP, TP and EP: one all-reduce, the reference rule, the same bias on every rank, which the next forward routes with; a resume from a checkpoint without the FP32 masters, eager and compiled; and saved masters resumed exactly on another mesh (FSDP2 to HSDP)"
+      },
+      "tests/distributed/test_ac_moe_recompute.py": {
+        "note": "Full activation checkpointing of MoE blocks on four GPUs (FSDP2, HSDP, TP, EP; text and MoT; both routers; fp32 and bf16): trains like none, and the recompute replaces no router attribute and counts no token twice"
       },
       "tests/distributed/test_optimizer_distributed.py": {
         "note": "Lion, Schedule-Free AdamW, optimizer-scheduler compat under FSDP2"

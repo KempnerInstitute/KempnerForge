@@ -71,7 +71,10 @@ freeze = []
 - Each listed module gets its own decay and no-decay groups, after the groups of the
   parameters no listed module holds, which keep `optimizer.lr`. Groups with no parameters
   are left out, so a module frozen when the optimizer is built gets none, and the build
-  warns that its multiplier has no effect.
+  warns that its multiplier has no effect. The training entry builds the optimizer with
+  every parameter that trains at some step of the run made trainable, so the parameters a
+  later `FreezeStage` unfreezes have their groups from the start, and those frozen for the
+  whole run stay out.
 - The one `[scheduler]` scales every group's own peak by the same factor, so every module
   follows the same warmup and decay shape, each from its own peak (and to its own floor,
   `min_lr_ratio` times that peak).
@@ -152,13 +155,18 @@ weight_decay = 0.1
 fused = true
 ```
 
-Direct wrapper of `torch.optim.AdamW`. `fused = true` enables the
-fused CUDA kernel on PyTorch 2.x + CUDA; falls back to foreach
-implementation otherwise. The `fused` kernel is the default in every
-shipped dense config.
+Direct wrapper of `torch.optim.AdamW`. `fused = true`, the default,
+runs the fused CUDA kernel when a GPU is available. Without one, or
+with `fused = false`, the builder passes `fused=False` and no
+`foreach`, and AdamW runs its single-tensor loop: torch picks the
+foreach kernel on its own only when neither is given.
 
-Memory: 2 optimizer-state tensors per parameter (exp_avg, exp_avg_sq)
-in fp32 — the master-weight budget most estimators assume.
+Memory: 2 optimizer-state tensors per parameter, exp_avg and
+exp_avg_sq, in the parameter's dtype, plus a scalar step count. That
+dtype is `train.master_dtype` for the language model and the adapter:
+bf16 by default, and fp32 with `train.fp32_master_weights = true` or
+`mixed_precision = "fp32"`. A VLM's vision encoder keeps the dtype it
+was loaded in.
 
 ## `lion`
 
@@ -310,7 +318,15 @@ DTensor / FSDP2 notes:
   [DCP model § Inner optimizers](../checkpointing/dcp-model.md#inner-optimizers).
 - `muon_adam_lr` unset (default) makes the internal AdamW use the same
   LR as Muon. Pass a smaller value (e.g. `muon_adam_lr = 1e-4`) if you
-  want the AdamW parameters on a gentler schedule.
+  want the AdamW parameters on a gentler schedule. A set `muon_adam_lr`
+  follows Muon's schedule: each step runs the internal AdamW at
+  `muon_adam_lr`, times its module's multiplier under
+  `optimizer.lr_multipliers`, times the factor the scheduler gives Muon's
+  first param group. A resume or warm start that restores `train_state.pt` continues
+  the saved schedule from its saved peak, whatever `optimizer.lr` is now
+  (see [Per-module learning rates](#per-module-learning-rates)), and the
+  internal AdamW stays at `muon_adam_lr` times that schedule's factor;
+  unset, it runs at Muon's restored LR.
 
 Momentum and update scale:
 
@@ -358,6 +374,21 @@ test of all three features together.
 
 For any optimizer, the decay-vs-no-decay grouping is handled
 automatically — no need to thread `no_decay_params` through your config.
+
+A resume refuses a checkpoint whose saved optimizer state holds entries the
+current optimizer does not keep, as one saved by another optimizer does,
+before loading anything, naming those parameters (each expert under the
+name the checkpoint holds it by): an AdamW checkpoint would otherwise load
+into a Lion run with its `exp_avg` as Lion's momentum and its other entries
+dropped. Only parameters the current optimizer keeps state for are
+compared, so one frozen since the save is not. A saved state short of
+entries, as a Lion checkpoint is for AdamW, is refused the same way before
+anything loads, as partial state, and a checkpoint saved before the first
+step holds no optimizer state, so it loads under any optimizer. To
+change `optimizer.name`, continue from the checkpoint's weights with a
+fresh optimizer: `checkpoint.load_path` set to it and
+`checkpoint.exclude_from_loading = ["optimizer"]`, with a `checkpoint.dir`
+that holds no checkpoint (see [DCP model](../checkpointing/dcp-model.md)).
 
 ## See also
 

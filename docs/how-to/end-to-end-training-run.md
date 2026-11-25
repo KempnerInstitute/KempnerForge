@@ -114,8 +114,8 @@ kill -TERM <pid>
 Expected rank-0 log:
 
 ```
-Shutdown requested at step 247 — saving emergency checkpoint
-Emergency checkpoint written to checkpoints/hf_wikitext/step_247
+Shutdown requested at step 247; saving emergency checkpoint
+Checkpoint committed: checkpoints/hf_wikitext/step_247 (step=247)
 ```
 
 If you just hit `Ctrl+C`, you'll resume from the last periodic save
@@ -135,10 +135,13 @@ completed if the symlink is missing; `CheckpointManager` then loads
 it. Training picks up at the next step with model, optimizer,
 scheduler, dataloader, and RNG state restored.
 
-The dataloader resumes from the exact sample via
-`StatefulDataLoader.load_state_dict` + `DistributedSampler.set_skip`
-(pre-tokenized path) or `_skip_rank_docs` (HF-streaming path), so no
-sample is replayed and none is skipped. See
+On the pre-tokenized path, `StatefulDataLoader` restores the position in
+the epoch's sample order, so the run resumes at the exact sample. This
+tutorial's HF-streaming path uses `StreamingDataLoader`, which replays
+each GPU's stream up to the batches it already trained on, so the resume
+is exact there too. The replay reads the consumed part of the stream
+again, which takes a moment at the start of the resumed run. See
+[Data § Hugging Face](../data/huggingface.md#resumption-in-streaming-mode),
 [Checkpointing § Auto-resume](../checkpointing/auto-resume.md) and
 [Resilience § SLURM preemption](../resilience/slurm-preemption.md).
 

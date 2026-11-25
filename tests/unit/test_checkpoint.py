@@ -34,6 +34,7 @@ from kempnerforge.config.schema import (
 )
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.optimizer import Muon, _should_decay, build_optimizer
+from tests.gloo_ranks import gloo_group, spawn
 
 
 class TestRNGState:
@@ -700,7 +701,15 @@ def _mock_dcp_load(monkeypatch):
     monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
 
 
-def _make_mock_mgr(tmp_path, monkeypatch, *, ignore_freeze_mismatch=False):
+def _listing(directory: Path) -> list[str]:
+    """The names in ``directory``, without the ``.nfs*`` entries an NFS client keeps for a
+    replaced or removed file that is still open, until its last reference closes."""
+    return sorted(p.name for p in directory.iterdir() if not p.name.startswith(".nfs"))
+
+
+def _make_mock_mgr(
+    tmp_path, monkeypatch, *, ignore_freeze_mismatch=False, ignore_plugins_mismatch=False
+):
     """Build a CheckpointManager with DCP calls mocked out (no distributed)."""
     from unittest.mock import MagicMock
 
@@ -709,7 +718,10 @@ def _make_mock_mgr(tmp_path, monkeypatch, *, ignore_freeze_mismatch=False):
     model = torch.nn.Linear(4, 4)
     opt = torch.optim.SGD(model.parameters(), lr=0.1)
     config = CheckpointConfig(
-        dir=str(tmp_path), keep_last_n=5, ignore_freeze_mismatch=ignore_freeze_mismatch
+        dir=str(tmp_path),
+        keep_last_n=5,
+        ignore_freeze_mismatch=ignore_freeze_mismatch,
+        ignore_plugins_mismatch=ignore_plugins_mismatch,
     )
     mgr = CheckpointManager(config, model, opt)
     monkeypatch.setattr(mgr._async_ckpt, "save", MagicMock())
@@ -1716,7 +1728,12 @@ class TestSaveCheckpointRegistration:
         assert (tmp_path / "latest").resolve() == (tmp_path / "step_1").resolve()
         assert len(warnings) == 1 and "<unprintable Unprintable>" in warnings[0]
 
-    def test_record_amends_one_record_atomically_through_a_temp_file(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("nfs_held", [False, True], ids=["local", "nfs-held"])
+    def test_record_amends_one_record_atomically_through_a_temp_file(
+        self, tmp_path, monkeypatch, nfs_held
+    ):
+        """With ``nfs-held`` the replace keeps the old sidecar under a ``.nfs`` name, as an NFS
+        client does while that file is still open; the listing leaves that entry out."""
         _, registrar = self._registered(tmp_path, monkeypatch, {"mlflow": {"model_name": "m"}})
         sidecar = tmp_path / "step_1" / "metadata.json"
         sidecar.chmod(0o640)
@@ -1725,6 +1742,8 @@ class TestSaveCheckpointRegistration:
 
         def spy(src, dst):
             replaced.append((Path(src), Path(dst), Path(src).read_text()))
+            if nfs_held:
+                os.link(dst, Path(dst).with_name(".nfs000000000000000200000002"))
             replace(src, dst)
 
         monkeypatch.setattr(os, "replace", spy)
@@ -1738,7 +1757,7 @@ class TestSaveCheckpointRegistration:
         }
         assert sidecar.read_text() == text == json.dumps(expected, indent=2)
         assert stat.S_IMODE(sidecar.stat().st_mode) == 0o640
-        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+        assert _listing(sidecar.parent) == [
             "metadata.json",
             "train_state.pt",
         ]
@@ -1778,7 +1797,7 @@ class TestSaveCheckpointRegistration:
         warnings = self._log(monkeypatch, "warning")
         registrar.records[0]("mlflow", {"model_id": "m-1"})
         assert sidecar.read_bytes() == before
-        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+        assert _listing(sidecar.parent) == [
             "metadata.json",
             "train_state.pt",
         ]
@@ -1799,7 +1818,7 @@ class TestSaveCheckpointRegistration:
         with pytest.raises(OSError, match="disk full"):
             mgr.save(step=1, tokens_seen=16)
         assert sidecar.read_bytes() == before
-        assert sorted(p.name for p in sidecar.parent.iterdir()) == [
+        assert _listing(sidecar.parent) == [
             "metadata.json",
             "train_state.pt",
         ]
@@ -2154,6 +2173,160 @@ class TestLoadVLMFreezeCompare:
             mgr2.load(path=str(tmp_path / "step_1"), vlm_freeze_expected=mismatched)
         assert "cross-arch" in str(exc_info.value)
         assert "future_arch" in str(exc_info.value)
+
+
+def _manager_warnings(call):
+    """Run ``call`` and return its result and the warnings the checkpoint manager logged."""
+    import logging
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    target = logging.getLogger("kempnerforge.checkpoint.manager")
+    capture = _Capture(level=logging.WARNING)
+    target.addHandler(capture)
+    try:
+        result = call()
+    finally:
+        target.removeHandler(capture)
+    return result, [record.getMessage() for record in records]
+
+
+class TestPluginsRecord:
+    """The plugins list is recorded in metadata.json and compared before any state is read."""
+
+    @staticmethod
+    def _saved(tmp_path, monkeypatch, plugins):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=1, extra=None if plugins is None else {"plugins": plugins})
+        return tmp_path / "step_1"
+
+    def test_save_records_the_plugins_list(self, tmp_path, monkeypatch):
+        path = self._saved(tmp_path, monkeypatch, ["pkg.a"])
+        assert json.loads((path / "metadata.json").read_text())["plugins"] == ["pkg.a"]
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [([], ["pkg.big"]), (["pkg.big"], []), (["pkg.a", "pkg.b"], ["pkg.b", "pkg.a"])],
+        ids=["added", "removed", "reordered"],
+    )
+    def test_another_list_is_refused_before_any_state_is_read(
+        self, tmp_path, monkeypatch, saved, current
+    ):
+        """A plugin can register a component the model is built from, or override another's
+        names, so the lists compare in order, and the refusal comes before DCP reads."""
+        from kempnerforge.checkpoint import manager as mgr_mod
+
+        path = self._saved(tmp_path, monkeypatch, saved)
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match=r"was saved with plugins = .*\. Set plugins as"):
+            mgr.load(path=str(path), plugins_expected=current)
+        mgr_mod.dcp.FileSystemReader.assert_not_called()
+        mgr_mod.dcp.load.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [
+            ([], []),
+            (["pkg.a"], ["pkg.a", "pkg.a"]),
+            (["pkg.a", "pkg.b", "pkg.a"], ["pkg.a", "pkg.b"]),
+        ],
+        ids=["empty", "repeated", "repeat-saved"],
+    )
+    def test_the_same_modules_in_the_same_order_load(self, tmp_path, monkeypatch, saved, current):
+        """A module listed again is imported once, so a repeat does not change the list."""
+        path = self._saved(tmp_path, monkeypatch, saved)
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        assert mgr.load(path=str(path), plugins_expected=current)[0] == 1
+
+    @pytest.mark.parametrize(
+        ("record", "reason"),
+        [
+            (None, "records no plugins list"),
+            ("pkg.a", "records plugins = 'pkg.a'"),
+            ("unreadable", "cannot read"),
+        ],
+        ids=["none", "invalid", "unreadable"],
+    )
+    def test_a_checkpoint_without_a_valid_record_loads_with_one_warning(
+        self, tmp_path, monkeypatch, record, reason
+    ):
+        """A missing, invalid or unreadable record is not compared, and rank 0 alone warns,
+        once."""
+        path = self._saved(tmp_path, monkeypatch, None)
+        meta_path = path / "metadata.json"
+        if record == "unreadable":
+            meta_path.write_text("{")
+        elif record is not None:
+            meta_path.write_text(
+                json.dumps({**json.loads(meta_path.read_text()), "plugins": record})
+            )
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        (step, _, _), warnings = _manager_warnings(
+            lambda: mgr.load(path=str(path), plugins_expected=["pkg.a"])
+        )
+        assert step == 1
+        skipped = [w for w in warnings if "is not compared" in w]
+        assert len(skipped) == 1 and reason in skipped[0]
+        mgr._rank = 1
+        _, quiet = _manager_warnings(
+            lambda: mgr._check_plugins(mgr._broadcast_metadata(path), path, ["pkg.a"])
+        )
+        assert quiet == []
+
+    def test_ignore_plugins_mismatch_loads_with_a_warning(self, tmp_path, monkeypatch):
+        path = self._saved(tmp_path, monkeypatch, ["pkg.big"])
+        mgr = _make_mock_mgr(tmp_path, monkeypatch, ignore_plugins_mismatch=True)
+        (step, _, _), warnings = _manager_warnings(
+            lambda: mgr.load(path=str(path), plugins_expected=[])
+        )
+        assert step == 1
+        assert any("checkpoint.ignore_plugins_mismatch is set" in w for w in warnings)
+
+    @pytest.mark.parametrize("expected", [None, ["pkg.other"]], ids=["not-given", "weights-only"])
+    def test_no_list_or_a_weights_only_load_is_not_compared(self, tmp_path, monkeypatch, expected):
+        path = self._saved(tmp_path, monkeypatch, ["pkg.big"])
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        exclude = ["optimizer", "train_state"] if expected is not None else None
+        _, warnings = _manager_warnings(
+            lambda: mgr.load(path=str(path), exclude_keys=exclude, plugins_expected=expected)
+        )
+        assert not any("plugins" in w for w in warnings)
+
+    def test_every_rank_decides_from_rank_zeros_read(self, tmp_path, monkeypatch):
+        """A rank other than 0 does not read metadata.json: it refuses from the record rank 0
+        broadcast, and under ignore_plugins_mismatch it goes on without a warning of its own."""
+        from kempnerforge.checkpoint import manager as mgr_mod
+
+        path = self._saved(tmp_path, monkeypatch, ["pkg.big"])
+        record = (json.loads((path / "metadata.json").read_text()), None)
+
+        def broadcast(objects, src):
+            if isinstance(objects[0], dict) and objects[0].keys() == {"dir", "error"}:
+                objects[0] = {"dir": str(path.resolve()), "error": None}
+            else:
+                objects[0] = record
+
+        reads = []
+
+        def unread(ckpt_dir):
+            reads.append(ckpt_dir)
+            raise AssertionError("only rank 0 reads metadata.json")
+
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        quiet = _make_mock_mgr(tmp_path, monkeypatch, ignore_plugins_mismatch=True)
+        mgr._rank = quiet._rank = 1
+        monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(mgr_mod.dist, "broadcast_object_list", broadcast)
+        monkeypatch.setattr(mgr_mod, "_read_metadata", unread)
+        with pytest.raises(ValueError, match="was saved with plugins"):
+            mgr.load(path=str(path), plugins_expected=[])
+        assert reads == []
+        _, warnings = _manager_warnings(lambda: quiet._check_plugins(record, path, []))
+        assert warnings == []
 
 
 class TestAsyncLatestSymlinkSafety:
@@ -3260,7 +3433,8 @@ class TestResumeWithUnsteppedParameters:
             manager2.load(path=str(tmp_path / "step_1"))
 
     def test_an_opaque_optimizer_entry_keeps_its_loaded_state(self, tmp_path, monkeypatch):
-        """A checkpoint that stores the optimizer as one entry loads it whole."""
+        """A checkpoint that stores the optimizer as one entry loads it whole, and no named
+        parameter counts as left out of it."""
         from torch.distributed.checkpoint import FileSystemReader, _version
         from torch.distributed.checkpoint.state_dict import (
             get_model_state_dict,
@@ -3290,7 +3464,7 @@ class TestResumeWithUnsteppedParameters:
 
         model2, optimizer2 = build(1)
         manager2 = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, optimizer2)
-        manager2.load(path=str(tmp_path / "step_1"))
+        manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=["unused.weight"])
         assert [optimizer2.state[p] for p in model2.parameters()] == [{"step": 2}] * 4
 
     def test_a_resumed_run_saves_and_resumes_again(self, tmp_path):
@@ -3308,6 +3482,184 @@ class TestResumeWithUnsteppedParameters:
         assert manager3.load() == (2, 0, {})
         self._step(model, optimizer, 2)
         self._assert_same_run(model, optimizer, model3, optimizer3)
+
+
+class TestFreshIfUnheld:
+    """``load(fresh_if_unheld=...)`` resumes the named parameters a saved optimizer did not
+    hold with empty state, and every other parameter with its saved state."""
+
+    _build = staticmethod(TestResumeWithUnsteppedParameters._build)
+    _step = staticmethod(TestResumeWithUnsteppedParameters._step)
+    _assert_same_run = staticmethod(TestResumeWithUnsteppedParameters._assert_same_run)
+    UNUSED = ("unused.weight", "unused.bias")
+
+    def test_a_module_the_saved_optimizer_left_out_resumes_without_state(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path, freeze_unused=True)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path)
+        loaded = manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=self.UNUSED)
+        assert loaded == (1, 0, {})
+        self._assert_same_run(model, optimizer, model2, optimizer2)
+        assert [len(g["params"]) for g in optimizer2.param_groups] == [4]
+        assert optimizer2.param_groups[0]["lr"] == 1e-2
+
+        self._step(model2, optimizer2, 2, both=True)
+        steps = {name: optimizer2.state[p]["step"].item() for name, p in model2.named_parameters()}
+        assert steps == {"used.weight": 2, "used.bias": 2, "unused.weight": 1, "unused.bias": 1}
+
+    def test_a_left_out_parameter_that_is_not_named_still_fails(self, tmp_path):
+        from torch.distributed.checkpoint.api import CheckpointException
+
+        model, optimizer, manager = self._build(0, tmp_path, freeze_unused=True)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        _, _, manager2 = self._build(1, tmp_path)
+        missing = r"Missing key in checkpoint state_dict: optimizer\.state\.unused\.bias\."
+        with pytest.raises(CheckpointException, match=missing):
+            manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=["unused.weight"])
+
+    def test_a_never_stepped_record_keeps_its_parameter_out_of_the_left_out(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path)
+        manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=self.UNUSED)
+        self._assert_same_run(model, optimizer, model2, optimizer2)
+
+    def test_names_are_compared_without_the_activation_checkpoint_prefix(self, tmp_path):
+        model, optimizer, manager = self._build(0, tmp_path, freeze_unused=True)
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path)
+        manager2.load(
+            path=str(tmp_path / "step_1"),
+            fresh_if_unheld=[
+                "unused._checkpoint_wrapped_module.weight",
+                "unused._checkpoint_wrapped_module.bias",
+            ],
+        )
+        self._assert_same_run(model, optimizer, model2, optimizer2)
+
+    @staticmethod
+    def _grouped(seed, tmp_path, groups_of, lrs):
+        """A model with ``unused`` frozen unless a group holds it, and an AdamW whose groups
+        ``groups_of`` picks from the model, each with the lr in ``lrs``."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        torch.manual_seed(seed)
+        model = _UsedAndUnused()
+        groups = [
+            {"params": params, "lr": lr} for params, lr in zip(groups_of(model), lrs, strict=True)
+        ]
+        held = {id(p) for group in groups for p in group["params"]}
+        model.unused.requires_grad_(any(id(p) in held for p in model.unused.parameters()))
+        optimizer = torch.optim.AdamW(groups)
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        return model, optimizer, manager
+
+    def test_left_out_parameters_join_the_empty_saved_group_in_their_groups_place(self, tmp_path):
+        """With no saved peer, they take the saved settings of the empty group in their place."""
+        model, optimizer, manager = self._grouped(
+            0, tmp_path, lambda m: [list(m.used.parameters()), []], [5e-3, 2e-3]
+        )
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        model2, optimizer2, manager2 = self._grouped(
+            1,
+            tmp_path,
+            lambda m: [list(m.used.parameters()), list(m.unused.parameters())],
+            [1e-2, 1e-2],
+        )
+        manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=self.UNUSED)
+        assert [g["lr"] for g in optimizer2.param_groups] == [5e-3, 2e-3]
+        assert [len(g["params"]) for g in optimizer2.param_groups] == [2, 2]
+        assert not any(optimizer2.state.get(p) for p in model2.unused.parameters())
+        self._step(model2, optimizer2, 2, both=True)
+        assert all(optimizer2.state[p]["step"].item() == 1 for p in model2.unused.parameters())
+
+    def test_a_group_no_saved_group_fits_is_refused(self, tmp_path):
+        """The saved group in their group's place holds other parameters, so no saved group
+        gives the left-out parameters their settings."""
+        model, optimizer, manager = self._grouped(
+            0, tmp_path, lambda m: [[m.used.weight], [m.used.bias]], [1e-2, 1e-2]
+        )
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        _, _, manager2 = self._grouped(
+            1,
+            tmp_path,
+            lambda m: [list(m.used.parameters()), list(m.unused.parameters())],
+            [1e-2, 1e-2],
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=re.escape(
+                "has no param group for 2 parameters its optimizer did not hold: "
+                "['unused.weight', 'unused.bias']"
+            ),
+        ):
+            manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=self.UNUSED)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            pytest.param(
+                lambda state: state["optimizer"]["state"].pop("unused.weight"),
+                id="whole_state_missing",
+            ),
+            pytest.param(
+                lambda state: state["optimizer"]["state"].update(
+                    renamed=state["optimizer"]["state"].pop("unused.weight")
+                ),
+                id="state_key_renamed",
+            ),
+        ],
+    )
+    def test_a_parameter_the_saved_optimizer_held_without_state_still_fails(self, tmp_path, mutate):
+        """The saved groups list it, so its state went missing; naming it does not let it
+        resume without state."""
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict,
+            get_optimizer_state_dict,
+        )
+
+        model, optimizer, _ = self._build(0, tmp_path)
+        self._step(model, optimizer, 1, both=True)
+        saved = {
+            "model": get_model_state_dict(model),
+            "optimizer": get_optimizer_state_dict(model, optimizer),
+        }
+        mutate(saved)
+        dcp.save(saved, checkpoint_id=str(tmp_path / "step_1"))
+        torch.save(build_train_state(step=1, tokens_seen=0), tmp_path / "step_1" / "train_state.pt")
+
+        _, _, manager2 = self._build(1, tmp_path)
+        with pytest.raises(
+            RuntimeError,
+            match=re.escape("for 1 parameters the saved optimizer held: ['unused.weight']"),
+        ):
+            manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=["unused.weight"])
+
+    def test_never_stepped_and_left_out_parameters_resume_together(self, tmp_path):
+        """``extra`` was held but never stepped, ``unused`` was left out: both resume without
+        state, ``used`` with its saved state."""
+        model, optimizer, manager = self._build(
+            0, tmp_path, model_cls=_WithExtra, freeze_unused=True
+        )
+        self._step(model, optimizer, 1)
+        manager.save(step=1)
+
+        model2, optimizer2, manager2 = self._build(1, tmp_path, model_cls=_WithExtra)
+        manager2.load(path=str(tmp_path / "step_1"), fresh_if_unheld=self.UNUSED)
+        self._assert_same_run(model, optimizer, model2, optimizer2)
+        assert [len(g["params"]) for g in optimizer2.param_groups] == [6]
 
 
 class TestMuonResume:
@@ -3395,6 +3747,16 @@ class TestMuonResume:
         self._train(model2, opt2, batches[3:])
         for (name, ref), p in zip(ref_model.named_parameters(), model2.parameters(), strict=True):
             assert torch.equal(ref, p), f"{name} diverged from the uninterrupted run"
+
+    def test_saved_inner_groups_show_by_settings_only_the_inner_groups_have(self):
+        """Muon's own settings do not mark an inner group, AdamW's do, whatever the count."""
+        from kempnerforge.checkpoint.manager import _saved_inner_groups
+
+        _, opt = self._build(seed=0)
+        own = {f"optimizer.param_groups.{i}.ns_steps" for i in range(2)}
+        assert not _saved_inner_groups(own, opt, [opt._adam])
+        assert _saved_inner_groups(own | {"optimizer.param_groups.1.betas"}, opt, [opt._adam])
+        assert not _saved_inner_groups({"optimizer.state.w.exp_avg"}, opt, [opt._adam])
 
     def test_checkpoint_without_inner_state_resumes_muon_and_warns(self, tmp_path):
         """A checkpoint without the inner AdamW resumes Muon alone and warns."""
@@ -3674,8 +4036,351 @@ class TestMuonResume:
         assert groups == {("local", False, "original")}
         self._assert_same_state(opt, opt2, "Muon")
 
+    LEFT_OUT = ("token_embedding.embedding.weight", "output_head.proj.weight")
+
+    def _build_without_the_embeddings(self, seed):
+        """A model whose token embedding and output head do not train, and its Muon."""
+        torch.manual_seed(seed)
+        model = Transformer(self.MODEL_CONFIG).to(self.DEVICE)
+        for name, param in model.named_parameters():
+            param.requires_grad_(name not in self.LEFT_OUT)
+        return model, build_optimizer(model, OptimizerConfig(name="muon", lr=1e-3, fused=False))
+
+    def test_a_checkpoint_without_the_inner_group_of_an_unfrozen_module_resumes(self, tmp_path):
+        """A checkpoint whose inner AdamW kept no group for left-out parameters resumes.
+
+        The save left out the embedding and head, so the checkpoint holds one group fewer.
+        They resume in their group as built, without state, and every other parameter with
+        its saved state.
+        """
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build_without_the_embeddings(seed=0)
+        self._train(model, opt, self._batches(2))
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=2)
+        assert [len(g["params"]) for g in opt._adam.param_groups] == [5]
+
+        model2, opt2 = self._build(seed=1)
+        built = [
+            {k: v for k, v in g.items() if k not in ("params", "lr")}
+            for g in opt2._adam.param_groups
+        ]
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2).load(
+            path=str(tmp_path / "step_2"), fresh_if_unheld=self.LEFT_OUT
+        )
+        self._assert_same_state(opt, opt2, "Muon")
+        self._assert_same_state(opt._adam, opt2._adam, "inner AdamW")
+        assert [len(g["params"]) for g in opt2._adam.param_groups] == [2, 5]
+        kept = {k: v for k, v in opt2._adam.param_groups[0].items() if k not in ("params", "lr")}
+        assert kept == built[0]
+        left_out = dict(model2.named_parameters())
+        assert not any(opt2._adam.state.get(left_out[name]) for name in self.LEFT_OUT)
+
+        before = {name: left_out[name].detach().clone() for name in self.LEFT_OUT}
+        self._train(model2, opt2, self._batches(1))
+        assert [g["lr"] for g in opt2._adam.param_groups] == [1e-3, 1e-3]
+        for name in self.LEFT_OUT:
+            assert opt2._adam.state[left_out[name]]["step"].item() == 1
+            assert not torch.equal(before[name], left_out[name]), f"{name} did not train"
+
+    def test_a_checkpoint_with_fewer_groups_for_other_parameters_names_the_way_out(self, tmp_path):
+        """A group mismatch the left-out names do not explain names the way out.
+
+        The missing group holds parameters the load was not told to resume fresh, so the
+        groups cannot be matched; the error says how to continue from the weights.
+        """
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build_without_the_embeddings(seed=0)
+        self._train(model, opt, self._batches(2))
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, opt).save(step=2)
+
+        model2, opt2 = self._build(seed=1)
+        manager2 = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2)
+        way_out = (
+            r'holds 2 optimizer param groups and the optimizer being loaded has 3.*\["optimizer"\]'
+        )
+        with pytest.raises(RuntimeError, match=way_out):
+            manager2.load(path=str(tmp_path / "step_2"))
+
+    def test_a_checkpoint_that_lists_left_out_names_without_their_state_still_fails(self, tmp_path):
+        """Fewer saved groups do not excuse missing state for names a saved group lists.
+
+        The saved inner groups are merged into one that still lists the embedding and head,
+        whose state is gone, so the save held them and their state went missing.
+        """
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict,
+            get_optimizer_state_dict,
+        )
+
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model, opt = self._build(seed=0)
+        self._train(model, opt, self._batches(2))
+        optim_state = get_optimizer_state_dict(model, [opt, opt._adam])
+        muon_group, embeddings, norms = optim_state["param_groups"]
+        optim_state["param_groups"] = [
+            muon_group,
+            {**norms, "params": [*embeddings["params"], *norms["params"]]},
+        ]
+        for name in self.LEFT_OUT:
+            del optim_state["state"][name]
+        step_dir = tmp_path / "step_2"
+        dcp.save(
+            {"model": get_model_state_dict(model), "optimizer": optim_state},
+            checkpoint_id=str(step_dir),
+        )
+        torch.save(build_train_state(step=2, tokens_seen=0), step_dir / "train_state.pt")
+
+        model2, opt2 = self._build(seed=1)
+        manager2 = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, opt2)
+        held = re.escape(f"for 2 parameters the saved optimizer held: {sorted(self.LEFT_OUT)}")
+        with pytest.raises(RuntimeError, match=held):
+            manager2.load(path=str(step_dir), fresh_if_unheld=self.LEFT_OUT)
+
+    def test_a_group_of_the_fixed_optimizer_is_never_taken(self):
+        """A scheduler other than a LambdaLR restores its rates by position, so the optimizer
+        it drives keeps every group; nothing is taken when its group would be."""
+        from kempnerforge.checkpoint.manager import _take_groups_the_save_lacks
+
+        outer, inner = object(), object()
+        state = {"param_groups": [{"params": ["a"]}, {"params": ["b"]}]}
+        owners = [outer, inner]
+        assert _take_groups_the_save_lacks(state, owners, outer, {"a"}, 1) is None
+        assert state["param_groups"] == [{"params": ["a"]}, {"params": ["b"]}]
+        assert owners == [outer, inner]
+
+        taken = _take_groups_the_save_lacks(state, owners, outer, {"b"}, 1)
+        assert taken == [(1, {"params": ["b"]})]
+        assert state["param_groups"] == [{"params": ["a"]}]
+        assert owners == [outer]
+
+    def test_with_no_fixed_optimizer_any_left_out_group_is_taken(self):
+        """A LambdaLR's state is laid out for the groups the optimizer has, so the group of
+        the optimizer it drives is taken like any other."""
+        from kempnerforge.checkpoint.manager import _take_groups_the_save_lacks
+
+        outer, inner = object(), object()
+        state = {"param_groups": [{"params": ["a"]}, {"params": ["b"]}]}
+        owners = [outer, inner]
+        taken = _take_groups_the_save_lacks(state, owners, None, {"a"}, 1)
+        assert taken == [(0, {"params": ["a"]})]
+        assert state["param_groups"] == [{"params": ["b"]}]
+        assert owners == [inner]
+
+    def test_groups_the_left_out_names_do_not_explain_are_not_taken(self):
+        from kempnerforge.checkpoint.manager import _take_groups_the_save_lacks
+
+        outer = object()
+        state = {"param_groups": [{"params": ["a"]}, {"params": ["b"]}, {"params": ["c"]}]}
+        owners = [outer, outer, outer]
+        assert _take_groups_the_save_lacks(state, owners, None, {"a"}, 1) is None
+        assert len(state["param_groups"]) == 3
+        assert owners == [outer, outer, outer]
+
+    @staticmethod
+    def _three_groups(lambda_fn=None):
+        params = [torch.nn.Parameter(torch.zeros(1)) for _ in range(3)]
+        rates = (1e-3, 1e-4, 1e-3)
+        optimizer = torch.optim.SGD(
+            [{"params": [p], "lr": lr} for p, lr in zip(params, rates, strict=True)]
+        )
+        if lambda_fn is None:
+            return optimizer, torch.optim.lr_scheduler.StepLR(optimizer, step_size=2)
+        return optimizer, torch.optim.lr_scheduler.LambdaLR(optimizer, lambda_fn)
+
+    def test_a_taken_group_runs_at_its_scheduled_rate_scaled_as_the_saved_ones(self):
+        """It gets its base rate times the lambda at the restored step, times the phase scale
+        the saved groups carry."""
+        from kempnerforge.checkpoint.manager import _rate_taken_groups
+
+        optimizer, scheduler = self._three_groups(lambda step: 0.5 + step / 10)
+        for _ in range(4):
+            optimizer.step()
+            scheduler.step()
+        for group in optimizer.param_groups:
+            group["lr"] *= 0.5
+        expected = [g["lr"] for g in optimizer.param_groups]
+        optimizer.param_groups[1]["lr"] = 123.0
+        _rate_taken_groups(optimizer, scheduler, [1])
+        assert [g["lr"] for g in optimizer.param_groups] == expected
+
+    def test_a_taken_group_rests_while_the_schedule_is_at_zero(self):
+        from kempnerforge.checkpoint.manager import _rate_taken_groups
+
+        optimizer, scheduler = self._three_groups(lambda step: 0.0 if step == 0 else 1.0)
+        optimizer.param_groups[1]["lr"] = 123.0
+        _rate_taken_groups(optimizer, scheduler, [1])
+        assert optimizer.param_groups[1]["lr"] == 0.0
+
+    def test_a_scheduler_that_does_not_cover_every_group_is_refused(self):
+        """A group added after the scheduler was built has no base rate or lambda of its own."""
+        from kempnerforge.checkpoint.manager import _rate_taken_groups
+
+        optimizer, scheduler = self._three_groups(lambda step: 1.0)
+        optimizer.add_param_group({"params": [torch.nn.Parameter(torch.zeros(1))], "lr": 1e-3})
+        before = [g["lr"] for g in optimizer.param_groups]
+        with pytest.raises(ValueError, match="zip"):
+            _rate_taken_groups(optimizer, scheduler, [3])
+        assert [g["lr"] for g in optimizer.param_groups] == before
+
+    def test_a_scheduler_without_lambdas_leaves_the_taken_rates(self):
+        from kempnerforge.checkpoint.manager import _rate_taken_groups
+
+        optimizer, scheduler = self._three_groups()
+        optimizer.param_groups[1]["lr"] = 123.0
+        _rate_taken_groups(optimizer, scheduler, [1])
+        assert optimizer.param_groups[1]["lr"] == 123.0
+
 
 REGISTERED_OPTIMIZERS = sorted(registry.list("optimizer"))
+
+
+class TestOptimizerTypeChangeOnResume:
+    """A checkpoint saved with another optimizer fails to load, whichever has more state (#239)."""
+
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    CONFIG = ModelConfig(dim=64, n_layers=1, n_heads=2, vocab_size=256, max_seq_len=64)
+
+    def _resume(self, saved_with: str, resumed_with: str, tmp_path):
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        model = Transformer(self.CONFIG).to(self.DEVICE)
+        saver = build_optimizer(model, OptimizerConfig(name=saved_with, lr=1e-3, fused=False))
+        TestMuonResume._save_stepped(model, saver, tmp_path)
+        model2 = Transformer(self.CONFIG).to(self.DEVICE)
+        optimizer = build_optimizer(
+            model2, OptimizerConfig(name=resumed_with, lr=1e-4, fused=False)
+        )
+        return CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model2, optimizer)
+
+    def test_an_adamw_checkpoint_fails_to_load_into_a_lion_run(self, tmp_path):
+        manager = self._resume("adamw", "lion", tmp_path)
+        entries = "saved with ['exp_avg', 'exp_avg_sq', 'step'] and is now kept with ['exp_avg']"
+        with pytest.raises(RuntimeError, match="holds another optimizer's state") as raised:
+            manager.load()
+        assert entries in str(raised.value)
+        assert "exclude_from_loading" in str(raised.value)
+
+    def test_a_lion_checkpoint_fails_to_load_into_an_adamw_run(self, tmp_path):
+        """Lion keeps less state than AdamW, so its checkpoint is refused as partial state,
+        with the optimizer.name change named as a cause."""
+        manager = self._resume("lion", "adamw", tmp_path)
+        with pytest.raises(RuntimeError, match="holds partial optimizer state") as raised:
+            manager.load()
+        assert "optimizer.name changed since the save" in str(raised.value)
+        assert "exclude_from_loading" in str(raised.value)
+
+    def test_the_same_optimizer_resumes(self, tmp_path):
+        assert self._resume("adamw", "adamw", tmp_path).load()[0] == 1
+
+    @staticmethod
+    def _expert_rank(
+        rank: int | None, optimizer: str, amsgrad: tuple[int, ...] = (), lr: float = 1e-3
+    ):
+        """A one-layer MoE model of four experts, or EP rank ``rank`` of two holding two of them.
+
+        Only the experts train, under ``build_optimizer``'s ``optimizer``, or with ``amsgrad`` under
+        an AdamW of two groups at ``lr``: the experts of those global indices with amsgrad, the rest
+        without.
+        """
+        torch.manual_seed(4)
+        config = ModelConfig(
+            dim=16, n_layers=1, n_heads=2, vocab_size=32, max_seq_len=16, num_experts=4
+        )
+        model = Transformer(config)
+        start = 0 if rank is None else 2 * rank
+        if rank is not None:
+            moe = model.layers["0"].mlp
+            moe.experts = torch.nn.ModuleList(list(moe.experts)[start : start + 2])
+            moe.ep_world_size, moe.local_expert_start, moe.num_local_experts = 2, start, 2
+        for name, param in model.named_parameters():
+            param.requires_grad_(".experts." in name)
+        if not amsgrad:
+            options = OptimizerConfig(name=optimizer, lr=1e-3, fused=False)
+            return model, build_optimizer(model, options)
+        groups: tuple[list, list] = ([], [])
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                index = start + int(name.split(".experts.")[1].split(".")[0])
+                groups[index not in amsgrad].append(param)
+        return model, torch.optim.AdamW(
+            [{"params": groups[0], "amsgrad": True}, {"params": groups[1]}], lr=lr
+        )
+
+    def test_each_expert_is_compared_with_its_own_saved_state_under_ep(self, tmp_path):
+        """Rank 1's local experts 0 and 1 resume the saved experts 2 and 3.
+
+        Their state, their groups' settings, and the update the next step makes all match the
+        saving run's, although the resumed optimizer was built with another learning rate.
+        """
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        source, saver = self._expert_rank(None, "adamw", amsgrad=(0, 3))
+        TestMuonResume._save_stepped(source, saver, tmp_path)
+        model, optimizer = self._expert_rank(1, "adamw", amsgrad=(0, 3), lr=5e-2)
+        assert (
+            CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer).load()[0] == 1
+        )
+
+        def settings(opt: torch.optim.Optimizer) -> list[dict]:
+            return [{k: v for k, v in group.items() if k != "params"} for group in opt.param_groups]
+
+        assert settings(optimizer) == settings(saver)
+        saved = dict(source.named_parameters())
+        held = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                local = int(name.split(".experts.")[1].split(".")[0])
+                held[name] = saved[name.replace(f".experts.{local}.", f".experts.{local + 2}.")]
+                _assert_same_state_dict(saver.state[held[name]], optimizer.state[param], name)
+                assert torch.equal(param, held[name]), name
+                param.grad = torch.randn_like(param)
+                held[name].grad = param.grad.clone()
+        optimizer.step()
+        saver.step()
+        for name, param in model.named_parameters():
+            if name in held:
+                assert torch.equal(param, held[name]), f"{name} took another update"
+
+    def test_an_adamw_expert_state_fails_to_load_into_a_lion_ep_rank(self, tmp_path):
+        """Only experts 2 and 3 were stepped, so only rank 1's experts hold the AdamW state."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+
+        source, saver = self._expert_rank(None, "adamw")
+        for name, param in source.named_parameters():
+            if ".experts.2." in name or ".experts.3." in name:
+                param.grad = torch.randn_like(param)
+        saver.step()
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), source, saver).save(step=1)
+        model, optimizer = self._expert_rank(1, "lion")
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        with pytest.raises(RuntimeError, match=r"holds another optimizer's state.*experts\.2\."):
+            manager.load()
+
+    def test_another_or_a_partial_state_is_refused(self):
+        """A frozen parameter keeps no state, so it is not compared; a state with entries the
+        optimizer does not keep is refused as another optimizer's, and one short of entries
+        as partial."""
+        from kempnerforge.checkpoint.manager import _check_saved_state_matches
+
+        adamw, lion = ("exp_avg", "exp_avg_sq", "step"), ("exp_avg",)
+
+        def check(kept: tuple, saved: tuple) -> None:
+            optim_state = {"state": {"frozen": {}, "w": dict.fromkeys(kept, 0)}}
+            keys = [f"optimizer.state.{fqn}.{entry}" for fqn in ("frozen", "w") for entry in saved]
+            _check_saved_state_matches(optim_state, keys, Path("ckpt"))
+
+        check(kept=adamw, saved=adamw)
+        with pytest.raises(
+            RuntimeError, match=re.escape("holds partial optimizer state for 1 parameters: ['w']")
+        ):
+            check(kept=adamw, saved=lion)
+        with pytest.raises(
+            RuntimeError, match=re.escape("holds another optimizer's state for 1 parameters: ['w']")
+        ):
+            check(kept=lion, saved=adamw)
 
 
 class TestSaveBeforeFirstStep:
@@ -3952,32 +4657,14 @@ class TestResumeWithoutTrainState:
         assert not missing_train_state(path)
 
 
-def _free_port() -> int:
-    """An unused local TCP port for a gloo rendezvous."""
-    import socket
-
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _load_with_a_stale_view(rank: int, world: int, port: int, ckpt_dir: str, stale: int) -> None:
     """Save on every rank, then load while rank ``stale`` cannot see ``train_state.pt``."""
     from datetime import timedelta
     from unittest.mock import patch
 
-    import torch.distributed as dist
-
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         torch.manual_seed(0)
         model = torch.nn.Linear(4, 4)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -3997,8 +4684,6 @@ def _load_with_a_stale_view(rank: int, world: int, port: int, ckpt_dir: str, sta
                     manager.load()
             else:
                 assert manager.load() == (3, 30, {})
-    finally:
-        dist.destroy_process_group()
 
 
 class TestResumeWithoutTrainStateAcrossRanks:
@@ -4007,9 +4692,7 @@ class TestResumeWithoutTrainStateAcrossRanks:
     @pytest.mark.parametrize("stale", [0, 1], ids=["rank_0_sees_none", "rank_1_sees_none"])
     def test_every_rank_follows_rank_zero(self, tmp_path, stale):
         """No rank raises alone and leaves the others waiting in a collective."""
-        import torch.multiprocessing as mp
-
-        mp.spawn(_load_with_a_stale_view, args=(2, _free_port(), str(tmp_path), stale), nprocs=2)
+        spawn(_load_with_a_stale_view, 2, str(tmp_path), stale)
 
 
 class _Unprintable(Exception):
@@ -4033,14 +4716,7 @@ def _load_an_unreadable_train_state(
     from kempnerforge.checkpoint import manager as mgr_mod
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=60),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=60)):
         torch.manual_seed(0)
         model = torch.nn.Linear(4, 4)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -4077,8 +4753,6 @@ def _load_an_unreadable_train_state(
         ):
             manager.load()
         assert time.monotonic() - start < 20
-    finally:
-        dist.destroy_process_group()
 
 
 class TestUnreadableTrainStateAcrossRanks:
@@ -4087,11 +4761,7 @@ class TestUnreadableTrainStateAcrossRanks:
     @pytest.mark.parametrize("how", ["torn", "foreign", "unprintable"])
     def test_every_rank_raises_rank_zeros_error(self, tmp_path, how):
         """Rank 0 raises its own error; rank 1 names it, instead of waiting for the timeout."""
-        import torch.multiprocessing as mp
-
-        mp.spawn(
-            _load_an_unreadable_train_state, args=(2, _free_port(), str(tmp_path), how), nprocs=2
-        )
+        spawn(_load_an_unreadable_train_state, 2, str(tmp_path), how)
 
 
 def _refuse_on_one_stage(
@@ -4104,14 +4774,7 @@ def _refuse_on_one_stage(
 
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         stages = [dist.new_group([r]) for r in range(world)]
 
         def manager(optimizer_name: str) -> tuple[torch.nn.Module, CheckpointManager]:
@@ -4146,8 +4809,6 @@ def _refuse_on_one_stage(
         with pytest.raises(RuntimeError, match=expected):
             loader.load()
         assert torch.equal(model.weight, before), "a refused load changed the model"
-    finally:
-        dist.destroy_process_group()
 
 
 def _resume_with_a_torn_stage(rank: int, world: int, port: int, ckpt_dir: str, case: str) -> None:
@@ -4169,14 +4830,7 @@ def _resume_with_a_torn_stage(rank: int, world: int, port: int, ckpt_dir: str, c
 
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         stages = [dist.new_group([r]) for r in range(world)]
 
         def manager() -> tuple[torch.nn.Module, CheckpointManager]:
@@ -4239,8 +4893,6 @@ def _resume_with_a_torn_stage(rank: int, world: int, port: int, ckpt_dir: str, c
         }.get(case, (10, 100, at_10))
         assert (step, tokens) == expected[:2], f"rank {rank} resumed step {step}"
         assert torch.equal(model.weight, expected[2]), f"rank {rank} loaded another step's weights"
-    finally:
-        dist.destroy_process_group()
 
 
 class TestTornStageAcrossRanks:
@@ -4259,9 +4911,7 @@ class TestTornStageAcrossRanks:
     )
     def test_every_stage_resumes_the_same_step(self, tmp_path, case):
         """No stage loads a step another stage does not, whatever its own view."""
-        import torch.multiprocessing as mp
-
-        mp.spawn(_resume_with_a_torn_stage, args=(2, _free_port(), str(tmp_path), case), nprocs=2)
+        spawn(_resume_with_a_torn_stage, 2, str(tmp_path), case)
 
 
 def _load_with_a_blind_rank(rank: int, world: int, port: int, ckpt_dir: str, case: str) -> None:
@@ -4273,14 +4923,7 @@ def _load_with_a_blind_rank(rank: int, world: int, port: int, ckpt_dir: str, cas
 
     from kempnerforge.checkpoint.manager import CheckpointManager
 
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
         torch.manual_seed(0)
         model = torch.nn.Linear(4, 4)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -4313,8 +4956,6 @@ def _load_with_a_blind_rank(rank: int, world: int, port: int, ckpt_dir: str, cas
         expected = (0, 0) if case == "weights_only" else (5, 50)
         assert (step, tokens) == expected, f"rank {rank} loaded step {step}"
         assert torch.equal(model.weight, saved), f"rank {rank} did not load the saved weights"
-    finally:
-        dist.destroy_process_group()
 
 
 class TestBlindRankLoadsWhatRankZeroResolves:
@@ -4323,9 +4964,7 @@ class TestBlindRankLoadsWhatRankZeroResolves:
 
     @pytest.mark.parametrize("case", ["warm_start", "weights_only", "named_path", "bare_latest"])
     def test_every_rank_loads_the_checkpoint(self, tmp_path, case):
-        import torch.multiprocessing as mp
-
-        mp.spawn(_load_with_a_blind_rank, args=(2, _free_port(), str(tmp_path), case), nprocs=2)
+        spawn(_load_with_a_blind_rank, 2, str(tmp_path), case)
 
 
 class TestOptimizerChecksAcrossStages:
@@ -4335,10 +4974,57 @@ class TestOptimizerChecksAcrossStages:
     @pytest.mark.parametrize("refusing", [0, 1], ids=["stage_0_refuses", "stage_1_refuses"])
     def test_every_rank_refuses_when_one_stage_does(self, tmp_path, refusing, scope):
         """No rank goes on to load while another has refused, whatever the manager records."""
-        import torch.multiprocessing as mp
+        spawn(_refuse_on_one_stage, 2, str(tmp_path), refusing, scope)
 
-        args = (2, _free_port(), str(tmp_path), refusing, scope)
-        mp.spawn(_refuse_on_one_stage, args=args, nprocs=2)
+    def test_a_stage_without_saved_optimizer_state_resumes_with_the_others(self, tmp_path):
+        """A stage whose checkpoint holds no optimizer state still meets the other stages."""
+        spawn(_resume_with_one_stage_unstepped, 2, str(tmp_path))
+
+
+def _resume_with_one_stage_unstepped(rank: int, world: int, port: int, ckpt_dir: str) -> None:
+    """Save stage 0 after a step and stage 1 before any, then resume both stages.
+
+    Stage 1's checkpoint holds no optimizer state, so only stage 0 restores any; both stages
+    must still meet in the load's agreements and return the saved step and state.
+    """
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from kempnerforge.checkpoint.manager import CheckpointManager
+
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=30)):
+        stages = [dist.new_group([r]) for r in range(world)]
+
+        def manager(seed: int, step: bool):
+            torch.manual_seed(seed)
+            model = torch.nn.Linear(4, 4)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            if step:
+                model(torch.ones(2, 4)).sum().backward()
+                optimizer.step()
+                optimizer.zero_grad()
+            config = CheckpointConfig(dir=ckpt_dir)
+            return (
+                model,
+                optimizer,
+                CheckpointManager(
+                    config, model, optimizer, process_group=stages[rank], pp_rank=rank
+                ),
+            )
+
+        model, optimizer, saver = manager(seed=rank, step=rank == 0)
+        saver.save(step=3)
+        resumed, resumed_optimizer, loader = manager(seed=rank + 2, step=False)
+        step, _, _ = loader.load()
+        assert step == 3
+        assert torch.equal(resumed.weight, model.weight)
+        if rank == 0:
+            _assert_same_state_dict(
+                optimizer.state_dict()["state"], resumed_optimizer.state_dict()["state"]
+            )
+        else:
+            assert not resumed_optimizer.state
 
 
 def _assert_same_state_dict(expected, actual, where="state_dict"):
@@ -4542,9 +5228,8 @@ class TestScheduleFreeCheckpoint:
 
 class TestComponentSwapOnResume:
     def test_resume_into_a_different_component_is_rejected(self, tmp_path):
-        """The `plugins` list is not recorded in the checkpoint, so a resume
-        that builds a different component must fail the load rather than train
-        on a silently mismatched model."""
+        """A resume that builds a component with other parameter names fails the load
+        rather than training a mismatched model."""
         import pytest
         from torch.distributed.checkpoint.api import CheckpointException
 
@@ -4561,6 +5246,72 @@ class TestComponentSwapOnResume:
         opt2 = build_optimizer(resumed, OptimizerConfig(lr=1e-3, fused=False))
         with pytest.raises(CheckpointException, match="Missing key in checkpoint"):
             CheckpointManager(CheckpointConfig(dir=ckpt_dir), resumed, opt2).load()
+
+    def test_resume_into_a_subset_component_is_refused_by_the_plugins_list(
+        self, tmp_path, monkeypatch
+    ):
+        """A component whose parameter names are a subset of the saved ones loads silently,
+        so a resume with another plugins list is refused (#180)."""
+        import pytest
+
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.schema import JobConfig
+
+        class Big(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj1 = torch.nn.Linear(8, 8)
+                self.proj2 = torch.nn.Linear(8, 4)
+
+        class Small(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj1 = torch.nn.Linear(8, 8)
+
+        config = JobConfig(checkpoint=CheckpointConfig(dir=str(tmp_path / "ckpt")))
+        big = Big()
+        manager = CheckpointManager(config.checkpoint, big, torch.optim.AdamW(big.parameters()))
+        manager.save(step=7, extra={"plugins": ["pkg.big_components"]})
+        manager.wait()
+
+        small = Small()
+        resumed = CheckpointManager(config.checkpoint, small, torch.optim.AdamW(small.parameters()))
+        assert resumed.load()[0] == 7
+        with pytest.raises(ValueError, match="saved with plugins"):
+            entry.restore_checkpoint(config, small, None, resumed)
+        config.plugins = ["pkg.big_components"]
+        assert entry.restore_checkpoint(config, small, None, resumed) == (7, 0)
+
+    def test_resume_into_a_superset_component_is_refused_before_dcp_reads_it(self, tmp_path):
+        """DCP fails on a parameter the checkpoint lacks, so the plugins list is compared
+        first and the refusal names the lists instead of a missing key."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.schema import JobConfig
+
+        class Big(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj1 = torch.nn.Linear(8, 8)
+                self.proj2 = torch.nn.Linear(8, 4)
+
+        class Small(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj1 = torch.nn.Linear(8, 8)
+
+        config = JobConfig(checkpoint=CheckpointConfig(dir=str(tmp_path / "ckpt")))
+        small = Small()
+        manager = CheckpointManager(config.checkpoint, small, torch.optim.AdamW(small.parameters()))
+        manager.save(step=7, extra={"plugins": []})
+        manager.wait()
+
+        big = Big()
+        resumed = CheckpointManager(config.checkpoint, big, torch.optim.AdamW(big.parameters()))
+        config.plugins = ["pkg.big_components"]
+        with pytest.raises(ValueError, match=r"saved with plugins = \[\], but this run sets"):
+            entry.restore_checkpoint(config, big, None, resumed)
 
 
 WEIGHT_DECAY = 0.5

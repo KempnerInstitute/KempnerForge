@@ -193,7 +193,7 @@ def _save_profiler_summary(stats: dict, prof: torch.profiler.profile, trace_dir:
         cuda_us = evt.self_device_time_total
         pct = 100 * cuda_us / max(stats["total_cuda_time_us"], 1)
         calls = evt.count
-        flops_str = f"{evt.flops / 1e9:.1f}" if evt.flops else "—"
+        flops_str = f"{evt.flops / 1e9:.1f}" if evt.flops else "-"
         if len(name) > 60:
             name = name[:57] + "..."
         kernel_rows.append(f"| {name} | {cuda_us / 1e3:.1f} | {pct:.1f} | {calls} | {flops_str} |")

@@ -93,6 +93,13 @@ The residual stream's visual tokens (`max_frames` × tokens per frame; none for
 config check enforces this when `vision_encoder.num_tokens` is set, and the model
 build does when the encoder infers it.
 
+From `[data]`, a video run reads `tokenizer_path` and the loader settings
+(`num_workers`, `pin_memory`, `prefetch_factor`). The Hugging Face fields there
+(`hf_dataset_name`, `hf_dataset_split`, `hf_image_size`, ...) belong to the
+text and image Hugging Face paths: `JobConfig.validate` refuses one set away from its default and names the
+`[video]` field to set instead, such as `video.split` or `video.frame_size`; see
+[Validation rules](../configuration/validation-rules.md#video-and-the-data-hugging-face-fields).
+
 The dataset side is **pluggable**: `dataset_type` selects a builder from the
 `video_dataset` registry (`"webvid"` ships; other styles — HuggingFace video
 sets, flat folders, alternate manifests — register as small follow-ups and are

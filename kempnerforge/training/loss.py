@@ -137,8 +137,9 @@ def chunked_cross_entropy_loss(
 
     Uses ``ignore_index=-100`` so packed-sequence boundary tokens are excluded.
     When no -100 labels are present, this has zero overhead. A batch with every
-    label ``-100`` returns an exact float32 zero that stays on the autograd graph
-    of ``logits``.
+    label ``-100``, or with no rows at all (``(0, vocab)`` or ``(batch, 0, vocab)``
+    logits, as a packed micro-batch with no text gives), returns an exact float32
+    zero that stays on the autograd graph of ``logits``.
 
     Note: the input logit tensor (B*S, V) is still fully materialized by the
     model's output head before reaching this function. For deeper savings
@@ -154,9 +155,9 @@ def chunked_cross_entropy_loss(
     """
     if fp32:
         return _fp32_cross_entropy(logits, labels, chunk_size)
-    num_tokens = logits.shape[0] * logits.shape[1] if logits.ndim == 3 else logits.shape[0]
-    flat_logits = logits.view(num_tokens, -1)
+    flat_logits = logits.view(-1, logits.shape[-1])
     flat_labels = labels.view(-1)
+    num_tokens = flat_logits.shape[0]
 
     if (flat_labels == -100).all():
         return _zero_on_graph(flat_logits)

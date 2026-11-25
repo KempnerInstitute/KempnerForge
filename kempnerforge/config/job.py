@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 from kempnerforge.config.adapter import AdapterConfig
 from kempnerforge.config.checkpoint import CheckpointConfig
@@ -20,6 +20,22 @@ from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import MoMaConfig, MoTConfig, VLMConfig
 
 _HF_VISION_ENCODER_TYPES = frozenset({"siglip2", "clip"})
+
+_VIDEO_INSTEAD_OF_DATA_HF_FIELDS = {
+    "hf_dataset_name": "set video.data_root and video.dataset_name instead",
+    "hf_dataset_config": "no [video] counterpart",
+    "hf_dataset_split": "set video.split instead",
+    "hf_dataset_text_field": "no [video] counterpart",
+    "hf_dataset_image_field": "no [video] counterpart",
+    "hf_dataset_prompt_field": "set video.prompt instead, one instruction for every clip",
+    "hf_image_size": "set video.frame_size instead",
+    "hf_streaming": "no [video] counterpart",
+}
+
+
+def _set_away_from_default(value: object, default: object) -> bool:
+    """Whether ``value`` departs from ``default``; ``""`` is unset where the default is ``None``."""
+    return bool(value) if default is None else value != default
 
 
 def _arch_of(vlm: VLMConfig) -> str:
@@ -66,7 +82,10 @@ class JobConfig:
         ``validate(world_size)`` covers checks that depend on the
         distributed world size; everything that is decidable from the
         config alone runs here so loader-time mistakes surface before
-        any distributed init.
+        any distributed init. A check of a field that a TOML may leave to
+        a command-line override, such as ``vision_encoder.path``, runs in
+        ``validate`` instead: this also runs on the TOML layer alone, before
+        the overrides land (#526).
         """
         if not isinstance(self.plugins, list) or not all(isinstance(p, str) for p in self.plugins):
             raise ValueError(f"plugins must be a list of module paths (got {self.plugins!r})")
@@ -123,7 +142,8 @@ class JobConfig:
                 logging.getLogger(__name__).warning(
                     "vision_encoder.type=%r is HF-backed and probes its own dims; "
                     "setting %s overrides the probe and may desync from the loaded "
-                    "model. Leave both at 0 to use the probed values.",
+                    "model. Leave both at 0 to use the probed values; feature_dim is "
+                    "needed only for a model whose config has no hidden_size.",
                     self.vision_encoder.type,
                     " and ".join(overrides),
                 )
@@ -367,21 +387,6 @@ class JobConfig:
                 "the first backward would fail. Change batch_size or seq_len, or train in bf16."
             )
 
-        if (
-            self.model.is_moe
-            and self.model.moe_router == "sigmoid_topk"
-            and self.train.activation_checkpointing == "full"
-        ):
-            raise ValueError(
-                "model.moe_router = 'sigmoid_topk' does not support "
-                "train.activation_checkpointing = 'full': the sigmoid router updates its expert "
-                "bias in place in every training forward, so the backward's replay of a "
-                "checkpointed block routes with a moved bias, can pick other experts than the "
-                "forward did, and then raises CheckpointError. Use activation_checkpointing = "
-                "'selective', which checkpoints attention only and leaves the MoE layers out "
-                "of the replay."
-            )
-
         if self.model.is_moe and self.distributed.pp > 1:
             alternatives = (
                 "Use FSDP instead; MoT runs neither TP nor EP."
@@ -422,6 +427,34 @@ class JobConfig:
         if self.is_vlm:
             assert self.vlm is not None
             assert self.vision_encoder is not None
+            if (
+                self.vision_encoder.type in _HF_VISION_ENCODER_TYPES
+                and not self.vision_encoder.path
+            ):
+                raise ValueError(
+                    f"vision_encoder.type = {self.vision_encoder.type!r} loads a pretrained "
+                    "Hugging Face model, but vision_encoder.path is empty; set "
+                    "vision_encoder.path to the model's Hub id or local directory"
+                )
+            if self.video is not None:
+                defaults = {f.name: f.default for f in fields(DataConfig)}
+                unread = [
+                    name
+                    for name in _VIDEO_INSTEAD_OF_DATA_HF_FIELDS
+                    if _set_away_from_default(getattr(self.data, name), defaults[name])
+                ]
+                if unread:
+                    settings = "; ".join(
+                        f"data.{name} = {getattr(self.data, name)!r} "
+                        f"({_VIDEO_INSTEAD_OF_DATA_HF_FIELDS[name]})"
+                        for name in unread
+                    )
+                    reset = ", ".join(f"{name} = {defaults[name]!r}" for name in unread)
+                    raise ValueError(
+                        "[video] is set, so the dataset comes from [video] and these [data] "
+                        f"fields would be ignored: {settings}. Leave them at their defaults "
+                        f"({reset})."
+                    )
             if self.vision_encoder.num_tokens > 0:
                 assert self.adapter is not None
                 per_frame = self.adapter.output_num_tokens(self.vision_encoder.num_tokens)

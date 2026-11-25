@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 import torch.distributed.checkpoint as dcp
 
+from kempnerforge.checkpoint.manager import derive_buffers, drop_derived_model_keys
 from kempnerforge.config.job import JobConfig
 from kempnerforge.model.vlm import VLMWrapper, build_vlm_wrapper
 from kempnerforge.resilience.elastic import resolve_resume_path
@@ -115,7 +116,9 @@ def load_model(config: JobConfig, step_dir: Path, device: torch.device) -> VLMWr
     ``train.mixed_precision``. The image encoder computes in
     ``vision_encoder.mixed_precision`` when that is set and otherwise in the
     dtype it loads in, which is how a training build on one device leaves it.
-    The calling process loads the whole model, whatever saved it.
+    The calling process loads the whole model, whatever saved it. A checkpoint that
+    predates a derived buffer, such as the sigmoid router's FP32 masters, loads with
+    the buffer derived from the loaded state (see ``drop_derived_model_keys``).
     """
     vision, adapter, vlm = config.vision_encoder, config.adapter, config.vlm
     assert vision is not None and adapter is not None and vlm is not None
@@ -128,6 +131,8 @@ def load_model(config: JobConfig, step_dir: Path, device: torch.device) -> VLMWr
     if vision.compute_dtype is not None:
         model.vision_encoder.to(dtype=vision.compute_dtype)
     state = {"model": model.state_dict()}
+    saved = dcp.FileSystemReader(str(step_dir)).read_metadata().state_dict_metadata
+    derived = drop_derived_model_keys(state["model"], model, saved)
     try:
         dcp.load(state, checkpoint_id=str(step_dir), no_dist=True)
     except dcp.CheckpointException as exc:
@@ -135,4 +140,5 @@ def load_model(config: JobConfig, step_dir: Path, device: torch.device) -> VLMWr
         raise RuntimeError(
             f"{step_dir} does not load into the model this config builds: {causes}"
         ) from exc
+    derive_buffers(model, derived)
     return model.eval()

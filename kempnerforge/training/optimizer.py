@@ -397,14 +397,23 @@ class Muon(torch.optim.Optimizer):
     For the rest (embeddings, the output head, norms, biases): uses
     standard AdamW.
 
-    FSDP2 note: Newton-Schulz operates on each rank's local shard
-    independently — an approximation, not mathematically equivalent to
-    orthogonalizing the full weight matrix. This is the standard approach
-    for distributed Muon and works well in practice.
+    FSDP2 note: with ``orthogonalize="local"``, the default, Newton-Schulz
+    runs on each rank's shard of a weight on its own. That approximates the
+    full-matrix update, and the gap changes with the shard count and the
+    matrix. Split by rows into 2, 4 and 8 shards, as FSDP2 splits a weight,
+    1024x512, 512x1024 and 1024x1024 Gaussian matrices get local updates with
+    a cosine similarity of 0.84 to 0.94 to the full-matrix update and 0.80 to
+    1.05 times its RMS. With singular values that fall geometrically over
+    three decades, the cosine similarity drops to 0.62 to 0.91, at 0.97 to
+    1.21 times the RMS. ``orthogonalize="exact"`` gives the full-matrix update.
 
     The AdamW fallback follows Muon's schedule: each step sets every AdamW
     group's rate to its base rate, its own ``lr`` or else ``adam_lr``, times
     the ratio of Muon's first group's current rate to that group's base rate.
+    Without ``adam_lr`` the fallback's base rates are Muon's, and that group's
+    base rate is the one it was built with. With ``adam_lr`` it is the peak a
+    scheduler runs the group from, its ``initial_lr``, when one set it, so a
+    load that restores a schedule saved under another ``lr`` keeps ``adam_lr``.
 
     Args:
         muon_params: Parameter groups for Muon (the hidden ``nn.Linear`` weights).
@@ -450,6 +459,7 @@ class Muon(torch.optim.Optimizer):
             raise ValueError(
                 f"orthogonalize must be one of {MUON_ORTHOGONALIZE_MODES}, got {orthogonalize!r}"
             )
+        self._adam_lr_given = adam_lr is not None
         adam_lr = adam_lr if adam_lr is not None else lr
         self._initial_lr = lr
         self._initial_adam_lr = adam_lr
@@ -568,7 +578,7 @@ class Muon(torch.optim.Optimizer):
                 buf_local.mul_(momentum).add_(g_local)
                 inputs.append(g_local.add(buf_local, alpha=momentum) if nesterov else buf_local)
 
-            matrices = [x.view(x.shape[0], -1) for x in inputs]
+            matrices = [x.flatten(1) for x in inputs]
             newton_schulz = functools.partial(_orthogonalize_matrix, steps=ns_steps)
             if orthogonalize == "exact":
                 orthos = orthogonalize_exact(params, matrices, newton_schulz)
@@ -598,9 +608,16 @@ class Muon(torch.optim.Optimizer):
         return loss
 
     def _fallback_lrs(self) -> list[float]:
-        """The rate each AdamW fallback group steps at, from Muon's current schedule."""
+        """The rate each AdamW fallback group steps at, from Muon's current schedule.
+
+        With ``adam_lr`` given, the schedule's factor is taken from the peak a scheduler runs
+        Muon's first group from, its ``initial_lr``, which ``restore_train_state`` sets to the
+        restored peak, not from the rate this optimizer was built with.
+        """
         assert self._adam is not None
         lead_lr = self._initial_lr if self._lead_group_lr is None else self._lead_group_lr
+        if self._adam_lr_given:
+            lead_lr = self.param_groups[0].get("initial_lr", lead_lr)
         if lead_lr <= 0:
             return [group["lr"] for group in self._adam.param_groups]
         scale = self.param_groups[0]["lr"] / lead_lr

@@ -1,9 +1,11 @@
 # NaN detection
 
 [`NaNDetector`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/health.py)
-watches for NaN / Inf in the loss and the gradient norm every step. When it fires, the
-training loop zeros gradients, skips the optimizer step, and increments
-a consecutive-NaN counter. The skipped step still counts as a step (see
+watches for NaN / Inf in the loss and the gradient norm every step. When it fires
+with the default `nan_action`, the training loop zeros gradients, skips the
+optimizer step, and increments a consecutive-NaN counter; `"raise"` stops the
+run instead (see [Three actions](#three-actions)). The skipped step still
+counts as a step (see
 [What a skipped step still does](#what-a-skipped-step-still-does)). If
 too many consecutive NaNs pile up, the loop stops so a human can roll
 back to an earlier checkpoint.
@@ -12,13 +14,15 @@ back to an earlier checkpoint.
 
 ```python
 # training/entry.py::run_training
-nan_detector = NaNDetector(action="warn", max_consecutive=10)
+nan_detector = NaNDetector(
+    action=config.train.nan_action, max_consecutive=config.train.nan_max_consecutive
+)
 ...
 # Inside the training loop, after backward:
 if not nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
     optimizer.zero_grad()
-    if nan_detector.should_rollback:
-        logger.error("Too many consecutive NaNs — stopping")
+    if nan_detector.rollback_recommended:    # stops without a checkpoint; no rollback
+        logger.error(f"Too many consecutive NaNs at step {step}: stopping ...")
         break
     _advance_lr_schedule(session)            # scheduler.step(), then the phase lr_scale
     step += 1
@@ -30,20 +34,29 @@ if not nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
     continue
 ```
 
-Two things to note:
+Three things to note:
 
-- **`action="warn"` and `max_consecutive=10` are hardcoded in
-  `training/entry.py`** — not exposed as TOML config. If you want
-  `"skip"` or `"raise"` behavior, edit the script or construct the
-  detector yourself.
+- **The action and the threshold come from `[train]`.** `nan_action`
+  (default `"warn"`, see [Three actions](#three-actions)) and
+  `nan_max_consecutive` (default `10`, see
+  [Rollback recommendation](#rollback-recommendation)):
+
+  ```toml
+  [train]
+  nan_action = "raise"         # fail fast on the first NaN / Inf step
+  # or keep "warn" and tolerate a longer run of them:
+  # nan_max_consecutive = 20
+  ```
 - **The gradient norm is checked with the loss.** A finite loss can come with
   non-finite gradients: a micro-batch whose labels are all `-100` has an exact
   zero cross-entropy loss whatever its activations, and without the norm check
   its NaN gradients would reach `optimizer.step()`. The norm goes into the same
   all-reduced flag as the loss, so every rank skips the step together even when
   a non-finite gradient reaches only some ranks' norms.
-- **`check_gradients` is *not* called by the training loop.** It returns a
-  rank-local verdict; the gradient norm check above covers non-finite gradients.
+- **`check_gradients` is *not* called by the training loop.** The gradient
+  norm check above covers non-finite gradients. Like `check_loss`, it is a
+  collective that gives every rank the same verdict (see
+  [Manual use](#manual-use)).
 
 ## What a skipped step still does
 
@@ -54,7 +67,7 @@ tick except the shutdown check are dropped:
 
 | Work | On a skipped step |
 |------|-------------------|
-| Optimizer update | Skipped. Gradients are zeroed; weights and optimizer state stay as they were, except that the sigmoid router updates its `expert_bias` and `expert_ema` during the forward pass, before the loss is checked. |
+| Optimizer update | Skipped. Gradients are zeroed and the sigmoid routers' expert counts dropped; weights, optimizer state and the routers' balancing state stay as they were. |
 | `tokens_seen`, metrics, `on_step_end` hooks | Skipped. |
 | LR schedule | Advanced: `scheduler.step()`, then the active phase's `lr_scale`, so warmup and decay stay on the step counter. |
 | `FreezeStage` and data phases due at the new step | Applied. A `FreezeStage` waits behind the same async-save fence as on a finite step. |
@@ -81,7 +94,7 @@ the uninterrupted run would have, with two exceptions:
 
 Two edge cases:
 
-- **The NaN that trips the stop.** `should_rollback` is checked first,
+- **The NaN that trips the stop.** `rollback_recommended` is checked first,
   so that step ends the run without a checkpoint, even with a shutdown
   pending (see [Rollback recommendation](#rollback-recommendation)).
 - **A fresh run whose first step is skipped.** PyTorch warns
@@ -131,9 +144,11 @@ if action not in ("warn", "skip", "raise"):
 | Action | Behavior | When to pick it |
 |--------|----------|-----------------|
 | `"warn"` | Log a warning, return `False`. Loop zeros grads and continues. | Default. NaN-tolerant training where a single bad step shouldn't kill the run. |
-| `"skip"` | Same as `"warn"` but logs `"— skipping optimizer step"` explicitly. | Same as warn; the two are nearly equivalent since the caller already skips the optimizer step on `False`. |
-| `"raise"` | Raise `RuntimeError` immediately. | Early development when you want the run to die loudly on first NaN. |
+| `"skip"` | Same as `"warn"` but logs `"; skipping optimizer step"` explicitly. | Same as warn; the two are nearly equivalent since the caller already skips the optimizer step on `False`. |
+| `"raise"` | Raise `RuntimeError` immediately, on every rank (the raise comes after the cross-rank reduction). | Early development when you want the run to die loudly on first NaN. |
 
+The training loop takes its action from `train.nan_action`, in the TOML
+`[train]` table or as `--train.nan_action=raise` on the command line.
 In the shipped training loop, `"warn"` and `"skip"` produce the same
 outcome (the caller already zeros grads and advances the step). The
 distinction exists for callers that only call `check_loss` and let the
@@ -151,17 +166,22 @@ on the next step.
 bad_loss = not _is_finite(loss)
 bad_grad_norm = grad_norm is not None and not _is_finite(grad_norm)
 local_nan = bad_loss or bad_grad_norm
-if dist.is_initialized():
-    nan_flag = torch.tensor([1.0 if local_nan else 0.0], device="cuda")
-    dist.all_reduce(nan_flag)
-    any_nan = nan_flag.item() > 0
-else:
-    any_nan = local_nan
+any_nan = _any_rank_flagged(local_nan)
+
+# _any_rank_flagged(flag)
+if not dist.is_initialized():
+    return flag
+device = "cuda" if torch.cuda.is_available() else "cpu"
+reduced = torch.tensor([1.0 if flag else 0.0], device=device)
+dist.all_reduce(reduced)
+return reduced.item() > 0
 ```
 
 Four bytes per step — dwarfed by the gradient all-reduce. The
 `all_reduce` is a `SUM` (the default) — any rank with NaN lifts the
-flag above zero on every rank.
+flag above zero on every rank. The flag goes on the current CUDA device
+when CUDA is available, so NCCL reduces it, and on the CPU otherwise,
+so a gloo process group without CUDA (a CPU-only test) reduces it too.
 
 If `any_nan` is true but `local_nan` is false, the log line mentions
 "detected on another rank" so you can correlate which rank blew up from
@@ -180,8 +200,9 @@ class NaNState:
 ```
 
 `consecutive_nans` resets on any finite step. It's the one that drives
-rollback: when it reaches `max_consecutive` (default 5 in the class, 10
-in the shipped config), `should_rollback` flips to `True`.
+rollback: when it reaches `max_consecutive` (default 5 in the class;
+the training loop's detector takes `train.nan_max_consecutive`, default
+10), `rollback_recommended` flips to `True`.
 
 `nan_steps` is a diagnostic — a post-hoc "which steps actually failed"
 list. Capped at 100 entries to bound memory on pathological runs.
@@ -190,17 +211,27 @@ list. Capped at 100 entries to bound memory on pathological runs.
 
 ```python
 @property
-def should_rollback(self) -> bool:
+def rollback_recommended(self) -> bool:
     return self.state.consecutive_nans >= self.max_consecutive
 ```
+
+The property recommends a rollback and does none. It used to be named
+`should_rollback`, which reads as if the detector rolled back;
+`should_rollback` still works as a deprecated alias that emits a
+`DeprecationWarning`.
 
 When this trips, the training loop *stops* — it doesn't roll back
 automatically:
 
 ```python
 # training/loop.py::run_training_loop
-if nan_detector.should_rollback:
-    logger.error("Too many consecutive NaNs — stopping")
+if nan_detector.rollback_recommended:
+    logger.error(
+        f"Too many consecutive NaNs at step {step}: stopping without a "
+        "checkpoint. Nothing rolls back on its own; to roll back, resubmit "
+        "with a new, empty checkpoint.dir and checkpoint.load_path set to "
+        "an earlier step_N"
+    )
     break
 ```
 
@@ -235,13 +266,13 @@ the *source* of the NaN determines what's safe:
 - **FP8 overflow** — reduce `distributed.fp8_interval` or disable FP8
   for sensitive layers, restart.
 
-A rule-of-thumb: if you hit `should_rollback`, don't resume from the
+A rule-of-thumb: if you hit `rollback_recommended`, don't resume from the
 most recent checkpoint. It holds the weights from just before the NaN
 storm, so whatever state caused the explosion is baked in. That also
 holds for an emergency checkpoint a shutdown wrote during the storm:
-skipped steps leave the weights as they were (the sigmoid router's
-`expert_bias` aside), so it carries the pre-storm weights under a later
-step. A storm that a bad update started leaves no such checkpoint (see
+skipped steps leave the weights as they were, so it carries the
+pre-storm weights under a later step. A storm that a bad update started
+leaves no such checkpoint (see
 [A shutdown after a bad update](#a-shutdown-after-a-bad-update)).
 
 ## Manual use
@@ -257,10 +288,14 @@ for step, batch in enumerate(loader):
     det.check_loss(loss, step)    # raises on first NaN
 ```
 
-`check_gradients(model, step)` does the same but walks
-`model.named_parameters()` and returns `False` on the first NaN grad.
-The `action="raise"` mode raises `RuntimeError` instead of returning
-`False` (the warning case still returns `False`).
+`check_gradients(model, step)` does the same for the gradients. Each
+rank walks `model.named_parameters()` and checks the gradients it holds
+(the local shard of a `DTensor`); when running distributed, one
+all-reduce of a flag gives every rank the same verdict, so every rank
+must call it. It returns `False` on every rank if any rank holds a
+NaN / Inf gradient, and the `action="raise"` mode raises `RuntimeError`
+on every rank instead. Unlike `check_loss`, it leaves the consecutive-NaN
+count as it is.
 
 `params_are_finite(model, device)` from
 `kempnerforge.resilience.health` checks the parameters themselves and
@@ -270,15 +305,13 @@ every rank must call it.
 
 ## Limitations
 
-- **NaN action isn't in config.** Fixed at `"warn"` / `max_consecutive=10`
-  in `run_training` (`kempnerforge/training/entry.py`). Change the source
-  if you need something different.
 - **No gradient scan in the hot path.** `check_gradients` exists but
   isn't wired in. Add it if you're hunting a specific gradient
-  pathology; expect a small per-step cost (one `isfinite` + `.all()`
-  per parameter).
+  pathology, on every rank; expect a small per-step cost (one
+  `isfinite` + `.all()` per parameter, plus one all-reduce).
 - **Loss is already a CPU scalar.** `check_loss` gets a Python float, so
-  the distributed sync creates a new tensor on CUDA and all-reduces it
+  the distributed sync creates a new tensor on CUDA (on the CPU when CUDA
+  is unavailable) and all-reduces it
   — a negligible one-off each step but not free. If you optimize this
   path, aggregate the NaN flag into the existing grad-norm all-reduce.
 

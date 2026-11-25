@@ -23,7 +23,8 @@ function or class when that is another one (a shared helper or an
 `get` raises `KeyError` with an "Available: […]" hint when a name is
 missing; `list(category)` returns registered names; `unregister(category, name)`
 removes an entry and returns it, raising the same `KeyError` when the name
-is missing (an adapter's `accepts` declaration goes with it).
+is missing (an adapter's `accepts` and `output_num_tokens` declarations go
+with it).
 
 ## The seven categories
 
@@ -130,7 +131,9 @@ def build_my_pool(in_dim, out_dim, pool_window=2, **_):
 ```
 
 `my_pool` uses `pool_window`, so `type = "my_pool"` with `pool_heads = 8`
-fails to load. A parameter counts when it is named after an `AdapterConfig`
+fails to load. An adapter that pools, as this one does, also declares its
+token count; see
+[Adapters that pool declare their token count](#adapters-that-pool-declare-their-token-count). A parameter counts when it is named after an `AdapterConfig`
 field and can be passed by keyword; a positional-only one never receives the
 field. A builder with no `**` parameter at all is read the same way. The
 builder's own signature counts: a wrapper made with `functools.wraps` is read
@@ -161,6 +164,39 @@ def build_my_head(in_dim, out_dim, hidden_dim=None, activation="gelu", **_):
 `accepts` that adapter accepts every field, and its builder receives them
 all. A declaration that names a field `AdapterConfig` does not have fails
 when the config loads.
+
+### Adapters that pool declare their token count
+
+When `vision_encoder.num_tokens` is set, the config checks, before any module
+exists, that the image tokens plus `vlm.max_text_len` fit `model.max_seq_len`
+(when `JobConfig` is built) and `train.seq_len` (in `JobConfig.validate`). It
+counts an image's tokens with `AdapterConfig.output_num_tokens`, which
+calls the `output_num_tokens` declaration the adapter registered with and
+returns the count that declaration returns. The declaration is a callable that
+takes the `AdapterConfig` and the encoder's tokens per image and returns the
+tokens the adapter emits. An adapter that registers none keeps the count, as
+the projection adapters do, so an adapter that pools declares its count. The
+built-in `avgpool` and `attentional_pool` declare theirs with
+`pooled_token_count`, which a plugin that pools a square patch grid the same
+way can use too:
+
+```python
+from kempnerforge.model.adapter import pooled_token_count
+
+def _my_pool_tokens(config, num_input_tokens):
+    return pooled_token_count(num_input_tokens, config.pool_window)
+
+@registry.register_adapter("my_pool", output_num_tokens=_my_pool_tokens)
+def build_my_pool(in_dim, out_dim, pool_window=2, **_):
+    return MyPool(in_dim, out_dim, pool_window)
+```
+
+The declaration must agree with the built module's `output_num_tokens`, which
+the model build uses to size the residual stream and to check
+`model.max_seq_len` again. Without it, the config checks count `my_pool`'s
+tokens unpooled and can reject a `model.max_seq_len` that the pooled tokens
+fit. A declaration that is not callable fails at registration with
+`TypeError`.
 
 ### Making sure the module runs
 
@@ -226,12 +262,21 @@ Four rules for plugin authors, all from the distributed contract:
   before `init_distributed`, so a rank stalled reading a manifest never
   reaches the rendezvous — the other ranks then fail there, minutes
   later and far from the cause.
-- **Keep `plugins` in the config you resume with.** The list is not
-  recorded in the checkpoint. Resuming with a list that builds a
-  different component fails the load with `Missing key in checkpoint
-  state_dict` rather than training a mismatched model — but a component
-  whose parameters are a strict subset of the saved ones would load
-  silently.
+- **Keep `plugins` in the config you resume with.** Every checkpoint the
+  training loop saves records the list in its `metadata.json`, and the
+  training entry point refuses to resume or warm start, with the train
+  state, from one saved with another list, before it reads any state: the
+  same modules in the same order, each counted once, since a plugin can
+  override the names another registers. Another list can build another
+  component, and one whose parameters are a strict subset of the saved
+  ones would load silently. If the plugins that differ build no part of
+  the model, set `checkpoint.ignore_plugins_mismatch = true` to go on
+  with a warning. When `metadata.json` holds no valid list, as in a
+  checkpoint saved before the list was recorded, or cannot be read, the
+  lists are not compared and rank 0 logs a warning. A weights-only warm
+  start (`checkpoint.exclude_from_loading = ["optimizer", "train_state"]`)
+  and scripts that load a checkpoint without the training entry point,
+  such as `scripts/eval.py`, are not checked either.
 
 ## Adding a new category
 

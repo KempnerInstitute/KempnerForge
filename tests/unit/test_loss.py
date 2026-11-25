@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import copy
 import functools
-import socket
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
@@ -24,6 +21,7 @@ from kempnerforge.training.loss import (
     cross_entropy_loss,
     z_loss,
 )
+from tests.gloo_ranks import gloo_group, spawn
 
 ALL_MASKED_LOSSES = {
     "cross_entropy": cross_entropy_loss,
@@ -502,19 +500,10 @@ class TestBuildLossFn:
         assert torch.equal(loss, expected)
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _rank_with_nothing_supervised_joins(rank: int, world: int, port: int, loss_name: str) -> None:
     """Rank 0's micro-batch is all ``-100``; FSDP2 still reduces every gradient with rank 1."""
     loss_fn = ALL_MASKED_LOSSES[loss_name]
-    dist.init_process_group(
-        "gloo", rank=rank, world_size=world, init_method=f"tcp://127.0.0.1:{port}"
-    )
-    try:
+    with gloo_group(rank, world, port):
         mesh = init_device_mesh("cpu", (world,))
         torch.manual_seed(0)
         model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 16))
@@ -532,8 +521,6 @@ def _rank_with_nothing_supervised_joins(rank: int, world: int, port: int, loss_n
         sum(loss_fn(reference(inputs[r]), labels[r]) for r in range(1, world)).div(world).backward()
         for p, expected in zip(model.parameters(), reference.parameters(), strict=True):
             torch.testing.assert_close(p.grad.full_tensor(), expected.grad)
-    finally:
-        dist.destroy_process_group()
 
 
 class TestAllMaskedBatch:
@@ -554,6 +541,18 @@ class TestAllMaskedBatch:
         loss.backward()
         assert torch.equal(logits.grad, torch.zeros_like(logits))
 
+    @pytest.mark.parametrize("shape", [(0, 16), (1, 0, 16), (2, 0, 16)])
+    @pytest.mark.parametrize("loss_name", sorted(ALL_MASKED_LOSSES))
+    def test_logits_with_no_rows_give_the_same_zero(self, loss_name, shape):
+        """A packed micro-batch with no text hands the loss logits with no rows (#588)."""
+        logits = torch.randn(*shape, dtype=torch.bfloat16).requires_grad_(True)
+        loss = ALL_MASKED_LOSSES[loss_name](logits, torch.full(shape[:-1], -100))
+        assert loss.item() == 0.0
+        assert loss.dtype == torch.float32
+        loss.backward()
+        assert logits.grad is not None
+        assert logits.grad.shape == logits.shape
+
     @pytest.mark.parametrize("loss_name", sorted(ALL_MASKED_LOSSES))
     def test_backward_reaches_the_model_parameters(self, loss_name):
         model = nn.Linear(4, 16)
@@ -564,4 +563,4 @@ class TestAllMaskedBatch:
 
     @pytest.mark.parametrize("loss_name", ["cross_entropy", "chunked_many_chunks"])
     def test_fsdp2_rank_with_nothing_supervised_still_reduces(self, loss_name):
-        mp.spawn(_rank_with_nothing_supervised_joins, args=(2, _free_port(), loss_name), nprocs=2)
+        spawn(_rank_with_nothing_supervised_joins, 2, loss_name)
