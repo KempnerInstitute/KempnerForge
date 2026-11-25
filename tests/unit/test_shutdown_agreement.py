@@ -6,9 +6,8 @@ control group it made, and a NaN loss on one rank skips the step on every rank
 (#375).
 
 Two gloo ranks run the real ``run_training_loop`` and only one of them sees the
-event. ``NaNDetector.check_loss`` makes its flag on CUDA, so each rank swaps the
-health module's ``torch`` for one that makes it on the CPU, as the
-``test_resilience`` reduction tests do.
+event. The loop tests start the ranks with CUDA hidden, so ``NaNDetector.check_loss``
+reduces its flag on the CPU and the NaN case runs the loop's real cross-rank check.
 """
 
 from __future__ import annotations
@@ -31,15 +30,6 @@ DEADLINE_S = 45
 VOTE_TIMEOUT_S = 10
 SAVE_ROUNDS = 10
 VOTES_PER_SAVE = 100
-
-
-class _CpuTorch:
-    def __getattr__(self, name):
-        return getattr(torch, name)
-
-    @staticmethod
-    def tensor(data, device=None, **kwargs):
-        return torch.tensor(data, **kwargs)
 
 
 def _check_any_rank(rank: int, world: int, port: int, flags: tuple[bool, ...]) -> None:
@@ -112,7 +102,6 @@ def _run_loop(rank: int, world: int, port: int, case: str, root: str, out_dir: s
     """Run the loop on one rank and write how it ended."""
     with gloo_group(rank, world, port, timeout=timedelta(seconds=PG_TIMEOUT_S)):
         try:
-            import kempnerforge.resilience.health as health
             import kempnerforge.training.loop as loop
             from kempnerforge.checkpoint.manager import CheckpointManager
             from tests.unit.test_train_entry import (
@@ -123,7 +112,6 @@ def _run_loop(rank: int, world: int, port: int, case: str, root: str, out_dir: s
                 make_session,
             )
 
-            health.torch = _CpuTorch()
             config = make_config(max_steps=6)
             config.checkpoint.dir = root
             config.checkpoint.interval = 100
@@ -209,6 +197,11 @@ class TestAnyRank:
 
 @pytest.mark.timeout(360)
 class TestLoopStopsOnEveryRank:
+    @pytest.fixture(autouse=True)
+    def _hide_cuda(self, monkeypatch):
+        """Start the ranks with CUDA hidden, so the loop's NaN check reduces a CPU flag."""
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+
     def test_a_shutdown_seen_on_one_rank_stops_every_rank_at_that_step(self, tmp_path):
         outcomes = _outcomes(tmp_path, "shutdown")
         assert outcomes == {r: "step=2 saves=[2] nans=0" for r in range(WORLD)}

@@ -52,9 +52,10 @@ initializes the collaborators:
   preemption.
 - **`NaNDetector`** from
   [`kempnerforge.resilience.health`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/resilience/health.py)
-  — tracks consecutive NaN steps; `action="warn"` by default. After
-  `max_consecutive=10` in a row it sets `should_rollback` and the loop
-  stops; rolling back is manual.
+  — tracks consecutive NaN steps, with the action `train.nan_action`
+  (`"warn"` by default). After `train.nan_max_consecutive` (default 10) in
+  a row it sets `rollback_recommended` and the loop stops; rolling back is
+  manual.
 - **Loss function** from the registry (`"cross_entropy"` or
   `"chunked_cross_entropy"`).
 - **Model** via `build_parallel_model` — applies the full parallelism
@@ -179,7 +180,7 @@ grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
 if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
     _route_balance(session, step_ran=False)  # drops the sigmoid routers' counts
     optimizer.zero_grad()
-    if nan_detector.should_rollback:
+    if nan_detector.rollback_recommended:
         break
     _advance_lr_schedule(session)            # scheduler.step() + phase LR scaling
     step += 1
@@ -205,7 +206,7 @@ expert parallelism it reads the EP group from the model and covers every
 rank's experts. The NaN detector returns `False` on a NaN/Inf loss or
 gradient norm, and the loop zeroes the grads.
 After `max_consecutive` NaN steps in a row the detector sets
-`should_rollback` and the loop stops; rolling back to an earlier
+`rollback_recommended` and the loop stops; rolling back to an earlier
 checkpoint is manual (see
 [NaN detection](../resilience/nan-detection.md#rollback-recommendation)).
 

@@ -82,7 +82,7 @@
       ],
       "classes": {
         "TrainConfig": {
-          "purpose": "Training hyperparameters (steps, batch, seq_len, precision, loss, grad accum)",
+          "purpose": "Training hyperparameters (steps, batch, seq_len, precision, loss, grad accum, NaN detector action and threshold)",
           "properties": [
             "param_dtype",
             "is_fp8"
@@ -1584,20 +1584,23 @@
     "kempnerforge/resilience/health.py": {
       "classes": {
         "NaNDetector": {
-          "purpose": "Detect and track NaN/Inf in loss and gradients with configurable actions",
+          "purpose": "Detect and track NaN/Inf in loss and gradients with configurable actions (train.nan_action, train.nan_max_consecutive)",
           "methods": [
-            "check_loss(loss, step)",
-            "check_grads(model, step)",
-            "should_recommend_rollback()"
+            "check_loss(loss, step, grad_norm=None) -> bool (collective: one all-reduce of a flag, on CUDA or, without CUDA, on the CPU)",
+            "check_gradients(model, step) -> bool (collective: each rank checks the gradients it holds, one all-reduce gives every rank the verdict)",
+            "rollback_recommended (property; should_rollback is its deprecated alias)",
+            "reset()"
           ]
         }
       },
       "functions": [
-        "check_gpu_health(device) -> bool",
-        "check_nccl_health(group, timeout_sec) -> bool"
+        "params_are_finite(model, device) -> bool (collective: one all-reduce of a flag on device)",
+        "check_gpu_health(device=0) -> dict[str, bool | str]",
+        "check_nccl_health(timeout_sec=10.0) -> bool"
       ],
       "tested_by": [
         "tests/unit/test_resilience.py::TestNaNDetector",
+        "tests/unit/test_resilience.py::TestNaNDetectorAcrossRanks",
         "tests/unit/test_resilience.py::TestGPUHealth",
         "tests/distributed/test_resilience.py::TestNCCLHealth",
         "tests/distributed/test_resilience.py::TestNaNDetectorDistributed"
@@ -1730,7 +1733,7 @@
       "tests/unit/test_config.py": {
         "classes": [
           "TestModelConfig(23)",
-          "TestTrainConfig(3)",
+          "TestTrainConfig(24)",
           "TestOptimizerConfig(6)",
           "TestDistributedConfig(6)",
           "TestCheckpointConfig(2)",
@@ -1747,7 +1750,7 @@
           "TestEvalConfig(7)",
           "TestDottedDictOverrides(13)"
         ],
-        "count": 138
+        "count": 159
       },
       "tests/unit/test_training.py": {
         "classes": [
@@ -1786,12 +1789,13 @@
       "tests/unit/test_resilience.py": {
         "classes": [
           "TestShutdownHandler(16)",
-          "TestNaNDetector(17)",
+          "TestNaNDetector(27)",
+          "TestNaNDetectorAcrossRanks(2)",
           "TestGPUHealth(2)",
           "TestSLURM(13)",
           "TestResumePathResolution(9)"
         ],
-        "count": 57
+        "count": 69
       },
       "tests/unit/test_shutdown_agreement.py": {
         "classes": [

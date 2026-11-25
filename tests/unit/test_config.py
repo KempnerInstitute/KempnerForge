@@ -325,6 +325,35 @@ class TestTrainConfig:
         assert t.effective_data_seed == 456
         assert t.seed == 123
 
+    def test_nan_detection_defaults_keep_the_shipped_behavior(self) -> None:
+        """A config that sets neither field, as every config before them, keeps warn and 10."""
+        for t in (TrainConfig(), load_config("configs/train/debug.toml", cli_args=[]).train):
+            assert (t.nan_action, t.nan_max_consecutive) == ("warn", 10)
+
+    @pytest.mark.parametrize("action", ["warn", "skip", "raise"])
+    def test_nan_action_accepts_the_detector_actions(self, action: str) -> None:
+        assert TrainConfig(nan_action=action).nan_action == action  # type: ignore[arg-type]
+
+    def test_rejects_an_unknown_nan_action(self) -> None:
+        with pytest.raises(ValueError, match="nan_action must be one of"):
+            TrainConfig(nan_action="ignore")  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("count", [0, -1])
+    def test_rejects_a_non_positive_nan_max_consecutive(self, count: int) -> None:
+        with pytest.raises(ValueError, match="nan_max_consecutive must be positive"):
+            TrainConfig(nan_max_consecutive=count)
+
+    def test_nan_detection_from_cli(self) -> None:
+        config = load_config(cli_args=["--train.nan_action=raise", "--train.nan_max_consecutive=3"])
+        assert config.train.nan_action == "raise"
+        assert config.train.nan_max_consecutive == 3
+
+    def test_unknown_nan_action_is_rejected_from_toml(self, tmp_path: Path) -> None:
+        toml = tmp_path / "nan.toml"
+        toml.write_text('[train]\nnan_action = "ignore"\n')
+        with pytest.raises(ValueError, match="not in allowed Literal"):
+            load_config(str(toml), cli_args=[])
+
 
 class TestOptimizerConfig:
     def test_defaults(self):

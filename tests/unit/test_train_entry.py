@@ -730,6 +730,31 @@ class TestRunTrainingLoop:
         assert ckpt.saves == []
         assert ckpt.waits == 1
 
+    def test_nan_stop_says_the_rollback_is_manual(self, monkeypatch, caplog):
+        """The stop's error gives the manual rollback, and the loop reads the new name."""
+        import logging
+        import warnings
+
+        config = make_config(max_steps=10)
+        session = make_session(
+            config,
+            loss_fn=lambda logits, labels: logits.sum() * float("nan"),
+            nan_detector=NaNDetector(action="warn", max_consecutive=3),
+        )
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+        with (
+            caplog.at_level(logging.ERROR, logger="kempnerforge"),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            run_training_loop(session)
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "Too many consecutive NaNs at step 2" in errors[0]
+        assert "Nothing rolls back on its own" in errors[0]
+        assert "checkpoint.load_path" in errors[0]
+        assert not [w for w in caught if "should_rollback" in str(w.message)]
+
     def test_a_finite_loss_with_nan_gradients_skips_the_step(self):
         """NaN gradients under a finite loss never reach the optimizer."""
 
@@ -1419,6 +1444,37 @@ class TestRunTraining:
         run_training(make_config(max_steps=3), step_fn=custom_step)
         assert seen == [0, 1, 2]
         assert torch.equal(before, model.out.weight)
+
+    @pytest.mark.parametrize(
+        ("train_kwargs", "expected"),
+        [({}, ("warn", 10)), ({"nan_action": "skip", "nan_max_consecutive": 2}, ("skip", 2))],
+        ids=["defaults", "configured"],
+    )
+    def test_the_nan_detector_follows_the_train_config(self, monkeypatch, train_kwargs, expected):
+        """Every step is NaN, so the run stops after ``nan_max_consecutive`` of them."""
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        _stub_entry(monkeypatch, TinyTextModel())
+        seen: list[tuple[int, str, int]] = []
+
+        def nan_step(session, step):
+            seen.append((step, session.nan_detector.action, session.nan_detector.max_consecutive))
+            return StepResult(loss=float("nan"), grad_norm=0.5)
+
+        run_training(make_config(max_steps=20, **train_kwargs), step_fn=nan_step)
+        assert seen == [(step, *expected) for step in range(expected[1])]
+
+    def test_nan_action_raise_in_the_config_fails_the_run(self, monkeypatch):
+        from kempnerforge.training.entry import run_training
+        from kempnerforge.training.loop import StepResult
+
+        _stub_entry(monkeypatch, TinyTextModel())
+        with pytest.raises(RuntimeError, match="NaN/Inf loss at step 0"):
+            run_training(
+                make_config(max_steps=20, nan_action="raise"),
+                step_fn=lambda _session, _step: StepResult(loss=float("nan"), grad_norm=0.5),
+            )
 
     def test_a_resumed_run_counts_documents_on_from_the_checkpoint(self, monkeypatch):
         from kempnerforge.training.entry import run_training

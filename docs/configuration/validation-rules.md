@@ -75,8 +75,10 @@ File:
 File:
 [`kempnerforge/config/training.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/training.py).
 
-- `batch_size`, `seq_len`, `max_steps`, `grad_accum_steps` all positive.
+- `batch_size`, `seq_len`, `max_steps`, `grad_accum_steps`, `nan_max_consecutive` all positive.
 - `grad_clip_norm > 0`.
+- `nan_action ∈ {"warn", "skip", "raise"}`; the TOML and CLI loader rejects any other value
+  first, through the field's `Literal`.
 - `mixed_precision = "fp16"` is rejected, since there is no loss scaling; use `"bf16"`,
   or `"fp32"` on GPUs without bf16. A TOML that sets it fails to load everywhere,
   including `scripts/eval.py`, `generate.py` and `convert_checkpoint.py`, and a CLI
