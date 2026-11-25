@@ -23,7 +23,9 @@ dry-run forward. Adapters register themselves under the ``adapter`` registry
 category. The ``AdapterConfig`` fields a builder names as parameters are the
 ones it uses (``avgpool``, whose set depends on ``hidden_dim``, declares them
 with ``accepts``), so a setting the selected adapter would ignore fails at
-config time.
+config time. The pooling adapters also register their ``output_num_tokens``,
+which ``AdapterConfig.output_num_tokens`` returns for the config-time
+sequence-length checks.
 """
 
 from __future__ import annotations
@@ -46,8 +48,6 @@ _ADAPTER_ACTIVATIONS: dict[str, type[nn.Module]] = {
     "silu": nn.SiLU,
     "relu": nn.ReLU,
 }
-
-POOLING_ADAPTER_TYPES: tuple[str, ...] = ("avgpool", "attentional_pool")
 
 
 def pooled_token_count(num_input_tokens: int, window: int) -> int:
@@ -440,7 +440,14 @@ def _avgpool_accepts(config: AdapterConfig) -> tuple[str, ...]:
     return ("pool_window", "hidden_dim")
 
 
-@registry.register_adapter("avgpool", accepts=_avgpool_accepts)
+def _pooled_output_num_tokens(config: AdapterConfig, num_input_tokens: int) -> int:
+    """The pooling adapters' ``output_num_tokens``, from the config's ``pool_window``."""
+    return pooled_token_count(num_input_tokens, config.pool_window)
+
+
+@registry.register_adapter(
+    "avgpool", accepts=_avgpool_accepts, output_num_tokens=_pooled_output_num_tokens
+)
 def _build_avgpool(
     in_dim: int,
     out_dim: int,
@@ -462,7 +469,7 @@ def _build_avgpool(
     )
 
 
-@registry.register_adapter("attentional_pool")
+@registry.register_adapter("attentional_pool", output_num_tokens=_pooled_output_num_tokens)
 def _build_attentional_pool(
     in_dim: int,
     out_dim: int,

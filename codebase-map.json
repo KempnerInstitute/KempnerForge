@@ -28,7 +28,9 @@
             "list_vlm_configs()",
             "register_modality_strategy(name)",
             "get_modality_strategy(name)",
-            "list_modality_strategies()"
+            "list_modality_strategies()",
+            "register_adapter(name, accepts=None, output_num_tokens=None) (output_num_tokens(config, n) -> the adapter's token count, which AdapterConfig.output_num_tokens returns for the config-time sequence-length checks)",
+            "get_adapter_output_num_tokens(name)"
           ]
         }
       },
@@ -36,7 +38,8 @@
         "registry: Registry"
       ],
       "tested_by": [
-        "tests/unit/test_config.py::TestRegistry"
+        "tests/unit/test_config.py::TestRegistry",
+        "tests/unit/test_adapter.py::TestAdapterOutputNumTokensDeclaration"
       ]
     },
     "kempnerforge/config/schema.py": {
@@ -192,7 +195,9 @@
         "tests/unit/test_mixing.py::TestDataConfigMixing",
         "tests/unit/test_annealing.py::TestTrainingPhase",
         "tests/unit/test_annealing.py::TestDataConfigPhases",
-        "tests/unit/test_fp8.py::TestFP8Config"
+        "tests/unit/test_fp8.py::TestFP8Config",
+        "tests/unit/test_vision_config.py::TestHFEncoderPath",
+        "tests/unit/test_video_config.py::TestJobConfigVideoWiring"
       ]
     },
     "kempnerforge/config/vlm.py": {
@@ -390,7 +395,7 @@
           "purpose": "Test-stub vision encoder: deterministic random features by image_id hash. No download; used for VLM smokes"
         },
         "_HFVisionEncoder(VisionEncoder)": {
-          "purpose": "Wraps a HuggingFace vision model (SigLIP2 or CLIP). Optionally strips the [CLS] token. Stays in HF's loaded dtype; the adapter casts at the boundary"
+          "purpose": "Wraps a HuggingFace vision model (SigLIP2 or CLIP). Optionally strips the [CLS] token. Stays in HF's loaded dtype; the adapter casts at the boundary. feature_dim is the builder's, else the tower config's hidden_size; a config without one raises asking for vision_encoder.feature_dim"
         }
       },
       "registry": [
@@ -401,7 +406,8 @@
       "tested_by": [
         "tests/unit/test_vision.py::TestRandomVisionEncoder",
         "tests/unit/test_vision.py::TestHFEncoders",
-        "tests/unit/test_vision.py::TestVisionEncoderRegistry"
+        "tests/unit/test_vision.py::TestVisionEncoderRegistry",
+        "tests/unit/test_vision.py::TestHFVisionEncoderMocked"
       ]
     },
     "kempnerforge/model/vlm.py": {
@@ -2137,9 +2143,9 @@
           "TestRandomVisionEncoder(6)",
           "TestHFEncoders(1)",
           "TestVisionEncoderRegistry(3)",
-          "TestHFVisionEncoderMocked(5)"
+          "TestHFVisionEncoderMocked(11)"
         ],
-        "count": 15
+        "count": 21
       },
       "tests/unit/test_cross_attention.py": {
         "classes": [

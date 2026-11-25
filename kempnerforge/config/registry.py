@@ -23,6 +23,7 @@ from collections.abc import Callable, Collection
 from typing import Any
 
 AdapterAccepts = Collection[str] | Callable[[Any], Collection[str]]
+AdapterOutputNumTokens = Callable[[Any, int], int]
 
 _UNKNOWN_MODULE = "an unknown module"
 
@@ -96,8 +97,9 @@ class Registry:
     def unregister(self, category: str, name: str) -> Any:
         """Remove the object under category/name and return it.
 
-        Removing an adapter also removes the ``accepts`` declaration it
-        registered with, so a later adapter under that name starts without one.
+        Removing an adapter also removes the ``accepts`` and
+        ``output_num_tokens`` declarations it registered with, so a later
+        adapter under that name starts without them.
 
         Raises:
             KeyError: Nothing is registered under category/name.
@@ -106,6 +108,7 @@ class Registry:
         del self._get_store(category)[name]
         if category == "adapter":
             self._get_store("adapter_accepts").pop(name, None)
+            self._get_store("adapter_output_num_tokens").pop(name, None)
         return obj
 
     def list(self, category: str) -> list[str]:
@@ -222,11 +225,16 @@ class Registry:
     def list_modality_strategies(self) -> list[str]:
         return self.list("modality_strategy")
 
-    def register_adapter(self, name: str, accepts: AdapterAccepts | None = None) -> Callable:
+    def register_adapter(
+        self,
+        name: str,
+        accepts: AdapterAccepts | None = None,
+        output_num_tokens: AdapterOutputNumTokens | None = None,
+    ) -> Callable:
         """Decorator to register an adapter builder.
 
         Adapters project image features (``(B, N, feature_dim)``) into the
-        LLM embedding space (``(B, N, model.dim)``). Builders take
+        LLM embedding space (``(B, M, model.dim)``). Builders take
         ``(in_dim, out_dim, **kwargs)`` and return an ``nn.Module`` with the
         expected forward shape.
 
@@ -244,21 +252,39 @@ class Registry:
                 ``**`` parameter is named ``_`` or it has none. A builder
                 with any other ``**`` parameter and no ``accepts`` accepts
                 every field.
+            output_num_tokens: The token count ``M`` the adapter emits for
+                ``N`` tokens in, as a callable that maps an ``AdapterConfig``
+                and ``N`` to ``M``. ``AdapterConfig.output_num_tokens`` returns
+                it, and the config-time sequence-length checks count image
+                tokens with it, so it must agree with the built module's
+                ``output_num_tokens``. ``None`` means the adapter keeps the
+                token count (``M == N``), as a projection adapter does; a
+                pooling adapter that declares nothing has its tokens counted
+                unpooled, and those checks can reject a ``model.max_seq_len``
+                that fits.
 
         Raises:
             TypeError: ``accepts`` is a string rather than a collection of
-                field names.
+                field names, or ``output_num_tokens`` is not callable.
         """
         if isinstance(accepts, str):
             raise TypeError(
                 f"accepts for adapter {name!r} must be a collection of field names or a "
                 f"callable, not the string {accepts!r}"
             )
+        if output_num_tokens is not None and not callable(output_num_tokens):
+            raise TypeError(
+                f"output_num_tokens for adapter {name!r} must be a callable that maps an "
+                f"AdapterConfig and an input token count to the output token count, not "
+                f"{output_num_tokens!r}"
+            )
 
         def decorator(fn: Callable) -> Callable:
             self.register("adapter", name, fn)
             if accepts is not None:
                 self.register("adapter_accepts", name, accepts)
+            if output_num_tokens is not None:
+                self.register("adapter_output_num_tokens", name, output_num_tokens)
             return fn
 
         return decorator
@@ -269,6 +295,10 @@ class Registry:
     def get_adapter_accepts(self, name: str) -> AdapterAccepts | None:
         """The ``accepts`` declaration adapter ``name`` registered, or ``None``."""
         return self._get_store("adapter_accepts").get(name)
+
+    def get_adapter_output_num_tokens(self, name: str) -> AdapterOutputNumTokens | None:
+        """The ``output_num_tokens`` declaration adapter ``name`` registered, or ``None``."""
+        return self._get_store("adapter_output_num_tokens").get(name)
 
     def list_adapters(self) -> list[str]:
         return self.list("adapter")
