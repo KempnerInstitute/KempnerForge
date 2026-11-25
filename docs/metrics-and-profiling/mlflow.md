@@ -336,10 +336,14 @@ environment, as described under credentials below.
   after every metric has been checked: a non-empty name, a finite number, at most 1000 in all.
   The metrics are linked to the checkpoint's model: the entry's `model_id`, else the run's model
   named by `model_name`, found or created as [above](#registering-checkpoints). An entry with
-  neither, or an MLflow too old to link metrics to a model, publishes them unlinked. It never starts, ends or edits a run and keeps no state, so
-  several publishers can write to one run at once. The call blocks on the server under MLflow's
-  own HTTP timeouts, so run it as a separate process, never from the training step. `log_batch`
-  is not atomic: a request that fails server side may still have stored some points.
+  neither, or an MLflow too old to link metrics to a model, publishes them unlinked. It never
+  starts, ends or edits a run and keeps no state. Several publishers can write to one run at
+  once only through a tracking server, which arbitrates them; MLflow's on-disk file store has
+  no server to do so, so two processes creating the same new metric directory can make one
+  fail with an `MlflowException` and lose the rest of its batch. Use a SQLite store or a
+  tracking server for concurrent publishes to one run. The call blocks on the server under
+  MLflow's own HTTP timeouts, so run it as a separate process, never from the training step.
+  `log_batch` is not atomic: a request that fails server side may still have stored some points.
 - **When it refuses.** The directory has no `metadata.json`; there is no `tracking` list or no
   `mlflow` entry (a checkpoint saved before the run's first log, an older one, or training
   without MLflow); more than one `mlflow` entry; a field is missing or empty; the metrics are
