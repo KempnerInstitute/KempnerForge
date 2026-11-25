@@ -380,16 +380,20 @@ class TestEPCopiesStayEqual:
         reason="EP+FSDP requires >= 4 GPUs (dp=2, ep=2)",
     )
     @pytest.mark.parametrize(
-        ("sizes", "packed", "max_norm"),
+        ("ep", "packed", "max_norm"),
         [
-            pytest.param((2, 2), False, 1e9, id="dp_shard2_ep2"),
-            pytest.param((2, 2), False, BINDING_CLIP, id="dp_shard2_ep2_clipped"),
-            pytest.param((2, 2), True, 1e9, id="dp_shard2_ep2_packed"),
-            pytest.param((1, 4), False, 1e9, id="ep4"),
+            pytest.param(2, False, 1e9, id="ep2"),
+            pytest.param(2, False, BINDING_CLIP, id="ep2_clipped"),
+            pytest.param(2, True, 1e9, id="ep2_packed"),
+            pytest.param(4, False, 1e9, id="ep4"),
         ],
     )
-    def test_non_expert_copies_stay_bitwise_equal(self, sizes, packed, max_norm):
-        mesh = init_device_mesh("cuda", sizes, mesh_dim_names=("dp_shard", "ep"))
+    def test_non_expert_copies_stay_bitwise_equal(self, ep, packed, max_norm):
+        world_size = dist.get_world_size()
+        if world_size % ep:
+            pytest.skip(f"{world_size} ranks do not split into EP groups of {ep}")
+        dp = world_size // ep
+        mesh = init_device_mesh("cuda", (dp, ep), mesh_dim_names=("dp_shard", "ep"))
         config = ModelConfig(
             dim=1024,
             n_layers=4,
@@ -419,7 +423,7 @@ class TestEPCopiesStayEqual:
         clipped = 0
         for _ in range(DRIFT_STEPS):
             rows = torch.randint(
-                0, config.vocab_size, (sizes[0], DRIFT_ROWS, DRIFT_SEQ + 1), generator=generator
+                0, config.vocab_size, (dp, DRIFT_ROWS, DRIFT_SEQ + 1), generator=generator
             )[dp_rank].cuda()
             logits = model(rows[:, :-1])
             loss = F.cross_entropy(logits.flatten(0, 1).float(), rows[:, 1:].flatten())

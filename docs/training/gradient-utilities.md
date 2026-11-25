@@ -152,7 +152,7 @@ for micro_step in range(tc.grad_accum_steps):
         scaled_loss.backward()
         total_loss += loss.item()
 
-grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
+grad_norm = clip_grads(model, tc.grad_clip_norm)
 optimizer.step()
 optimizer.zero_grad()
 ```
@@ -163,9 +163,9 @@ Two invariants:
   effective LR independent of the accumulation factor. If you change
   `grad_accum_steps=4 → 8`, the optimizer step size stays the same
   per-token.
-- **Clip after accumulate**: `clip_grad_norm_` runs **after** the
-  microbatch loop, not inside it — the clip sees the final accumulated
-  gradient.
+- **Clip after accumulate**: `clip_grads` runs **after** the microbatch
+  loop, not inside it, so the EP average and the clip see the final
+  accumulated gradient.
 
 ## Config fields
 
