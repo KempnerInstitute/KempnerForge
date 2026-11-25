@@ -57,12 +57,12 @@ if __name__ == "__main__":
 """
 
 
-def _pinning_loader() -> StatefulDataLoader:
+def _pinning_loader(workers: int = 2) -> StatefulDataLoader:
     if not worker_sockets_fit():
         pytest.skip("the temp directory path is too long for DataLoader worker sockets")
     dataset = TensorDataset(torch.arange(64))
     sampler = DistributedSampler(dataset, num_replicas=1, rank=0, shuffle=False)
-    config = DataConfig(num_workers=2, pin_memory=True)
+    config = DataConfig(num_workers=workers, pin_memory=True)
     return StatefulDataLoader(dataset, batch_size=4, sampler=sampler, config=config)
 
 
@@ -80,32 +80,31 @@ def test_close_stops_the_pin_memory_thread_and_the_workers():
 
 
 def test_close_returns_while_the_pin_memory_thread_is_stuck(monkeypatch):
-    pinned, stuck, unstick = threading.Event(), threading.Event(), threading.Event()
+    """One worker hands the batches over in order, so batch 0 is pinned before the stall."""
+    stuck, unstick = threading.Event(), threading.Event()
     pin = pin_memory_module.pin_memory
 
-    def pin_once_then_stick(data, device=None):
-        if pinned.is_set():
+    def stick_after_the_first_batch(data, device=None):
+        if int(data[0][0]) >= 4:
             stuck.set()
             unstick.wait()
-        pinned.set()
         return pin(data, device)
 
-    monkeypatch.setattr(pin_memory_module, "pin_memory", pin_once_then_stick)
+    monkeypatch.setattr(pin_memory_module, "pin_memory", stick_after_the_first_batch)
     monkeypatch.setattr(dataloader, "_SHUTDOWN_WAIT_S", 0.5)
-    loader = _pinning_loader()
-    next(iter(loader))
-    iterator = loader._dataloader._iterator
-    thread, workers = iterator._pin_memory_thread, list(iterator._workers)
-    closer = threading.Thread(target=loader.close, daemon=True)
+    loader = _pinning_loader(workers=1)
     try:
+        next(iter(loader))
+        workers = list(loader._dataloader._iterator._workers)
         assert stuck.wait(timeout=60), "the pin-memory thread never took a second batch"
+        closer = threading.Thread(target=loader.close, daemon=True)
         closer.start()
         closer.join(timeout=60)
         assert not closer.is_alive(), "close() waited on the stuck pin-memory thread"
-        assert [worker.exitcode for worker in workers] == [0, 0]
+        assert [worker.exitcode for worker in workers] == [0]
     finally:
         unstick.set()
-        thread.join(timeout=30)
+        loader.close()
 
 
 def test_a_process_with_a_stalled_pinned_loader_after_an_unpinned_one_exits(tmp_path):
