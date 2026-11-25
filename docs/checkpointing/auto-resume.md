@@ -74,11 +74,11 @@ Two fallbacks:
    with that stage loading an older step. A checkpoint of another
    layout counts as complete when its own shards are, so the newest
    one is resumed as found, never passed over for an older one, and
-   the load then treats it as it treats a checkpoint named by
-   `load_path`: a PP run loads its weights from a checkpoint saved
-   without PP when that holds no optimizer state, and every other
-   layout it cannot load is refused, naming both layouts (see
-   [Resharding § PP](resharding.md#pp-the-one-special-case)).
+   the load applies the layout checks it applies to any checkpoint
+   (see [Resharding § PP](resharding.md#pp-the-one-special-case)): a
+   stage checkpoint of another `pp`, or one resumed without PP, is
+   refused, naming both layouts, and so is a checkpoint saved without
+   PP that holds optimizer state, since a resume restores it.
 
    A checkpoint saved before the degree was recorded takes `n` from
    `distributed.pp`. When no step has every stage, the newest one that
