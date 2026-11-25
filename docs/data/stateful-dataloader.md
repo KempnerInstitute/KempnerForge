@@ -271,6 +271,26 @@ Changing `num_workers` across a resume means different worker seeds
 and different downstream shuffling, even though the sampler state is
 restored. Keep the count stable through a run.
 
+## Shutting the workers down
+
+Both loaders start their workers with a `worker_init_fn` that ignores
+`SIGTERM` and `SIGUSR1`. SLURM preemption signals the whole process
+group, and a worker that died on the signal would fail the step in
+progress before the emergency checkpoint is written. The same shield
+keeps `multiprocessing` from stopping the workers at exit: its exit hook
+sends leftover workers `SIGTERM` and then waits for them.
+
+`close()` shuts the workers down through the loader's own sentinel path
+instead, and kills a worker still alive after it. The loader keeps its
+position: `state_dict()` does not change, and the next `iter()` starts new
+workers where it stopped. The training loop calls `close()` on every exit
+path. A process also calls it at exit, before `multiprocessing` stops its
+leftover workers, for every loader whose workers are still alive, so a
+script, or a `multiprocessing` child process, that ends or raises with an
+iterator alive still exits. `shutdown_workers(loader)` from the same module
+does the same for a plain `DataLoader` whose workers use
+`ignore_shutdown_signals_in_worker`.
+
 ## Eval dataloader
 
 The eval path uses a plain `torch.utils.data.DataLoader` (not

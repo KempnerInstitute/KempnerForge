@@ -954,7 +954,7 @@
     "kempnerforge/training/loop.py": {
       "classes": {
         "BatchStream": {
-          "purpose": "Dataloader + live iterator with epoch restart"
+          "purpose": "Dataloader + live iterator with epoch restart; close() stops the loader's workers through its close(), or shutdown_workers for a plain DataLoader"
         },
         "StepResult": {
           "purpose": "Loss, grad norm, positions run, text-token count, per-source token and loss tensors, and a VLM step's documents, image and text tokens and encoder images from one step"
@@ -1085,6 +1085,7 @@
           "methods": [
             "__iter__()",
             "__next__()",
+            "close() (shuts the workers down through the sentinel path and keeps the position; rank-local, no collective; a process also calls it at exit while the workers are alive)",
             "__len__()",
             "_consumed()",
             "state_dict()",
@@ -1099,6 +1100,7 @@
           "methods": [
             "__iter__()",
             "_restart_workers()",
+            "close() (as StatefulDataLoader.close; the next pass replays to the position)",
             "_replay()",
             "__next__()",
             "_identity()",
@@ -1108,10 +1110,19 @@
           ]
         }
       },
+      "functions": [
+        "shutdown_workers(loader) (stops a DataLoader's persistent workers through the sentinel path: the pin-memory thread, torch's worker shutdown, then a kill for a worker still alive; every wait bounded; rank-local, no collective)",
+        "_stop_pin_memory_thread(iterator)",
+        "_register_exit_finalizer(pid) (a multiprocessing finalizer, once per process)",
+        "_close_at_exit(loader) (registers the atexit hook again at each start of workers)",
+        "_close_open_loaders() (closes the loaders whose workers this process started)"
+      ],
       "tested_by": [
         "tests/unit/test_data.py::TestStatefulDataLoader",
         "tests/unit/test_data_position.py",
-        "tests/unit/test_streaming_resume.py"
+        "tests/unit/test_streaming_resume.py",
+        "tests/unit/test_dataloader_shutdown.py",
+        "tests/integration/test_dataloader_pin_memory_shutdown.py"
       ]
     },
     "kempnerforge/data/sampler.py": {
@@ -2251,8 +2262,12 @@
         "count": 23
       },
       "tests/unit/test_streaming_resume.py": {
-        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning on another rank's position, replay past a shorter part warning in every rank's log, mid-pass restart with workers, replay progress, check_state's verdicts; gloo CheckpointManager auto-resume with ignore_rank_state_mismatch of a stream saved as dp 2 x tp 2: each data-parallel rank's own position on the saved data-parallel size, a restart on every rank on another, a restart on every rank when one rank sees a data file at another size, every rank raising together without the flag, and every rank stopping when one rank's check fails another way; a warm start on 2 ranks restarting every rank when one rank sees a data file at another size",
-        "count": 21
+        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning on another rank's position, replay past a shorter part warning in every rank's log, mid-pass restart with workers, replay progress, check_state's verdicts; gloo CheckpointManager auto-resume with ignore_rank_state_mismatch of a stream saved as dp 2 x tp 2: each data-parallel rank's own position on the saved data-parallel size, a restart on every rank on another, a restart on every rank when one rank sees a data file at another size, every rank raising together without the flag, and every rank stopping when one rank's check fails another way; a warm start on 2 ranks restarting every rank when one rank sees a data file at another size; a process with a live stream with workers exits; close() stops the workers and keeps the stream position",
+        "count": 23
+      },
+      "tests/unit/test_dataloader_shutdown.py": {
+        "note": "Module-level pytest functions (no Test* classes): a script, and a fork or spawn multiprocessing child, that returns, raises or takes the multiprocessing logger with a live iterator exits; close() through the sentinel, its kill fallback, the kept position and idempotence; the exit hook closing a loader whose workers are alive and leaving a loader without workers, or one another process started; the hook's order after every start of workers and the finalizer's priority; shutdown_workers on a plain DataLoader; the pin-memory thread stopping, left behind when stuck, and left alone when already stopped",
+        "count": 15
       }
     },
     "integration": {
@@ -2278,6 +2293,10 @@
           "TestDataResumption(4)"
         ],
         "count": 4
+      },
+      "tests/integration/test_dataloader_pin_memory_shutdown.py": {
+        "note": "Module-level pytest functions on one GPU: close() of a loader that pins its batches stops the pin-memory thread and the workers, and returns while the pin-memory thread is stuck; a process whose stalled pinned loader started after an unpinned one exits",
+        "count": 3
       },
       "tests/integration/test_compile.py": {
         "classes": [

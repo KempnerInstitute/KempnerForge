@@ -30,6 +30,7 @@ from kempnerforge.training.data_pipeline import DataPipeline, build_data_pipelin
 from kempnerforge.training.loop import BatchStream
 from kempnerforge.training.runtime import RuntimeContext
 from tests.gloo_ranks import gloo_group, spawn
+from tests.loader_workers import run_to_exit, worker_sockets_fit
 
 SHARDS, DOCS_PER_SHARD = 4, 50
 ALL_SHARDS = tuple(range(SHARDS))
@@ -99,17 +100,6 @@ def _close(loader) -> None:
     BatchStream(DataPipeline(dataloader=loader)).close()
 
 
-def _worker_sockets_fit() -> bool:
-    """Whether DataLoader workers can hand batches to this process here.
-
-    Workers send tensors over AF_UNIX sockets created in the multiprocessing temp
-    directory, and a socket path may not exceed 107 bytes.
-    """
-    import multiprocessing.util
-
-    return len(multiprocessing.util.get_temp_dir()) + len("/listener-12345678") <= 107
-
-
 def _stream_loader(corpus, *, num_workers=0, batch_size=2, **dataset_kwargs):
     """A loader over the corpus; ``dataset_kwargs`` override the dataset's arguments."""
     data, tokenizer = corpus
@@ -122,7 +112,7 @@ def _stream_loader(corpus, *, num_workers=0, batch_size=2, **dataset_kwargs):
 @pytest.mark.parametrize("num_workers", [0, 2])
 def test_resume_continues_the_stream(corpus, num_workers):
     """After 5 batches, a resumed loader yields the uninterrupted run's batches 5 to 7."""
-    if num_workers and not _worker_sockets_fit():
+    if num_workers and not worker_sockets_fit():
         pytest.skip("the temp directory path is too long for DataLoader worker sockets")
     config = _config(corpus, num_workers)
     loader, resumed = _loader(config), _loader(config)
@@ -149,7 +139,7 @@ def test_resume_in_a_later_epoch_follows_that_epochs_shuffle(corpus, num_workers
     Persistent workers keep their own copy of the dataset, so they reach epoch 1 by
     counting their own passes rather than through ``set_epoch``.
     """
-    if num_workers and not _worker_sockets_fit():
+    if num_workers and not worker_sockets_fit():
         pytest.skip("the temp directory path is too long for DataLoader worker sockets")
     config = _config(corpus, num_workers)
     loader, resumed = _loader(config), _loader(config)
@@ -452,7 +442,7 @@ def test_restarting_a_pass_midway_with_workers_reads_the_same_epoch(corpus, tmp_
     With 3 shards and 2 workers, worker 1 reads one shard and finishes early; its
     persistent copy of the dataset then moves to the next epoch.
     """
-    if not _worker_sockets_fit():
+    if not worker_sockets_fit():
         pytest.skip("the temp directory path is too long for DataLoader worker sockets")
     uneven = _copy(corpus, tmp_path / "three", shards=(0, 1, 2))
     reference = _stream_loader(uneven, num_workers=2)
@@ -467,6 +457,74 @@ def test_restarting_a_pass_midway_with_workers_reads_the_same_epoch(corpus, tmp_
         _close(reference)
         _close(restarted)
     assert torch.equal(got, expected[-2])
+
+
+LIVE_STREAM_AT_EXIT = """
+import sys
+
+from kempnerforge.config.schema import DataConfig
+from kempnerforge.data.dataloader import StreamingDataLoader
+from kempnerforge.data.dataset import StreamingHuggingFaceDataset
+
+if __name__ == "__main__":
+    data, tokenizer = sys.argv[1], sys.argv[2]
+    dataset = StreamingHuggingFaceDataset(
+        data, "train", "text", seq_len=8, tokenizer_path=tokenizer
+    )
+    loader = StreamingDataLoader(
+        dataset, batch_size=2, config=DataConfig(num_workers=2, pin_memory=False)
+    )
+    batches = iter(loader)
+    next(batches)
+    print("served a batch", flush=True)
+"""
+
+
+def test_a_process_with_a_live_stream_exits(corpus, tmp_path):
+    """A script whose streaming iterator, with workers, is alive at exit still exits.
+
+    The stream's workers ignore SIGTERM as the map-style loader's do, so
+    ``multiprocessing``'s exit hook would wait on them forever.
+    """
+    if not worker_sockets_fit():
+        pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+    script = tmp_path / "live_stream.py"
+    script.write_text(LIVE_STREAM_AT_EXIT)
+    data, tokenizer = corpus
+
+    result = run_to_exit(script, str(data), str(tokenizer))
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.splitlines()[-1:] == ["served a batch"]
+
+
+def test_close_stops_the_workers_and_keeps_the_stream_position(corpus):
+    """After ``close``, the next pass replays to the position and goes on as before."""
+    if not worker_sockets_fit():
+        pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+    closed = _stream_loader(corpus, num_workers=2)
+    uninterrupted = _stream_loader(corpus, num_workers=2)
+    try:
+        batches = iter(closed)
+        for _ in range(3):
+            next(batches)
+        state = closed.state_dict()
+        workers = list(closed._dataloader._iterator._workers)
+
+        closed.close()
+
+        assert not any(worker.is_alive() for worker in workers)
+        assert closed.state_dict() == state
+        got = [next(iter(closed))["input_ids"], next(closed)["input_ids"]]
+        reference = iter(uninterrupted)
+        for _ in range(3):
+            next(reference)
+        expected = [next(reference)["input_ids"] for _ in range(2)]
+    finally:
+        closed.close()
+        uninterrupted.close()
+    for want, have in zip(expected, got, strict=True):
+        assert torch.equal(want, have)
 
 
 def test_the_replay_logs_its_progress(corpus, caplog, monkeypatch):

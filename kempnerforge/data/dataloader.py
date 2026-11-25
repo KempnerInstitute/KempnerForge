@@ -6,17 +6,24 @@ Wraps PyTorch DataLoader with:
   - Integration with DistributedSampler for rank-partitioned data
   - A resume position that survives a change of data-parallel size or batch size
   - A streaming loader that resumes by replaying its stream to the saved position
+  - Worker shutdown through the loader's sentinel path, from ``close()`` and at exit
 """
 
 from __future__ import annotations
 
+import atexit
+import functools
 import logging
+import os
 import time
+import weakref
 from collections.abc import Callable, Sized
+from multiprocessing.util import Finalize
 from typing import Any
 
 import torch
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.dataloader import _MultiProcessingDataLoaderIter
 
 from kempnerforge.config.schema import DataConfig
 from kempnerforge.data.dataset import StreamingHuggingFaceDataset
@@ -24,6 +31,95 @@ from kempnerforge.data.sampler import DistributedSampler, MixtureSampler
 from kempnerforge.resilience.signal_handler import ignore_shutdown_signals_in_worker
 
 logger = logging.getLogger(__name__)
+
+_SHUTDOWN_WAIT_S = 5.0
+
+_EXIT_FINALIZER_PRIORITY = 100
+
+_loaders_with_workers: weakref.WeakKeyDictionary[StatefulDataLoader | StreamingDataLoader, int] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def shutdown_workers(loader: DataLoader) -> None:
+    """Stop a ``DataLoader``'s persistent workers through its sentinel path.
+
+    Stops the pin-memory thread, waiting up to 5 s for it, then runs torch's own
+    worker shutdown, which sends each worker its sentinel and waits for it with
+    a timeout, and kills a worker still alive, since a worker that runs
+    ``ignore_shutdown_signals_in_worker`` ignores SIGTERM, waiting up to 5 s
+    for it. Every wait is bounded. The next ``iter(loader)`` starts new workers;
+    a loader with no persistent workers is left as it is. Rank-local, with no
+    collective.
+    """
+    iterator = loader._iterator
+    loader._iterator = None
+    if not isinstance(iterator, _MultiProcessingDataLoaderIter):
+        return
+    _stop_pin_memory_thread(iterator)
+    iterator._shutdown_workers()
+    for worker in iterator._workers:
+        if worker.is_alive():
+            worker.kill()
+            worker.join(timeout=_SHUTDOWN_WAIT_S)
+
+
+def _stop_pin_memory_thread(iterator: _MultiProcessingDataLoaderIter) -> None:
+    """Stop ``iterator``'s pin-memory thread, waiting up to 5 s for it.
+
+    torch's worker shutdown joins this thread with no timeout. A thread still
+    running after the wait, stuck pinning a batch, is a daemon left behind:
+    its handle is dropped so that torch's shutdown goes on to the workers. A
+    thread that already stopped, as torch's own shutdown leaves it, is left
+    alone.
+    """
+    thread = getattr(iterator, "_pin_memory_thread", None)
+    if thread is None or not thread.is_alive():
+        return
+    iterator._pin_memory_thread_done_event.set()
+    iterator._worker_result_queue.put((None, None))
+    thread.join(timeout=_SHUTDOWN_WAIT_S)
+    if thread.is_alive():
+        iterator._worker_result_queue.cancel_join_thread()
+        del iterator._pin_memory_thread
+
+
+@functools.cache
+def _register_exit_finalizer(pid: int) -> None:
+    """Have process ``pid`` close its loaders when ``multiprocessing``'s exit function runs.
+
+    That function runs finalizers before it stops any worker, this one ahead of
+    those that close the queues the sentinel goes through. It covers a process
+    whose exit function runs before the ``atexit`` hook: a ``multiprocessing``
+    child, which runs it as its target returns, and a process that called
+    ``multiprocessing.get_logger``, which registers it again.
+    """
+    Finalize(None, _close_open_loaders, exitpriority=_EXIT_FINALIZER_PRIORITY)
+
+
+def _close_at_exit(loader: StatefulDataLoader | StreamingDataLoader) -> None:
+    """Have this process close ``loader`` at exit, unless it is closed first.
+
+    Called once the loader's workers have started, it registers the ``atexit``
+    hook again. ``atexit`` runs hooks in reverse order, so the hook runs before
+    every hook registered by then: ``multiprocessing``'s, which stops leftover
+    workers with SIGTERM and joins them, torch's, after which a loader can no
+    longer stop its workers through the sentinel, and torch's shutdown of
+    pinned iterators, which waits on their pin-memory threads with no timeout.
+    """
+    pid = os.getpid()
+    _register_exit_finalizer(pid)
+    atexit.unregister(_close_open_loaders)
+    atexit.register(_close_open_loaders)
+    _loaders_with_workers[loader] = pid
+
+
+def _close_open_loaders() -> None:
+    """Close every loader that holds workers this process started."""
+    pid = os.getpid()
+    for loader, owner in list(_loaders_with_workers.items()):
+        if owner == pid:
+            loader.close()
 
 
 class DataPositionError(ValueError):
@@ -68,6 +164,9 @@ class StatefulDataLoader:
     data-parallel ranks consumed together, so it resumes exactly on another
     data-parallel size or batch size. With any other sampler it is this
     rank's sample count, which resumes on the data-parallel size that saved it.
+
+    The worker processes ignore SIGTERM, so ``close()`` shuts them down, and
+    a process does so at exit for every loader whose workers are still alive.
 
     Args:
         dataset: Dataset to load from.
@@ -136,6 +235,8 @@ class StatefulDataLoader:
         elif consumed > 0:
             self.sampler.set_skip(consumed)
         self._iterator = iter(self._dataloader)
+        if self._dataloader.num_workers > 0:
+            _close_at_exit(self)
         return self
 
     def __next__(self) -> dict[str, torch.Tensor]:
@@ -152,6 +253,21 @@ class StatefulDataLoader:
             self._start = 0
             self._iterator = None
             raise
+
+    def close(self) -> None:
+        """Shut the worker processes down; the loader keeps its position.
+
+        The workers ignore SIGTERM (``ignore_shutdown_signals_in_worker``), so
+        ``shutdown_workers`` stops them through the loader's sentinel path. The
+        ``state_dict`` is unchanged, ``next`` raises ``StopIteration`` until the
+        next ``iter()``, and that ``iter()`` starts new workers at the same
+        position. Rank-local and idempotent, with no collective. A process calls
+        it at exit for every loader whose workers are still alive, before
+        ``multiprocessing`` stops its workers.
+        """
+        self._iterator = None
+        shutdown_workers(self._dataloader)
+        _loaders_with_workers.pop(self, None)
 
     def __len__(self) -> int:
         return len(self._dataloader)
@@ -396,6 +512,8 @@ class StreamingDataLoader:
             self._restart_workers()
         self.dataset.set_epoch(self._epoch)
         self._iterator = iter(self._dataloader)
+        if self._num_workers > 0:
+            _close_at_exit(self)
         if self._batches_yielded:
             self._replay()
         return self
@@ -407,14 +525,19 @@ class StreamingDataLoader:
         its part of the pass has moved that copy to the next epoch, so it would
         read the next epoch's shuffle. New workers copy the dataset at this epoch.
         """
-        running = getattr(self._dataloader, "_iterator", None)
-        if running is not None and hasattr(running, "_shutdown_workers"):
-            running._shutdown_workers()
-            for worker in getattr(running, "_workers", ()):
-                if worker.is_alive():
-                    worker.kill()
-                    worker.join(timeout=10)
+        shutdown_workers(self._dataloader)
         self._dataloader = DataLoader(self.dataset, **self._loader_kwargs)
+
+    def close(self) -> None:
+        """Shut the worker processes down; the loader keeps its position.
+
+        As ``StatefulDataLoader.close``: the next ``iter()`` starts new workers
+        and replays the stream to the position. A process calls it at exit for
+        every loader whose workers are still alive.
+        """
+        self._iterator = None
+        shutdown_workers(self._dataloader)
+        _loaders_with_workers.pop(self, None)
 
     def _replay(self) -> None:
         """Discard the batches this epoch already gave training, logging progress."""

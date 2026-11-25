@@ -19,6 +19,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.data import DataLoader
 
 from kempnerforge.config.checkpoint import CheckpointConfig, DynamicCheckpointWindow
 from kempnerforge.config.data import DataConfig, TrainingPhase
@@ -46,6 +47,7 @@ from kempnerforge.training.loop import (
     vlm_step,
 )
 from kempnerforge.training.runtime import RuntimeContext
+from tests.loader_workers import worker_sockets_fit
 
 VOCAB = 16
 DIM = 8
@@ -290,83 +292,56 @@ class TestBatchStream:
         stream.close()
         assert stream._iter is None
 
-    def test_close_drains_the_workers_explicitly(self):
-        """Shielded workers ignore SIGTERM, so terminate() cannot reap them.
+    def test_close_hands_the_call_to_the_loader(self):
+        """The loader shuts its own workers down, through its sentinel path."""
 
-        close() must go through the loader's own sentinel path instead, or the
-        interpreter blocks at exit joining daemonic children that refuse to die.
-        """
-
-        class _FakeIterator:
+        class _Loader:
             def __init__(self):
-                self.shutdown_calls = 0
+                self.closed = 0
 
-            def _shutdown_workers(self):
-                self.shutdown_calls += 1
+            def __iter__(self):
+                return iter(_fake_batches(3))
 
-        class _FakeInner:
-            def __init__(self):
-                self._iterator = _FakeIterator()
+            def close(self):
+                self.closed += 1
 
-        class _FakeLoader:
-            def __init__(self):
-                self._dataloader = _FakeInner()
-
-        loader = _FakeLoader()
-        iterator = loader._dataloader._iterator
+        loader = _Loader()
         stream = BatchStream(DataPipeline(dataloader=loader))
+        stream.next_batch()
 
         stream.close()
 
-        assert iterator.shutdown_calls == 1
-        assert loader._dataloader._iterator is None
+        assert loader.closed == 1
+        assert stream._iter is None
 
-    @pytest.mark.parametrize("alive", [True, False], ids=["stuck", "already-gone"])
-    def test_close_kills_a_worker_the_drain_left_behind(self, alive):
-        """SIGKILL is the only way out for a worker that ignored the sentinel.
+    def test_close_stops_a_plain_dataloaders_persistent_workers(self):
+        if not worker_sockets_fit():
+            pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+        batches = _fake_batches(4)
+        loader = DataLoader(batches, batch_size=None, num_workers=2, persistent_workers=True)
+        stream = BatchStream(DataPipeline(dataloader=loader))
+        stream.next_batch()
+        workers = list(loader._iterator._workers)
 
-        These workers ignore SIGTERM by design, so terminate() cannot reap one
-        that failed to drain. Without a kill the interpreter blocks at exit on a
-        daemonic child that refuses to die -- the exact hang the shield would
-        otherwise reintroduce by removing the usual escape.
-        """
+        stream.close()
 
-        class _FakeWorker:
-            def __init__(self, alive):
-                self._alive = alive
-                self.killed = 0
-                self.joined = 0
+        assert [worker.exitcode for worker in workers] == [0, 0]
+        assert loader._iterator is None
 
-            def is_alive(self):
-                return self._alive
+    def test_close_prefers_a_dataloaders_own_close(self):
+        class _ClosingLoader(DataLoader):
+            closed = 0
 
-            def kill(self):
-                self.killed += 1
-                self._alive = False
+            def close(self):
+                self.closed += 1
 
-            def join(self, timeout=None):
-                self.joined += 1
+        loader = _ClosingLoader(_fake_batches(2), batch_size=None)
+        stream = BatchStream(DataPipeline(dataloader=loader))
+        stream.next_batch()
 
-        class _FakeIterator:
-            def __init__(self, worker):
-                self._workers = [worker]
+        stream.close()
 
-            def _shutdown_workers(self):
-                pass
-
-        class _FakeInner:
-            def __init__(self, worker):
-                self._iterator = _FakeIterator(worker)
-
-        class _FakeLoader:
-            def __init__(self, worker):
-                self._dataloader = _FakeInner(worker)
-
-        worker = _FakeWorker(alive)
-        BatchStream(DataPipeline(dataloader=_FakeLoader(worker))).close()
-
-        assert worker.killed == (1 if alive else 0)
-        assert worker.joined == (1 if alive else 0)
+        assert loader.closed == 1
 
     def test_close_is_idempotent(self):
         stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))

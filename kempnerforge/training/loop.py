@@ -19,10 +19,12 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.vlm import FreezeSpec
+from kempnerforge.data.dataloader import shutdown_workers
 from kempnerforge.distributed.parallel import refresh_fsdp_dtypes
 from kempnerforge.distributed.utils import (
     any_rank,
@@ -54,9 +56,6 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 LossFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-
-
-_WORKER_KILL_TIMEOUT_S = 5.0
 
 
 class BatchStream:
@@ -102,33 +101,25 @@ class BatchStream:
         self._iter = None
 
     def close(self) -> None:
-        """Shut the loader's worker processes down explicitly.
+        """Drop the live iterator and shut the loader's worker processes down.
 
-        Workers ignore SIGTERM (see ``ignore_shutdown_signals_in_worker``) so a
-        preemption signal cannot kill them out from under an in-flight step.
-        The same shield means ``Process.terminate()``, which is SIGTERM, cannot
-        reap them either: left to the interpreter's exit hook, the process would
-        block forever joining daemonic children that refuse to die. Draining
-        them through the loader's own sentinel path avoids that.
+        Calls the loader's ``close()`` where it has one, as ``StatefulDataLoader``
+        and ``StreamingDataLoader`` do, and ``shutdown_workers`` for a plain
+        ``DataLoader``. Both stop the workers through the loader's own sentinel
+        path, since workers that ignore SIGTERM (see
+        ``ignore_shutdown_signals_in_worker``) cannot be stopped with it.
 
-        Rank-local and idempotent — it issues no collectives, so it is safe on
-        the exception path in ``train_loop``'s ``finally``.
+        Rank-local and idempotent, with no collective, so it is safe on the
+        exception path in ``train_loop``'s ``finally``.
         """
         self._iter = None
         self._source = None
         loader = self.pipeline.dataloader
-        if loader is None:
-            return
-        inner = getattr(loader, "_dataloader", loader)
-        iterator = getattr(inner, "_iterator", None)
-        if iterator is not None and hasattr(iterator, "_shutdown_workers"):
-            iterator._shutdown_workers()
-            for worker in getattr(iterator, "_workers", ()):
-                if worker.is_alive():
-                    worker.kill()
-                    worker.join(timeout=_WORKER_KILL_TIMEOUT_S)
-        if hasattr(inner, "_iterator"):
-            inner._iterator = None
+        close = getattr(loader, "close", None)
+        if close is not None:
+            close()
+        elif isinstance(loader, DataLoader):
+            shutdown_workers(loader)
 
     def next_batch(self) -> dict[str, torch.Tensor]:
         if self.dataloader is None:
