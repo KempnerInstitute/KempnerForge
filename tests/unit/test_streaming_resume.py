@@ -13,7 +13,6 @@ import json
 import logging
 import random
 import shutil
-import socket
 from datetime import timedelta
 from pathlib import Path
 
@@ -21,7 +20,6 @@ import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from kempnerforge.config.schema import CheckpointConfig, DataConfig, JobConfig, TrainConfig
 from kempnerforge.data.dataloader import DataPositionError, StatefulDataLoader, StreamingDataLoader
@@ -31,6 +29,7 @@ from kempnerforge.metrics.logger import _RankFilter
 from kempnerforge.training.data_pipeline import DataPipeline, build_data_pipeline
 from kempnerforge.training.loop import BatchStream
 from kempnerforge.training.runtime import RuntimeContext
+from tests.gloo_ranks import gloo_group, spawn
 from tests.loader_workers import run_to_exit, worker_sockets_fit
 
 SHARDS, DOCS_PER_SHARD = 4, 50
@@ -550,23 +549,6 @@ def test_the_replay_logs_its_progress(corpus, caplog, monkeypatch):
 DP2_TP2 = [(0, 2), (0, 2), (1, 2), (1, 2)]
 
 
-def _free_port() -> int:
-    """An unused local TCP port for the gloo rendezvous."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def _init_gloo(rank: int, world: int, port: int) -> None:
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world,
-        init_method=f"tcp://127.0.0.1:{port}",
-        timeout=timedelta(seconds=120),
-    )
-
-
 def _seed_all(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -623,8 +605,7 @@ def _save_stream_job(
     save, rank 0 writes every rank's saved pass and count and its next 3 batches, which
     an exact resume of that data-parallel rank must read next.
     """
-    _init_gloo(rank, world, port)
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=120)):
         loader = _part_loader(data, tokenizer, DP2_TP2[rank])
         stream = BatchStream(DataPipeline(dataloader=loader))
         for _ in range(steps):
@@ -636,8 +617,6 @@ def _save_stream_job(
         dist.all_gather_object(gathered, report)
         if rank == 0:
             Path(out).write_text(json.dumps(gathered))
-    finally:
-        dist.destroy_process_group()
 
 
 def _resume_stream_job(
@@ -662,9 +641,8 @@ def _resume_stream_job(
     rank's report: the error the resume raised or the next 3 batches, the next random
     draw and the one the fresh seeds give, and the warnings.
     """
-    _init_gloo(rank, world, port)
-    warnings: list[str] = []
-    try:
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=120)):
+        warnings: list[str] = []
         dp = (layout[rank][0], layout[rank][1])
         manager = _stream_manager(root, dp, lenient)
         loader = _part_loader(views[rank], tokenizer, dp)
@@ -688,8 +666,6 @@ def _resume_stream_job(
         dist.all_gather_object(gathered, report)
         if rank == 0:
             Path(out).write_text(json.dumps(gathered))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.fixture(scope="module")
@@ -704,15 +680,13 @@ def stream_checkpoint(uneven_corpus, tmp_path_factory) -> tuple[str, list[dict]]
     assert parts[0] != parts[1], parts
     root = tmp_path_factory.mktemp("stream_checkpoint")
     out = str(root / "saved.json")
-    args = (4, _free_port(), str(root / "ckpt"), data, tokenizer, max(parts) + 3, out)
-    mp.spawn(_save_stream_job, args=args, nprocs=4)
+    spawn(_save_stream_job, 4, str(root / "ckpt"), data, tokenizer, max(parts) + 3, out)
     return str(root / "ckpt"), json.loads(Path(out).read_text())
 
 
 def _resume_streams(tmp_path, root, views, tokenizer, layout, lenient, warm=False) -> list[dict]:
     out = str(tmp_path / "resumed.json")
-    args = (len(layout), _free_port(), root, views, tokenizer, layout, lenient, out, warm)
-    mp.spawn(_resume_stream_job, args=args, nprocs=len(layout))
+    spawn(_resume_stream_job, len(layout), root, views, tokenizer, layout, lenient, out, warm)
     return json.loads(Path(out).read_text())
 
 

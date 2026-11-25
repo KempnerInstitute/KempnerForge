@@ -473,9 +473,14 @@ class TestBuildParallelModelVLM:
         assert all(not p.requires_grad for p in model.vision_encoder.parameters())
 
     def test_partially_unfrozen_encoder_stays_in_train_mode(self):
+        """An unfrozen spec under vision_encoder keeps the encoder in train mode.
+
+        The random encoder has no parameter a pattern could match, so the spec names its
+        buffer through an alias, which the build's pattern check leaves alone.
+        """
         from kempnerforge.config.adapter import AdapterConfig
         from kempnerforge.config.vision import VisionEncoderConfig
-        from kempnerforge.config.vlm import FreezeSpec, VLMConfig
+        from kempnerforge.config.vlm import DEFAULT_MODULE_PATTERNS, FreezeSpec, VLMConfig
         from kempnerforge.distributed.parallel import build_parallel_model
 
         mc = ModelConfig(
@@ -492,8 +497,12 @@ class TestBuildParallelModelVLM:
             max_text_len=32,
             freeze=[
                 FreezeSpec("vision_encoder", True),
-                FreezeSpec("vision_encoder._anchor", False),
+                FreezeSpec("vision_encoder.anchor", False),
             ],
+            module_patterns={
+                **DEFAULT_MODULE_PATTERNS,
+                "vision_encoder.anchor": ["vision_encoder._anchor"],
+            },
         )
         model = build_parallel_model(
             mc,
