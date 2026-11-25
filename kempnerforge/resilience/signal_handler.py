@@ -36,9 +36,12 @@ def ignore_shutdown_signals_in_worker(worker_id: int) -> None:
     path rather than on an exception path.
 
     The cost: ``multiprocessing.Process.terminate()`` is itself SIGTERM, so a
-    shielded worker cannot be reaped that way and the interpreter's exit hook
-    would block joining it. Workers must therefore be shut down explicitly
-    through the loader's sentinel path — see ``BatchStream.close``.
+    shielded worker cannot be reaped that way, and ``multiprocessing``'s exit
+    hook, which terminates leftover workers and then joins them, would block
+    on one forever. Workers are therefore shut down through the loader's
+    sentinel path: ``StatefulDataLoader.close`` and ``StreamingDataLoader.close``,
+    which the training loop calls on every exit path and a process calls at
+    exit for every loader whose workers are still alive.
 
     Args:
         worker_id: Worker index, supplied by ``DataLoader``. Unused.
