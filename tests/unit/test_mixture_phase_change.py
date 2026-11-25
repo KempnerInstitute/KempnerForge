@@ -325,6 +325,18 @@ def test_a_dataset_entering_mid_epoch_draws_each_ranks_own_share(
     assert len(entering) == len(set(entering))
 
 
+def test_a_change_at_the_largest_seed_draws_the_rest_of_the_epoch():
+    sampler = MixtureSampler([0, 100, 200], [1.0, 1.0], num_replicas=1, rank=0, seed=2**64 - 1)
+    epoch = list(sampler)[:40]
+    sampler.update_weights([3.0, 1.0])
+    sampler.set_skip(40)
+    epoch += list(sampler)
+
+    b = [i for i in epoch if i >= 100]
+    assert len(epoch) == 200
+    assert len(b) == len(set(b))
+
+
 def test_the_state_records_a_change_until_the_next_epoch():
     sampler = MixtureSampler([0, 100, 200], [1.0, 1.0], num_replicas=1, rank=0, seed=2)
     list(sampler)
