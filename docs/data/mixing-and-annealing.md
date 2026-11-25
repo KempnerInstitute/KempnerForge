@@ -184,9 +184,10 @@ while (current_phase_idx < len(active_phases)
 Two effects:
 
 - **Sampler re-weighting** — `MixtureSampler.update_weights` recomputes
-  probabilities and target counts. Takes effect on the *next*
-  `__iter__()` call (so within the current epoch, the previous weights
-  are still in play; phase changes are clean at epoch boundaries).
+  probabilities and target counts, and the loop drops the batch iterator,
+  so the next step draws with the new weights. Inside an epoch, that is the
+  rest of the epoch, drawn from the samples the epoch has not drawn yet
+  (see [Phase changes inside an epoch](#phase-changes-inside-an-epoch)).
 - **LR scale** — `phase_lr_scale` is applied to every optimizer param
   group on each step: `pg["lr"] *= phase_lr_scale`. The base LR comes
   from the scheduler; the phase scale is an overlay.
@@ -209,6 +210,30 @@ for i, phase in enumerate(active_phases):
 `current_phase_idx` itself is saved in the checkpoint's `extra` dict
 so the resume logic matches what was live at save time — see
 [Checkpointing § Train state](../checkpointing/train-state.md).
+
+### Phase changes inside an epoch
+
+A phase's `start_step` seldom falls on an epoch boundary. From that step
+on, the rest of the epoch draws with the new weights: its remaining
+positions are split across the datasets in proportion to the new weights,
+and each dataset fills its part from the samples this rank has not drawn
+in the epoch, before it repeats any. A dataset that no weighting of the
+epoch oversamples (asks for more samples than the rank's share holds)
+takes at most the samples it has left, and the positions it cannot fill go
+to the datasets with samples to spare, the most weighted first, so it
+draws no sample twice in the epoch. A dataset that a weighting of the
+epoch oversamples repeats samples once its undrawn ones run out, as that
+weighting does on its own. The epoch keeps its length, and the next epoch
+draws with the new weights from its start.
+
+The sampler records the weights the epoch drew with from each position
+where they changed, and its state dict carries that record as
+`epoch_weights` while the epoch has such a change. A resume at any step,
+before, at or after a change, draws what the uninterrupted run draws.
+Weights that differ at a resume, say from an edited phase, take effect at
+the saved position like any other change. A checkpoint saved without the
+record resumes the epoch as if the current weights had held from its
+start, which can skip or repeat samples for the rest of that epoch.
 
 ## Per-source metrics
 
@@ -235,12 +260,6 @@ Exposed names come from `DatasetSource.name` (auto-derived from
 
 ## Limitations
 
-- Sampler weight changes are per-epoch: `update_weights` takes effect
-  on the next iteration, not mid-epoch.
-- `MixtureSampler` doesn't expose a true `load_state_dict` for
-  skip-ahead — `StatefulDataLoader` calls `set_skip()` on it, which
-  the sampler honors, but mid-epoch exact reproducibility across
-  weight changes is not guaranteed.
 - A mixture's resume position counts this rank's samples, so it resumes
   only on the data-parallel size that saved it; on another size the
   loader raises `DataPositionError`, and a warm start, or an auto-resume

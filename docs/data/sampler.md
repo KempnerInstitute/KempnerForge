@@ -126,20 +126,31 @@ Each `__iter__()` then does:
    offset so the final list indexes into the parent `MixtureDataset`.
 7. **Final shuffle** — the assembled index list is shuffled once more
    so samples from different sources are interleaved, not grouped.
+8. **Weights changed inside the epoch**: when the weights changed after
+   the epoch began and the pass starts at a skip inside the epoch, the
+   list keeps its first `skip` entries and draws the rest under the new
+   weights, from the samples not drawn in the epoch first, shuffled with
+   the same generator. Every earlier change of the epoch is replayed the
+   same way, in order (see
+   [Mixing and annealing § Phase changes inside an epoch](mixing-and-annealing.md#phase-changes-inside-an-epoch)).
 
 ### `update_weights(weights, temperature)`
 
 Called by the training loop at phase boundaries. Recomputes
 probabilities and `_target_counts`; takes effect on the next
-`__iter__()` call. The sampler's internal `seed + epoch` behavior is
+`__iter__()` call, which draws a new epoch with them, or the rest of
+the current one when it starts inside it (step 8). The sampler's
+internal `seed + epoch` behavior is
 unchanged — weight changes don't re-seed.
 
 ### Skip-ahead behavior
 
 Same as `DistributedSampler`: `set_skip(k)` drops the first `k`
-entries of the assembled (final, shuffled) index list. Resumes are
-robust if the weights and `num_replicas` match between save and load;
-a phase change between save and load would shift the index list. Each
+entries of the assembled (final, shuffled) index list. The state dict
+records the weights the epoch drew with from each position where they
+changed, so a resume rebuilds the same list, phase changes before the
+saved position included, and weights that differ at the resume apply
+from the saved position as a change of their own. Each
 rank's list depends on `num_replicas`, so there is no global position to
 carry over: `StatefulDataLoader` refuses to resume a mixture position on
 another data-parallel size.
@@ -157,11 +168,20 @@ Both samplers return the same keys:
 }
 ```
 
-`load_state_dict` restores **only** `epoch`. `num_replicas` and `rank`
-are local to this process and are re-derived from the current world
-size, not transplanted from the save; `StatefulDataLoader` compares the
-saved `num_replicas` with the current one to decide whether a per-rank
-position still applies. `seed` comes from `TrainConfig`;
+`MixtureSampler` adds `epoch_weights` while its epoch has a weight
+change inside it: the sampling probabilities the epoch drew with, as
+`[position, probabilities]` pairs from position 0, such as
+`[[0, [0.5, 0.5]], [1000, [0.6, 0.4]]]`. Its `load_state_dict` restores
+that record with `epoch`, and drops it with a warning when it covers
+another number of datasets. A state without it draws the epoch with the
+current weights from its start.
+
+Apart from that record, `load_state_dict` restores **only** `epoch`.
+`num_replicas` and `rank` are local to this process and are re-derived
+from the current world size, not transplanted from the save;
+`StatefulDataLoader` compares the saved `num_replicas` with the current
+one to decide whether a per-rank position still applies. `seed` comes
+from `TrainConfig`;
 `StatefulDataLoader` logs a warning when the saved seed or the dataset
 length differs from the run's, since its position counts samples of the
 saved order.
