@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.vlm import FreezeSpec
+from kempnerforge.distributed.expert_parallel import average_non_expert_grads_
 from kempnerforge.distributed.parallel import refresh_fsdp_dtypes
 from kempnerforge.distributed.utils import (
     any_rank,
@@ -244,6 +245,13 @@ class TrainingSession:
 
 
 def clip_grads(model: torch.nn.Module, max_norm: float, pp_group: Any = None) -> float:
+    """Clip the step's gradients to ``max_norm``; return their norm before clipping.
+
+    Under expert parallelism the gradients of the parameters every EP rank holds a copy
+    of are first averaged over the EP group (``average_non_expert_grads_``), so every EP
+    rank clips and steps its copies alike. Every rank must make the call.
+    """
+    average_non_expert_grads_(model)
     grad_norm = clip_grad_norm_(model, max_norm, pp_group=pp_group)
     return grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
 

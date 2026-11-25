@@ -14,7 +14,11 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from kempnerforge.distributed.expert_parallel import ep_dispatch_and_compute, expert_parallel_params
+from kempnerforge.distributed.expert_parallel import (
+    average_non_expert_grads_,
+    ep_dispatch_and_compute,
+    expert_parallel_params,
+)
 from kempnerforge.model.moe import _HAS_GROUPED_MM, MoEMLP, build_moe
 
 pytestmark = pytest.mark.skipif(not _HAS_GROUPED_MM, reason="torch._grouped_mm not available")
@@ -164,3 +168,22 @@ class TestExpertParallelParams:
         """One norm all-reduce covers one group, so a second group must not pass silently."""
         with pytest.raises(ValueError, match="different expert-parallel groups"):
             expert_parallel_params(self._model([object(), object()]))
+
+
+class TestAverageWithoutEP:
+    def test_changes_no_gradient_and_communicates_nothing(self, monkeypatch):
+        """Without expert parallelism every gradient stays as it is, and no collective runs."""
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("a collective ran without expert parallelism")
+
+        monkeypatch.setattr(dist, "all_reduce", refuse)
+        model = torch.nn.Sequential(_moe(False), _moe(True))
+        torch.manual_seed(3)
+        for p in model.parameters():
+            p.grad = torch.randn_like(p)
+        before = [p.grad.clone() for p in model.parameters() if p.grad is not None]
+        average_non_expert_grads_(model)
+        after = [p.grad for p in model.parameters() if p.grad is not None]
+        assert len(after) == len(before)
+        assert all(torch.equal(a, b) for a, b in zip(after, before, strict=True))

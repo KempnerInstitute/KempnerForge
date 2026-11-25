@@ -23,6 +23,7 @@ for micro_step in range(grad_accum_steps):       ── maybe_no_sync sets
     ├─ [+ moe_aux_loss_weight * model.get_moe_aux_loss()]
     └─ (loss / grad_accum_steps).backward()       ── gradient accumulation
 
+[EP] average_non_expert_grads_(model)
 grad_norm = clip_grad_norm_(model, grad_clip_norm)
 if NaN: drop the routers' counts, zero_grad, maybe stop, skip the update;
         still run scheduler.step(), freeze stages / phases and the shutdown check
@@ -175,6 +176,7 @@ invariant to the accumulation factor.
 After the microbatch loop:
 
 ```python
+average_non_expert_grads_(model)
 grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
 
 if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
@@ -199,6 +201,10 @@ if phase_lr_scale != 1.0:
 optimizer.zero_grad()
 ```
 
+The step bodies make both calls through `clip_grads`. Under expert
+parallelism `average_non_expert_grads_` gives every EP rank the EP
+group's mean gradient of each parameter it holds a copy of, so the
+copies take the same step and stay equal; without EP it does nothing.
 `clip_grad_norm_` wraps PyTorch's utility so it works with FSDP2 sharded
 parameters. Under pipeline parallelism `pipeline_step` also passes the PP
 group, so the norm covers every stage rather than this rank's own; under

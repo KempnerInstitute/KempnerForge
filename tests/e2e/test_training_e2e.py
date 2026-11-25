@@ -961,8 +961,7 @@ def test_moe_ep_resume_matches_uninterrupted(tmp_path, packed):
     """An ep=2 run resumed from its own step-20 checkpoint goes on as the run did.
 
     The resume has the run's schedule, data and RNG, so with each EP rank's experts back
-    the losses match up to GPU nondeterminism: EP runs are not bit-reproducible, and a
-    checkpoint keeps one of the EP copies of the other weights, which drift apart (#482).
+    the losses match up to GPU nondeterminism, since EP runs are not bit-reproducible.
     One rank's experts on every rank lands far outside the tolerance.
     """
     common = _ep_moe_args(

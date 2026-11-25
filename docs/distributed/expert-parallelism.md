@@ -150,13 +150,15 @@ expert. An `ep=1` checkpoint loads into an EP run the same way, each
 rank taking its own experts.
 
 Every EP rank also holds a copy of each weight outside the routed
-experts. The copies can drift apart on GPU
-([#482](https://github.com/KempnerInstitute/KempnerForge/issues/482)),
-and DCP writes each chunk that several ranks hold from one of them, by
-default the one with the least to write so far, which could join
-chunks of different copies into one tensor. An EP save writes each
-such chunk from its lowest rank instead, so the checkpoint holds EP
-rank 0's copy whole, and a resume gives every EP rank that copy. The
+experts. The training step keeps the copies bitwise equal (see
+[Gradients and clipping](#gradients-and-clipping)), but a loop that
+steps the model without `clip_grads` can let them differ in the last
+bits, and DCP writes each chunk that several ranks hold from one of
+them, by default the one with the least to write so far, which could
+then join chunks of different copies into one tensor. An EP save
+writes each such chunk from its lowest rank instead, so the checkpoint
+holds EP rank 0's copy whole, and a resume gives every EP rank that
+copy. The
 lowest rank also writes every other chunk that several ranks share:
 under HSDP (`dp_replicate > 1`) replica 0 writes all of them, and
 under TP, which leaves the MoE layers whole, `tp` rank 0 writes every
@@ -264,17 +266,22 @@ which reaches every parameter outside the routed experts, takes two
 extra roundings, which shows in bf16.
 
 The routers, the shared experts and every parameter outside the MoE
-layers have a copy on each EP rank. FSDP2 does not reduce their
-gradients over `ep`, so the copies stay equal only as long as the EP
-ranks compute and scale those gradients alike. `clip_grad_norm_`
-therefore sums the routed experts' squared norms over the EP group and
-averages the copies', and every EP rank clips by the whole model's norm
-with the same coefficient; see
+layers have a copy on each EP rank. FSDP2 reduces their gradients over
+the DP mesh only, and on GPU the EP ranks' backward passes can round
+them differently, so stepped as they are the copies drift apart.
+`clip_grads`, which every step body calls after the backward, therefore
+first gives every EP rank the EP group's mean of those gradients
+(`average_non_expert_grads_` in
+[`kempnerforge/distributed/expert_parallel.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/expert_parallel.py)):
+one all-reduce over the EP group per gradient dtype, of each rank's
+FSDP shards. `clip_grad_norm_` then sums the routed experts' squared
+norms over the EP group and averages the copies', and every EP rank
+clips by the whole model's norm with the same coefficient; see
 [Gradient utilities § Under expert parallelism](../training/gradient-utilities.md#under-expert-parallelism).
-That removes one cause of drift, not every cause: on GPU the copies
-still drift apart over training, with or without clipping, and nothing
-re-syncs them across the EP group yet
-([#482](https://github.com/KempnerInstitute/KempnerForge/issues/482)).
+The copies are equal at initialization and after a load, so with the
+same gradients they take the same optimizer step and stay bitwise
+equal. Without EP, `average_non_expert_grads_` does nothing and
+communicates nothing.
 
 ## Gradient scaling (optional)
 

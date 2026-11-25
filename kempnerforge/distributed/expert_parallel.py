@@ -2,7 +2,9 @@
 
 Each EP rank holds ``num_experts // ep_size`` experts. Tokens are shuffled
 between ranks via all-to-all so every token reaches its assigned expert,
-then results are returned to the originating rank.
+then results are returned to the originating rank. Every EP rank also holds
+a copy of each other parameter, which ``average_non_expert_grads_`` keeps
+equal across the EP group.
 
 When ``ep=1`` (default), this module is a no-op and the model runs with
 all experts replicated on every rank (the pre-EP behavior).
@@ -15,6 +17,7 @@ import logging
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
 
 from kempnerforge.model.moe import MoEMLP
 
@@ -365,3 +368,41 @@ def expert_parallel_params(
         else:
             params += module.experts.parameters()
     return params, group
+
+
+@torch.no_grad()
+def average_non_expert_grads_(model: torch.nn.Module) -> None:
+    """Give every EP rank the EP group's mean gradient of each parameter outside the experts.
+
+    Each EP rank holds a copy of every parameter but its routed experts, and the EP ranks
+    of a data-parallel group train on the same batches, so the copies' gradients differ
+    only in how the backward's kernels round. Every EP rank leaves with the same mean, so
+    copies that start equal take the same optimizer step and stay bitwise equal. Call it
+    once per optimizer step, after the backward, when FSDP2 has reduced the gradients over
+    the data-parallel ranks, and before clipping. A gradient that is None stays None.
+
+    Does nothing, and communicates nothing, when no ``MoEMLP`` has ``ep_world_size > 1``.
+    Otherwise every EP rank must call it with gradients on the same parameters: it runs one
+    all-reduce over the EP group per gradient dtype, of this rank's shards of those
+    gradients, and holds one flat copy of a dtype's shards while that all-reduce runs.
+
+    Args:
+        model: The model, with ``apply_expert_parallel`` applied or not.
+    """
+    expert_params, group = expert_parallel_params(model)
+    if group is None:
+        return
+    expert_ids = {id(p) for p in expert_params}
+    by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
+    for p in model.parameters():
+        if p.grad is None or id(p) in expert_ids:
+            continue
+        grad = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
+        by_dtype.setdefault(grad.dtype, []).append(grad)
+    ep_size = dist.get_world_size(group)
+    for grads in by_dtype.values():
+        flat = torch.cat([grad.reshape(-1) for grad in grads])
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group)
+        flat.div_(ep_size)
+        for grad, mean in zip(grads, flat.split([grad.numel() for grad in grads]), strict=True):
+            grad.copy_(mean.view_as(grad))
