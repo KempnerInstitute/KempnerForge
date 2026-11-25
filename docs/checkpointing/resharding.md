@@ -74,10 +74,11 @@ its layout, and before reading any shard, every rank refuses with a
 
 A PP run loads a checkpoint saved without PP, such as the output of
 `hf-to-dcp`: each stage loads its own layers from the one DCP index,
-through `checkpoint.load_path` or auto-resume. It loads the weights
-only. The saved optimizer param groups are the whole model's, not
-one stage's, so a load that would restore the optimizer state such a
-checkpoint holds is refused, also on auto-resume. To continue from its
+through `checkpoint.load_path` or auto-resume. Of its DCP state a
+stage loads the model weights alone: the saved optimizer param groups
+are the whole model's, not one stage's, so a load that would restore
+the optimizer state such a checkpoint holds is refused, also on
+auto-resume. To continue from its
 weights with a fresh optimizer, set `checkpoint.load_path` to it with
 `checkpoint.exclude_from_loading = ["optimizer"]` (add
 `"train_state"` to also restart the step, schedule and data

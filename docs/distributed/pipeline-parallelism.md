@@ -51,8 +51,8 @@ The layer keys in `PipelineStageModule.layers` match the full
 and the checkpoint records the degree, so a stage checkpoint resumes
 only at the `pp` it was saved with; any other `pp` is refused with an
 error that names both. The full model's names also let each stage
-load its own layers from a checkpoint saved without PP, its weights
-only (see
+load its own layers from a checkpoint saved without PP, but not its
+optimizer state (see
 [Resharding § PP](../checkpointing/resharding.md#pp-the-one-special-case),
 which also shows how to move weights to another `pp`).
 

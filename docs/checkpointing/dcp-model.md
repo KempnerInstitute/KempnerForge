@@ -170,7 +170,8 @@ checkpoints/step_1000/
 `metadata.json` records the degree as `pp`, and a load compares it
 with the run's before it reads any shard: a stage checkpoint loads
 only at the `pp` it was saved with, and a PP run loads each stage's
-own layers from a checkpoint saved without PP, its weights only. The
+own layers from a checkpoint saved without PP, but not its optimizer
+state. The
 module `kempnerforge/checkpoint/layout.py` reads a checkpoint's
 layout; see
 [Resharding § PP](resharding.md#pp-the-one-special-case) for what each
