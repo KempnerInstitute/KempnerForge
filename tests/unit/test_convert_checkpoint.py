@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import sys
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,6 +15,7 @@ import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 from safetensors.torch import load_file, save_file
+from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
@@ -28,6 +31,7 @@ from convert_checkpoint import (
 from kempnerforge.checkpoint.manager import derive_buffers, derived_buffer_owners
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.distributed.pipeline_parallel import build_stage_module
 from kempnerforge.model.router import SigmoidTopKRouter
 from kempnerforge.model.transformer import Transformer
 
@@ -1247,3 +1251,115 @@ class TestSigmoidRouterMasters:
         for router, source in zip(loaded, routers, strict=True):
             for got, want in zip(router._masters(), source._masters(), strict=True):
                 assert torch.equal(got, want)
+
+
+def _keep_all(key: str) -> bool:
+    return True
+
+
+def _stage_dcp(
+    path: Path,
+    model: Transformer,
+    config: ModelConfig,
+    stages: int,
+    *,
+    record: bool = True,
+    keep: Callable[[str], bool] = _keep_all,
+) -> None:
+    """Save ``model`` as a run with ``stages`` pipeline stages saves it.
+
+    Each stage writes its model and optimizer state into ``pp{k}/``, its model entries the
+    ones ``keep`` passes, and with ``record`` the degree goes in ``metadata.json``.
+    """
+    weights = model.state_dict()
+    for k in range(stages):
+        stage = build_stage_module(config, k, stages)
+        stage.load_state_dict({key: weights[key] for key in stage.state_dict()})
+        optimizer = torch.optim.AdamW(stage.parameters(), lr=0.0)
+        for param in stage.parameters():
+            param.grad = torch.ones_like(param)
+        optimizer.step()
+        state = {
+            "model": {key: value for key, value in stage.state_dict().items() if keep(key)},
+            "optimizer": get_optimizer_state_dict(stage, optimizer),
+        }
+        dcp.save(state, checkpoint_id=str(path / f"pp{k}"))
+    meta = {"step": 1, "tokens_seen": 0, **({"pp": stages} if record else {})}
+    (path / "metadata.json").write_text(json.dumps(meta))
+
+
+def _same_exports(first: Path, second: Path) -> None:
+    for name in ("model.safetensors", "config.json"):
+        assert (first / name).read_bytes() == (second / name).read_bytes(), name
+
+
+class TestPipelineParallelExport:
+    """A checkpoint saved under pipeline parallelism exports as the same weights saved without."""
+
+    CONFIG = ModelConfig(dim=32, n_layers=4, n_heads=4, vocab_size=64, max_seq_len=16)
+
+    @pytest.mark.parametrize("stages", [2, 4])
+    @pytest.mark.parametrize("record", [True, False], ids=["recorded", "unrecorded"])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=str)
+    def test_the_export_is_the_one_saved_without_pp(self, tmp_path, stages, record, dtype):
+        """Each stage gives the tensors its own index lists; its optimizer entries are ignored."""
+        source = _random_dcp(tmp_path / "flat", self.CONFIG)
+        _stage_dcp(tmp_path / "staged", source, self.CONFIG, stages, record=record)
+        for name in ("flat", "staged"):
+            dcp_to_hf(str(tmp_path / name), str(tmp_path / f"hf-{name}"), self.CONFIG, dtype=dtype)
+        _same_exports(tmp_path / "hf-flat", tmp_path / "hf-staged")
+
+    def test_stages_saved_before_the_router_masters_export(self, tmp_path):
+        """The derived buffers no stage holds are left out of the load, as for a flat save."""
+        config = TestSigmoidRouterMasters.CONFIG
+        source = _random_dcp(tmp_path / "unused", config)
+
+        def no_masters(key: str) -> bool:
+            return not key.endswith("_bits")
+
+        flat = {k: v for k, v in source.state_dict().items() if no_masters(k)}
+        dcp.save({"model": flat}, checkpoint_id=str(tmp_path / "flat"))
+        _stage_dcp(tmp_path / "staged", source, config, 2, keep=no_masters)
+        for name in ("flat", "staged"):
+            dcp_to_hf(
+                str(tmp_path / name),
+                str(tmp_path / f"hf-{name}"),
+                config,
+                dtype=torch.float32,
+                check_architecture=False,
+            )
+        _same_exports(tmp_path / "hf-flat", tmp_path / "hf-staged")
+
+    def test_a_stage_without_its_index_is_refused(self, tmp_path):
+        _stage_dcp(tmp_path / "staged", Transformer(self.CONFIG), self.CONFIG, 2)
+        shutil.rmtree(tmp_path / "staged" / "pp1")
+        with pytest.raises(ValueError, match=r"\['pp1'\] hold no DCP index"):
+            dcp_to_hf(str(tmp_path / "staged"), str(tmp_path / "hf"), self.CONFIG)
+        assert not (tmp_path / "hf").exists()
+
+    def test_stages_that_lack_a_tensor_are_refused(self, tmp_path):
+        """Without a recorded degree, a missing stage directory shows as missing tensors."""
+        _stage_dcp(tmp_path / "staged", Transformer(self.CONFIG), self.CONFIG, 2, record=False)
+        shutil.rmtree(tmp_path / "staged" / "pp1")
+        with pytest.raises(ValueError, match=r"none of its stages holds 20 tensors"):
+            dcp_to_hf(str(tmp_path / "staged"), str(tmp_path / "hf"), self.CONFIG)
+
+    def test_a_tensor_two_stages_hold_is_refused(self, tmp_path):
+        _stage_dcp(tmp_path / "staged", Transformer(self.CONFIG), self.CONFIG, 2, record=False)
+        shutil.copytree(tmp_path / "staged" / "pp1", tmp_path / "staged" / "pp2")
+        with pytest.raises(ValueError, match=r"pp1 and pp2 both hold model\.layers\.2\."):
+            dcp_to_hf(str(tmp_path / "staged"), str(tmp_path / "hf"), self.CONFIG)
+
+    def test_a_tied_config_is_refused(self, tmp_path):
+        """A pipeline-parallel run never ties, so its stages hold the embedding and the head."""
+        _stage_dcp(tmp_path / "staged", Transformer(self.CONFIG), self.CONFIG, 2)
+        tied = replace(self.CONFIG, tie_embeddings=True)
+        with pytest.raises(ValueError, match=r"pp=2.*tie_embeddings = true"):
+            dcp_to_hf(str(tmp_path / "staged"), str(tmp_path / "hf"), tied)
+
+    def test_stages_short_of_experts_are_refused(self, tmp_path):
+        """The experts are counted over every stage's index, as over a flat checkpoint's."""
+        saved = _moe_config(num_experts=2)
+        _stage_dcp(tmp_path / "staged", Transformer(saved), saved, 2)
+        with pytest.raises(ValueError, match=r"holds 2 of the 4 experts of 2 MoE layers"):
+            dcp_to_hf(str(tmp_path / "staged"), str(tmp_path / "hf"), _moe_config(num_experts=4))

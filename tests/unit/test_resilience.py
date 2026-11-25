@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -1099,9 +1100,9 @@ class TestResumePathResolution:
     ):
         """A checkpoint saved with fewer stages fails to load instead of starting over.
 
-        The stage layout records no degree, so it looks like a save whose later
+        Saved before the degree was recorded, it looks like a save whose later
         stages never ran. With nothing better to resume, the scan returns it as
-        it did before, and the load fails on the missing stages.
+        it did before, and the load refuses it, naming both layouts.
         """
         import logging
 
@@ -1114,6 +1115,43 @@ class TestResumePathResolution:
         assert result is not None
         assert result.name == "step_10"
         assert "another pipeline degree" in caplog.text
+
+    @staticmethod
+    def _record_degree(step_dir, degree: int) -> None:
+        (step_dir / "metadata.json").write_text(json.dumps({"step": 1, "pp": degree}))
+
+    def test_a_recorded_stage_that_never_saved_is_noticed_without_the_degree(self, tmp_path):
+        """The recorded degree shows the missing ``pp1/`` that the directories cannot."""
+        partial = _durable_step_dir(tmp_path, 20, pp_stages=1)
+        assert _dcp_durable(partial)
+        self._record_degree(partial, 2)
+        assert not _dcp_durable(partial)
+        assert not _dcp_durable(partial, num_stages=1)
+
+    def test_a_recorded_checkpoint_is_complete_at_its_own_degree(self, tmp_path):
+        complete = _durable_step_dir(tmp_path, 10, pp_stages=2)
+        (complete / "pp2").mkdir()
+        self._record_degree(complete, 2)
+        assert _dcp_durable(complete)
+        assert _dcp_durable(complete, num_stages=4)
+
+    def test_a_checkpoint_of_another_recorded_degree_is_resumed_as_found(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        """It is complete, so no fallback picks an older step; the load refuses it."""
+        import logging
+
+        self._let_caplog_see_kempnerforge(monkeypatch)
+        _durable_step_dir(tmp_path, 5, pp_stages=4)
+        self._record_degree(_durable_step_dir(tmp_path, 10, pp_stages=2), 2)
+        (tmp_path / "latest").symlink_to("step_10")
+
+        with caplog.at_level(logging.INFO, logger="kempnerforge"):
+            result = resolve_resume_path(str(tmp_path), num_stages=4)
+        assert result is not None
+        assert result.name == "step_10"
+        assert "found latest checkpoint" in caplog.text
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     @staticmethod
     def _let_caplog_see_kempnerforge(monkeypatch):

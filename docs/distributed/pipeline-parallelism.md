@@ -47,10 +47,14 @@ layers. For Llama-3 8B (32 layers) with `pp=3`: stage 0 and 1 get
 
 The layer keys in `PipelineStageModule.layers` match the full
 `Transformer` — stage 1 has keys `"11", "12", ..."21"`, not
-`"0", "1", ...`. Each stage still saves and loads only its own
-`pp{N}/` subdirectory, so a checkpoint resumes only at the `pp` it was
-saved with (see
-[Resharding § PP](../checkpointing/resharding.md#pp-the-one-special-case)).
+`"0", "1", ...`. Each stage saves only its own `pp{N}/` subdirectory,
+and the checkpoint records the degree, so a stage checkpoint resumes
+only at the `pp` it was saved with; any other `pp` is refused with an
+error that names both. The full model's names also let each stage
+load its own layers from a checkpoint saved without PP, its weights
+only (see
+[Resharding § PP](../checkpointing/resharding.md#pp-the-one-special-case),
+which also shows how to move weights to another `pp`).
 
 ## Application order with PP
 

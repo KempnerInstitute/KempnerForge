@@ -182,16 +182,19 @@ def build_checkpoint_manager(
     With PP, each stage has different parameters — DCP needs a group scoped
     to ranks within the same PP stage (all non-PP mesh dimensions), and each
     stage saves DCP shards to its own subdirectory to avoid file collisions.
-    The manager records each rank's data-parallel coordinates, the partition
+    The manager records the pipeline degree with every save and compares it on
+    load. It records each rank's data-parallel coordinates, the partition
     ``build_data_pipeline`` reads, with the per-rank loader/RNG state.
     """
     ckpt_pg = None
     ckpt_pp_rank = None
+    ckpt_pp_size = None
     device_mesh = runtime.device_mesh
     if pipeline is not None and device_mesh is not None:
         from kempnerforge.distributed.pipeline_parallel import build_stage_group
 
         ckpt_pp_rank = pipeline.rank
+        ckpt_pp_size = pipeline.size
         ckpt_pg = build_stage_group(device_mesh, config.distributed.nccl_timeout_sec)
     return CheckpointManager(
         config.checkpoint,
@@ -199,6 +202,7 @@ def build_checkpoint_manager(
         optimizer,
         process_group=ckpt_pg,
         pp_rank=ckpt_pp_rank,
+        pp_size=ckpt_pp_size,
         dp_info=get_dp_info(device_mesh),
         weight_decay_scope=config.optimizer.weight_decay_scope,
         lr_multipliers=config.optimizer.lr_multipliers,
