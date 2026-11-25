@@ -27,11 +27,10 @@ _STAGE_DIR = re.compile(r"pp(\d+)")
 class SavedLayout:
     """How a checkpoint lays out its DCP shards.
 
-    Attributes:
-        stages: 0 for the flat layout; otherwise the number of pipeline stages, each with its
-            own DCP index in ``pp{k}/``.
-        recorded: Whether the checkpoint's ``metadata.json`` records ``stages``; otherwise it is
-            the number of stage directories the checkpoint holds.
+    ``stages`` is 0 for the flat layout, and otherwise the number of pipeline stages, each with
+    its own DCP index in ``pp{k}/``. ``recorded`` is whether the checkpoint's ``metadata.json``
+    records ``stages``; when it does not, ``stages`` is the number of stage directories the
+    checkpoint holds.
     """
 
     stages: int
