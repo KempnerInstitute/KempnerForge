@@ -257,7 +257,7 @@ def test_config_error_stops_a_4gpu_run_before_the_device_mesh(tmp_path: Path) ->
     )
     output = result.stdout + result.stderr
     assert result.returncode != 0, f"the run was not rejected:\n{output[-2000:]}"
-    message = "ValueError: train.seq_len (4096) exceeds model.max_seq_len (512)"
+    message = "train.seq_len (4096) exceeds model.max_seq_len (512)"
     assert message in output, output[-2000:]
     assert "DeviceMesh:" not in output, output[-2000:]
 
