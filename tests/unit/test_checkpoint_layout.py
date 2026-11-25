@@ -9,7 +9,6 @@ import pytest
 
 from kempnerforge.checkpoint.layout import (
     SavedLayout,
-    recorded_pp_degree,
     saved_layout,
     stage_dir,
     stage_dirs,
@@ -77,13 +76,11 @@ class TestSavedLayout:
         elif make == "file":
             ckpt.write_text("not a directory")
         assert saved_layout(ckpt) is None
-        assert recorded_pp_degree(ckpt) is None
 
     @pytest.mark.parametrize("value", ["two", 0, -1, 1.5, True, [2]])
     def test_a_record_that_is_not_a_degree_counts_as_none(self, tmp_path, value, warnings_seen):
         _index(tmp_path)
         _record(tmp_path, pp=value)
-        assert recorded_pp_degree(tmp_path) is None
         assert saved_layout(tmp_path) == SavedLayout(0)
         assert "which is not a pipeline degree" in warnings_seen.text
 
@@ -96,8 +93,34 @@ class TestSavedLayout:
 
     def test_an_unreadable_record_is_logged(self, tmp_path, warnings_seen):
         (tmp_path / "metadata.json").write_text("{not json")
-        assert recorded_pp_degree(tmp_path) is None
+        assert saved_layout(tmp_path) is None
         assert "Could not read the pipeline degree" in warnings_seen.text
+
+    def test_a_read_that_fails_another_way_counts_as_no_record(
+        self, tmp_path, monkeypatch, warnings_seen
+    ):
+        _index(tmp_path)
+        _record(tmp_path, pp=2)
+
+        def fail(text, *args, **kwargs):
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(json, "loads", fail)
+        assert saved_layout(tmp_path) == SavedLayout(0)
+        assert "Could not read the pipeline degree" in warnings_seen.text
+        assert "maximum recursion depth exceeded" in warnings_seen.text
+
+    def test_a_record_the_caller_read_is_taken_as_given(self, tmp_path, monkeypatch):
+        """The file is not read again, so a load decides its layout from its one read."""
+        _index(tmp_path)
+        _record(tmp_path, pp=2)
+
+        def unread(*args, **kwargs):
+            raise AssertionError("metadata.json was read again")
+
+        monkeypatch.setattr(json, "loads", unread)
+        assert saved_layout(tmp_path, {}) == SavedLayout(0)
+        assert saved_layout(tmp_path, {"pp": 3}) == SavedLayout(3, recorded=True)
 
 
 class TestDescribe:

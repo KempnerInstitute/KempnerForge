@@ -2305,8 +2305,8 @@ class TestPluginsRecord:
         record = (json.loads((path / "metadata.json").read_text()), None)
 
         def broadcast(objects, src):
-            if isinstance(objects[0], dict) and objects[0].keys() == {"dir", "error"}:
-                objects[0] = {"dir": str(path.resolve()), "error": None}
+            if isinstance(objects[0], dict) and objects[0].keys() == {"dir", "layout", "error"}:
+                objects[0] = {"dir": str(path.resolve()), "layout": None, "error": None}
             else:
                 objects[0] = record
 
@@ -5526,8 +5526,12 @@ class TestWeightDecayScopeOnResume:
 
         def broadcast_object_list(objects, src):
             calls.append(("broadcast", src, list(objects)))
-            if rank != 0 and isinstance(objects[0], dict) and objects[0].keys() == {"dir", "error"}:
-                objects[0] = {"dir": str(resolved), "error": None}
+            if (
+                rank != 0
+                and isinstance(objects[0], dict)
+                and objects[0].keys() == {"dir", "layout", "error"}
+            ):
+                objects[0] = {"dir": str(resolved), "layout": None, "error": None}
             elif rank != 0:
                 objects[0] = sent
 
@@ -5545,7 +5549,7 @@ class TestWeightDecayScopeOnResume:
         """The collectives after the first, rank 0's broadcast of the checkpoint it resolved."""
         kind, src, objects = calls[0]
         assert (kind, src) == ("broadcast", 0), calls[0]
-        assert objects[0].keys() == {"dir", "error"}, calls[0]
+        assert objects[0].keys() == {"dir", "layout", "error"}, calls[0]
         return calls[1:]
 
     @staticmethod

@@ -404,10 +404,11 @@ class TestGroupTimeouts:
         runtime = SimpleNamespace(device_mesh=object())
         model = torch.nn.Linear(2, 2)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-        pipeline = SimpleNamespace(rank=1)
+        pipeline = SimpleNamespace(rank=1, size=2)
         assert (
             entry.build_checkpoint_manager(config, runtime, model, optimizer, pipeline) == "manager"
         )
         assert seen["group_timeout_sec"] == 123
         assert seen["stage_timeout_sec"] == 123
         assert seen["process_group"] == "pg"
+        assert (seen["pp_rank"], seen["pp_size"]) == (1, 2)

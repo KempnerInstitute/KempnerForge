@@ -1128,8 +1128,12 @@ class TestResume:
 
         def broadcast_object_list(objects, src):
             calls.append(("broadcast", src, list(objects)))
-            if rank != 0 and isinstance(objects[0], dict) and objects[0].keys() == {"dir", "error"}:
-                objects[0] = {"dir": str(resolved), "error": None}
+            if (
+                rank != 0
+                and isinstance(objects[0], dict)
+                and objects[0].keys() == {"dir", "layout", "error"}
+            ):
+                objects[0] = {"dir": str(resolved), "layout": None, "error": None}
             elif rank != 0:
                 objects[0] = next(delivered)
 
@@ -1157,7 +1161,7 @@ class TestResume:
         """The collectives after the first, rank 0's broadcast of the checkpoint it resolved."""
         kind, src, objects = calls[0]
         assert (kind, src) == ("broadcast", 0), calls[0]
-        assert objects[0].keys() == {"dir", "error"}, calls[0]
+        assert objects[0].keys() == {"dir", "layout", "error"}, calls[0]
         return calls[1:]
 
     RECORD = {"lr_multipliers": {"head": 2.0}, "lr_module_patterns": {"head": ["output_head.*"]}}

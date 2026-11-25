@@ -495,6 +495,17 @@ def _read_metadata(ckpt_dir: Path) -> dict[str, Any]:
     return meta
 
 
+def _metadata_outcome(ckpt_dir: Path) -> _MetadataOutcome:
+    """A read of a checkpoint's ``metadata.json``: the JSON object it holds, or why it could not
+    be read, as ``(None, reason)``."""
+    try:
+        return _read_metadata(ckpt_dir), None
+    except ValueError as e:
+        return None, str(e)
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
 def _recorded_weight_decay_scope(meta: Mapping[str, Any], metadata_path: Path) -> str:
     """Return the weight-decay scope a checkpoint's metadata ``meta`` records.
 
@@ -1129,7 +1140,7 @@ class CheckpointManager:
             rank when it restores the checkpoint's optimizer state on any rank, before anything
             is loaded, or the scheduler state in its ``train_state.pt``, before anything from
             that file is restored. A load that restores neither, such as a weights-only warm
-            start (``exclude_keys=["optimizer", "train_state"]``), goes ahead without reading
+            start (``exclude_keys=["optimizer", "train_state"]``), goes ahead without checking
             the record. A checkpoint that records none counts as saved without multipliers.
             One whose ``metadata.json`` cannot be read, or holds an invalid record, is refused
             the same way when multipliers are set; without them it loads as one saved without
@@ -2051,7 +2062,7 @@ class CheckpointManager:
         will_load_dcp = (
             exclude_keys is None or "model" not in exclude_keys or "optimizer" not in exclude_keys
         )
-        ckpt_dir, ckpt_layout = self._agreed_load_dir(
+        ckpt_dir, ckpt_layout, metadata_read = self._agreed_load_dir(
             path, fall_back=exact_resume and will_load_dcp
         )
         if ckpt_dir is None:
@@ -2122,7 +2133,7 @@ class CheckpointManager:
 
         metadata: _MetadataOutcome | None = None
         if plugins_expected is not None and load_train_state:
-            metadata = self._broadcast_metadata(ckpt_dir)
+            metadata = self._broadcast_metadata(ckpt_dir, metadata_read)
             self._check_plugins(metadata, ckpt_dir, plugins_expected)
 
         load_model = exclude_keys is None or "model" not in exclude_keys
@@ -2140,7 +2151,7 @@ class CheckpointManager:
             self._weight_decay_scope is not None or self._lr_multipliers is not None
         ):
             if metadata is None:
-                metadata = self._broadcast_metadata(ckpt_dir)
+                metadata = self._broadcast_metadata(ckpt_dir, metadata_read)
             if self._weight_decay_scope is not None:
                 self._check_weight_decay_scope(metadata, ckpt_dir)
             if self._lr_multipliers is not None:
@@ -2295,7 +2306,7 @@ class CheckpointManager:
                 and "scheduler" in train_state
             ):
                 if metadata is None:
-                    metadata = self._broadcast_metadata(ckpt_dir)
+                    metadata = self._broadcast_metadata(ckpt_dir, metadata_read)
                 self._check_lr_multipliers(metadata, ckpt_dir)
             held_position = "dataloader" in train_state
             carried = False
@@ -2431,22 +2442,20 @@ class CheckpointManager:
         assert state is not None
         return state
 
-    def _broadcast_metadata(self, ckpt_dir: Path) -> _MetadataOutcome:
+    def _broadcast_metadata(
+        self, ckpt_dir: Path, read: _MetadataOutcome | None = None
+    ) -> _MetadataOutcome:
         """Return rank 0's read of the checkpoint's ``metadata.json`` on every rank: the JSON
         object it holds, or why rank 0 could not read one.
 
-        Every rank calls this or none does. Rank 0 alone reads the file and broadcasts the
-        outcome once, so every check of a load decides from the same record on every rank and
-        none is left waiting on the broadcast.
+        Every rank calls this or none does. Rank 0 alone reads the file, or takes ``read``, the
+        read ``_agreed_load_dir`` made for the same load, and broadcasts the outcome once, so
+        every check of a load decides from the same record on every rank and none is left
+        waiting on the broadcast.
         """
         outcome: list[_MetadataOutcome] = [(None, None)]
         if self._rank == 0 or not dist.is_initialized():
-            try:
-                outcome[0] = (_read_metadata(ckpt_dir), None)
-            except ValueError as e:
-                outcome[0] = (None, str(e))
-            except Exception as e:
-                outcome[0] = (None, f"{type(e).__name__}: {e}")
+            outcome[0] = read if read is not None else _metadata_outcome(ckpt_dir)
         if dist.is_initialized():
             dist.broadcast_object_list(outcome, src=0)
         return outcome[0]
@@ -2759,23 +2768,29 @@ class CheckpointManager:
 
     def _agreed_load_dir(
         self, path: str | None, fall_back: bool
-    ) -> tuple[Path | None, SavedLayout | None]:
+    ) -> tuple[Path | None, SavedLayout | None, _MetadataOutcome | None]:
         """Return the checkpoint rank 0 resolves for a load, and its layout, on every rank.
 
         Rank 0 resolves ``path`` (see ``_resolve_load_path``), following symlinks, and, with
         ``fall_back`` (an exact resume that reads DCP shards), takes the newest ``step_N``
         beside it whose every stage directory holds them when that one's do not (see
-        ``_newest_saved_beside``). It then reads how the chosen checkpoint lays out its DCP
-        shards (see ``saved_layout``), None for one that holds no DCP index. It broadcasts
-        both, or why it could not choose, so every rank loads the same directory as the same
-        layout, or returns or raises together, whatever its own view of the filesystem. Every
-        rank must call this.
+        ``_newest_saved_beside``). It then reads the chosen checkpoint's ``metadata.json``, and
+        how the checkpoint lays out its DCP shards (see ``saved_layout``), None for one that
+        holds no DCP index. It broadcasts the directory and the layout, or why it could not
+        choose, so every rank loads the same directory as the same layout, or returns or raises
+        together, whatever its own view of the filesystem. Every rank must call this.
+
+        Returns:
+            The directory and the layout, both None when no checkpoint resolves, and on rank 0
+            its read of ``metadata.json`` (see ``_broadcast_metadata``), None on every other
+            rank, so the whole load decides from one read of the record.
 
         Raises:
             Exception: On rank 0, what resolving the checkpoint raised.
             RuntimeError: On every other rank, naming rank 0's error.
         """
         outcome: list[dict[str, Any]] = [{"dir": None, "layout": None, "error": None}]
+        read: _MetadataOutcome | None = None
         error: Exception | None = None
         if self._rank == 0 or not dist.is_initialized():
             try:
@@ -2784,9 +2799,13 @@ class CheckpointManager:
                     resolved = resolved.resolve()
                 if resolved is not None and fall_back:
                     resolved = self._newest_saved_beside(resolved, self._pp_size).resolve()
+                layout = None
+                if resolved is not None:
+                    read = _metadata_outcome(resolved)
+                    layout = saved_layout(resolved, read[0] or {})
                 outcome[0] = {
                     "dir": None if resolved is None else str(resolved),
-                    "layout": None if resolved is None else saved_layout(resolved),
+                    "layout": layout,
                     "error": None,
                 }
             except Exception as e:
@@ -2804,8 +2823,8 @@ class CheckpointManager:
         if reason is not None:
             raise RuntimeError(f"Rank 0 could not pick the checkpoint to load: {reason}")
         if chosen is None:
-            return None, None
-        return Path(chosen), outcome[0]["layout"]
+            return None, None, None
+        return Path(chosen), outcome[0]["layout"], read
 
     @staticmethod
     def _newest_saved_beside(resolved: Path, num_stages: int | None = None) -> Path:

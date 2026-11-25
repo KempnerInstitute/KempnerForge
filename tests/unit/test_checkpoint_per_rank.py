@@ -183,8 +183,8 @@ def _install_fake_load_world(
     ts_path = ckpt_dir / "train_state.pt"
 
     def fake_broadcast(obj_list, src=0):
-        if isinstance(obj_list[0], dict) and obj_list[0].keys() == {"dir", "error"}:
-            obj_list[0] = {"dir": str(ckpt_dir), "error": None}
+        if isinstance(obj_list[0], dict) and obj_list[0].keys() == {"dir", "layout", "error"}:
+            obj_list[0] = {"dir": str(ckpt_dir), "layout": None, "error": None}
             return
         if obj_list[0] is False:
             obj_list[0] = ts_path.exists()
@@ -1384,8 +1384,12 @@ def _install_recording_world(
 
     def broadcast(obj_list, src=0):
         calls.append((rank, "broadcast", obj_list[0]))
-        if rank != 0 and isinstance(obj_list[0], dict) and obj_list[0].keys() == {"dir", "error"}:
-            obj_list[0] = {"dir": str(resolved), "error": None}
+        if (
+            rank != 0
+            and isinstance(obj_list[0], dict)
+            and obj_list[0].keys() == {"dir", "layout", "error"}
+        ):
+            obj_list[0] = {"dir": str(resolved), "layout": None, "error": None}
 
     m.setattr(mgr_mod.dist, "is_initialized", lambda: True)
     m.setattr(mgr_mod.dist, "get_rank", lambda group=None: rank)
@@ -1461,7 +1465,10 @@ class TestWeightsOnlyWarmStart:
             assert mgr._pending_dataloader_state is None
             dcp_load.assert_called_once()
             assert set(dcp_load.call_args.args[0]) == {"model"}
-        chosen = [{"dir": str(ckpt_dir) if r == 0 else None, "error": None} for r in range(world)]
+        chosen = [
+            {"dir": str(ckpt_dir) if r == 0 else None, "layout": None, "error": None}
+            for r in range(world)
+        ]
         assert calls == [(r, "broadcast", chosen[r]) for r in range(world)]
 
     @TOPOLOGIES
@@ -1495,7 +1502,10 @@ class TestWeightsOnlyWarmStart:
             assert scheduler.restored is None
             assert mgr._pending_dataloader_state is None
         nothing = {"path": None, "error": None}
-        chosen = [{"dir": str(ckpt_dir) if r == 0 else None, "error": None} for r in range(world)]
+        chosen = [
+            {"dir": str(ckpt_dir) if r == 0 else None, "layout": None, "error": None}
+            for r in range(world)
+        ]
         expected = [[(r, "broadcast", nothing), (r, "broadcast", chosen[r])] for r in range(world)]
         assert calls == [call for pair in expected for call in pair]
 

@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -73,21 +75,20 @@ def _found_stage_dirs(ckpt_dir: Path) -> list[Path]:
     return [d for _, d in sorted(found)]
 
 
-def recorded_pp_degree(ckpt_dir: Path) -> int | None:
-    """The pipeline degree ``ckpt_dir``'s ``metadata.json`` records, None when it records none.
-
-    A ``metadata.json`` that cannot be read, or that records something other than a positive
-    integer, is logged and counts as recording none.
-    """
+def _read_record(ckpt_dir: Path) -> Mapping[str, Any]:
     path = ckpt_dir / METADATA_FILE
     try:
         meta = json.loads(path.read_text())
     except (FileNotFoundError, NotADirectoryError):
-        return None
-    except (OSError, ValueError) as e:
+        return {}
+    except Exception as e:
         logger.warning(f"Could not read the pipeline degree from {path}: {e}")
-        return None
-    degree = meta.get(PP_DEGREE_KEY) if isinstance(meta, dict) else None
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _recorded_degree(meta: Mapping[str, Any], path: Path) -> int | None:
+    degree = meta.get(PP_DEGREE_KEY)
     if degree is None:
         return None
     if isinstance(degree, bool) or not isinstance(degree, int) or degree < 1:
@@ -96,14 +97,22 @@ def recorded_pp_degree(ckpt_dir: Path) -> int | None:
     return degree
 
 
-def saved_layout(ckpt_dir: Path) -> SavedLayout | None:
+def saved_layout(ckpt_dir: Path, meta: Mapping[str, Any] | None = None) -> SavedLayout | None:
     """How ``ckpt_dir`` lays out its DCP shards, None when it holds no DCP index.
 
     The degree ``metadata.json`` records comes first. Without one, a ``.metadata`` at the top
     makes the layout flat, and ``pp{k}/`` directories make it a stage layout of as many stages,
-    whether or not each holds its index yet.
+    whether or not each holds its index yet. A record of something other than a positive
+    integer is logged and counts as none.
+
+    Args:
+        ckpt_dir: The checkpoint directory.
+        meta: The JSON object the checkpoint's ``metadata.json`` holds, when the caller has
+            read it. Without it the file is read here, and one that cannot be read is logged
+            and counts as recording no degree.
     """
-    recorded = recorded_pp_degree(ckpt_dir)
+    record = _read_record(ckpt_dir) if meta is None else meta
+    recorded = _recorded_degree(record, ckpt_dir / METADATA_FILE)
     if recorded is not None:
         return SavedLayout(recorded, recorded=True)
     if (ckpt_dir / DCP_INDEX_FILE).exists():
