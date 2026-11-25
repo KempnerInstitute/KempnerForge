@@ -177,10 +177,12 @@ stage that is not compiled is then all-gathered once per step: the
 schedule keeps it gathered through the step's backwards and reshards it
 after the last one. A compiled stage (`train.compile_model`) reaches the
 schedule as a wrapper the schedule does not treat as FSDP, so FSDP2
-reshards it after each microbatch's backward, and `False` saves the
-backward's all-gather. The cost is memory: a unit holds its unsharded
-parameters, in the param dtype, from its first forward until it
-reshards.
+reshards it after each microbatch's backward; `False` then saves only
+the all-gather of a forward or backward that directly follows a
+forward, about half of them, and a backward that follows another
+backward still all-gathers. The cost is memory: a unit holds its
+unsharded parameters, in the param dtype, from its first forward until
+it reshards.
 
 The training loop evaluates inside `evaluation_point(optimizer, model)`,
 which reshards every unit around the schedule-free swap, so a unit left
