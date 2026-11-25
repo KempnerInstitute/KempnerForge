@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any, Union, get_args, get_origin, get_type_hin
 
 from image_text.testbed import chartqa, coco_captions, docvqa, textvqa, vqav2
 
+from .realworldqa import realworldqa
 from .scorers import SCORERS
 
 if TYPE_CHECKING:
@@ -55,6 +56,7 @@ READERS: dict[str, Callable[..., DocumentSource]] = {
     "docvqa": docvqa,
     "textvqa": textvqa,
     "vqav2": vqav2,
+    "realworldqa": realworldqa,
 }
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")

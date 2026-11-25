@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 import pytest
 from evaluation.scorers import (
@@ -12,11 +15,20 @@ from evaluation.scorers import (
     anls,
     get_scorer,
     mean_scores,
+    realworldqa_accuracy,
     relaxed_accuracy,
     vqa_accuracy,
 )
 
-TEXT_SCORERS = {"anls": anls, "relaxed_accuracy": relaxed_accuracy, "vqa_accuracy": vqa_accuracy}
+TEXT_SCORERS = {
+    "anls": anls,
+    "relaxed_accuracy": relaxed_accuracy,
+    "vqa_accuracy": vqa_accuracy,
+    "realworldqa_accuracy": realworldqa_accuracy,
+}
+LMMS_EVAL_SCORES = json.loads(
+    Path(__file__).with_name("realworldqa_lmms_eval_scores.json").read_text(encoding="utf-8")
+)
 
 
 def _votes(matching: int, total: int) -> list[str]:
@@ -337,3 +349,117 @@ class TestLookup:
         scores = [count_error("3", 3), count_error("5", 2)]
         assert Scorer(count_error).aggregate(scores) == {"correct": 0.5, "error": 1.5}
         assert Scorer(count_error, aggregate=worst).aggregate(scores) == {"worst_error": 3.0}
+
+
+class TestRealWorldQAAccuracy:
+    """``realworldqa_accuracy`` against the scores lmms-eval 0.7.4 gives.
+
+    ``realworldqa_lmms_eval_scores.json`` is a fixed table built from the 222
+    reviewed cases of lmms-eval's extractor corpus whose choices are A to D; its
+    ``source`` names the file, tag and sha256, and ``license`` is that file's MIT
+    notice. A row is a case's response and its score against each reference
+    letter, which is what lmms-eval's ``realworldqa_process_results`` gives: 1
+    for the letter the case expects ``extract_mcq_answer`` to return and 0 for
+    the others, so 0 for every letter when it expects no answer. The one null
+    response is scored as the empty string, as lmms-eval scores it.
+    """
+
+    def test_the_table_holds_every_case_with_the_four_letters(self) -> None:
+        rows = LMMS_EVAL_SCORES["rows"]
+        assert len(rows) == len({row["case"] for row in rows}) == 222
+        assert sum(max(row["scores"].values()) == 1.0 for row in rows) == 113
+        assert all(list(row["scores"]) == ["A", "B", "C", "D"] for row in rows)
+
+    @pytest.mark.parametrize("row", LMMS_EVAL_SCORES["rows"], ids=lambda row: row["case"])
+    def test_a_letter_reference_scores_as_in_lmms_eval(self, row: dict[str, Any]) -> None:
+        scores = {
+            letter: realworldqa_accuracy(row["prediction"], [letter]) for letter in row["scores"]
+        }
+        assert scores == row["scores"]
+
+    @pytest.mark.parametrize(
+        ("prediction", "answer", "expected"),
+        [
+            ("B. Left", "B", 1.0),
+            ("(B)", "B", 1.0),
+            ("**B**", "B", 1.0),
+            ("The answer is B", "B", 1.0),
+            ("B. Left", "C", 0.0),
+            ("**B. dog**", "B", 1.0),
+            ("**(C) Red**", "C", 1.0),
+            ("<answer>C</answer>", "C", 1.0),
+            ("\\boxed{D}", "D", 1.0),
+            ("Answer: B. Final answer: Z", "B", 0.0),
+            ("A or B", "A", 0.0),
+            ("A or B", "B", 0.0),
+            ("b", "B", 1.0),
+            ("Answer: c", "C", 1.0),
+            ("Answer: Option B", "B", 1.0),
+            ("B,", "B", 1.0),
+            ("Left", "B", 0.0),
+            ("", "A", 0.0),
+        ],
+    )
+    def test_the_option_letter_is_extracted_from_the_reply(
+        self, prediction: str, answer: str, expected: float
+    ) -> None:
+        assert realworldqa_accuracy(prediction, [answer]) == expected
+
+    @pytest.mark.parametrize(
+        ("prediction", "answer"),
+        [
+            ("**B**ecause it is red.", "B"),
+            ("A-list", "A"),
+            ("B's", "B"),
+            ("B.com", "B"),
+            ("C:/path", "C"),
+            ("<answer B", "B"),
+        ],
+    )
+    def test_a_letter_inside_a_word_or_a_broken_tag_names_no_option(
+        self, prediction: str, answer: str
+    ) -> None:
+        assert realworldqa_accuracy(prediction, [answer]) == 0.0
+
+    @pytest.mark.parametrize(
+        ("prediction", "answer", "expected"),
+        [("B", "b", 1.0), ("(b)", "b", 1.0), ("C", " C ", 1.0), ("C", "c\n", 1.0)],
+    )
+    def test_a_letter_reference_is_stripped_and_read_in_either_case(
+        self, prediction: str, answer: str, expected: float
+    ) -> None:
+        assert realworldqa_accuracy(prediction, [answer]) == expected
+
+    @pytest.mark.parametrize(
+        ("prediction", "answer", "expected"),
+        [
+            ("Downhill", "Downhill", 1.0),
+            ("downhill", "Downhill", 1.0),
+            ("Downhill.", "Downhill", 1.0),
+            ("Downhill..", "Downhill", 1.0),
+            (" Downhill. \n", "Downhill", 1.0),
+            ("Downhill", " Downhill ", 1.0),
+            ("Downhill!", "Downhill", 0.0),
+            ("Downhill?", "Downhill", 0.0),
+            ("Downhill .", "Downhill", 0.0),
+            ("It is downhill.", "Downhill", 0.0),
+            ("Downhill", "Downhill.", 0.0),
+            ("2", "2", 1.0),
+            ("2.", "2", 1.0),
+            ("2.0", "2", 0.0),
+            ("two", "2", 0.0),
+            ("E", "E", 1.0),
+            ("e.", "E", 1.0),
+            ("(E)", "E", 0.0),
+            ("", "No", 0.0),
+        ],
+    )
+    def test_any_other_reference_is_matched_as_text_without_trailing_periods(
+        self, prediction: str, answer: str, expected: float
+    ) -> None:
+        assert realworldqa_accuracy(prediction, [answer]) == expected
+
+    def test_any_matching_reference_counts(self) -> None:
+        assert realworldqa_accuracy("B", ["A", "B"]) == 1.0
+        assert realworldqa_accuracy("Downhill.", ("A", "Downhill")) == 1.0
+        assert realworldqa_accuracy("C", ("A", "B")) == 0.0

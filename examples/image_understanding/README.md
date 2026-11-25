@@ -485,9 +485,10 @@ or the evaluator stops on a directory that is gone.
 the scorers of their answers.
 
 - `tasks.py`: `load_tasks` reads a TOML task file into frozen `EvalTask`s. A task
-  has a unique `name`, a `reader` (one of the `testbed.py` loaders) with that
-  loader's arguments in `reader_args`, a `scorer`, and `max_new_tokens`, the cap
-  on a decoded answer. `reader_args` is a read-only copy. The file is checked as
+  has a unique `name`, a `reader` (one of the `testbed.py` loaders, or
+  `realworldqa`) with that loader's arguments in `reader_args`, a `scorer`, and
+  `max_new_tokens`, the cap on a decoded answer. `reader_args` is a read-only
+  copy. The file is checked as
   it loads, before a reader opens anything: an unknown key, reader or scorer, an
   unknown or missing reader argument, a required reader parameter that cannot be
   given by keyword, and a value of the wrong TOML type for a parameter annotated
@@ -496,8 +497,9 @@ the scorers of their answers.
   nested values and every limit on a value (a count of at least 1, say) are
   checked by the reader itself when `build_reader` constructs it. A relative
   path given to a reader parameter annotated `Path`, as the testbed loaders'
-  `annotation_file` and `image_root` are, is taken from the task file's
-  directory, so a task file reads the same data from any working directory.
+  `annotation_file` and `image_root` and `realworldqa`'s `dataset_dir` are, is
+  taken from the task file's directory, so a task file reads the same data from
+  any working directory.
 - `scorers.py`: a scorer rates one prediction against a sample's reference
   answers with a value in [0, 1], and a task's score is the mean over its
   samples. The text scorers take the prediction as a `str` and the references as
@@ -524,10 +526,19 @@ the scorers of their answers.
     `"yes !"` becomes `"yes "`. A number is what `float` parses, and a trailing
     `%` makes hundredths, as in Pix2Struct's relaxed correctness: `45%` matches
     `0.45` and `45.1%` but not `45`. `1,000` is text, while `1_000` is 1000.
+  - `realworldqa_accuracy` (RealWorldQA): lmms-eval 0.7.4's rule. A reference
+    that is a letter from A to D names an option, and the prediction matches it
+    when `extract_mcq_answer` picks that letter out of it: `B. Left`, `(B)`,
+    `**B**` and `The answer is B` all match `B`, while `A or B` matches
+    neither. Any other reference must equal the prediction lowercased, stripped
+    of surrounding whitespace and then of trailing periods, so `Downhill.`
+    matches `Downhill` and `Downhill!` does not. `extract_mcq_answer` is
+    adopted from lmms-eval under the Apache License 2.0, as the docstring of
+    `scorers.py` records.
 
-`configs/eval_tasks.toml` is a sample with five tasks and their caps (VQAv2 10,
-TextVQA 75, DocVQA 50, ChartQA human and machine 50); its paths are
-placeholders:
+`configs/eval_tasks.toml` is a sample with six tasks and their caps (VQAv2 10,
+TextVQA 75, DocVQA 50, ChartQA human and machine 50, RealWorldQA 16); its paths
+are placeholders:
 
 ```toml
 [[tasks]]
@@ -540,6 +551,27 @@ max_new_tokens = 50
 annotation_file = "path-to-docvqa-annotations"
 image_root = "path-to-docvqa-images"
 ```
+
+RealWorldQA is read as the Hugging Face Hub publishes it (`xai-org/RealworldQA`,
+CC BY-ND 4.0): one `test` split of 765 questions, each about one image and with
+one reference answer, in parquet shards that hold the images. Its card says the
+set will grow, so download it once at the revision of these 765 rows and point
+the task's `dataset_dir` at the download:
+
+```bash
+hf download xai-org/RealworldQA --repo-type dataset \
+    --revision 17e7f75e092e47169732462ea3cdfebe911105dd --local-dir path-to-realworldqa
+```
+
+`evaluation/realworldqa.py` reads the shards, `data/test-<i>-of-<n>.parquet`, in
+order and refuses a directory where one is missing, so a partial download is
+never scored. The question, stripped of surrounding whitespace, is the prompt:
+it ends with its own answer instruction, a single word or number, or the letter
+of an option. As in lmms-eval 0.7.4, the answer is decoded greedily, capped at
+16 tokens and scored with `realworldqa_accuracy`. The score matches lmms-eval
+0.7.4's, and the one difference left is the data: lmms-eval reads
+`lmms-lab-encoder/RealWorldQA`, while this task reads `xai-org/RealworldQA` at
+the pinned revision.
 
 A reader is an entry of `READERS` and a scorer an entry of `SCORERS`, so a new
 one is added there. A scorer may report several named components per sample and
