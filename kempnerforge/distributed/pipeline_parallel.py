@@ -17,8 +17,8 @@ Application order when combining parallelisms:
 Note on FSDP reshard policy:
   The training entry wraps each stage with reshard_after_forward=False: the
   schedule sends every microbatch of a step through the stage, and its units
-  stay gathered after a forward instead of being all-gathered again for the
-  backward and the next microbatch. A unit left gathered keeps what it
+  stay gathered after each forward, so the next forward or backward through
+  them does not all-gather them again. A unit left gathered keeps what it
   gathered last, so the training loop evaluates inside
   evaluation_point(optimizer, model), which reshards the model around the
   schedule-free swap; otherwise the next training step would see the

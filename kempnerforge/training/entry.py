@@ -80,8 +80,8 @@ def build_model(
     delegates to ``build_parallel_model`` and returns no pipeline. A stage
     is wrapped with FSDP2's ``reshard_after_forward=False``: the schedule
     sends every microbatch of a step through it, and its parameters stay
-    gathered after a forward instead of being gathered again for the
-    backward and the next microbatch.
+    gathered after each forward, so the next forward or backward through it
+    does not all-gather them again.
     """
     tc = config.train
     device = runtime.device
