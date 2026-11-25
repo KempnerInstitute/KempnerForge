@@ -12,16 +12,17 @@ Application order when combining parallelisms:
   1. Build per-stage model via build_stage_module()
   2. Tensor parallelism (per stage, via apply_tensor_parallel) — must see raw blocks
   3. Activation checkpointing (per stage, via apply_ac)
-  4. FSDP2 (per stage, via apply_fsdp2)
+  4. FSDP2 (per stage, via apply_fsdp2 with reshard_after_forward=False)
 
 Note on FSDP reshard policy:
-  The training entry wraps each stage with apply_fsdp2's default,
-  reshard_after_forward=True. False would keep a stage's params gathered
-  across its microbatches and save the repeated all-gathers, but a unit left
-  gathered keeps what it gathered last: evaluation then needs
+  The training entry wraps each stage with reshard_after_forward=False: the
+  schedule sends every microbatch of a step through the stage, and its units
+  stay gathered after a forward instead of being all-gathered again for the
+  backward and the next microbatch. A unit left gathered keeps what it
+  gathered last, so the training loop evaluates inside
   evaluation_point(optimizer, model), which reshards the model around the
-  schedule-free swap, or the next training step would see the averaged
-  weights x.
+  schedule-free swap; otherwise the next training step would see the
+  averaged weights x.
 """
 
 from __future__ import annotations
