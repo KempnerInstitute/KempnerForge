@@ -19,10 +19,12 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.job import JobConfig
 from kempnerforge.config.vlm import FreezeSpec
+from kempnerforge.data.dataloader import shutdown_workers
 from kempnerforge.distributed.parallel import refresh_fsdp_dtypes
 from kempnerforge.distributed.utils import (
     any_rank,
@@ -102,19 +104,21 @@ class BatchStream:
         """Drop the live iterator and shut the loader's worker processes down.
 
         Calls the loader's ``close()`` where it has one, as ``StatefulDataLoader``
-        and ``StreamingDataLoader`` do: their workers ignore SIGTERM (see
-        ``ignore_shutdown_signals_in_worker``), so a preemption signal cannot
-        kill them under an in-flight step, and ``close()`` stops them through
-        the loader's own sentinel path, keeping its position.
+        and ``StreamingDataLoader`` do, and ``shutdown_workers`` for a plain
+        ``DataLoader``. Both stop the workers through the loader's own sentinel
+        path, since workers that ignore SIGTERM (see
+        ``ignore_shutdown_signals_in_worker``) cannot be stopped with it.
 
         Rank-local and idempotent, with no collective, so it is safe on the
         exception path in ``train_loop``'s ``finally``.
         """
         self._iter = None
         self._source = None
-        close = getattr(self.pipeline.dataloader, "close", None)
-        if close is not None:
-            close()
+        loader = self.pipeline.dataloader
+        if isinstance(loader, DataLoader):
+            shutdown_workers(loader)
+        elif hasattr(loader, "close"):
+            loader.close()
 
     def next_batch(self) -> dict[str, torch.Tensor]:
         if self.dataloader is None:

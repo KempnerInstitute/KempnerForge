@@ -18,6 +18,7 @@ import os
 import time
 import weakref
 from collections.abc import Callable, Sized
+from multiprocessing.util import Finalize
 from typing import Any
 
 import torch
@@ -33,17 +34,21 @@ logger = logging.getLogger(__name__)
 
 _WORKER_KILL_TIMEOUT_S = 5.0
 
+_EXIT_FINALIZER_PRIORITY = 100
+
 _loaders_with_workers: weakref.WeakKeyDictionary[StatefulDataLoader | StreamingDataLoader, int] = (
     weakref.WeakKeyDictionary()
 )
 
 
-def _shutdown_workers(loader: DataLoader) -> None:
-    """Stop ``loader``'s persistent workers through its sentinel path.
+def shutdown_workers(loader: DataLoader) -> None:
+    """Stop a ``DataLoader``'s persistent workers through its sentinel path.
 
-    The workers ignore SIGTERM (``ignore_shutdown_signals_in_worker``), so one
-    still alive after the sentinel is killed. Every wait is bounded, and the
-    next ``iter(loader)`` starts new workers.
+    Runs torch's own worker shutdown, which sends each worker its sentinel and
+    waits for it with a timeout, then kills a worker still alive, since a worker
+    that runs ``ignore_shutdown_signals_in_worker`` ignores SIGTERM, and waits up
+    to 5 s for it. The next ``iter(loader)`` starts new workers; a loader with no
+    persistent workers is left as it is. Rank-local, with no collective.
     """
     iterator = loader._iterator
     loader._iterator = None
@@ -57,22 +62,29 @@ def _shutdown_workers(loader: DataLoader) -> None:
 
 
 @functools.cache
-def _register_exit_hook() -> None:
-    """Register ``_close_open_loaders`` with ``atexit``, once."""
+def _register_exit_hooks(pid: int) -> None:
+    """Have process ``pid`` close its loaders before ``multiprocessing`` stops its workers.
+
+    Runs once a worker has started in the process, after ``multiprocessing`` and
+    torch registered their exit hooks. ``atexit`` runs hooks in reverse order, so
+    this hook runs before both: ``multiprocessing``'s stops leftover workers with
+    SIGTERM and joins them, and after torch's a loader can no longer stop its
+    workers through the sentinel. The finalizer covers a process whose
+    ``multiprocessing`` exit function runs before the hook: a ``multiprocessing``
+    child, which runs it as its target returns, and a process that called
+    ``multiprocessing.get_logger``, which registers it again. That function runs
+    finalizers before it stops any worker, this one ahead of those that close
+    the queues the sentinel goes through.
+    """
     atexit.register(_close_open_loaders)
+    Finalize(None, _close_open_loaders, exitpriority=_EXIT_FINALIZER_PRIORITY)
 
 
 def _close_at_exit(loader: StatefulDataLoader | StreamingDataLoader) -> None:
-    """Have this process close ``loader`` at exit, unless it is closed first.
-
-    Called once the loader's workers have started, so ``multiprocessing`` has
-    already registered its exit hook, which stops leftover workers with SIGTERM
-    and then joins them, and torch the hook after which its iterators'
-    ``_shutdown_workers`` does nothing. ``atexit`` runs hooks in reverse order
-    of registration, so this one runs before both.
-    """
-    _register_exit_hook()
-    _loaders_with_workers[loader] = os.getpid()
+    """Have this process close ``loader`` at exit, unless it is closed first."""
+    pid = os.getpid()
+    _register_exit_hooks(pid)
+    _loaders_with_workers[loader] = pid
 
 
 def _close_open_loaders() -> None:
@@ -219,15 +231,15 @@ class StatefulDataLoader:
         """Shut the worker processes down; the loader keeps its position.
 
         The workers ignore SIGTERM (``ignore_shutdown_signals_in_worker``), so
-        they are stopped through the loader's sentinel path, and one still
-        alive after it is killed. ``state_dict`` is unchanged, ``next`` raises
-        ``StopIteration`` until the next ``iter()``, and that ``iter()`` starts
-        new workers at the same position. Rank-local, idempotent and bounded,
-        with no collective. A process calls it at exit for every loader whose
-        workers are still alive, before ``multiprocessing`` joins its workers.
+        ``shutdown_workers`` stops them through the loader's sentinel path. The
+        ``state_dict`` is unchanged, ``next`` raises ``StopIteration`` until the
+        next ``iter()``, and that ``iter()`` starts new workers at the same
+        position. Rank-local and idempotent, with no collective. A process calls
+        it at exit for every loader whose workers are still alive, before
+        ``multiprocessing`` stops its workers.
         """
         self._iterator = None
-        _shutdown_workers(self._dataloader)
+        shutdown_workers(self._dataloader)
         _loaders_with_workers.pop(self, None)
 
     def __len__(self) -> int:
@@ -486,7 +498,7 @@ class StreamingDataLoader:
         its part of the pass has moved that copy to the next epoch, so it would
         read the next epoch's shuffle. New workers copy the dataset at this epoch.
         """
-        _shutdown_workers(self._dataloader)
+        shutdown_workers(self._dataloader)
         self._dataloader = DataLoader(self.dataset, **self._loader_kwargs)
 
     def close(self) -> None:
@@ -497,7 +509,7 @@ class StreamingDataLoader:
         every loader whose workers are still alive.
         """
         self._iterator = None
-        _shutdown_workers(self._dataloader)
+        shutdown_workers(self._dataloader)
         _loaders_with_workers.pop(self, None)
 
     def _replay(self) -> None:

@@ -10,6 +10,7 @@ workers are still alive.
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import signal
 import time
@@ -19,15 +20,17 @@ from pathlib import Path
 import pytest
 import torch
 import torch.utils.data._utils
-from torch.utils.data import Dataset, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from kempnerforge.config.schema import DataConfig
 from kempnerforge.data import dataloader
-from kempnerforge.data.dataloader import StatefulDataLoader
+from kempnerforge.data.dataloader import StatefulDataLoader, shutdown_workers
 from kempnerforge.data.sampler import DistributedSampler
+from kempnerforge.resilience.signal_handler import ignore_shutdown_signals_in_worker
 from tests.loader_workers import run_to_exit, worker_sockets_fit
 
 LIVE_ITERATOR_AT_EXIT = """
+import multiprocessing
 import sys
 
 import torch
@@ -45,9 +48,45 @@ if __name__ == "__main__":
     )
     batches = iter(loader)
     next(batches)
+    if ending == "takes the multiprocessing logger":
+        multiprocessing.get_logger()
     print("served a batch", flush=True)
     if ending == "raises":
         raise RuntimeError("step failed")
+"""
+
+LIVE_ITERATOR_IN_A_CHILD = """
+import multiprocessing
+import sys
+
+import torch
+from torch.utils.data import TensorDataset
+
+from kempnerforge.config.schema import DataConfig
+from kempnerforge.data.dataloader import StatefulDataLoader
+
+kept = []
+
+
+def serve_a_batch(ending):
+    loader = StatefulDataLoader(
+        TensorDataset(torch.arange(64)),
+        batch_size=4,
+        config=DataConfig(num_workers=2, pin_memory=False),
+    )
+    next(iter(loader))
+    if ending == "raises":
+        raise RuntimeError("step failed")
+    kept.append(loader)
+
+
+if __name__ == "__main__":
+    start_method, ending = sys.argv[1], sys.argv[2]
+    context = multiprocessing.get_context(start_method)
+    child = context.Process(target=serve_a_batch, args=(ending,))
+    child.start()
+    child.join()
+    print(f"the child exited with {child.exitcode}", flush=True)
 """
 
 
@@ -95,10 +134,22 @@ class _Closes:
         self.closed += 1
 
 
-@pytest.mark.parametrize("workers", [0, 2])
-@pytest.mark.parametrize("ending", ["returns", "raises"])
+@pytest.mark.parametrize(
+    ("workers", "ending"),
+    [
+        (0, "returns"),
+        (0, "raises"),
+        (2, "returns"),
+        (2, "raises"),
+        (2, "takes the multiprocessing logger"),
+    ],
+)
 def test_a_process_with_a_live_iterator_exits(tmp_path, workers, ending):
-    """The script's iterator is still alive at exit, held by a module global."""
+    """The script's iterator is still alive at exit, held by a module global.
+
+    ``multiprocessing.get_logger`` registers ``multiprocessing``'s exit hook
+    again, so that hook then runs before every hook registered earlier.
+    """
     _skip_without_worker_sockets(workers)
     script = tmp_path / "live_iterator.py"
     script.write_text(LIVE_ITERATOR_AT_EXIT)
@@ -106,11 +157,30 @@ def test_a_process_with_a_live_iterator_exits(tmp_path, workers, ending):
     result = run_to_exit(script, str(workers), ending)
 
     assert result.stdout == "served a batch\n"
-    if ending == "returns":
-        assert result.returncode == 0, result.stderr[-2000:]
-    else:
+    if ending == "raises":
         assert result.returncode == 1
         assert "RuntimeError: step failed" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr[-2000:]
+
+
+@pytest.mark.parametrize("start_method", ["fork", "spawn"])
+@pytest.mark.parametrize("ending", ["returns", "raises"])
+def test_a_multiprocessing_child_with_a_live_iterator_exits(tmp_path, start_method, ending):
+    """A ``multiprocessing`` child stops its own workers before it exits.
+
+    Python 3.12 runs ``multiprocessing``'s exit function in the child as soon as
+    its target returns or raises, before any ``atexit`` hook.
+    """
+    _skip_without_worker_sockets(2)
+    script = tmp_path / "live_iterator_in_a_child.py"
+    script.write_text(LIVE_ITERATOR_IN_A_CHILD)
+
+    result = run_to_exit(script, start_method, ending)
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    exit_code = 1 if ending == "raises" else 0
+    assert result.stdout == f"the child exited with {exit_code}\n"
 
 
 def test_close_stops_the_workers_through_their_sentinel():
@@ -213,19 +283,62 @@ def test_the_exit_hook_leaves_the_loaders_another_process_started(monkeypatch):
     assert (mine.closed, inherited.closed) == (1, 0)
 
 
-def test_the_exit_hook_is_registered_once_workers_start(monkeypatch):
-    """Registered after a worker starts, so after ``multiprocessing`` registered its own."""
+def test_the_exit_hooks_are_registered_once_per_process_after_workers_start(monkeypatch):
+    """Registered after a worker starts, so after ``multiprocessing`` registered its own.
+
+    Another process registers its own: a ``multiprocessing`` child starts with no
+    finalizers, and on Python 3.14 with no ``atexit`` hooks but that one.
+    """
     _skip_without_worker_sockets(2)
-    registered = []
+    registered, finalizers = [], []
     monkeypatch.setattr(dataloader.atexit, "register", registered.append)
-    dataloader._register_exit_hook.cache_clear()
+
+    def finalize(obj, callback, exitpriority):
+        finalizers.append((obj, callback, exitpriority))
+
+    monkeypatch.setattr(dataloader, "Finalize", finalize)
+    dataloader._register_exit_hooks.cache_clear()
     without_workers, with_workers = _loader(workers=0), _loader(workers=2)
     try:
         next(iter(without_workers))
-        assert registered == []
+        assert (registered, finalizers) == ([], [])
         next(iter(with_workers))
         next(iter(with_workers))
-        assert registered == [dataloader._close_open_loaders]
+        dataloader._register_exit_hooks(os.getpid() + 1)
     finally:
         with_workers.close()
-        dataloader._register_exit_hook.cache_clear()
+        dataloader._register_exit_hooks.cache_clear()
+    hook = dataloader._close_open_loaders
+    assert registered == [hook, hook]
+    assert finalizers == [(None, hook, dataloader._EXIT_FINALIZER_PRIORITY)] * 2
+
+
+def test_the_exit_finalizer_runs_before_multiprocessing_closes_its_queues():
+    """The sentinel travels through ``multiprocessing`` queues, which close at exit too."""
+    queue = multiprocessing.get_context().Queue()
+    queue.put(0)
+    try:
+        queue_priority, _ = queue._close._key
+        assert queue_priority < dataloader._EXIT_FINALIZER_PRIORITY
+    finally:
+        queue.get()
+        queue.close()
+        queue.join_thread()
+
+
+def test_shutdown_workers_stops_a_plain_loaders_shielded_workers():
+    _skip_without_worker_sockets(2)
+    loader = DataLoader(
+        TensorDataset(torch.arange(16)),
+        batch_size=4,
+        num_workers=2,
+        persistent_workers=True,
+        worker_init_fn=ignore_shutdown_signals_in_worker,
+    )
+    next(iter(loader))
+    workers = list(loader._iterator._workers)
+
+    shutdown_workers(loader)
+
+    assert [worker.exitcode for worker in workers] == [0, 0]
+    assert loader._iterator is None

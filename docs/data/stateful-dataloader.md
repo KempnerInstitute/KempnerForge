@@ -284,9 +284,12 @@ sends leftover workers `SIGTERM` and then waits for them.
 instead, and kills a worker still alive after it. The loader keeps its
 position: `state_dict()` does not change, and the next `iter()` starts new
 workers where it stopped. The training loop calls `close()` on every exit
-path. A process also calls it at exit, before `multiprocessing`'s own exit
-hook, for every loader whose workers are still alive, so a script that
-ends or raises with an iterator alive still exits.
+path. A process also calls it at exit, before `multiprocessing` stops its
+leftover workers, for every loader whose workers are still alive, so a
+script, or a `multiprocessing` child process, that ends or raises with an
+iterator alive still exits. `shutdown_workers(loader)` from the same module
+does the same for a plain `DataLoader` whose workers use
+`ignore_shutdown_signals_in_worker`.
 
 ## Eval dataloader
 

@@ -41,7 +41,8 @@ def ignore_shutdown_signals_in_worker(worker_id: int) -> None:
     on one forever. Workers are therefore shut down through the loader's
     sentinel path: ``StatefulDataLoader.close`` and ``StreamingDataLoader.close``,
     which the training loop calls on every exit path and a process calls at
-    exit for every loader whose workers are still alive.
+    exit for every loader whose workers are still alive, and
+    ``shutdown_workers`` for a plain ``DataLoader``.
 
     Args:
         worker_id: Worker index, supplied by ``DataLoader``. Unused.

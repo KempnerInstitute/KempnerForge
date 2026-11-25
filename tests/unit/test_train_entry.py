@@ -19,6 +19,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.data import DataLoader
 
 from kempnerforge.config.checkpoint import CheckpointConfig, DynamicCheckpointWindow
 from kempnerforge.config.data import DataConfig, TrainingPhase
@@ -46,6 +47,7 @@ from kempnerforge.training.loop import (
     vlm_step,
 )
 from kempnerforge.training.runtime import RuntimeContext
+from tests.loader_workers import worker_sockets_fit
 
 VOCAB = 16
 DIM = 8
@@ -311,6 +313,20 @@ class TestBatchStream:
 
         assert loader.closed == 1
         assert stream._iter is None
+
+    def test_close_stops_a_plain_dataloaders_persistent_workers(self):
+        if not worker_sockets_fit():
+            pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+        batches = _fake_batches(4)
+        loader = DataLoader(batches, batch_size=None, num_workers=2, persistent_workers=True)
+        stream = BatchStream(DataPipeline(dataloader=loader))
+        stream.next_batch()
+        workers = list(loader._iterator._workers)
+
+        stream.close()
+
+        assert [worker.exitcode for worker in workers] == [0, 0]
+        assert loader._iterator is None
 
     def test_close_is_idempotent(self):
         stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
