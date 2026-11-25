@@ -68,15 +68,25 @@ Two fallbacks:
    `require_train_state=False` and keeps the second kind.
 
    Under pipeline parallelism, DCP's `.metadata` means every stage's
-   `pp{k}/.metadata`, for `pp0` through `pp{n-1}` where `n` is
-   `distributed.pp`, so a step that one stage never started saving is
-   skipped instead of resumed with that stage loading an older step.
-   When no step has every stage, the newest one that is otherwise
-   complete (neither of the two kinds skipped above) is resumed as
-   before, after an error log, instead of the run starting over. The
-   stage layout records no degree, so a checkpoint saved with another
-   `distributed.pp` looks the same; resume needs the degree it was
-   saved with.
+   `pp{k}/.metadata`, for `pp0` through `pp{n-1}` where `n` is the
+   degree the checkpoint's `metadata.json` records as `pp`, so a step
+   that one stage never started saving is skipped instead of resumed
+   with that stage loading an older step. A checkpoint of another
+   layout counts as complete when its own shards are, so the newest
+   one is resumed as found, never passed over for an older one, and
+   the load applies the layout checks it applies to any checkpoint
+   (see [Resharding § PP](resharding.md#pp-the-one-special-case)): a
+   stage checkpoint of another `pp`, or one resumed without PP, is
+   refused, naming both layouts, and so is a checkpoint saved without
+   PP that holds optimizer state, since a resume restores it.
+
+   A checkpoint saved before the degree was recorded takes `n` from
+   `distributed.pp`. When no step has every stage, the newest one that
+   is otherwise complete (neither of the two kinds skipped above) is
+   resumed as before, after an error log, instead of the run starting
+   over. Such a checkpoint saved with another `distributed.pp` looks
+   the same, and the load refuses it, naming the stage directories it
+   holds.
 
 If neither path finds anything, the function returns `None` and
 training starts from step 0, or from `checkpoint.load_path` when one is
@@ -385,13 +395,14 @@ committed and the save still succeeds on every rank.
   stage directory in it holds DCP's `.metadata`. If not, it picks the
   newest `step_N` beside it in which every stage directory does, and
   logs a warning; with none, it keeps the checkpoint as resolved, and
-  the load fails on the stage that lacks its shards. This check has no
-  pipeline degree, so a stage that never created its directory is not
-  noticed here; the resolver, which has the degree, has already skipped
-  such a `latest`. Every rank loads
-  the checkpoint rank 0 picked, whatever its own view of the filesystem,
-  so no stage resumes a different step than another. A checkpoint named
-  by `load_path` is loaded as named.
+  the load fails on the stage that lacks its shards. A stage that never
+  created its directory is noticed here too, by the degree the
+  checkpoint records or, for one saved before that record, by the
+  run's `distributed.pp`. Every rank loads
+  the checkpoint rank 0 picked, as the layout rank 0 read in it, whatever
+  its own view of the filesystem, so no stage resumes a different step
+  or layout than another. A checkpoint named by `load_path` is loaded as
+  named.
 - **A rank that cannot see the checkpoint**: every load, a `load_path`
   warm start or an evaluation as well as a resume, takes the directory
   rank 0 resolves (the path passed to it, `load_path`, or `latest`,

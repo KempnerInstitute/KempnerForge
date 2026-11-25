@@ -26,7 +26,8 @@ def _dcp_durable(ckpt_dir: Path, num_stages: int | None = None) -> bool:
     """Whether ``ckpt_dir`` holds a complete set of DCP shards.
 
     Accepts both layouts: a flat directory, and the per-stage ``pp{k}/``
-    subdirectories written under pipeline parallelism.
+    subdirectories written under pipeline parallelism (see
+    ``kempnerforge.checkpoint.layout``).
 
     Under pipeline parallelism *every* stage must be durable. Each stage saves
     through its own process group, so an interrupted save can leave the earlier
@@ -35,13 +36,24 @@ def _dcp_durable(ckpt_dir: Path, num_stages: int | None = None) -> bool:
     different steps. An empty stage list is not durable either -- ``all()`` is
     vacuously true on it, and a directory with no stage at all holds nothing.
 
-    A stage that died before its save started leaves no ``pp{k}/`` directory at
-    all, so only ``num_stages``, the run's pipeline degree, can tell that it is
-    missing: with it, ``pp0`` through ``pp{num_stages - 1}`` must also be there.
-    Without it, only the stage directories that exist are checked. The stage
-    layout records no degree of its own, so a checkpoint saved with fewer stages
-    than ``num_stages`` looks the same as one whose later stages never saved.
+    A checkpoint whose ``metadata.json`` records its pipeline degree is complete when
+    ``pp0`` through the last stage of that degree each hold a ``.metadata``, whatever
+    ``num_stages`` is: a stage that died before its save started is noticed, and a
+    checkpoint saved with another degree counts as complete, for the load to refuse
+    naming both degrees. For one saved before the degree was recorded, a stage that
+    died before its save started leaves no ``pp{k}/`` directory at all, so only
+    ``num_stages``, the run's pipeline degree, can tell that it is missing: with it,
+    ``pp0`` through ``pp{num_stages - 1}`` must also be there. Without it, only the
+    stage directories that exist are checked, and a checkpoint saved with fewer
+    stages than ``num_stages`` looks the same as one whose later stages never saved.
     """
+    from kempnerforge.checkpoint.layout import saved_layout, stage_dir
+
+    layout = saved_layout(ckpt_dir)
+    if layout is not None and layout.recorded:
+        return all(
+            (stage_dir(ckpt_dir, k) / _DCP_METADATA_FILE).exists() for k in range(layout.stages)
+        )
     if (ckpt_dir / _DCP_METADATA_FILE).exists():
         return True
     if not ckpt_dir.is_dir():
@@ -134,13 +146,15 @@ def resolve_resume_path(
     Args:
         checkpoint_dir: Base checkpoint directory.
         num_stages: The run's pipeline degree. With it, a ``step_N`` in the
-            per-stage layout counts only when ``pp0`` through ``pp{num_stages - 1}``
-            all hold ``.metadata``, including stages that never created their
-            directory; see ``_dcp_durable``. When no step has every stage, the
-            newest one that is otherwise complete is returned as
-            before, after an error log, rather than the run starting over: a
-            checkpoint saved with another pipeline degree looks the same, and
-            resume does not support changing the degree.
+            per-stage layout that records no degree counts only when ``pp0`` through
+            ``pp{num_stages - 1}`` all hold ``.metadata``, including stages that never
+            created their directory; see ``_dcp_durable``. When no step has every
+            stage, the newest one that is otherwise complete is returned as before,
+            after an error log, rather than the run starting over: a checkpoint saved
+            with another pipeline degree before the degree was recorded looks the
+            same. One that records its degree is complete at that degree, so a
+            checkpoint of any layout is returned as it is, and loading it refuses
+            what the run cannot load with an error that names both layouts.
         require_train_state: Skip a ``step_N`` whose shards hold optimizer state but
             that has no ``train_state.pt``. A caller that loads the weights alone, which
             such a checkpoint still holds in full, passes False to keep the newest one.

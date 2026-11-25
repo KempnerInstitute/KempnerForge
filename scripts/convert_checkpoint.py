@@ -27,11 +27,13 @@ import logging
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed.checkpoint as dcp
 
 from kempnerforge.checkpoint.expert_layout import check_saved_experts
+from kempnerforge.checkpoint.layout import DCP_INDEX_FILE, SavedLayout, saved_layout, stage_dirs
 from kempnerforge.checkpoint.manager import derived_buffer_owners, drop_derived_model_keys
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import Activation, ModelConfig, NormType
@@ -162,13 +164,77 @@ def _pack_experts(state: dict[str, torch.Tensor], model_state: dict[str, torch.T
             state[kf_key] = torch.stack([state.pop(name).t() for name in names])
 
 
-def _detect_pp_stages(dcp_path: Path) -> list[Path]:
-    """Detect pipeline-parallel stage subdirectories (pp0/, pp1/, ...)."""
-    pp_dirs = sorted(
-        (d for d in dcp_path.iterdir() if d.is_dir() and d.name.startswith("pp")),
-        key=lambda d: int(d.name[2:]),
-    )
-    return pp_dirs
+def _stage_model_keys(
+    dcp_path: Path, layout: SavedLayout, stages: list[Path]
+) -> dict[Path, dict[str, Any]]:
+    """Each stage directory's model entries, as its own DCP index lists them.
+
+    Raises:
+        ValueError: A stage has no DCP index, or two stages hold the same model tensor.
+    """
+    unsaved = [d.name for d in stages if not (d / DCP_INDEX_FILE).exists()]
+    if unsaved:
+        raise ValueError(
+            f"{dcp_path} was {layout.describe()}, but {unsaved} hold no DCP index "
+            f"({DCP_INDEX_FILE}): the save of those stages did not complete, so the model "
+            "cannot be exported whole."
+        )
+    indexes = {d: dcp.FileSystemReader(str(d)).read_metadata().state_dict_metadata for d in stages}
+    owners: dict[str, Path] = {}
+    for d, index in indexes.items():
+        for key in index:
+            if key.startswith("model.") and owners.setdefault(key, d) != d:
+                raise ValueError(
+                    f"{dcp_path} was {layout.describe()}, but {owners[key].name} and {d.name} "
+                    f"both hold {key}: a stage holds only its own layers, so the directories "
+                    "come from different saves, and the export cannot tell which is this "
+                    "checkpoint's."
+                )
+    return {
+        d: {key: meta for key, meta in index.items() if key.startswith("model.")}
+        for d, index in indexes.items()
+    }
+
+
+def _load_stages(
+    model: Transformer, tied: bool, dcp_path: Path, layout: SavedLayout, stages: list[Path]
+) -> None:
+    """Load a pipeline-parallel checkpoint into ``model``, each stage from its own DCP index.
+
+    Each stage directory gives the model tensors its own index lists. The union of the indexes
+    is checked as a flat checkpoint's index is: for the experts it holds (see
+    ``check_saved_experts``) and for derived buffers it predates (see
+    ``drop_derived_model_keys``).
+
+    Raises:
+        ValueError: ``tied``, since a pipeline-parallel run never ties the token embedding to
+            the output head and its checkpoint holds both; a stage has no DCP index; two stages
+            hold the same model tensor; or the stages together lack a tensor of ``model``.
+    """
+    if tied:
+        raise ValueError(
+            f"{dcp_path} was {layout.describe()}, and the model config sets tie_embeddings = "
+            "true: a pipeline-parallel run never ties the token embedding to the output head, "
+            "so its checkpoint holds the two separately. Export it with tie_embeddings = false, "
+            "as it was trained."
+        )
+    keys = _stage_model_keys(dcp_path, layout, stages)
+    saved = {key: meta for index in keys.values() for key, meta in index.items()}
+    check_saved_experts(model, saved, dcp_path)
+    template = model.state_dict()
+    drop_derived_model_keys(template, model, saved)
+    uncovered = sorted(key for key in template if f"model.{key}" not in saved)
+    if uncovered:
+        raise ValueError(
+            f"{dcp_path} was {layout.describe()}, and none of its stages holds {len(uncovered)} "
+            f"tensors of the model: {uncovered[:8]}. A stage directory is missing, or the model "
+            "config is not the one the checkpoint was trained with."
+        )
+    for d, index in keys.items():
+        part = {"model": {key: value for key, value in template.items() if f"model.{key}" in index}}
+        dcp.load(part, checkpoint_id=str(d))
+        template.update(part["model"])
+    model.load_state_dict(template)
 
 
 def dcp_to_hf(
@@ -180,7 +246,12 @@ def dcp_to_hf(
 ) -> None:
     """Convert a DCP checkpoint to HuggingFace safetensors format.
 
-    Handles both standard and pipeline-parallel checkpoints (pp0/, pp1/, ...).
+    Handles both standard and pipeline-parallel checkpoints (pp0/, pp1/, ...); see
+    ``kempnerforge.checkpoint.layout``. Each stage of a pipeline-parallel checkpoint gives
+    the tensors its own DCP index lists, and the export is the one a checkpoint of the same
+    weights saved without pipeline parallelism gives. One whose stages do not hold every
+    tensor of the model, or hold one twice, is refused, and so is a ``model_config`` that
+    ties the embeddings, since a pipeline-parallel run never ties them.
     A dense model is written as a Llama checkpoint and an MoE model as a Mixtral
     checkpoint, with packed experts split into one tensor per expert; a model that
     its architecture cannot hold is refused before anything is read or written,
@@ -210,13 +281,11 @@ def dcp_to_hf(
 
     model = Transformer(model_config)
 
-    pp_dirs = _detect_pp_stages(dcp_path)
-    if pp_dirs:
-        logger.info(f"Detected {len(pp_dirs)} PP stages: {[d.name for d in pp_dirs]}")
-        for pp_path in pp_dirs:
-            stage_state = {"model": model.state_dict()}
-            dcp.load(stage_state, checkpoint_id=str(pp_path))
-            model.load_state_dict(stage_state["model"], strict=False)
+    layout = saved_layout(dcp_path)
+    if layout is not None and not layout.flat:
+        stages = stage_dirs(dcp_path, layout)
+        logger.info(f"Loading {len(stages)} pipeline stages: {[d.name for d in stages]}")
+        _load_stages(model, model_config.tie_embeddings, dcp_path, layout, stages)
     else:
         saved = dcp.FileSystemReader(dcp_dir).read_metadata().state_dict_metadata
         check_saved_experts(model, saved, dcp_dir)

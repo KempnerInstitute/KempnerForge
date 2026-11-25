@@ -1372,7 +1372,7 @@
             "_resume_past_mismatch(view, envelope, error) -> (view, carried) (with ignore_rank_state_mismatch: a changed topology keeps the saved data position if the envelope is sound where it was saved, rank 0's or for a stream on the saved data-parallel size its own data-parallel rank's, else drops it; never restores RNG)",
             "_resume_without_rank_state(train_state) -> (view, carried) (with ignore_rank_state_mismatch, a checkpoint with no per-rank state resumes as if the topology changed: rank 0's data position kept, its RNG dropped)",
             "_read_saved_keys(dcp_dir) -> (keys, restored_on_any_rank) (this rank's DCP keys; with a scope or multipliers an all-reduce on the gloo group tells every rank whether any rank's index holds optimizer state)",
-            "_broadcast_metadata(ckpt_dir) -> (meta, error) (rank 0 reads metadata.json once per load and broadcasts the object or why it could not; the scope, multipliers and group-layout checks all decide from it)",
+            "_broadcast_metadata(ckpt_dir, read) -> (meta, error) (rank 0 shares the read _agreed_load_dir made, or reads metadata.json, and broadcasts the object or why it could not; the layout, scope, multipliers and group-layout checks all decide from one read per load)",
             "_check_plugins(metadata, ckpt_dir, expected) (every rank refuses another plugins list before any state is read, unless checkpoint.ignore_plugins_mismatch)",
             "_broadcast_train_state(path) -> dict (rank 0 reads train_state.pt and broadcasts the state or why it could not; rank 0 re-raises its error, every other rank raises a RuntimeError naming it)",
             "_check_weight_decay_scope(metadata, ckpt_dir) (every rank refuses a mismatch or an unreadable record)",
@@ -1384,12 +1384,16 @@
             "release_dir() (marks the <dir>/.owner record this rank's claim_dir wrote released, at a clean exit)",
             "restored_extra (property: the extra keys the last load restored)",
             "_resolve_load_path(path)",
-            "_agreed_load_dir(path, fall_back) -> Path | None (every load: rank 0 resolves the checkpoint, on an exact resume that reads shards takes the newest step_N beside it that every stage saved when that one is not, and broadcasts its choice or its error)",
+            "_agreed_load_dir(path, fall_back) -> (Path | None, SavedLayout | None, rank 0's metadata read | None) (every load: rank 0 resolves the checkpoint, on an exact resume that reads shards takes the newest step_N beside it that every stage saved when that one is not, reads its metadata.json once for the whole load and its saved layout, and broadcasts the directory and the layout or its error)",
+            "_newest_saved_beside(resolved, num_stages) -> Path (the newest step_N beside resolved whose shards are durable, judged at its recorded pipeline degree, else at num_stages)",
+            "_shard_dir(ckpt_dir, layout) -> Path (where this rank reads the shards: the top of a flat checkpoint, also for a pipeline stage, or this rank's pp{k}/; refuses a stage checkpoint without PP or at another pp_size, naming both layouts and the dcp-to-hf, hf-to-dcp, load_path route)",
+            "_optimizer_across_layouts(ckpt_dir) -> str (why a stage refuses a flat checkpoint's optimizer state, with the weights-only route)",
             "_cleanup()"
           ]
         }
       },
       "functions": [
+        "_weights_route(ckpt_dir) -> str (the dcp-to-hf, hf-to-dcp and load_path route a layout refusal names)",
         "_load_train_state(path) -> dict (ownership-gated torch.load with weights_only=False)",
         "_intersect_freeze_meta_by_module(saved, expected) -> (saved_filt, expected_filt) (cross-arch drop-zero-match rule)",
         "_read_metadata(ckpt_dir) -> dict (the JSON object metadata.json holds; empty when there is none)",
@@ -1431,7 +1435,30 @@
         "tests/distributed/test_checkpoint.py",
         "tests/unit/test_checkpoint_per_rank.py",
         "tests/unit/test_data_position.py",
-        "tests/unit/test_streaming_resume.py"
+        "tests/unit/test_streaming_resume.py",
+        "tests/unit/test_pipeline_checkpoint_layouts.py"
+      ]
+    },
+    "kempnerforge/checkpoint/layout.py": {
+      "classes": {
+        "SavedLayout": {
+          "purpose": "How a checkpoint lays out its DCP shards: stages 0 for one index at its top (saved without PP), else the number of pp{k}/ stage indexes; recorded when metadata.json records the degree",
+          "properties": [
+            "flat"
+          ],
+          "methods": [
+            "describe() -> str (the layout in words, as the refusals name it)"
+          ]
+        }
+      },
+      "functions": [
+        "stage_dir(ckpt_dir, stage) -> Path",
+        "saved_layout(ckpt_dir, meta) -> SavedLayout | None (the pp the metadata.json record holds first, from meta when the caller read it, then an index at the top, then the pp{k}/ directories; None without any index; an unreadable or invalid record is logged and counts as none)",
+        "stage_dirs(ckpt_dir, layout) -> list[Path] (pp0/ to pp{n-1}/ when recorded, else the stage directories found)"
+      ],
+      "tested_by": [
+        "tests/unit/test_checkpoint_layout.py",
+        "tests/unit/test_pipeline_checkpoint_layouts.py"
       ]
     },
     "kempnerforge/checkpoint/async_save.py": {
@@ -1651,7 +1678,8 @@
         "get_slurm_info() -> SLURMInfo | None",
         "is_slurm_job() -> bool",
         "is_slurm_requeue() -> bool",
-        "resolve_resume_path(checkpoint_dir) -> Path | None",
+        "resolve_resume_path(checkpoint_dir, num_stages, require_train_state) -> Path | None",
+        "_dcp_durable(ckpt_dir, num_stages) -> bool (every shard index of the checkpoint's layout is there; a recorded stage checkpoint is complete at its own degree, one saved before the record at num_stages)",
         "log_job_info()"
       ],
       "tested_by": [
@@ -1686,11 +1714,14 @@
       "functions": [
         "_kf_to_hf_key()",
         "_hf_to_kf_key()",
-        "_build_hf_config()"
+        "_build_hf_config()",
+        "_load_stages() (a pipeline-parallel checkpoint, each stage from its own DCP index, the indexes checked together; refuses a tied config)",
+        "_stage_model_keys() (each stage's model entries; refuses a stage without an index or a tensor two stages hold)"
       ],
       "tested_by": [
         "tests/unit/test_convert_checkpoint.py",
-        "tests/unit/test_ep_checkpoint.py::TestExportFromAnEPCheckpoint"
+        "tests/unit/test_ep_checkpoint.py::TestExportFromAnEPCheckpoint",
+        "tests/unit/test_pipeline_checkpoint_layouts.py::TestAcrossRanks"
       ]
     },
     "scripts/prepare_data.py": {
@@ -1802,9 +1833,9 @@
           "TestNaNDetectorAcrossRanks(2)",
           "TestGPUHealth(2)",
           "TestSLURM(13)",
-          "TestResumePathResolution(9)"
+          "TestResumePathResolution(12)"
         ],
-        "count": 69
+        "count": 72
       },
       "tests/unit/test_shutdown_agreement.py": {
         "classes": [
@@ -1981,9 +2012,29 @@
           "TestMoEKFtoHFKeyMapping(5)",
           "TestMoEHFtoKFKeyMapping(5)",
           "TestMoERoundTrip(1)",
-          "TestSigmoidRouterMasters(3)"
+          "TestSigmoidRouterMasters(3)",
+          "TestPipelineParallelExport(14)"
         ],
-        "count": 32
+        "count": 46
+      },
+      "tests/unit/test_checkpoint_layout.py": {
+        "classes": [
+          "TestSavedLayout(17)",
+          "TestDescribe(2)"
+        ],
+        "count": 19
+      },
+      "tests/unit/test_pipeline_checkpoint_layouts.py": {
+        "classes": [
+          "TestManagerArguments(3)",
+          "TestSavedDegree(2)",
+          "TestStageLoadsAFlatCheckpoint(6)",
+          "TestStageCheckpointRefusals(4)",
+          "TestStageCheckpointLoads(4)",
+          "TestResumeFallback(2)",
+          "TestAcrossRanks(5)"
+        ],
+        "count": 26
       },
       "tests/unit/test_ep_checkpoint.py": {
         "classes": [

@@ -28,8 +28,8 @@ What happens:
    random-initialized parameters serve only as target shapes that
    DCP overwrites on load.
 2. Load the checkpoint into that model with DCP. A pipeline-parallel
-   checkpoint, one with stage subdirectories (`pp0/`, `pp1/`, …),
-   fails at this step; see [With PP](#with-pp).
+   checkpoint, one with stage subdirectories (`pp0/`, `pp1/`, …), is
+   loaded stage by stage; see [With PP](#with-pp).
 3. Convert state dict keys from KempnerForge → HF naming.
 4. Cast every tensor to the export dtype (see [Dtypes](#dtypes)).
 5. Write `model.safetensors` (or fall back to `pytorch_model.bin`
@@ -115,14 +115,32 @@ held `x` has the training point `y` instead.
 
 ### With PP
 
-`dcp-to-hf` cannot export a PP checkpoint today
-([#450](https://github.com/KempnerInstitute/KempnerForge/issues/450)).
-The script finds the `pp0/`, `pp1/`, … stage subdirectories, but asks
-each stage for every tensor of the full model, and DCP stops at the
-first one the stage does not hold: a `pp=2` checkpoint of
-`configs/train/debug.toml` fails with `Missing key in checkpoint
-state_dict: model.layers.2.attention_norm.weight`. Keep a PP run's
-checkpoints in DCP and resume them at the same `pp` (see
+A PP checkpoint holds one DCP index per stage, in `pp0/` to
+`pp{n-1}/`, and its `metadata.json` records `n` as `pp` (see
+[DCP model § With pipeline parallelism](dcp-model.md#with-pipeline-parallelism)).
+`dcp-to-hf` reads each stage's tensors from that stage's own index,
+into the one full model, and writes the same files as for the same
+weights saved without PP. Before reading any tensor it checks the
+stages together as it checks a flat checkpoint: for the experts they
+hold, and for derived buffers they predate, such as the sigmoid
+router's FP32 masters (see [Key mapping](#key-mapping)). It refuses,
+naming the stage directories, a checkpoint in which:
+
+- a stage directory has no `.metadata`, because its save did not
+  complete;
+- two stage directories hold the same tensor, as when a stage
+  directory comes from another save;
+- no stage holds a tensor the model has, as when a stage directory is
+  missing from a checkpoint saved before the degree was recorded, or
+  the config is not the one the run trained with.
+
+A PP run never ties the token embedding to the output head
+(`tie_embeddings` needs `pp = 1`), so its stages hold the two
+separately, and `dcp-to-hf` refuses a config with
+`tie_embeddings = true` for a PP checkpoint. Export it with the
+config the run trained with. Export at `--dtype float32` to keep the
+weights exact for `hf-to-dcp`, which is how a PP run's weights move
+to another `pp` (see
 [Resharding § PP](resharding.md#pp-the-one-special-case)).
 
 ## HuggingFace → DCP
@@ -184,8 +202,9 @@ Point a training config at this directory via
 training picks it up like any other DCP checkpoint, as a warm start
 at step 0. `load_path` is used while the run's `checkpoint.dir` holds
 no checkpoint; once the run has saved one, a restart resumes from it.
-A run with PP cannot load it, since it has no `pp{N}/` stages
-([#317](https://github.com/KempnerInstitute/KempnerForge/issues/317)).
+A run with PP loads it too: the checkpoint has no `pp{N}/` stages, and
+each stage loads its own layers from the one index (see
+[Resharding § PP](resharding.md#pp-the-one-special-case)).
 
 ## Key mapping
 
@@ -301,7 +320,7 @@ Not included: tokenizer files. Copy `tokenizer.json`, `tokenizer_config.json`,
 - [DCP model + optimizer](dcp-model.md): the source format for
   `dcp-to-hf` and the target format for `hf-to-dcp`.
 - [Resharding](resharding.md): the changes DCP reshards on load, and
-  the `dcp-to-hf` → `hf-to-dcp` round trip for a run without PP that
-  adds parameters.
+  the `dcp-to-hf` → `hf-to-dcp` round trip that adds parameters or
+  changes `pp`.
 - [Configuration § CheckpointConfig](../configuration/config-sections.md):
   `load_path` to pick up a converted checkpoint.

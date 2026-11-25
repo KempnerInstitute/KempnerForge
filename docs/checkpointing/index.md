@@ -34,10 +34,11 @@ It holds `step` and `tokens_seen`, plus the run's `optimizer.weight_decay_scope`
 `weight_decay_scope` when the checkpoint manager was built with it, as the training entry does
 (VLM runs add `vlm_freeze`, and `lr_multipliers` with the `lr_module_patterns` of its
 modules and the module of each optimizer param group, `lr_group_modules`, when
-`optimizer.lr_multipliers` lists any), and the run's `plugins` list as `plugins` (see
-[Train state](train-state.md)). A load reads it on rank 0, once, for the checks of
-those records. When a logging backend has a live run at save time it also holds a
-`tracking` list, one entry per backend:
+`optimizer.lr_multipliers` lists any), the run's `plugins` list as `plugins` (see
+[Train state](train-state.md)), and under pipeline parallelism the degree as `pp` (see
+[Resharding § PP](resharding.md#pp-the-one-special-case)). A load reads it on rank 0,
+once, for the checks of those records and the checkpoint's layout. When a logging backend
+has a live run at save time it also holds a `tracking` list, one entry per backend:
 
 ```json
 {

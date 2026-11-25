@@ -42,7 +42,7 @@ state_dict`, naming the tensor.
 | `tp` | yes | Heads must still divide evenly |
 | `ep` | yes | `num_experts` must still divide evenly; see [EP](#ep-every-expert-under-its-global-index) |
 | World size | yes | Pure rebalance across fewer/more ranks |
-| **`pp` stage count** | **no** | Per-stage `pp{N}/` subdirs; changing `pp` reassigns layers and moves the embedding/output to different stages |
+| **`pp` stage count** | **no** | Per-stage `pp{N}/` subdirs; changing `pp` reassigns layers and moves the embedding/output to different stages. The weights move by conversion, and a PP run loads a checkpoint saved without PP; see [PP](#pp-the-one-special-case) |
 | Precision (bf16 → fp32) | yes | DCP upcasts on load |
 | Add a new parameter | no | Not in `.metadata` → `Missing key in checkpoint state_dict`; see Missing parameter below |
 | Rename a parameter | no | Old name not in `.metadata` → error (or you patch the state dict keys before `load_state_dict`) |
@@ -56,17 +56,51 @@ config line on resume: see
 
 ## PP: the one special case
 
-PP stores shards per-stage under `pp0/`, `pp1/`, …. A checkpoint saved
-at `pp=4` is **not loadable at `pp=2`**: each stage loads only its own
+PP stores shards per-stage under `pp0/`, `pp1/`, …, and records the
+degree as `pp` in `metadata.json`. Each stage loads only its own
 `pp{N}/` subdirectory, and a different `pp` gives each stage different
-layers. Keep the same `pp` on resume. Auto-resume never changes the
-parallelism shape, so a straight restart always works.
+layers, so a stage checkpoint loads only at the `pp` it was saved
+with. Auto-resume never changes the parallelism shape, so a straight
+restart always works. Every rank loads the checkpoint as rank 0 reads
+its layout, and before reading any shard, every rank refuses with a
+`ValueError` naming both layouts:
 
-No path changes `pp` today. `dcp-to-hf` cannot export a PP checkpoint
-([#450](https://github.com/KempnerInstitute/KempnerForge/issues/450)),
-and a PP run cannot load a checkpoint saved without PP, such as the
-output of `hf-to-dcp`
-([#317](https://github.com/KempnerInstitute/KempnerForge/issues/317)).
+- a checkpoint saved at another `pp`, for example `pp=4` loaded at
+  `pp=2`. One saved before the degree was recorded loads when it holds
+  as many stage directories as the run has stages, and is refused
+  otherwise;
+- a stage checkpoint loaded without PP, by a run or by
+  `scripts/eval.py`.
+
+A PP run loads a checkpoint saved without PP, such as the output of
+`hf-to-dcp`: each stage loads its own layers from the one DCP index,
+through `checkpoint.load_path` or auto-resume. Of its DCP state a
+stage loads the model weights alone: the saved optimizer param groups
+are the whole model's, not one stage's, so a load that would restore
+the optimizer state such a checkpoint holds is refused, also on
+auto-resume. To continue from its
+weights with a fresh optimizer, set `checkpoint.load_path` to it with
+`checkpoint.exclude_from_loading = ["optimizer"]` (add
+`"train_state"` to also restart the step, schedule and data
+position), in a `checkpoint.dir` that holds no checkpoint yet.
+
+To change `pp`, or to load a PP checkpoint without PP, carry the
+weights over: `dcp-to-hf` exports the stages as one model (see
+[HF conversion § With PP](hf-conversion.md#with-pp)), `hf-to-dcp`
+imports the export as a checkpoint saved without PP, and
+`checkpoint.load_path` points the new run at it:
+
+```bash
+uv run python scripts/convert_checkpoint.py dcp-to-hf \
+    --dcp-dir checkpoints/run/step_1000 --hf-dir exports/run \
+    --config <the run's TOML> --dtype float32
+uv run python scripts/convert_checkpoint.py hf-to-dcp \
+    --hf-dir exports/run --dcp-dir checkpoints/run_flat \
+    --config <the run's TOML>
+```
+
+The new run starts at step 0 from those weights, with a fresh
+optimizer, as after any `hf-to-dcp` import.
 
 ## EP: every expert under its global index
 
@@ -95,7 +129,7 @@ checkpoint loads into an EP run. Packed experts under FSDP need torch
   `exclude_from_loading` skips the whole model or the whole optimizer,
   not single tensors. For a change `ModelConfig` can express that adds
   tensors without resizing existing ones (more layers, for example),
-  in a run without PP (see [PP](#pp-the-one-special-case)), the
+  with or without PP (see [PP](#pp-the-one-special-case)), the
   weights-only round trip in [HF conversion](hf-conversion.md) carries
   the old weights over:
   `dcp-to-hf` with the old config, then `hf-to-dcp` with the new one,
@@ -259,6 +293,6 @@ if you need to keep the global batch size constant.
 - [Auto-resume](auto-resume.md): how the training script chooses
   which checkpoint to reshard.
 - [HF conversion](hf-conversion.md): the weights-only round trip
-  for a run without PP that adds parameters.
+  that adds parameters or changes `pp`.
 - [Device mesh](../distributed/device-mesh.md): the mesh construction
   that determines the target shard layout.

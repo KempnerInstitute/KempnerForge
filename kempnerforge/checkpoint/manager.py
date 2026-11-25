@@ -73,6 +73,7 @@ from kempnerforge.checkpoint.expert_layout import (
     moe_layers,
     state_dict_name,
 )
+from kempnerforge.checkpoint.layout import PP_DEGREE_KEY, SavedLayout, saved_layout, stage_dir
 from kempnerforge.checkpoint.ownership import claim_checkpoint_dir, release_checkpoint_dir
 from kempnerforge.checkpoint.state import (
     PER_RANK_KEY,
@@ -423,6 +424,17 @@ def _holds_optimizer(saved_keys: Iterable[str]) -> bool:
     return any(key == "optimizer" or key.startswith(_OPTIM_PREFIX) for key in saved_keys)
 
 
+def _weights_route(ckpt_dir: Path) -> str:
+    """How to carry the weights of a stage checkpoint into a run of another layout."""
+    return (
+        f"To carry its weights over, export them with scripts/convert_checkpoint.py dcp-to-hf "
+        f"--dcp-dir {ckpt_dir} --dtype float32, which assembles every stage, import the export "
+        f"with hf-to-dcp, which writes a checkpoint saved without pipeline parallelism, and set "
+        f"checkpoint.load_path to that: a run at any pipeline degree, or none, starts from its "
+        f"weights with a fresh optimizer, at step 0."
+    )
+
+
 def missing_train_state(ckpt_dir: Path) -> bool:
     """Whether checkpoint ``ckpt_dir`` holds optimizer state but no ``train_state.pt``.
 
@@ -481,6 +493,17 @@ def _read_metadata(ckpt_dir: Path) -> dict[str, Any]:
     if not isinstance(meta, dict):
         raise ValueError(f"{metadata_path} does not hold a JSON object")
     return meta
+
+
+def _metadata_outcome(ckpt_dir: Path) -> _MetadataOutcome:
+    """A read of a checkpoint's ``metadata.json``: the JSON object it holds, or why it could not
+    be read, as ``(None, reason)``."""
+    try:
+        return _read_metadata(ckpt_dir), None
+    except ValueError as e:
+        return None, str(e)
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def _recorded_weight_decay_scope(meta: Mapping[str, Any], metadata_path: Path) -> str:
@@ -1087,6 +1110,17 @@ class CheckpointManager:
         config: Checkpoint configuration.
         model: The model (FSDP-wrapped or plain).
         optimizer: The optimizer.
+        pp_rank: This rank's pipeline stage, None without pipeline parallelism. Each stage
+            saves its DCP shards in ``pp{pp_rank}/`` of the checkpoint (see
+            ``kempnerforge.checkpoint.layout``), through ``process_group``.
+        pp_size: The run's pipeline degree, which needs ``pp_rank``. Every save then records
+            it in ``metadata.json`` as ``pp``. A load refuses, with a ``ValueError`` on every
+            rank before anything is loaded, a stage checkpoint of another degree: one that
+            records its degree, or, saved before the record existed, holds another number of
+            stage directories. Without it, the degree is neither recorded nor compared. A
+            pipeline-parallel run loads its stage's model weights from a checkpoint saved
+            without pipeline parallelism, but refuses its optimizer state, and a run without
+            pipeline parallelism refuses a stage checkpoint (see ``load``).
         dp_info: This rank's ``(dp_rank, dp_size)``, the data partition its
             loader reads. Recorded with the per-rank loader/RNG state and
             checked on load, so a resume under a different data-parallel
@@ -1106,7 +1140,7 @@ class CheckpointManager:
             rank when it restores the checkpoint's optimizer state on any rank, before anything
             is loaded, or the scheduler state in its ``train_state.pt``, before anything from
             that file is restored. A load that restores neither, such as a weights-only warm
-            start (``exclude_keys=["optimizer", "train_state"]``), goes ahead without reading
+            start (``exclude_keys=["optimizer", "train_state"]``), goes ahead without checking
             the record. A checkpoint that records none counts as saved without multipliers.
             One whose ``metadata.json`` cannot be read, or holds an invalid record, is refused
             the same way when multipliers are set; without them it loads as one saved without
@@ -1135,12 +1169,18 @@ class CheckpointManager:
         lr_multipliers: Mapping[str, float] | None = None,
         module_patterns: Mapping[str, Sequence[str]] | None = None,
         group_timeout_sec: float | None = None,
+        pp_size: int | None = None,
     ) -> None:
         self._dp_info = dp_coordinates(dp_info) if dp_info is not None else None
         if dp_info is not None and self._dp_info is None:
             raise ValueError(
                 f"dp_info must be (dp_rank, dp_size) ints with 0 <= dp_rank < dp_size, "
                 f"got {dp_info!r}"
+            )
+        if pp_size is not None and (pp_rank is None or not 0 <= pp_rank < pp_size):
+            raise ValueError(
+                f"pp_size needs a pp_rank with 0 <= pp_rank < pp_size, got pp_rank={pp_rank!r} "
+                f"and pp_size={pp_size!r}"
             )
         self.config = config
         self.model = model
@@ -1155,6 +1195,7 @@ class CheckpointManager:
         self._async_ckpt = AsyncCheckpointer(mode=config.async_mode)
         self._process_group = process_group
         self._pp_rank = pp_rank
+        self._pp_size = pp_size
         self._weight_decay_scope = weight_decay_scope
         self._lr_multipliers = None if lr_multipliers is None else dict(lr_multipliers)
         listed = sorted(self._lr_multipliers or ())
@@ -1192,6 +1233,52 @@ class CheckpointManager:
     def _dcp_dir(self, ckpt_dir: Path) -> Path:
         """DCP shard directory for a checkpoint (per-stage subdir under PP)."""
         return ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
+
+    def _shard_dir(self, ckpt_dir: Path, layout: SavedLayout | None) -> Path:
+        """The directory this rank reads ``ckpt_dir``'s DCP shards from, given its saved layout.
+
+        ``layout`` is the one rank 0 found (see ``_agreed_load_dir``), so every rank takes the
+        same branch. A flat checkpoint is read at its top, also by a pipeline stage, which
+        loads its own layers from it, and a stage checkpoint in this rank's ``pp{k}/``. With
+        no layout, the shards are read where this run's own layout keeps them.
+
+        Raises:
+            ValueError: ``layout`` is a stage layout, and this run has no pipeline parallelism
+                or a pipeline degree, ``pp_size``, other than the checkpoint's.
+        """
+        if layout is None:
+            return self._dcp_dir(ckpt_dir)
+        if layout.flat:
+            return ckpt_dir
+        if self._pp_rank is None:
+            raise ValueError(
+                f"{ckpt_dir} was {layout.describe()}, and this run has no pipeline parallelism, "
+                f"so it reads one DCP index at the top of the checkpoint. "
+                f"{_weights_route(ckpt_dir)}"
+            )
+        if self._pp_size is not None and layout.stages != self._pp_size:
+            raise ValueError(
+                f"{ckpt_dir} was {layout.describe()}, and this run has pp={self._pp_size}: each "
+                f"stage reads the stage directory of its own number, and another degree gives "
+                f"each stage other layers. {_weights_route(ckpt_dir)}"
+            )
+        return stage_dir(ckpt_dir, self._pp_rank)
+
+    def _optimizer_across_layouts(self, ckpt_dir: Path) -> str:
+        """Why a pipeline stage refuses the optimizer state of a checkpoint saved without PP."""
+        run = "this run is pipeline-parallel"
+        if self._pp_size is not None:
+            run = f"this run has pp={self._pp_size}"
+        return (
+            f"{ckpt_dir} was {SavedLayout(0).describe()}, and {run}: each stage loads its model "
+            f"weights from it, but not its optimizer state, whose param groups are those of the "
+            f"whole model's optimizer, not of one stage's. To continue from its weights with a "
+            f"fresh optimizer, set checkpoint.load_path={str(ckpt_dir)!r} with "
+            f'checkpoint.exclude_from_loading = ["optimizer"] (add "train_state" to also '
+            f"restart the step, schedule and data position) and a checkpoint.dir that holds no "
+            f"checkpoint yet, since training auto-resumes from a checkpoint there in place of "
+            f"load_path."
+        )
 
     def _dcp_complete(self, ckpt_dir: Path) -> bool:
         """True once DCP has written its `.metadata` (all shards durable)."""
@@ -1380,12 +1467,14 @@ class CheckpointManager:
         """``meta`` as JSON, plus the run's ``weight_decay_scope`` when the manager has one, its
         ``lr_multipliers`` and their ``lr_module_patterns`` when it has a non-empty one, with
         the module of each checkpointed param group as ``lr_group_modules`` when every rank
-        holds rank 0's groups, as without pipeline parallelism, and the live tracking runs when
-        the source can supply them.
+        holds rank 0's groups, as without pipeline parallelism, the pipeline degree as ``pp``
+        when the manager has one, and the live tracking runs when the source can supply them.
 
         Everything that depends on the source sits inside one guard: it runs on rank 0 alone,
         so a raise here would strand the other ranks. A bad source costs the ``tracking`` key.
         """
+        if self._pp_size is not None:
+            meta = {**meta, PP_DEGREE_KEY: self._pp_size}
         if self._weight_decay_scope is not None:
             meta = {**meta, "weight_decay_scope": self._weight_decay_scope}
         if self._lr_multipliers:
@@ -1917,6 +2006,9 @@ class CheckpointManager:
                 (see ``_agreed_load_dir``); an exact resume that reads DCP shards falls back,
                 when not every stage directory there holds them all, to the newest
                 ``step_N`` beside it whose does. Any other load takes its checkpoint as is.
+                Whichever it takes, a load that reads DCP shards reads them as the layout
+                rank 0 found there: a pipeline stage loads its model weights from a
+                checkpoint saved without pipeline parallelism too (see ``_shard_dir``).
             plugins_expected: The run's ``plugins`` list, compared with the one the
                 checkpoint's ``metadata.json`` records before any state is read (see
                 ``_check_plugins``). Every rank must pass the same value. A weights-only
@@ -1938,6 +2030,12 @@ class CheckpointManager:
                 list (see ``plugins_expected``); or, on an exact resume, its per-rank state
                 does not fit this run's topology and
                 ``checkpoint.ignore_rank_state_mismatch`` is off (see ``exact_resume``).
+                Also, for a load that reads DCP shards, before any is read: the checkpoint
+                was saved under pipeline parallelism and this run has none, or another
+                pipeline degree (see ``pp_size`` in ``__init__``); or it was saved without
+                pipeline parallelism, this run is pipeline-parallel, and the load would
+                restore the optimizer state it holds. Each message names both layouts and
+                the way to carry the weights over.
             RuntimeError: The saved optimizer state does not fit this run's optimizers, as
                 when a name in ``fresh_if_unheld`` with neither saved state nor a
                 never-stepped record is listed in the saved param groups, or no saved
@@ -1964,7 +2062,9 @@ class CheckpointManager:
         will_load_dcp = (
             exclude_keys is None or "model" not in exclude_keys or "optimizer" not in exclude_keys
         )
-        ckpt_dir = self._agreed_load_dir(path, fall_back=exact_resume and will_load_dcp)
+        ckpt_dir, ckpt_layout, metadata_read = self._agreed_load_dir(
+            path, fall_back=exact_resume and will_load_dcp
+        )
         if ckpt_dir is None:
             requested = path if path is not None else self.config.load_path
             if requested:
@@ -1974,6 +2074,13 @@ class CheckpointManager:
             return 0, 0, {}
 
         logger.info(f"Loading checkpoint: {ckpt_dir}")
+        dcp_dir = self._shard_dir(ckpt_dir, ckpt_layout if will_load_dcp else None)
+        restaged = (
+            will_load_dcp
+            and self._pp_rank is not None
+            and ckpt_layout is not None
+            and ckpt_layout.flat
+        )
         load_train_state = not is_weights_only(exclude_keys)
         if not load_train_state and vlm_freeze_expected is not None:
             logger.warning(
@@ -2026,10 +2133,8 @@ class CheckpointManager:
 
         metadata: _MetadataOutcome | None = None
         if plugins_expected is not None and load_train_state:
-            metadata = self._broadcast_metadata(ckpt_dir)
+            metadata = self._broadcast_metadata(ckpt_dir, metadata_read)
             self._check_plugins(metadata, ckpt_dir, plugins_expected)
-
-        dcp_dir = ckpt_dir / f"pp{self._pp_rank}" if self._pp_rank is not None else ckpt_dir
 
         load_model = exclude_keys is None or "model" not in exclude_keys
         optimizer_requested = exclude_keys is None or "optimizer" not in exclude_keys
@@ -2038,13 +2143,15 @@ class CheckpointManager:
         saved_keys, restored_on_any_rank = (
             self._read_saved_keys(dcp_dir) if load_optim else ({}, False)
         )
+        if restaged and restored_on_any_rank:
+            raise ValueError(self._optimizer_across_layouts(ckpt_dir))
         saved_modules: list[str | None] | None = None
         lr_checked = False
         if restored_on_any_rank and (
             self._weight_decay_scope is not None or self._lr_multipliers is not None
         ):
             if metadata is None:
-                metadata = self._broadcast_metadata(ckpt_dir)
+                metadata = self._broadcast_metadata(ckpt_dir, metadata_read)
             if self._weight_decay_scope is not None:
                 self._check_weight_decay_scope(metadata, ckpt_dir)
             if self._lr_multipliers is not None:
@@ -2199,7 +2306,7 @@ class CheckpointManager:
                 and "scheduler" in train_state
             ):
                 if metadata is None:
-                    metadata = self._broadcast_metadata(ckpt_dir)
+                    metadata = self._broadcast_metadata(ckpt_dir, metadata_read)
                 self._check_lr_multipliers(metadata, ckpt_dir)
             held_position = "dataloader" in train_state
             carried = False
@@ -2335,22 +2442,20 @@ class CheckpointManager:
         assert state is not None
         return state
 
-    def _broadcast_metadata(self, ckpt_dir: Path) -> _MetadataOutcome:
+    def _broadcast_metadata(
+        self, ckpt_dir: Path, read: _MetadataOutcome | None = None
+    ) -> _MetadataOutcome:
         """Return rank 0's read of the checkpoint's ``metadata.json`` on every rank: the JSON
         object it holds, or why rank 0 could not read one.
 
-        Every rank calls this or none does. Rank 0 alone reads the file and broadcasts the
-        outcome once, so every check of a load decides from the same record on every rank and
-        none is left waiting on the broadcast.
+        Every rank calls this or none does. Rank 0 alone reads the file, or takes ``read``, the
+        read ``_agreed_load_dir`` made for the same load, and broadcasts the outcome once, so
+        every check of a load decides from the same record on every rank and none is left
+        waiting on the broadcast.
         """
         outcome: list[_MetadataOutcome] = [(None, None)]
         if self._rank == 0 or not dist.is_initialized():
-            try:
-                outcome[0] = (_read_metadata(ckpt_dir), None)
-            except ValueError as e:
-                outcome[0] = (None, str(e))
-            except Exception as e:
-                outcome[0] = (None, f"{type(e).__name__}: {e}")
+            outcome[0] = read if read is not None else _metadata_outcome(ckpt_dir)
         if dist.is_initialized():
             dist.broadcast_object_list(outcome, src=0)
         return outcome[0]
@@ -2661,21 +2766,31 @@ class CheckpointManager:
 
         return None
 
-    def _agreed_load_dir(self, path: str | None, fall_back: bool) -> Path | None:
-        """Return the checkpoint rank 0 resolves for a load, on every rank.
+    def _agreed_load_dir(
+        self, path: str | None, fall_back: bool
+    ) -> tuple[Path | None, SavedLayout | None, _MetadataOutcome | None]:
+        """Return the checkpoint rank 0 resolves for a load, and its layout, on every rank.
 
         Rank 0 resolves ``path`` (see ``_resolve_load_path``), following symlinks, and, with
         ``fall_back`` (an exact resume that reads DCP shards), takes the newest ``step_N``
         beside it whose every stage directory holds them when that one's do not (see
-        ``_newest_saved_beside``). It broadcasts its choice, or why it could not make one, so
-        every rank loads the same directory, or returns or raises together, whatever its own
-        view of the filesystem. Every rank must call this.
+        ``_newest_saved_beside``). It then reads the chosen checkpoint's ``metadata.json``, and
+        how the checkpoint lays out its DCP shards (see ``saved_layout``), None for one that
+        holds no DCP index. It broadcasts the directory and the layout, or why it could not
+        choose, so every rank loads the same directory as the same layout, or returns or raises
+        together, whatever its own view of the filesystem. Every rank must call this.
+
+        Returns:
+            The directory and the layout, both None when no checkpoint resolves, and on rank 0
+            its read of ``metadata.json`` (see ``_broadcast_metadata``), None on every other
+            rank, so the whole load decides from one read of the record.
 
         Raises:
             Exception: On rank 0, what resolving the checkpoint raised.
             RuntimeError: On every other rank, naming rank 0's error.
         """
-        outcome: list[dict[str, str | None]] = [{"dir": None, "error": None}]
+        outcome: list[dict[str, Any]] = [{"dir": None, "layout": None, "error": None}]
+        read: _MetadataOutcome | None = None
         error: Exception | None = None
         if self._rank == 0 or not dist.is_initialized():
             try:
@@ -2683,11 +2798,23 @@ class CheckpointManager:
                 if resolved is not None:
                     resolved = resolved.resolve()
                 if resolved is not None and fall_back:
-                    resolved = self._newest_saved_beside(resolved).resolve()
-                outcome[0] = {"dir": None if resolved is None else str(resolved), "error": None}
+                    resolved = self._newest_saved_beside(resolved, self._pp_size).resolve()
+                layout = None
+                if resolved is not None:
+                    read = _metadata_outcome(resolved)
+                    layout = saved_layout(resolved, read[0] or {})
+                outcome[0] = {
+                    "dir": None if resolved is None else str(resolved),
+                    "layout": layout,
+                    "error": None,
+                }
             except Exception as e:
                 error = e
-                outcome[0] = {"dir": None, "error": f"{type(e).__name__}: {_error_text(e)}"}
+                outcome[0] = {
+                    "dir": None,
+                    "layout": None,
+                    "error": f"{type(e).__name__}: {_error_text(e)}",
+                }
         if dist.is_initialized():
             dist.broadcast_object_list(outcome, src=0)
         if error is not None:
@@ -2695,26 +2822,30 @@ class CheckpointManager:
         chosen, reason = outcome[0]["dir"], outcome[0]["error"]
         if reason is not None:
             raise RuntimeError(f"Rank 0 could not pick the checkpoint to load: {reason}")
-        return None if chosen is None else Path(chosen)
+        if chosen is None:
+            return None, None, None
+        return Path(chosen), outcome[0]["layout"], read
 
     @staticmethod
-    def _newest_saved_beside(resolved: Path) -> Path:
+    def _newest_saved_beside(resolved: Path, num_stages: int | None = None) -> Path:
         """``resolved``, or the newest ``step_N`` beside it with all its shards if it lacks some.
 
-        A checkpoint's shards are all there when its ``.metadata`` is, or every ``pp{k}`` stage
-        directory in it holds one (``_dcp_durable`` without a pipeline degree, so a stage that
-        never created its directory is not noticed). A switch is logged, so resume degrades to
-        the last good step instead of failing in ``dcp.load`` with "metadata is None";
-        ``resolved`` comes back when no step beside it qualifies.
+        A checkpoint's shards are all there when its ``.metadata`` is, or every stage
+        directory of its layout holds one (see ``_dcp_durable``). One that records its
+        pipeline degree has every stage of that degree; one saved before the degree was
+        recorded has every ``pp{k}`` stage directory it holds and, with ``num_stages``, the
+        run's pipeline degree, also ``pp0`` through ``pp{num_stages - 1}``. A switch is
+        logged, so resume degrades to the last good step instead of failing in ``dcp.load``
+        with "metadata is None"; ``resolved`` comes back when no step beside it qualifies.
         """
-        if _dcp_durable(resolved):
+        if _dcp_durable(resolved, num_stages):
             return resolved
         saved = {
             int(number): d
             for d in resolved.parent.iterdir()
             if d.name.startswith("step_")
             and (number := d.name.removeprefix("step_")).isdigit()
-            and _dcp_durable(d)
+            and _dcp_durable(d, num_stages)
         }
         if not saved:
             return resolved

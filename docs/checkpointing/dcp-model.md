@@ -163,8 +163,19 @@ checkpoints/step_1000/
 │   └── __*_0.distcp
 ├── pp2/                           ← ...
 ├── pp3/                           ← last stage (final norm + output head)
+├── metadata.json                  ← records "pp": 4
 └── train_state.pt                 ← one per checkpoint, written by global rank 0
 ```
+
+`metadata.json` records the degree as `pp`, and a load compares it
+with the run's before it reads any shard: a stage checkpoint loads
+only at the `pp` it was saved with, and a PP run loads each stage's
+own layers from a checkpoint saved without PP, but not its optimizer
+state. The
+module `kempnerforge/checkpoint/layout.py` reads a checkpoint's
+layout; see
+[Resharding § PP](resharding.md#pp-the-one-special-case) for what each
+mismatch does and how to move weights to another `pp`.
 
 Each stage also gets a process group of its own ranks: every rank at
 the same `pp` coordinate, whatever the other mesh dimensions are (all
