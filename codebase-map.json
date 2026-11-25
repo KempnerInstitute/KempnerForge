@@ -1884,9 +1884,9 @@
           "TestFp32CrossEntropy(8)",
           "TestZLoss(11)",
           "TestBuildLossFn(12)",
-          "TestAllMaskedBatch(3)"
+          "TestAllMaskedBatch(4)"
         ],
-        "count": 42
+        "count": 43
       },
       "tests/unit/test_moe.py": {
         "classes": [

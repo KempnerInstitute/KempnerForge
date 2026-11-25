@@ -541,6 +541,18 @@ class TestAllMaskedBatch:
         loss.backward()
         assert torch.equal(logits.grad, torch.zeros_like(logits))
 
+    @pytest.mark.parametrize("shape", [(0, 16), (1, 0, 16), (2, 0, 16)])
+    @pytest.mark.parametrize("loss_name", sorted(ALL_MASKED_LOSSES))
+    def test_logits_with_no_rows_give_the_same_zero(self, loss_name, shape):
+        """A packed micro-batch with no text hands the loss logits with no rows (#588)."""
+        logits = torch.randn(*shape, dtype=torch.bfloat16).requires_grad_(True)
+        loss = ALL_MASKED_LOSSES[loss_name](logits, torch.full(shape[:-1], -100))
+        assert loss.item() == 0.0
+        assert loss.dtype == torch.float32
+        loss.backward()
+        assert logits.grad is not None
+        assert logits.grad.shape == logits.shape
+
     @pytest.mark.parametrize("loss_name", sorted(ALL_MASKED_LOSSES))
     def test_backward_reaches_the_model_parameters(self, loss_name):
         model = nn.Linear(4, 16)
