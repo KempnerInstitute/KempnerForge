@@ -9,20 +9,23 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.device_mesh import init_device_mesh
+import torch.nn.functional as F
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.schema import CheckpointConfig, ModelConfig
 from kempnerforge.distributed.expert_parallel import apply_expert_parallel
-from kempnerforge.distributed.parallel import apply_fsdp2
+from kempnerforge.distributed.parallel import apply_fsdp2, build_parallel_model, default_mp_policy
 from kempnerforge.model.moe import MoEMLP
 from kempnerforge.model.transformer import Transformer
+from kempnerforge.training.loop import add_moe_losses, clip_grads
 
 pytestmark = pytest.mark.skipif(
     "RANK" not in os.environ,
@@ -340,3 +343,90 @@ class TestEPCheckpoint:
         CheckpointManager(ckpt, resumed, resumed_optimizer).load()
         for name, p in resumed.named_parameters():
             assert torch.equal(_local(p), live[name]), name
+
+
+ROUTED_EXPERT = re.compile(r".*\.mlp\.(experts\.\d+\..*|up_w|down_w|gate_w)")
+DRIFT_STEPS = 30
+DRIFT_ROWS = 8
+DRIFT_SEQ = 1024
+BINDING_CLIP = 0.1
+
+
+def _ep_copy_gaps(model: torch.nn.Module, mesh: DeviceMesh) -> dict[str, float]:
+    """The largest gap to an EP peer's copy, for each non-expert parameter whose copies differ."""
+    group = mesh["ep"].get_group()
+    gaps = {}
+    for name, p in model.named_parameters():
+        if ROUTED_EXPERT.fullmatch(name):
+            continue
+        local = _local(p.detach()).contiguous()
+        copies = [torch.empty_like(local) for _ in range(mesh["ep"].size())]
+        dist.all_gather(copies, local, group=group)
+        if not all(torch.equal(copy, local) for copy in copies):
+            gaps[name] = max(float((copy.float() - local.float()).abs().max()) for copy in copies)
+    return gaps
+
+
+class TestEPCopiesStayEqual:
+    """The EP ranks of a DP group train their copies of each non-expert parameter alike.
+
+    The copies start equal and take the steps ``text_step`` takes, in bf16 with fp32
+    master weights and AdamW, so they must still be bitwise equal at the end, however
+    the GPU's backward kernels round.
+    """
+
+    @pytest.mark.skipif(
+        int(os.environ.get("WORLD_SIZE", "1")) < 4,
+        reason="EP+FSDP requires >= 4 GPUs (dp=2, ep=2)",
+    )
+    @pytest.mark.parametrize(
+        ("sizes", "packed", "max_norm"),
+        [
+            pytest.param((2, 2), False, 1e9, id="dp_shard2_ep2"),
+            pytest.param((2, 2), False, BINDING_CLIP, id="dp_shard2_ep2_clipped"),
+            pytest.param((2, 2), True, 1e9, id="dp_shard2_ep2_packed"),
+            pytest.param((1, 4), False, 1e9, id="ep4"),
+        ],
+    )
+    def test_non_expert_copies_stay_bitwise_equal(self, sizes, packed, max_norm):
+        mesh = init_device_mesh("cuda", sizes, mesh_dim_names=("dp_shard", "ep"))
+        config = ModelConfig(
+            dim=1024,
+            n_layers=4,
+            n_heads=16,
+            n_kv_heads=8,
+            vocab_size=8192,
+            max_seq_len=DRIFT_SEQ,
+            num_experts=8,
+            moe_top_k=2,
+            moe_shared_experts=1,
+            moe_packed_experts=packed,
+            moe_router_z_loss_weight=1e-3,
+        )
+        torch.manual_seed(0)
+        model = build_parallel_model(
+            config,
+            torch.device("cuda"),
+            mesh,
+            mp_policy=default_mp_policy(torch.bfloat16),
+            param_dtype=torch.float32,
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.1)
+        assert _ep_copy_gaps(model, mesh) == {}
+
+        dp_rank = mesh.get_local_rank("dp_shard")
+        generator = torch.Generator().manual_seed(1234)
+        clipped = 0
+        for _ in range(DRIFT_STEPS):
+            rows = torch.randint(
+                0, config.vocab_size, (sizes[0], DRIFT_ROWS, DRIFT_SEQ + 1), generator=generator
+            )[dp_rank].cuda()
+            logits = model(rows[:, :-1])
+            loss = F.cross_entropy(logits.flatten(0, 1).float(), rows[:, 1:].flatten())
+            add_moe_losses(loss, model, config).backward()
+            clipped += clip_grads(model, max_norm) > max_norm
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        assert clipped == (DRIFT_STEPS if max_norm == BINDING_CLIP else 0)
+        assert _ep_copy_gaps(model, mesh) == {}
