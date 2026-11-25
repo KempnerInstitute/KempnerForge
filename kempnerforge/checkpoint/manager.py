@@ -1679,11 +1679,12 @@ class CheckpointManager:
         so adding one means moving the swap back after staging completes.
 
         Under expert parallelism each EP rank holds a copy of every weight outside the
-        routed experts, and the copies can drift apart on GPU (#482). DCP writes each
-        chunk that several ranks hold from one of them, by default the one with the least
-        to write so far, which could join chunks of different copies into one tensor. An
-        EP save writes each such chunk from its lowest rank instead, so the checkpoint
-        holds one EP rank's copy whole.
+        routed experts. The training step keeps the copies equal, but a model stepped
+        without ``average_non_expert_grads_`` can hold copies that differ in the last
+        bits. DCP writes each chunk that several ranks hold from one of them, by default
+        the one with the least to write so far, which could join chunks of different
+        copies into one tensor. An EP save writes each such chunk from its lowest rank
+        instead, so the checkpoint holds one EP rank's copy whole.
 
         Args:
             step: Current training step.

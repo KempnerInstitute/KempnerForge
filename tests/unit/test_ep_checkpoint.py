@@ -423,8 +423,9 @@ def _save_on_two_meshes(rank, world, port, names, sizes, overrides, root) -> Non
 def _save_drifted(rank, world, port, names, sizes, overrides, root, async_mode) -> None:
     """Shift EP rank 1's copy of every weight outside the routed experts, then save.
 
-    The EP copies then differ, as they drift apart on GPU (#482). Rank 0, which is EP rank
-    0, writes its copy. The save runs in ``async_mode`` and is waited for.
+    The EP copies then differ, as they can in a model stepped without averaging their
+    gradients. Rank 0, which is EP rank 0, writes its copy. The save runs in ``async_mode``
+    and is waited for.
     """
     with _group(rank, world, port):
         mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)

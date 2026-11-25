@@ -24,11 +24,15 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
 
 from kempnerforge.config.model import ModelConfig
+from kempnerforge.distributed.expert_parallel import (
+    apply_expert_parallel,
+    average_non_expert_grads_,
+)
 from kempnerforge.distributed.parallel import build_parallel_model
 from kempnerforge.distributed.utils import clip_grad_norm_
 from kempnerforge.model.transformer import Transformer
 from kempnerforge.training.grad import maybe_no_sync
-from kempnerforge.training.loop import add_moe_losses
+from kempnerforge.training.loop import add_moe_losses, clip_grads
 from tests.gloo_ranks import gloo_group, spawn
 
 SEQ = 16
@@ -138,12 +142,8 @@ def _loss(model: torch.nn.Module, rows: torch.Tensor, config: ModelConfig) -> to
     return add_moe_losses(loss, model, config)
 
 
-def _build(
-    names: tuple[str, ...], sizes: tuple[int, ...], overrides: dict
-) -> tuple[torch.nn.Module, Transformer, DeviceMesh]:
-    """The parallel model, the unsharded one loaded with its weights, and the mesh."""
-    mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
-    config = ModelConfig(
+def _config(overrides: dict) -> ModelConfig:
+    return ModelConfig(
         dim=64,
         n_layers=2,
         n_heads=4,
@@ -154,6 +154,14 @@ def _build(
         moe_router_z_loss_weight=1e-3,
         **overrides,
     )
+
+
+def _build(
+    names: tuple[str, ...], sizes: tuple[int, ...], overrides: dict
+) -> tuple[torch.nn.Module, Transformer, DeviceMesh]:
+    """The parallel model, the unsharded one loaded with its weights, and the mesh."""
+    mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+    config = _config(overrides)
     torch.manual_seed(0)
     model = build_parallel_model(
         config, torch.device("cpu"), mesh, mp_policy=FP32, param_dtype=torch.float32
@@ -353,3 +361,139 @@ class TestClipUnderExpertParallelism:
     def test_moe_without_ep_matches_one_process(self):
         """Without ``ep`` the norm and gradients of an MoE model are those of one process."""
         _spawn(_check_without_ep, ("dp_shard",), (2,), {})
+
+
+FROZEN = "norm.weight"
+
+
+def _local(t: torch.Tensor) -> torch.Tensor:
+    return t.to_local() if isinstance(t, DTensor) else t
+
+
+def _ep_model(
+    names: tuple[str, ...], sizes: tuple[int, ...], overrides: dict, fsdp: bool
+) -> tuple[torch.nn.Module, DeviceMesh]:
+    """The model ``build_parallel_model`` gives, or without ``fsdp`` one with only EP applied."""
+    if fsdp:
+        model, _, mesh = _build(names, sizes, overrides)
+        return model, mesh
+    mesh = init_device_mesh("cpu", sizes, mesh_dim_names=names)
+    torch.manual_seed(0)
+    model = Transformer(_config(overrides))
+    apply_expert_parallel(model, mesh)
+    return model, mesh
+
+
+def _rank_gradients(
+    model: torch.nn.Module, rank: int, widen: str | None = None
+) -> dict[str, torch.Tensor]:
+    """Run a backward, then give each gradient values of this rank's own; return copies by name.
+
+    The final norm's gradient is dropped, as a frozen parameter's is. ``widen`` names a
+    parameter of a model without FSDP that goes to float64 with its gradient, so the
+    gradients come in two dtypes.
+    """
+    rows = torch.randint(
+        0, model.config.vocab_size, (ROWS, SEQ + 1), generator=torch.Generator().manual_seed(7)
+    )
+    _loss(model, rows, model.config).backward()
+    generator = torch.Generator().manual_seed(rank)
+    given = {}
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            assert p.grad is not None, name
+            if name == FROZEN:
+                p.grad = None
+                continue
+            if name == widen:
+                p.data = p.data.double()
+                p.grad = p.grad.double()
+            grad = _local(p.grad)
+            grad.copy_(torch.randn(grad.shape, generator=generator, dtype=grad.dtype))
+            given[name] = grad.clone()
+    return given
+
+
+def _ep_gathered(tensor: torch.Tensor, mesh: DeviceMesh) -> list[torch.Tensor]:
+    """``tensor`` from every rank of this rank's EP group."""
+    peers = [torch.empty_like(tensor) for _ in range(_ep_size(mesh))]
+    dist.all_gather(peers, tensor.contiguous(), group=mesh["ep"].get_group())
+    return peers
+
+
+def _assert_ep_mean(
+    model: torch.nn.Module, mesh: DeviceMesh, given: dict[str, torch.Tensor], coefficient: float
+) -> None:
+    """Each gradient outside the routed experts is ``coefficient`` times the EP mean of ``given``.
+
+    The EP ranks' copies of each such gradient must also be bitwise equal.
+    """
+    for name, p in model.named_parameters():
+        if _is_expert(name) or name == FROZEN:
+            continue
+        assert p.grad is not None, name
+        grad = _local(p.grad)
+        mean = torch.stack(_ep_gathered(given[name], mesh)).mean(0)
+        torch.testing.assert_close(
+            grad, coefficient * mean, rtol=1e-5, atol=1e-7, msg=lambda m, name=name: f"{name}: {m}"
+        )
+        assert all(torch.equal(copy, grad) for copy in _ep_gathered(grad, mesh)), name
+
+
+def _check_average(rank, world, port, names, sizes, overrides, fsdp, widen) -> None:
+    """EP ranks that hold different gradients each end with the EP group's mean.
+
+    The routed experts keep their own gradients, and the dropped one stays None.
+    """
+    with _group(rank, world, port):
+        model, mesh = _ep_model(names, sizes, overrides, fsdp)
+        given = _rank_gradients(model, rank, widen)
+        average_non_expert_grads_(model)
+        _assert_ep_mean(model, mesh, given, 1.0)
+        for name, p in model.named_parameters():
+            if name == FROZEN:
+                assert p.grad is None
+            elif _is_expert(name):
+                assert p.grad is not None and torch.equal(_local(p.grad), given[name]), name
+
+
+def _check_clip_grads(rank, world, port, names, sizes, overrides) -> None:
+    """``clip_grads`` averages the EP copies' gradients, then clips them by one coefficient."""
+    with _group(rank, world, port):
+        model, mesh = _ep_model(names, sizes, overrides, fsdp=True)
+        given = _rank_gradients(model, rank)
+        norm = clip_grads(model, MAX_NORM)
+        assert norm > 2 * MAX_NORM, f"the clip does not bind: norm {norm}"
+        _assert_ep_mean(model, mesh, given, MAX_NORM / (norm + 1e-6))
+
+
+class TestEPCopiesAveraged:
+    @pytest.mark.parametrize(
+        ("names", "sizes", "overrides", "fsdp", "widen"),
+        [
+            pytest.param(
+                ("dp_shard", "ep"),
+                (2, 2),
+                {"moe_packed_experts": True, "moe_shared_experts": 1},
+                True,
+                None,
+                id="dp_shard2_ep2_packed_shared",
+            ),
+            pytest.param(
+                ("dp_shard", "ep"),
+                (1, 2),
+                {},
+                False,
+                "layers.0.attention_norm.weight",
+                id="ep2_without_fsdp_two_dtypes",
+            ),
+            pytest.param(("dp_shard", "ep", "tp"), (1, 2, 2), {}, True, None, id="ep2_tp2"),
+        ],
+    )
+    def test_ep_ranks_end_with_the_mean_gradient(self, names, sizes, overrides, fsdp, widen):
+        """Every gradient outside the routed experts becomes the EP mean, equal on every rank."""
+        _spawn(_check_average, names, sizes, overrides, fsdp, widen)
+
+    def test_clip_grads_averages_before_it_clips(self):
+        """The training step's clip leaves every EP rank the same clipped mean gradient."""
+        _spawn(_check_clip_grads, ("dp_shard", "ep"), (2, 2), {})

@@ -77,6 +77,7 @@ already has it.
 After the step body (either branch):
 
 ```python
+average_non_expert_grads_(model)
 grad_norm = clip_grad_norm_(model, tc.grad_clip_norm)
 if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
     _route_balance(session, step_ran=False)
@@ -92,6 +93,13 @@ if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
         break
     continue
 ```
+
+The step bodies make the first two calls through `clip_grads`. Under EP,
+`average_non_expert_grads_` first gives every EP rank the EP group's
+mean gradient of each parameter it holds a copy of, so the copies stay
+bitwise equal (see
+[Expert parallelism § Gradients and clipping](../distributed/expert-parallelism.md#gradients-and-clipping));
+without EP it does nothing.
 
 `clip_grad_norm_` is the DTensor-aware wrapper from
 [`kempnerforge.distributed.utils`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/distributed/utils.py) —

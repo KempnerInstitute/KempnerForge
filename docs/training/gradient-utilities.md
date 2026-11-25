@@ -117,16 +117,19 @@ group from the model's `MoEMLP` layers (`expert_parallel_params` in
 and, in one all-reduce over that group, sums the routed experts'
 squared norms and averages the squared norms of the copies. Every EP
 rank then returns the whole model's norm and scales by the same
-coefficient, so its copies of the shared parameters stay equal to the
-other ranks' as long as every EP rank computes them identically; the
-norm is the same on every EP rank even when the copies differ in the
-last bits. Clipping each rank by its own norm instead scales the
-copies by different coefficients, and nothing reduces them over `ep`
-afterwards, so they drift apart. On GPU the copies drift apart even
-with one coefficient, with or without clipping, and nothing re-syncs
-them yet ([#482](https://github.com/KempnerInstitute/KempnerForge/issues/482)).
-Every EP rank must make the call, since the sum is a collective. How
-the expert gradients themselves are averaged over the group is in
+coefficient; the norm is the same on every EP rank even when the
+copies' gradients differ in the last bits. Clipping each rank by its
+own norm instead would scale the copies by different coefficients.
+Every EP rank must make the call, since the sum is a collective.
+
+The training loop calls `clip_grad_norm_` through `clip_grads`, which
+first gives every EP rank the EP group's mean gradient of each copy
+(`average_non_expert_grads_`). On GPU the EP ranks' backward passes can
+round those gradients differently, and the mean makes them the same,
+so every EP rank clips and steps its copies alike and they stay
+bitwise equal. A loop that calls `clip_grad_norm_` directly makes that
+call first. How the expert gradients themselves are averaged over the
+group is in
 [Expert parallelism § Gradients and clipping](../distributed/expert-parallelism.md#gradients-and-clipping).
 
 ### `foreach` parameter
