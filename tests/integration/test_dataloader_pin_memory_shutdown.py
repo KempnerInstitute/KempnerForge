@@ -17,9 +17,44 @@ from kempnerforge.config.schema import DataConfig
 from kempnerforge.data import dataloader
 from kempnerforge.data.dataloader import StatefulDataLoader
 from kempnerforge.data.sampler import DistributedSampler
-from tests.loader_workers import worker_sockets_fit
+from tests.loader_workers import run_to_exit, worker_sockets_fit
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a CUDA device")
+
+UNPINNED_THEN_PINNED_AT_EXIT = """
+import time
+
+import torch
+from torch.utils.data import Dataset, TensorDataset
+
+from kempnerforge.config.schema import DataConfig
+from kempnerforge.data.dataloader import StatefulDataLoader
+from kempnerforge.data.sampler import DistributedSampler
+
+
+class StallsAfterFirstBatch(Dataset):
+    def __len__(self):
+        return 64
+
+    def __getitem__(self, index):
+        if index >= 4:
+            time.sleep(600)
+        return torch.tensor([index])
+
+
+def loader(dataset, pin_memory):
+    sampler = DistributedSampler(dataset, num_replicas=1, rank=0, shuffle=False)
+    config = DataConfig(num_workers=1, pin_memory=pin_memory)
+    return StatefulDataLoader(dataset, batch_size=4, sampler=sampler, config=config)
+
+
+if __name__ == "__main__":
+    unpinned = loader(TensorDataset(torch.arange(64)), pin_memory=False)
+    pinned = loader(StallsAfterFirstBatch(), pin_memory=True)
+    next(iter(unpinned))
+    next(iter(pinned))
+    print("served a batch from each", flush=True)
+"""
 
 
 def _pinning_loader() -> StatefulDataLoader:
@@ -71,3 +106,20 @@ def test_close_returns_while_the_pin_memory_thread_is_stuck(monkeypatch):
     finally:
         unstick.set()
         thread.join(timeout=30)
+
+
+def test_a_process_with_a_stalled_pinned_loader_after_an_unpinned_one_exits(tmp_path):
+    """torch registers its exit cleanup of pinned iterators when the pinned loader starts.
+
+    That is after the first loader with workers started, and the cleanup leaves the
+    stalled worker, which ignores SIGTERM, for the loader's own exit hook to kill.
+    """
+    if not worker_sockets_fit():
+        pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+    script = tmp_path / "unpinned_then_pinned.py"
+    script.write_text(UNPINNED_THEN_PINNED_AT_EXIT)
+
+    result = run_to_exit(script)
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout == "served a batch from each\n"

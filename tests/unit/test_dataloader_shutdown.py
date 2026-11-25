@@ -141,8 +141,11 @@ class _ResultQueue:
     def __init__(self) -> None:
         self.put_items = []
         self.join_cancelled = False
+        self.closed = False
 
     def put(self, item) -> None:
+        if self.closed:
+            raise ValueError("Queue is closed")
         self.put_items.append(item)
 
     def cancel_join_thread(self) -> None:
@@ -310,33 +313,35 @@ def test_the_exit_hook_leaves_the_loaders_another_process_started(monkeypatch):
     assert (mine.closed, inherited.closed) == (1, 0)
 
 
-def test_the_exit_hooks_are_registered_once_per_process_after_workers_start(monkeypatch):
-    """Registered after a worker starts, so after ``multiprocessing`` registered its own.
+def test_the_exit_hooks_follow_every_start_of_workers(monkeypatch):
+    """The ``atexit`` hook moves behind every hook registered before workers start.
 
-    Another process registers its own: a ``multiprocessing`` child starts with no
-    finalizers, and on Python 3.14 with no ``atexit`` hooks but that one.
+    So it runs before them, torch's shutdown of pinned iterators included. The
+    finalizer is created once per process: a ``multiprocessing`` child starts with
+    none.
     """
     _skip_without_worker_sockets(2)
-    registered, finalizers = [], []
-    monkeypatch.setattr(dataloader.atexit, "register", registered.append)
+    calls, finalizers = [], []
+    monkeypatch.setattr(dataloader.atexit, "register", lambda hook: calls.append(("add", hook)))
+    monkeypatch.setattr(dataloader.atexit, "unregister", lambda hook: calls.append(("drop", hook)))
 
     def finalize(obj, callback, exitpriority):
         finalizers.append((obj, callback, exitpriority))
 
     monkeypatch.setattr(dataloader, "Finalize", finalize)
-    dataloader._register_exit_hooks.cache_clear()
+    dataloader._register_exit_finalizer.cache_clear()
     without_workers, with_workers = _loader(workers=0), _loader(workers=2)
     try:
         next(iter(without_workers))
-        assert (registered, finalizers) == ([], [])
+        assert (calls, finalizers) == ([], [])
         next(iter(with_workers))
         next(iter(with_workers))
-        dataloader._register_exit_hooks(os.getpid() + 1)
+        dataloader._register_exit_finalizer(os.getpid() + 1)
     finally:
         with_workers.close()
-        dataloader._register_exit_hooks.cache_clear()
+        dataloader._register_exit_finalizer.cache_clear()
     hook = dataloader._close_open_loaders
-    assert registered == [hook, hook]
+    assert calls == [("drop", hook), ("add", hook)] * 2
     assert finalizers == [(None, hook, dataloader._EXIT_FINALIZER_PRIORITY)] * 2
 
 
@@ -397,3 +402,15 @@ def test_a_stuck_pin_memory_thread_is_left_behind(monkeypatch):
     finally:
         iterator.unstick.set()
         thread.join()
+
+
+def test_a_pin_memory_thread_that_already_stopped_is_left_alone():
+    """torch's own exit cleanup of a pinned iterator may stop it and close its queue first."""
+    iterator = _PinMemoryIterator(stuck=False)
+    iterator._pin_memory_thread_done_event.set()
+    iterator._pin_memory_thread.join()
+    iterator._worker_result_queue.closed = True
+
+    dataloader._stop_pin_memory_thread(iterator)
+
+    assert iterator._worker_result_queue.put_items == []

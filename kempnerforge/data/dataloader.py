@@ -69,10 +69,12 @@ def _stop_pin_memory_thread(iterator: _MultiProcessingDataLoaderIter) -> None:
 
     torch's worker shutdown joins this thread with no timeout. A thread still
     running after the wait, stuck pinning a batch, is a daemon left behind:
-    its handle is dropped so that torch's shutdown goes on to the workers.
+    its handle is dropped so that torch's shutdown goes on to the workers. A
+    thread that already stopped, as torch's own shutdown leaves it, is left
+    alone.
     """
     thread = getattr(iterator, "_pin_memory_thread", None)
-    if thread is None:
+    if thread is None or not thread.is_alive():
         return
     iterator._pin_memory_thread_done_event.set()
     iterator._worker_result_queue.put((None, None))
@@ -83,28 +85,32 @@ def _stop_pin_memory_thread(iterator: _MultiProcessingDataLoaderIter) -> None:
 
 
 @functools.cache
-def _register_exit_hooks(pid: int) -> None:
-    """Have process ``pid`` close its loaders before ``multiprocessing`` stops its workers.
+def _register_exit_finalizer(pid: int) -> None:
+    """Have process ``pid`` close its loaders when ``multiprocessing``'s exit function runs.
 
-    Runs once a worker has started in the process, after ``multiprocessing`` and
-    torch registered their exit hooks. ``atexit`` runs hooks in reverse order, so
-    this hook runs before both: ``multiprocessing``'s stops leftover workers with
-    SIGTERM and joins them, and after torch's a loader can no longer stop its
-    workers through the sentinel. The finalizer covers a process whose
-    ``multiprocessing`` exit function runs before the hook: a ``multiprocessing``
+    That function runs finalizers before it stops any worker, this one ahead of
+    those that close the queues the sentinel goes through. It covers a process
+    whose exit function runs before the ``atexit`` hook: a ``multiprocessing``
     child, which runs it as its target returns, and a process that called
-    ``multiprocessing.get_logger``, which registers it again. That function runs
-    finalizers before it stops any worker, this one ahead of those that close
-    the queues the sentinel goes through.
+    ``multiprocessing.get_logger``, which registers it again.
     """
-    atexit.register(_close_open_loaders)
     Finalize(None, _close_open_loaders, exitpriority=_EXIT_FINALIZER_PRIORITY)
 
 
 def _close_at_exit(loader: StatefulDataLoader | StreamingDataLoader) -> None:
-    """Have this process close ``loader`` at exit, unless it is closed first."""
+    """Have this process close ``loader`` at exit, unless it is closed first.
+
+    Called once the loader's workers have started, it registers the ``atexit``
+    hook again. ``atexit`` runs hooks in reverse order, so the hook runs before
+    every hook registered by then: ``multiprocessing``'s, which stops leftover
+    workers with SIGTERM and joins them, torch's, after which a loader can no
+    longer stop its workers through the sentinel, and torch's shutdown of
+    pinned iterators, which waits on their pin-memory threads with no timeout.
+    """
     pid = os.getpid()
-    _register_exit_hooks(pid)
+    _register_exit_finalizer(pid)
+    atexit.unregister(_close_open_loaders)
+    atexit.register(_close_open_loaders)
     _loaders_with_workers[loader] = pid
 
 
