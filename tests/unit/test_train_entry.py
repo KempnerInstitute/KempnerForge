@@ -579,6 +579,22 @@ class TestCheckpointExtra:
         )
         assert "vlm_freeze" in checkpoint_extra(config, 3, PhaseState())
 
+    def test_vlm_freeze_metadata_takes_a_parameter_pattern(self, tiny_vlm_configs):
+        """A pattern the build applies goes into the metadata written after every step."""
+        from kempnerforge.config.vlm import FreezeSpec, VLMConfig
+
+        mc, vision, adapter, _ = tiny_vlm_configs
+        freeze = [FreezeSpec("transformer"), FreezeSpec("transformer.layers.1.*", False)]
+        config = JobConfig(
+            model=mc,
+            train=TrainConfig(batch_size=1, seq_len=64, max_steps=1),
+            vision_encoder=vision,
+            adapter=adapter,
+            vlm=VLMConfig(max_text_len=32, freeze=freeze),
+        )
+        meta = checkpoint_extra(config, 3, PhaseState())["vlm_freeze"]
+        assert {"module": "transformer.layers.1.*", "frozen": False} in meta
+
 
 def _mixture_pipeline() -> DataPipeline:
     return DataPipeline(
@@ -2987,6 +3003,89 @@ class TestRestoreCheckpoint:
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
         assert mgr.peeked == [str(tmp_path / "s")]
         assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(11, config.vlm)
+
+    def test_vlm_resume_takes_parameter_patterns(self, monkeypatch, tmp_path):
+        """A resume compares and reapplies a freeze that names parameter patterns."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.config.vlm import FreezeSpec, FreezeStage
+        from kempnerforge.training.freeze import freeze_meta_at_step
+
+        monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: tmp_path / "s")
+        applied: list = []
+        monkeypatch.setattr(
+            entry,
+            "apply_freeze_specs",
+            lambda m, specs, pat: applied.append([(s.module, s.frozen) for s in specs]),
+        )
+        config = _vlm_config(
+            freeze=[FreezeSpec("transformer"), FreezeSpec("transformer.layers.1.*", False)],
+            freeze_schedule=(FreezeStage(start_step=5, specs=(FreezeSpec("adapter.*", True),)),),
+        )
+        mgr = FakeResumeManager(step=9, saved_step=9)
+        entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
+        expected = mgr.load_kwargs["vlm_freeze_expected"]
+        assert expected == freeze_meta_at_step(9, config.vlm)
+        assert {"module": "adapter.*", "frozen": True} in expected
+        assert applied == [
+            [("transformer", True), ("transformer.layers.1.*", False), ("adapter.*", True)]
+        ]
+
+    def test_a_pattern_freeze_saves_and_resumes_with_its_masks(self, tiny_vlm_configs, tmp_path):
+        """A freeze that names parameter patterns saves, and a resume restores the weights,
+        the AdamW moments and every parameter's requires_grad as the save had them."""
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.config.vlm import FreezeSpec, FreezeStage, VLMConfig
+        from kempnerforge.model.vlm import build_vlm_wrapper
+        from kempnerforge.training.entry import restore_checkpoint
+        from kempnerforge.training.freeze import apply_freeze_specs, effective_freeze
+
+        mc, vision, adapter, _ = tiny_vlm_configs
+        vlm = VLMConfig(
+            max_text_len=32,
+            freeze=[FreezeSpec("transformer"), FreezeSpec("transformer.layers.1.*", False)],
+            freeze_schedule=(
+                FreezeStage(start_step=2, specs=(FreezeSpec("transformer.layers.0.*", True),)),
+            ),
+        )
+        config = JobConfig(
+            model=mc,
+            train=TrainConfig(batch_size=1, seq_len=64, max_steps=4),
+            vision_encoder=vision,
+            adapter=adapter,
+            vlm=vlm,
+            checkpoint=CheckpointConfig(dir=str(tmp_path / "ckpt")),
+        )
+
+        def build(seed: int) -> tuple[nn.Module, torch.optim.Optimizer]:
+            torch.manual_seed(seed)
+            model = build_vlm_wrapper(mc, vision, adapter, vlm)
+            apply_freeze_specs(model, vlm.freeze, vlm.module_patterns)
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            return model, torch.optim.AdamW(trainable, lr=1e-2)
+
+        model, optimizer = build(seed=0)
+        specs = effective_freeze(3, vlm.freeze, vlm.freeze_schedule)
+        apply_freeze_specs(model, specs, vlm.module_patterns)
+        sum(p.sum() for p in model.parameters() if p.requires_grad).backward()
+        optimizer.step()
+        masks = {name: p.requires_grad for name, p in model.named_parameters()}
+        assert all(v for k, v in masks.items() if k.startswith("transformer.layers.1."))
+        assert not any(v for k, v in masks.items() if k.startswith("transformer.layers.0."))
+        CheckpointManager(config.checkpoint, model, optimizer).save(
+            step=3, extra=checkpoint_extra(config, 3, PhaseState())
+        )
+
+        resumed, resumed_optimizer = build(seed=1)
+        manager = CheckpointManager(config.checkpoint, resumed, resumed_optimizer)
+        assert restore_checkpoint(config, resumed, None, manager)[0] == 3
+        assert {name: p.requires_grad for name, p in resumed.named_parameters()} == masks
+        pairs = zip(model.named_parameters(), resumed.parameters(), strict=True)
+        for (name, p), q in pairs:
+            assert torch.equal(p, q), name
+            if p.requires_grad:
+                for moment in ("exp_avg", "exp_avg_sq"):
+                    resumed_moment = resumed_optimizer.state[q][moment]
+                    assert torch.equal(optimizer.state[p][moment], resumed_moment), name
 
     def test_freeze_schedule_is_reapplied_at_the_resumed_step(self, monkeypatch, tmp_path):
         import kempnerforge.training.entry as entry

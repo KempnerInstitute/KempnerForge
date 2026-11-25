@@ -212,6 +212,20 @@ File:
 
 - `end_step > start_step`.
 
+### `VLMConfig` freeze specs
+
+File:
+[`kempnerforge/config/vlm.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/vlm.py).
+
+- `freeze_schedule` start steps are strictly increasing.
+- Every `module` in `freeze` and in each `FreezeStage` is a module alias, a key of
+  `module_patterns`, or a parameter pattern, which holds a dot or one of `*?[`; a key
+  resolves as its alias first, dot or not. A bare word that is neither, such as a typo of
+  an alias, fails when the config loads. The check runs once the TOML is applied and again
+  once the CLI overrides land, so a name the TOML gets wrong must be fixed in the TOML.
+- The VLM build refuses a pattern in `freeze` or in a `FreezeStage` that matches no
+  parameter of the built model, and names it.
+
 ### `AdapterConfig`
 
 File:
