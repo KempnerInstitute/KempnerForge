@@ -80,12 +80,16 @@ def test_close_stops_the_pin_memory_thread_and_the_workers():
 
 
 def test_close_returns_while_the_pin_memory_thread_is_stuck(monkeypatch):
-    """One worker hands the batches over in order, so batch 0 is pinned before the stall."""
+    """One worker hands the batches over in order, so batch 0 is pinned before the stall.
+
+    torch's ``pin_memory`` calls itself by name for each item of a batch, so the
+    stand-in stalls on whole batches only.
+    """
     stuck, unstick = threading.Event(), threading.Event()
     pin = pin_memory_module.pin_memory
 
     def stick_after_the_first_batch(data, device=None):
-        if int(data[0][0]) >= 4:
+        if isinstance(data, list) and int(data[0][0]) >= 4:
             stuck.set()
             unstick.wait()
         return pin(data, device)
