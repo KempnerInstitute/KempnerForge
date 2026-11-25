@@ -1410,6 +1410,26 @@ class TestLayoutChange:
             self._train(model, optimizer, scheduler, 1)
             self._assert_module_rates(optimizer, scheduler, adam_lr=self.LR)
 
+    @pytest.mark.parametrize("adam_lr", [ADAM_LR, None], ids=["muon_adam_lr", "unset"])
+    @pytest.mark.parametrize("exclude", [None, ["optimizer"]], ids=["resume", "warm-start"])
+    def test_a_load_with_another_lr_keeps_the_muon_fallback_rate(self, tmp_path, exclude, adam_lr):
+        """Under the restored schedule Muon's AdamW fallback runs at ``muon_adam_lr`` times the
+        schedule's factor, not at that rate scaled by the saved ``lr`` over the new one, with
+        or without the optimizer state. Unset, it runs at Muon's rate, the saved peak's."""
+        model, optimizer, scheduler = self._build(
+            "muon", set(), self.DEFAULT_SCOPE, adam_lr=adam_lr
+        )
+        self._train(model, optimizer, scheduler, 4)
+        self._manager(tmp_path, model, optimizer).save(step=4, scheduler=scheduler)
+
+        model, optimizer, scheduler = self._build(
+            "muon", set(), self.DEFAULT_SCOPE, lr=self.LR / 10, adam_lr=adam_lr
+        )
+        self._manager(tmp_path, model, optimizer).load(scheduler=scheduler, exclude_keys=exclude)
+        for _ in range(3):
+            self._train(model, optimizer, scheduler, 1)
+            self._assert_module_rates(optimizer, scheduler, adam_lr=adam_lr or self.LR)
+
     def test_the_load_logs_the_peak_each_module_resumes_at(self, tmp_path, caplog, monkeypatch):
         monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
         model, optimizer, scheduler = self._build("adamw", {"transformer", "vision_encoder"}, "all")
@@ -1804,6 +1824,17 @@ class TestSchedulerStateLayout:
         resumed = self._scheduler([(None, 0.1), ("b", 0.1 * 3.0)])
         restore_train_state(state, scheduler=resumed, lr_multipliers={"b": 3.0})
         assert resumed.base_lrs == [0.1, 0.1 * 3.0]
+
+    def test_each_group_takes_the_rate_the_restored_schedule_runs_it_from_as_initial_lr(self):
+        """Building a scheduler sets each group's ``initial_lr`` to its base rate, and the
+        restore keeps them equal when the restored base rates are others."""
+        saved = self._scheduler([(None, 0.1), ("a", 0.5)])
+        saved.step()
+        state = build_train_state(step=1, tokens_seen=0, scheduler=saved)
+        resumed = self._scheduler([(None, 0.01), ("b", 0.03), ("a", 0.05)])
+        restore_train_state(state, scheduler=resumed, lr_multipliers={"a": 5.0, "b": 3.0})
+        assert resumed.base_lrs == pytest.approx([0.1, 0.3, 0.5], rel=1e-15)
+        assert [g["initial_lr"] for g in resumed.optimizer.param_groups] == resumed.base_lrs
 
     @pytest.mark.parametrize("multipliers", [None, {"b": 3.0}], ids=["none", "without-a"])
     def test_a_layout_that_needs_a_missing_multiplier_restores_nothing(self, multipliers):

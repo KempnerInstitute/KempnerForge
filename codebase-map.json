@@ -1938,11 +1938,11 @@
       "tests/unit/test_optimizer.py": {
         "classes": [
           "TestNewtonSchulz(5)",
-          "TestMuon(29)",
+          "TestMuon(31)",
           "TestMuonRouting(6)",
           "TestAdamW(2)"
         ],
-        "count": 42
+        "count": 44
       },
       "tests/unit/test_eval.py": {
         "classes": [

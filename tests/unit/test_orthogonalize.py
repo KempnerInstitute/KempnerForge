@@ -42,6 +42,38 @@ def _own_rows(full: torch.Tensor, mesh: DeviceMesh) -> torch.Tensor:
     return distribute_tensor(full, mesh, [Shard(0)], src_data_rank=None).to_local().clone()
 
 
+def _check_rowless_rank(rank: int, world: int, port: int, orthogonalize: str) -> None:
+    """Step Muon on a weight with fewer rows than ranks beside a larger one and compare with
+    unsharded Muon. The ranks past its rows hold none of it, and step with the others."""
+    with gloo_group(rank, world, port):
+        mesh = init_device_mesh("cpu", (world,))
+        generator = torch.Generator().manual_seed(0)
+        fulls = [torch.randn(rows, 8, generator=generator) for rows in (2 * world + 1, 1)]
+        steps = [[torch.randn(full.shape, generator=generator) for full in fulls] for _ in range(2)]
+        exact = orthogonalize == "exact"
+        sharded = [
+            nn.Parameter(distribute_tensor(full.clone(), mesh, [Shard(0)], src_data_rank=None))
+            for full in fulls
+        ]
+        references = [
+            nn.Parameter(full.clone() if exact else _own_rows(full, mesh)) for full in fulls
+        ]
+        optimizer = Muon(
+            [{"params": sharded}], [{"params": []}], lr=0.1, orthogonalize=orthogonalize
+        )
+        ref_optimizer = Muon([{"params": references}], [{"params": []}], lr=0.1)
+        assert sharded[1].to_local().shape == (1 if rank == 0 else 0, 8)
+        for grads in steps:
+            for param, reference, grad in zip(sharded, references, grads, strict=True):
+                param.grad = distribute_tensor(grad.clone(), mesh, [Shard(0)], src_data_rank=None)
+                reference.grad = grad.clone() if exact else _own_rows(grad, mesh)
+            optimizer.step()
+            ref_optimizer.step()
+        for param, reference in zip(sharded, references, strict=True):
+            expected = _own_rows(reference.data, mesh) if exact else reference.data
+            assert torch.equal(param.to_local(), expected)
+
+
 def _check_muon_rank(rank: int, world: int, port: int, orthogonalize: str, options: dict) -> None:
     """Step Muon on a row-sharded weight and compare with unsharded Muon."""
     with gloo_group(rank, world, port):
@@ -98,6 +130,11 @@ class TestOrthogonalizeExact:
 
 
 class TestMuonOnRowShards:
+    @pytest.mark.parametrize("orthogonalize", ["local", "exact"])
+    def test_a_rank_without_rows_of_a_weight_steps_with_the_others(self, orthogonalize):
+        """Every rank finishes the step, and exact still steps the rows of the full matrix."""
+        spawn(_check_rowless_rank, 2, orthogonalize)
+
     @pytest.mark.parametrize("options", [{}, {"nesterov": True, "adjust_lr": "match_rms_adamw"}])
     @pytest.mark.parametrize("orthogonalize", ["local", "exact"])
     def test_step_matches_unsharded_muon(self, orthogonalize, options):

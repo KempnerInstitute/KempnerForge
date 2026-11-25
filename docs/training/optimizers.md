@@ -318,7 +318,15 @@ DTensor / FSDP2 notes:
   [DCP model § Inner optimizers](../checkpointing/dcp-model.md#inner-optimizers).
 - `muon_adam_lr` unset (default) makes the internal AdamW use the same
   LR as Muon. Pass a smaller value (e.g. `muon_adam_lr = 1e-4`) if you
-  want the AdamW parameters on a gentler schedule.
+  want the AdamW parameters on a gentler schedule. A set `muon_adam_lr`
+  follows Muon's schedule: each step runs the internal AdamW at
+  `muon_adam_lr`, times its module's multiplier under
+  `optimizer.lr_multipliers`, times the factor the scheduler gives Muon's
+  first param group. A resume or warm start that restores `train_state.pt` continues
+  the saved schedule from its saved peak, whatever `optimizer.lr` is now
+  (see [Per-module learning rates](#per-module-learning-rates)), and the
+  internal AdamW stays at `muon_adam_lr` times that schedule's factor;
+  unset, it runs at Muon's restored LR.
 
 Momentum and update scale:
 
