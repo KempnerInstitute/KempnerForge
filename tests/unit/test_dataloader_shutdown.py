@@ -13,6 +13,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import signal
+import threading
 import time
 import weakref
 from pathlib import Path
@@ -132,6 +133,32 @@ class _Closes:
 
     def close(self) -> None:
         self.closed += 1
+
+
+class _ResultQueue:
+    """Records what the shutdown does to the queue the pin-memory thread reads."""
+
+    def __init__(self) -> None:
+        self.put_items = []
+        self.join_cancelled = False
+
+    def put(self, item) -> None:
+        self.put_items.append(item)
+
+    def cancel_join_thread(self) -> None:
+        self.join_cancelled = True
+
+
+class _PinMemoryIterator:
+    """Holds a pin-memory thread as torch's iterator does, stuck pinning or not."""
+
+    def __init__(self, stuck: bool) -> None:
+        self._pin_memory_thread_done_event = threading.Event()
+        self._worker_result_queue = _ResultQueue()
+        self.unstick = threading.Event()
+        waits_on = self.unstick if stuck else self._pin_memory_thread_done_event
+        self._pin_memory_thread = threading.Thread(target=waits_on.wait, daemon=True)
+        self._pin_memory_thread.start()
 
 
 @pytest.mark.parametrize(
@@ -342,3 +369,31 @@ def test_shutdown_workers_stops_a_plain_loaders_shielded_workers():
 
     assert [worker.exitcode for worker in workers] == [0, 0]
     assert loader._iterator is None
+
+
+def test_the_pin_memory_thread_stops_on_its_done_event():
+    iterator = _PinMemoryIterator(stuck=False)
+    thread = iterator._pin_memory_thread
+
+    dataloader._stop_pin_memory_thread(iterator)
+
+    assert not thread.is_alive()
+    assert iterator._worker_result_queue.put_items == [(None, None)]
+    assert iterator._pin_memory_thread is thread
+    assert not iterator._worker_result_queue.join_cancelled
+
+
+def test_a_stuck_pin_memory_thread_is_left_behind(monkeypatch):
+    """torch's shutdown would join it with no timeout, so it no longer sees it."""
+    monkeypatch.setattr(dataloader, "_SHUTDOWN_WAIT_S", 0.1)
+    iterator = _PinMemoryIterator(stuck=True)
+    thread = iterator._pin_memory_thread
+    try:
+        dataloader._stop_pin_memory_thread(iterator)
+
+        assert thread.is_alive()
+        assert not hasattr(iterator, "_pin_memory_thread")
+        assert iterator._worker_result_queue.join_cancelled
+    finally:
+        iterator.unstick.set()
+        thread.join()

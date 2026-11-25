@@ -328,6 +328,21 @@ class TestBatchStream:
         assert [worker.exitcode for worker in workers] == [0, 0]
         assert loader._iterator is None
 
+    def test_close_prefers_a_dataloaders_own_close(self):
+        class _ClosingLoader(DataLoader):
+            closed = 0
+
+            def close(self):
+                self.closed += 1
+
+        loader = _ClosingLoader(_fake_batches(2), batch_size=None)
+        stream = BatchStream(DataPipeline(dataloader=loader))
+        stream.next_batch()
+
+        stream.close()
+
+        assert loader.closed == 1
+
     def test_close_is_idempotent(self):
         stream = BatchStream(DataPipeline(dataloader=_fake_batches(3)))
         stream.next_batch()

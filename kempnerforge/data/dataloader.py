@@ -32,7 +32,7 @@ from kempnerforge.resilience.signal_handler import ignore_shutdown_signals_in_wo
 
 logger = logging.getLogger(__name__)
 
-_WORKER_KILL_TIMEOUT_S = 5.0
+_SHUTDOWN_WAIT_S = 5.0
 
 _EXIT_FINALIZER_PRIORITY = 100
 
@@ -44,21 +44,42 @@ _loaders_with_workers: weakref.WeakKeyDictionary[StatefulDataLoader | StreamingD
 def shutdown_workers(loader: DataLoader) -> None:
     """Stop a ``DataLoader``'s persistent workers through its sentinel path.
 
-    Runs torch's own worker shutdown, which sends each worker its sentinel and
-    waits for it with a timeout, then kills a worker still alive, since a worker
-    that runs ``ignore_shutdown_signals_in_worker`` ignores SIGTERM, and waits up
-    to 5 s for it. The next ``iter(loader)`` starts new workers; a loader with no
-    persistent workers is left as it is. Rank-local, with no collective.
+    Stops the pin-memory thread, waiting up to 5 s for it, then runs torch's own
+    worker shutdown, which sends each worker its sentinel and waits for it with
+    a timeout, and kills a worker still alive, since a worker that runs
+    ``ignore_shutdown_signals_in_worker`` ignores SIGTERM, waiting up to 5 s
+    for it. Every wait is bounded. The next ``iter(loader)`` starts new workers;
+    a loader with no persistent workers is left as it is. Rank-local, with no
+    collective.
     """
     iterator = loader._iterator
     loader._iterator = None
     if not isinstance(iterator, _MultiProcessingDataLoaderIter):
         return
+    _stop_pin_memory_thread(iterator)
     iterator._shutdown_workers()
     for worker in iterator._workers:
         if worker.is_alive():
             worker.kill()
-            worker.join(timeout=_WORKER_KILL_TIMEOUT_S)
+            worker.join(timeout=_SHUTDOWN_WAIT_S)
+
+
+def _stop_pin_memory_thread(iterator: _MultiProcessingDataLoaderIter) -> None:
+    """Stop ``iterator``'s pin-memory thread, waiting up to 5 s for it.
+
+    torch's worker shutdown joins this thread with no timeout. A thread still
+    running after the wait, stuck pinning a batch, is a daemon left behind:
+    its handle is dropped so that torch's shutdown goes on to the workers.
+    """
+    thread = getattr(iterator, "_pin_memory_thread", None)
+    if thread is None:
+        return
+    iterator._pin_memory_thread_done_event.set()
+    iterator._worker_result_queue.put((None, None))
+    thread.join(timeout=_SHUTDOWN_WAIT_S)
+    if thread.is_alive():
+        iterator._worker_result_queue.cancel_join_thread()
+        del iterator._pin_memory_thread
 
 
 @functools.cache

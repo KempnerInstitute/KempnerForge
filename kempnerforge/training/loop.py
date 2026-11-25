@@ -115,10 +115,10 @@ class BatchStream:
         self._iter = None
         self._source = None
         loader = self.pipeline.dataloader
-        if isinstance(loader, DataLoader):
-            shutdown_workers(loader)
-        elif hasattr(loader, "close"):
+        if hasattr(loader, "close"):
             loader.close()
+        elif isinstance(loader, DataLoader):
+            shutdown_workers(loader)
 
     def next_batch(self) -> dict[str, torch.Tensor]:
         if self.dataloader is None:
