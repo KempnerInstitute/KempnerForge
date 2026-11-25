@@ -115,8 +115,9 @@ class BatchStream:
         self._iter = None
         self._source = None
         loader = self.pipeline.dataloader
-        if hasattr(loader, "close"):
-            loader.close()
+        close = getattr(loader, "close", None)
+        if close is not None:
+            close()
         elif isinstance(loader, DataLoader):
             shutdown_workers(loader)
 
