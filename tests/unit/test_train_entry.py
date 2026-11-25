@@ -561,6 +561,14 @@ class TestCheckpointExtra:
         phases = PhaseState(phases=[TrainingPhase(start_step=1)], next_idx=1)
         assert checkpoint_extra(make_config(), 5, phases) == {"phase_idx": 1, "plugins": []}
 
+    def test_includes_a_nonzero_nan_count(self):
+        extra = checkpoint_extra(make_config(), 5, PhaseState(), consecutive_nans=2)
+        assert extra == {"plugins": [], "consecutive_nans": 2}
+
+    def test_a_zero_nan_count_adds_nothing(self):
+        extra = checkpoint_extra(make_config(), 5, PhaseState(), consecutive_nans=0)
+        assert extra == {"plugins": []}
+
     def test_includes_metrics_run_ids(self):
         config = make_config()
         config.metrics.wandb_run_id = "wid"
@@ -1195,7 +1203,7 @@ class TestNanSkippedStep:
         assert handler.finished is False
 
     def test_emergency_checkpoint_records_the_phase_the_skipped_step_entered(self, monkeypatch):
-        """It also saves the dataloader, so the resume continues from the same data position."""
+        """It also saves the dataloader and the NaN count, so the resume continues from both."""
         ckpt = FakeCheckpointManager()
         session = self._phase_session(
             TrainingPhase(start_step=2, dataset_weights={"a": 5.0}),
@@ -1213,7 +1221,8 @@ class TestNanSkippedStep:
         monkeypatch.setattr(ckpt, "save", save)
         step, tokens_seen = run_training_loop(session)
         assert step == 2
-        assert ckpt.saves == [(2, tokens_seen, {"phase_idx": 1, "plugins": []})]
+        extra = {"phase_idx": 1, "plugins": [], "consecutive_nans": 1}
+        assert ckpt.saves == [(2, tokens_seen, extra)]
         assert loaders == [session.data.dataloader]
         assert loaders[0] is not None
 
@@ -1342,8 +1351,14 @@ class TestNanSkippedStep:
         assert run(2) == ([2], 1)
 
 
-def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
-    """Replace every phase run_training builds so the orchestration runs on CPU."""
+def _stub_entry(
+    monkeypatch, model: nn.Module, *, real_checkpoints: bool = False
+) -> FakeCheckpointManager:
+    """Replace every phase run_training builds so the orchestration runs on CPU.
+
+    With ``real_checkpoints`` the checkpoint manager and the restore stay real, so the run
+    saves into ``checkpoint.dir`` and resumes what it holds, and the fake goes unused.
+    """
     import kempnerforge.training.entry as entry
 
     ckpt = FakeCheckpointManager()
@@ -1358,8 +1373,9 @@ def _stub_entry(monkeypatch, model: nn.Module) -> FakeCheckpointManager:
         "build_scheduler",
         lambda o, _c, max_steps: torch.optim.lr_scheduler.LambdaLR(o, lambda _s: 1.0),
     )
-    monkeypatch.setattr(entry, "build_checkpoint_manager", lambda *_a, **_k: ckpt)
-    monkeypatch.setattr(entry, "restore_checkpoint", lambda *_a, **_k: (0, 0))
+    if not real_checkpoints:
+        monkeypatch.setattr(entry, "build_checkpoint_manager", lambda *_a, **_k: ckpt)
+        monkeypatch.setattr(entry, "restore_checkpoint", lambda *_a, **_k: (0, 0))
     monkeypatch.setattr(entry, "build_profiler", lambda *_a, **_k: None)
     monkeypatch.setattr(entry, "build_data_pipeline", lambda *_a, **_k: DataPipeline())
     monkeypatch.setattr(entry, "build_eval_dataloader", lambda *_a, **_k: None)
@@ -1778,6 +1794,74 @@ class TestRunTraining:
         expected = config.vlm.module_patterns if config.vlm is not None else None
         assert seen["module_patterns"] == expected
         assert (expected is not None) is vlm
+
+
+def _run_through_nans(
+    monkeypatch, ckpt_dir: Path, nan_steps: set[int], shutdown_after: int | None = None
+) -> list[int]:
+    """The steps a ``run_training`` of up to 10 steps runs, resuming what ``ckpt_dir`` holds.
+
+    The step body reports a NaN loss in the steps ``nan_steps`` and three in a row stop the
+    run. With ``shutdown_after``, a shutdown is requested after that many steps.
+    """
+    import kempnerforge.training.entry as entry
+
+    _stub_entry(monkeypatch, TinyTextModel(), real_checkpoints=True)
+    monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: FakeShutdownHandler(shutdown_after))
+    config = make_config(max_steps=10, nan_max_consecutive=3)
+    config.checkpoint.dir = str(ckpt_dir)
+    config.checkpoint.interval = 100
+    ran: list[int] = []
+    body = _nan_on(nan_steps)
+
+    def step_fn(session: TrainingSession, step: int):
+        ran.append(step)
+        return body(session, step)
+
+    entry.run_training(config, step_fn=step_fn)
+    return ran
+
+
+class TestNanCountAcrossResume:
+    """A run resumed from its emergency checkpoint stops where the uninterrupted run stops.
+
+    Each run goes through ``run_training`` with the real checkpoint manager and restore. The
+    split run saves through a shutdown after ``shutdown_after`` steps, then resumes.
+    """
+
+    @pytest.mark.parametrize(
+        ("nan_steps", "shutdown_after", "saved_count", "last_step"),
+        [
+            (set(range(3, 10)), 2, None, 5),
+            (set(range(10)), 2, 2, 2),
+            ({1, 2} | set(range(5, 10)), 4, None, 7),
+        ],
+        ids=["saved-before-a-nan-run", "saved-in-a-nan-run", "saved-after-a-nan-run"],
+    )
+    def test_the_resumed_run_stops_at_the_uninterrupted_runs_step(
+        self, monkeypatch, tmp_path, nan_steps, shutdown_after, saved_count, last_step
+    ):
+        """Only a save in a run of NaN steps holds a count, the NaN steps it follows."""
+        full = _run_through_nans(monkeypatch, tmp_path / "full", nan_steps)
+        split = tmp_path / "split"
+        first = _run_through_nans(monkeypatch, split, nan_steps, shutdown_after)
+        state_path = split / f"step_{shutdown_after}" / "train_state.pt"
+        saved = torch.load(state_path, weights_only=False)
+        resumed = _run_through_nans(monkeypatch, split, nan_steps)
+        assert full == list(range(last_step + 1))
+        assert first == list(range(shutdown_after))
+        assert first + resumed == full
+        assert saved.get("consecutive_nans") == saved_count
+
+    def test_a_checkpoint_without_the_count_resumes_counting_from_zero(self, monkeypatch, tmp_path):
+        """A checkpoint saved before the count was saved resumes as it always has."""
+        nan_steps = set(range(10))
+        _run_through_nans(monkeypatch, tmp_path, nan_steps, shutdown_after=2)
+        state_path = tmp_path / "step_2" / "train_state.pt"
+        state = torch.load(state_path, weights_only=False)
+        assert state.pop("consecutive_nans") == 2
+        torch.save(state, state_path)
+        assert _run_through_nans(monkeypatch, tmp_path, nan_steps) == [2, 3, 4]
 
 
 class TestBuildPhaseHelpers:

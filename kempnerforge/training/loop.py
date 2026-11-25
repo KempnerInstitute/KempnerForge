@@ -682,7 +682,11 @@ def select_step_fn(config: JobConfig) -> StepFn:
 
 
 def checkpoint_extra(
-    config: JobConfig, step: int, phases: PhaseState, documents_seen: int | None = None
+    config: JobConfig,
+    step: int,
+    phases: PhaseState,
+    documents_seen: int | None = None,
+    consecutive_nans: int = 0,
 ) -> dict:
     """Metadata saved alongside every checkpoint so a resume is exact.
 
@@ -690,11 +694,16 @@ def checkpoint_extra(
     has fired (see ``freeze_meta_at_step``). ``plugins`` is the run's plugins
     list, which a resume compares with its own (see ``restore_checkpoint``).
     ``documents_seen``, when given, is saved for the resumed run to count on from.
+    ``consecutive_nans``, the NaN detector's count of NaN steps in a row, is saved
+    when it is not zero, for the resumed run to count on from, so it stops at the
+    step the uninterrupted run stops at; a checkpoint without it resumes at zero.
     """
     extra: dict = {"phase_idx": phases.next_idx} if phases.phases else {}
     extra["plugins"] = list(config.plugins)
     if documents_seen is not None:
         extra["documents_seen"] = documents_seen
+    if consecutive_nans:
+        extra["consecutive_nans"] = consecutive_nans
     if config.metrics.wandb_run_id:
         extra["wandb_run_id"] = config.metrics.wandb_run_id
     if config.metrics.mlflow_run_id:
@@ -936,7 +945,11 @@ def _shutdown_if_requested(
                 scheduler=session.scheduler,
                 dataloader=session.data.dataloader,
                 extra=checkpoint_extra(
-                    session.config, step, session.phases, session.documents_seen
+                    session.config,
+                    step,
+                    session.phases,
+                    session.documents_seen,
+                    consecutive_nans=session.nan_detector.state.consecutive_nans,
                 ),
             )
     return True
@@ -997,7 +1010,13 @@ def run_training_loop(
                 tokens_seen=0,
                 scheduler=scheduler,
                 dataloader=data.dataloader,
-                extra=checkpoint_extra(config, 0, phases, session.documents_seen),
+                extra=checkpoint_extra(
+                    config,
+                    0,
+                    phases,
+                    session.documents_seen,
+                    consecutive_nans=session.nan_detector.state.consecutive_nans,
+                ),
             )
         hooks.on_checkpoint_save(0, config.checkpoint.dir)
 
@@ -1119,7 +1138,13 @@ def run_training_loop(
             if prof is not None:
                 prof.step()
 
-            ckpt_extra = checkpoint_extra(config, step, phases, session.documents_seen)
+            ckpt_extra = checkpoint_extra(
+                config,
+                step,
+                phases,
+                session.documents_seen,
+                consecutive_nans=session.nan_detector.state.consecutive_nans,
+            )
             saved_this_step = config.checkpoint.should_save(step)
             if saved_this_step:
                 with _logged_time(tracker, "checkpoint/save_sec", step):

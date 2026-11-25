@@ -277,11 +277,16 @@ if config.metrics.wandb_run_id:
     extra["wandb_run_id"] = config.metrics.wandb_run_id
 if config.metrics.mlflow_run_id:
     extra["mlflow_run_id"] = config.metrics.mlflow_run_id
+if consecutive_nans:
+    extra["consecutive_nans"] = consecutive_nans
 ...
 return extra
 
 # training/loop.py::run_training_loop (documents_seen: a VLM run's documents)
-ckpt_extra = checkpoint_extra(config, step, phases, session.documents_seen)
+ckpt_extra = checkpoint_extra(
+    config, step, phases, session.documents_seen,
+    consecutive_nans=session.nan_detector.state.consecutive_nans,
+)
 ckpt_mgr.save(step=step, tokens_seen=tokens_seen, scheduler=scheduler,
               dataloader=data.dataloader, extra=ckpt_extra)
 ```
@@ -319,6 +324,13 @@ KempnerForge uses this for:
   `kempnerforge.warm_start.source_run_id`. The checkpoint's
   `metadata.json` also records the live run as plain JSON, for tools
   that read it without loading this file.
+- `consecutive_nans`: the NaN detector's count of NaN steps in a row,
+  saved only when it is not zero, so only by an emergency checkpoint
+  written partway through a run of NaN steps. `run_training` restores it
+  whenever a load reads this file, so the resumed run stops at the step
+  the uninterrupted run stops at; a checkpoint without it resumes the
+  count at zero (see
+  [NaN detection § State tracking](../resilience/nan-detection.md#state-tracking)).
 
 Custom training workflows can use it for anything
 `torch.save`-serializable.

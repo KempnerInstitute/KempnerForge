@@ -969,7 +969,7 @@
         "text_step(session, step) -> StepResult",
         "vlm_step(session, step) -> StepResult",
         "pipeline_step(session, step) -> StepResult",
-        "checkpoint_extra(config, step, phases, documents_seen) -> dict",
+        "checkpoint_extra(config, step, phases, documents_seen, consecutive_nans) -> dict",
         "_apply_stage_specs(model, specs, pattern_map) -> dict (one FreezeStage: refreshes the FSDP2 dtypes of what it unfreezes and resets a compiled model when it unfreezes parameters)",
         "_batch_counts(batch, image_positions) -> (documents, image_tokens, text_tokens, encoder_images)",
         "_step_counts(session, result) -> (tokens, documents, encoder_images) over the DP ranks"
@@ -1008,6 +1008,7 @@
         "tests/unit/test_train_entry.py::TestResumePastAnUnfreezeStage",
         "tests/unit/test_train_entry.py::TestResumeACheckpointThatLeftTheModuleOut",
         "tests/unit/test_train_entry.py::TestStageChangeWarmStart",
+        "tests/unit/test_train_entry.py::TestNanCountAcrossResume",
         "tests/e2e/test_training_e2e.py",
         "tests/smoke/test_smoke.py"
       ]

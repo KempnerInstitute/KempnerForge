@@ -18,6 +18,8 @@ nan_detector = NaNDetector(
     action=config.train.nan_action, max_consecutive=config.train.nan_max_consecutive
 )
 ...
+nan_detector.state.consecutive_nans = ckpt_mgr.restored_extra.get("consecutive_nans", 0)
+...
 # Inside the training loop, after backward:
 if not nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
     optimizer.zero_grad()
@@ -76,14 +78,12 @@ tick except the shutdown check are dropped:
 | Profiler step | Skipped; the profiler steps on the next finite step. |
 
 The checkpoint holds the weights as the skipped step left them, and the
-schedule, freeze state, data phase and data position are all those of
-the new step, so resuming from that emergency checkpoint continues as
-the uninterrupted run would have, with two exceptions:
+schedule, freeze state, data phase, data position and consecutive-NaN
+count are all those of the new step, so resuming from that emergency
+checkpoint continues as the uninterrupted run would have, and stops at
+the step it stops at (see [State tracking](#state-tracking)), with one
+exception:
 
-- **Partway through a run of NaN steps.** The consecutive-NaN count is
-  not checkpointed, so the resumed run counts from zero and allows a
-  full `max_consecutive` more before it stops. Tracked in
-  [#480](https://github.com/KempnerInstitute/KempnerForge/issues/480).
 - **Before the run's first optimizer update.** The checkpoint holds no
   optimizer state, so the resumed optimizer keeps the LR the scheduler
   set at step 0 (0 under the default warmup) for its first update. That
@@ -203,6 +203,19 @@ class NaNState:
 rollback: when it reaches `max_consecutive` (default 5 in the class;
 the training loop's detector takes `train.nan_max_consecutive`, default
 10), `rollback_recommended` flips to `True`.
+
+A checkpoint saves `consecutive_nans` in its `train_state.pt` when it is
+not zero, which only an emergency checkpoint written partway through a
+run of NaN steps does, and `run_training` restores it whenever a load
+reads `train_state.pt`: an auto-resume, or a `checkpoint.load_path` warm
+start that is not weights-only. A run resumed partway through a run of
+NaN steps therefore stops at the step the uninterrupted run stops at.
+Every rank counts the same steps, since the NaN flag is reduced over the
+ranks (see [Cross-rank sync](#cross-rank-sync)), and every rank restores
+the count rank 0 saved, so the ranks still stop together. A checkpoint
+without the count, such as one saved before it was recorded, resumes it
+at zero. The other fields are diagnostics that no stop reads, and they
+start over in each process.
 
 `nan_steps` is a diagnostic — a post-hoc "which steps actually failed"
 list. Capped at 100 entries to bound memory on pathological runs.
