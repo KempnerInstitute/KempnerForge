@@ -293,21 +293,36 @@ def test_several_changes_never_repeat_a_dataset_no_weighting_oversamples():
     assert [position for position, _ in sampler.state_dict()["epoch_weights"]] == [0, 200, 500]
 
 
-def test_a_dataset_entering_mid_epoch_draws_each_ranks_own_share():
-    """``c`` has weight 0 until position 30, then draws from disjoint shares on two ranks."""
-    cumulative = [0, 60, 120, 180]
-    drawn_c: list[int] = []
-    for rank in range(2):
-        sampler = MixtureSampler(cumulative, [1.0, 1.0, 0.0], num_replicas=2, rank=rank, seed=5)
-        epoch = list(sampler)[:30]
-        sampler.update_weights([2.0, 2.0, 1.0])
-        sampler.set_skip(30)
-        epoch += list(sampler)
-        assert len(epoch) == 90
-        drawn_c += [i for i in epoch if i >= 120]
+@pytest.mark.parametrize(
+    ("cumulative", "replicas", "drop_last", "position", "after", "lengths", "drawn"),
+    [
+        ([0, 60, 120, 180], 2, True, 30, [2.0, 2.0, 1.0], [90, 90], 24),
+        ([0, 1, 61, 121], 3, False, 5, [1.0, 1.0, 1.0], [41, 41, 20], 29),
+    ],
+    ids=["even", "uneven_lists"],
+)
+def test_a_dataset_entering_mid_epoch_draws_each_ranks_own_share(
+    cumulative, replicas, drop_last, position, after, lengths, drawn
+):
+    """The last dataset has weight 0 until ``position``, then draws disjoint shares.
 
-    assert len(drawn_c) == 2 * 12
-    assert len(drawn_c) == len(set(drawn_c))
+    With one sample padded across three ranks, one rank's list is shorter than
+    the others', which must not change how the new dataset is split.
+    """
+    entering: list[int] = []
+    for rank in range(replicas):
+        sampler = MixtureSampler(
+            cumulative, [1.0, 1.0, 0.0], replicas, rank, seed=5, drop_last=drop_last
+        )
+        epoch = list(sampler)[:position]
+        sampler.update_weights(after)
+        sampler.set_skip(position)
+        epoch += list(sampler)
+        assert len(epoch) == lengths[rank]
+        entering += [i for i in epoch if i >= cumulative[2]]
+
+    assert len(entering) == drawn
+    assert len(entering) == len(set(entering))
 
 
 def test_the_state_records_a_change_until_the_next_epoch():

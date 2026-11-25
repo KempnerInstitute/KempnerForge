@@ -17,6 +17,8 @@ from torch.utils.data import Dataset, Sampler
 
 logger = logging.getLogger(__name__)
 
+_REDRAW_SEED_OFFSET = 1 << 32
+
 
 def _validate_weights(weights: list[float], context: str) -> None:
     """Fail fast on empty, negative, or all-zero weight lists.
@@ -372,12 +374,19 @@ class MixtureSampler(Sampler[int]):
         return rest
 
     def _epoch_order(self) -> list[int]:
-        """This rank's samples for the epoch, in order, under the weights it recorded."""
+        """This rank's samples for the epoch, in order, under the weights it recorded.
+
+        The draws after a change of weights use a generator of their own, seeded
+        by the seed and epoch alone, so the rank shares of the datasets the
+        epoch's start did not draw from are the same split on every rank, even
+        when the ranks' lists differ in length.
+        """
         g = torch.Generator().manual_seed(self.seed + self._epoch)
         targets = _apportion(self._total_per_rank, self._epoch_weights[0][1])
         order, first_pools = self._first_order(targets, g)
         if len(self._epoch_weights) == 1:
             return order
+        g = torch.Generator().manual_seed(self.seed + self._epoch + _REDRAW_SEED_OFFSET)
         pools = [
             pool if pool is not None else self._partition(size, g)
             for pool, size in zip(first_pools, self._dataset_sizes, strict=True)

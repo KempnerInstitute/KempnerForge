@@ -129,9 +129,11 @@ Each `__iter__()` then does:
 8. **Weights changed inside the epoch**: when the weights changed after
    the epoch began and the pass starts at a skip inside the epoch, the
    list keeps its first `skip` entries and draws the rest under the new
-   weights, from the samples not drawn in the epoch first, shuffled with
-   the same generator. Every earlier change of the epoch is replayed the
-   same way, in order (see
+   weights, from the samples not drawn in the epoch first. A second
+   generator, seeded from the seed and the epoch alone, splits the datasets the
+   epoch's start did not draw from across ranks and shuffles the rest, so
+   every rank splits them the same way. Every earlier change of the epoch
+   is replayed the same way, in order (see
    [Mixing and annealing § Phase changes inside an epoch](mixing-and-annealing.md#phase-changes-inside-an-epoch)).
 
 ### `update_weights(weights, temperature)`
