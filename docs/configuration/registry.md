@@ -267,11 +267,10 @@ Four rules for plugin authors, all from the distributed contract:
   training entry point refuses to resume or warm start, with the train
   state, from one saved with another list, before it reads any state: the
   same modules in the same order, each counted once, since a plugin can
-  override the names another registers. Another list can build another
-  component, and one whose parameters are a strict subset of the saved
-  ones would load silently. If the plugins that differ build no part of
-  the model, set `checkpoint.ignore_plugins_mismatch = true` to go on
-  with a warning. When `metadata.json` holds no valid list, as in a
+  override the names another registers, and another list can build
+  another component. If the plugins that differ build no part of the
+  model, set `checkpoint.ignore_plugins_mismatch = true` to go on with a
+  warning. When `metadata.json` holds no valid list, as in a
   checkpoint saved before the list was recorded, or cannot be read, the
   lists are not compared and rank 0 logs a warning. A weights-only warm
   start (`checkpoint.exclude_from_loading = ["optimizer", "train_state"]`)

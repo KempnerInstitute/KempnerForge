@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import time
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1209,3 +1210,84 @@ class TestPinnedSnapshot:
         dcp.load(loaded, checkpoint_id=checkpoint_id)
         assert torch.equal(loaded["weight"].full_tensor(), torch.ones(64, 32, device="cuda"))
         assert loaded["scale"].full_tensor().item() == 1.0
+
+
+def _refusals(call) -> list[str | None]:
+    """Each rank's ``ValueError`` message from ``call``, None where it raised none."""
+    message = None
+    try:
+        call()
+    except ValueError as error:
+        message = str(error)
+    messages: list[str | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(messages, message)
+    return messages
+
+
+class TestModelFitAcrossRanks:
+    """A checkpoint of another model is refused on every rank alike, before DCP reads a tensor."""
+
+    def test_every_rank_refuses_a_shallower_model(self, distributed_env, shared_tmp_dir):
+        from kempnerforge.config.schema import OptimizerConfig
+
+        torch.manual_seed(0)
+        deep = Transformer(replace(SMALL_CONFIG, n_layers=4)).cuda()
+        apply_fsdp2(deep, distributed_env)
+        opt = build_optimizer(deep, OptimizerConfig(lr=1e-3, fused=False))
+        deep(torch.randint(0, 512, (2, 32), device="cuda")).sum().backward()
+        opt.step()
+        CheckpointManager(CheckpointConfig(dir=shared_tmp_dir), deep, opt).save(step=1)
+
+        shallow = Transformer(SMALL_CONFIG).cuda()
+        apply_fsdp2(shallow, distributed_env)
+        opt2 = build_optimizer(shallow, OptimizerConfig(lr=1e-3, fused=False))
+        before = [p.to_local().detach().clone() for p in shallow.parameters()]
+        manager = CheckpointManager(CheckpointConfig(dir=shared_tmp_dir), shallow, opt2)
+        messages = _refusals(manager.load)
+        assert messages[0] is not None, "a 2-layer model loaded a 4-layer checkpoint"
+        assert messages == [messages[0]] * dist.get_world_size()
+        assert "such as ['model.layers.2." in messages[0]
+        for b, p in zip(before, shallow.parameters(), strict=True):
+            assert torch.equal(b, p.to_local())
+
+    def test_every_pipeline_stage_refuses_when_one_stage_does_not_fit(
+        self, distributed_env, shared_tmp_dir
+    ):
+        """Two stages save into pp0/ and pp1/ through their own groups; stage 1 resumes with
+        two layers fewer than it saved, stage 0 with the model it saved."""
+        world = dist.get_world_size()
+        if world % 2:
+            pytest.skip("needs an even number of ranks, two stages")
+        group, _ = dist.new_subgroups_by_enumeration(
+            [list(range(0, world, 2)), list(range(1, world, 2))]
+        )
+        stage = dist.get_rank() % 2
+
+        def stage_run(n_layers):
+            torch.manual_seed(stage)
+            model = Transformer(replace(SMALL_CONFIG, n_layers=n_layers)).cuda()
+            opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            manager = CheckpointManager(
+                CheckpointConfig(dir=shared_tmp_dir),
+                model,
+                opt,
+                process_group=group,
+                pp_rank=stage,
+                pp_size=2,
+            )
+            return model, opt, manager
+
+        model, opt, saver = stage_run(4)
+        model(torch.randint(0, 512, (2, 32), device="cuda")).sum().backward()
+        opt.step()
+        saver.save(step=1)
+
+        model, _, loader = stage_run(4 if stage == 0 else 2)
+        before = [p.detach().clone() for p in model.parameters()]
+        messages = _refusals(loader.load)
+        assert messages[0] is not None and messages == [messages[0]] * world
+        assert "step_1/pp1 holds" in messages[0]
+        assert "such as ['model.layers.2." in messages[0]
+        assert "pp0 holds" not in messages[0]
+        for b, p in zip(before, model.parameters(), strict=True):
+            assert torch.equal(b, p)

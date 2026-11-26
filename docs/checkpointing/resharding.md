@@ -118,10 +118,13 @@ checkpoint loads into an EP run. Packed experts under FSDP need torch
 
 ## What to check if resharding fails
 
-- **Tensor shape mismatch**: the most common cause is that the
-  model config changed between save and load (e.g. `n_heads`
-  changed, `dim` changed, `vocab_size` changed). DCP errors with
-  the target vs saved shape. Diff the configs.
+- **Tensor size mismatch** (`... holds N model tensors of another
+  size, such as <key> (saved [...], this run [...])`): the most common
+  cause is that the model config changed between save and load (e.g.
+  `n_heads`, `dim` or `vocab_size` changed). Before it reads any
+  tensor, the load compares each model tensor with the size the
+  checkpoint's DCP index lists, and every rank refuses with the first
+  few keys and both sizes. Diff the configs.
 - **Missing parameter** (`Missing key in checkpoint state_dict:
   model.layers.42.mlp.some_new_module.weight`): the saver never wrote
   that tensor because the module wasn't in the model yet. Neither a
@@ -142,10 +145,17 @@ checkpoint loads into an EP run. Packed experts under FSDP need torch
   in `hf-to-dcp` with a size mismatch. A model that Llama or Mixtral
   cannot hold needs `--no-architecture-check` on `dcp-to-hf` (see
   [HF conversion](hf-conversion.md#what-transformers-can-load)).
-- **Extra parameter**: the saver wrote a tensor the loader doesn't
-  want (you removed a module). DCP ignores the extra shard —
-  silently, so watch the checkpoint size rather than relying on
-  warnings.
+- **Extra tensors** (`... holds N model tensors this run's model does
+  not have, such as [...]`): the saver wrote tensors the loader's model
+  lacks, as when the model has fewer layers, or a module or component
+  was removed. DCP would leave them unread without a word, so the load
+  refuses the checkpoint on every rank before it reads any tensor. The
+  index is compared with what every rank loads together: each pipeline
+  stage's index with that stage's layers, and a checkpoint saved
+  without pipeline parallelism with the layers of every stage. To start
+  a smaller model from the tensors it shares with the checkpoint, set
+  `checkpoint.ignore_extra_model_tensors = true`: rank 0 then names
+  the tensors left unread, and a size mismatch is still refused.
 - **A `pp{i}/` subdir without its own `.metadata`**: each stage saves
   over its own process group and indexes only its own shards, so the
   stages' indexes differ by design. A save coordinated over every rank

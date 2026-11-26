@@ -98,6 +98,7 @@ class CheckpointConfig:
     ignore_freeze_mismatch: bool = False
     ignore_rank_state_mismatch: bool = False
     ignore_plugins_mismatch: bool = False
+    ignore_extra_model_tensors: bool = False
 
     def __post_init__(self) -> None:
         if self.interval <= 0:

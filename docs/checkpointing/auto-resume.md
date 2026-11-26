@@ -112,7 +112,7 @@ if resume_path or config.checkpoint.load_path:
     warm_start_exclude = (
         (config.checkpoint.exclude_from_loading or None) if resume_path is None else None
     )
-    vlm_freeze_expected = ...  # VLM runs, unless a weights-only warm start
+    vlm_freeze_expected = partial(freeze_meta_at_step, config=config.vlm)  # VLM, not weights-only
     with _trainable_for_the_run(model, config) as unfrozen_later:
         step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(
             path=str(resume_path) if resume_path else None,
@@ -201,9 +201,9 @@ streams restart. See
 
 A training checkpoint also holds `train_state.pt`, and `load_path` restores
 it: the step, token count, LR schedule, dataloader position and RNG state
-continue from the saved run, and the saved freeze metadata is compared with
-the new run's. To start a new stage from a previous stage's weights alone,
-add `"train_state"`:
+continue from the saved run, and the freeze the checkpoint records is compared
+with the new run's at the step it records. To start a new stage from a
+previous stage's weights alone, add `"train_state"`:
 
 ```toml
 [checkpoint]
@@ -220,12 +220,14 @@ freeze check; with the model excluded too, nothing would load. A MoT run
 with `mot_warm_start_from_text` keeps the loaded weights: the text warm
 start runs only when no checkpoint supplied the model, that is on a run
 with nothing to resume from or a warm start that excludes `"model"` and
-starts at step 0, and never on a resume. A weights-only warm start also skips the
-`metadata.json` probe for the freeze check, since the new run's own
-freeze applies, and the `plugins` comparison. Any other warm start, like
-a resume, compares the run's `plugins` list with the one `metadata.json`
-records before reading any state, and refuses another list unless
-`checkpoint.ignore_plugins_mismatch` is set.
+starts at step 0, and never on a resume. A weights-only warm start also skips
+the freeze check, since the new run's own freeze applies, and the `plugins`
+comparison. The freeze check takes the step and the freeze from rank 0's read
+of the `metadata.json` of the checkpoint `load` settles on, the one it falls
+back to included, so every rank compares the same record. Any other warm
+start, like a resume, compares the run's `plugins` list with the one
+`metadata.json` records before reading any state, and refuses another list
+unless `checkpoint.ignore_plugins_mismatch` is set.
 
 ## Symlink updates
 

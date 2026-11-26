@@ -37,7 +37,11 @@ modules and the module of each optimizer param group, `lr_group_modules`, when
 `optimizer.lr_multipliers` lists any), the run's `plugins` list as `plugins` (see
 [Train state](train-state.md)), and under pipeline parallelism the degree as `pp` (see
 [Resharding § PP](resharding.md#pp-the-one-special-case)). A load reads it on rank 0,
-once, for the checks of those records and the checkpoint's layout. When a logging backend
+once, for the checks of those records and the checkpoint's layout. A checkpoint without the
+file records none of them: the `plugins` and VLM freeze comparisons are skipped with a
+warning, and the training entry refuses to restore its optimizer state, since the
+weight-decay scope it was saved under is unknown (see
+[Optimizers](../training/optimizers.md)). When a logging backend
 has a live run at save time it also holds a `tracking` list, one entry per backend:
 
 ```json

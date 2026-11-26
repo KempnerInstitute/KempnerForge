@@ -919,11 +919,12 @@ class TestResume:
         assert scheduler.last_epoch == 0
 
     @pytest.mark.parametrize("rank", [0, 1])
-    def test_a_weights_only_warm_start_issues_only_the_path_broadcast(
+    def test_a_weights_only_warm_start_issues_only_the_path_broadcast_and_the_model_check(
         self, tmp_path, monkeypatch, rank
     ):
         """Every rank skips the same checks, so besides the model load, which every rank enters,
-        the only collective is rank 0's broadcast of the checkpoint it resolved."""
+        the only collectives are rank 0's broadcast of the checkpoint it resolved and the model
+        check, which gathers every rank's model on rank 0 and broadcasts its verdict."""
         import kempnerforge.checkpoint.manager as mgr_mod
 
         self._save(tmp_path, {"head": 2.0})
@@ -933,7 +934,11 @@ class TestResume:
         monkeypatch.setattr(mgr_mod.dcp, "load", lambda state, **_: loaded.append(sorted(state)))
         monkeypatch.setattr(mgr_mod, "set_model_state_dict", lambda *_: None)
         assert manager.load(scheduler=scheduler, exclude_keys=self.WEIGHTS_ONLY) == (0, 0, {})
-        assert self._past_the_path(calls) == []
+        step_dir = str((tmp_path / "step_3").resolve())
+        assert self._past_the_path(calls) == [
+            ("gather", "GLOO_GROUP", step_dir),
+            ("broadcast", 0, [None]),
+        ]
         assert loaded == [["model"]]
 
     @pytest.mark.parametrize("train_state", ["without_scheduler", "absent"])
@@ -969,12 +974,18 @@ class TestResume:
         assert manager.load(scheduler=scheduler)[0] == 0
         assert not any(o.state for o in manager.checkpointed_optimizers)
 
-    def test_a_checkpoint_without_metadata_counts_as_saved_without_multipliers(self, tmp_path):
+    def test_a_checkpoint_without_metadata_is_not_taken_as_saved_without_multipliers(
+        self, tmp_path
+    ):
+        """It records no multipliers, so a run with some cannot check them and refuses it, and a
+        run without any loads it as one saved without them."""
         (self._save(tmp_path, {}) / "metadata.json").unlink()
         _, scheduler, manager = self._resume(tmp_path, {})
         assert manager.load(scheduler=scheduler)[0] == 3
         _, scheduler, manager = self._resume(tmp_path, {"head": 2.0})
-        with pytest.raises(ValueError, match=r"saved with optimizer.lr_multipliers=\{\}"):
+        with pytest.raises(
+            ValueError, match="Cannot check the lr_multipliers.*has no metadata.json"
+        ):
             manager.load(scheduler=scheduler)
 
     def test_a_record_of_a_module_name_with_a_slash_is_read(self, tmp_path):
@@ -1114,8 +1125,9 @@ class TestResume:
         """Run ``manager`` as ``rank`` of two, the other rank adding nothing to the all-reduce.
 
         ``sent`` lists what rank 0's other broadcasts deliver to any other rank, in order; its
-        broadcast of the checkpoint it resolved delivers the one the manager resolves. Returns the
-        collectives issued, in order.
+        broadcast of the checkpoint it resolved delivers the one the manager resolves, and the
+        model check, which gathers on the manager's gloo group, finds nothing to refuse.
+        Returns the collectives issued, in order.
         """
         import kempnerforge.checkpoint.manager as mgr_mod
 
@@ -1126,22 +1138,26 @@ class TestResume:
         def all_reduce(flags, group=None):
             calls.append(("all_reduce", group, flags.tolist()))
 
-        def broadcast_object_list(objects, src):
+        def broadcast_object_list(objects, src, group=None):
             calls.append(("broadcast", src, list(objects)))
-            if (
-                rank != 0
-                and isinstance(objects[0], dict)
-                and objects[0].keys() == {"dir", "layout", "error"}
-            ):
+            if rank == 0 or group is not None:
+                return
+            if isinstance(objects[0], dict) and objects[0].keys() == {"dir", "layout", "error"}:
                 objects[0] = {"dir": str(resolved), "layout": None, "error": None}
-            elif rank != 0:
+            else:
                 objects[0] = next(delivered)
+
+        def gather_object(obj, object_gather_list=None, dst=0, group=None):
+            calls.append(("gather", group, obj[0]))
+            if object_gather_list is not None:
+                object_gather_list[:] = [obj, obj]
 
         monkeypatch.setattr(mgr_mod.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(mgr_mod.dist, "get_rank", lambda group=None: rank)
         monkeypatch.setattr(mgr_mod.dist, "get_world_size", lambda group=None: 2)
         monkeypatch.setattr(mgr_mod.dist, "all_reduce", all_reduce)
         monkeypatch.setattr(mgr_mod.dist, "broadcast_object_list", broadcast_object_list)
+        monkeypatch.setattr(mgr_mod.dist, "gather_object", gather_object)
         manager._rank = rank
         manager._sync_group = "GLOO_GROUP"
         return calls

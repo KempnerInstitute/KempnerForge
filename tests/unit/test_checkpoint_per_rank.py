@@ -91,6 +91,17 @@ class _FakeScheduler:
         self.last_lr = state["last_lr"]
 
 
+def _mock_dcp_reads(monkeypatch) -> None:
+    """Mock out ``dcp.load`` and the reads of the DCP index before it, which a mocked save
+    never wrote."""
+    reader = MagicMock()
+    reader.read_metadata.return_value.state_dict_metadata = {"optimizer": None}
+    monkeypatch.setattr(
+        "kempnerforge.checkpoint.manager.dcp.FileSystemReader", MagicMock(return_value=reader)
+    )
+    monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+
+
 def _mock_mgr(tmp_path, monkeypatch, dp_info=None, **cfg_kwargs) -> CheckpointManager:
     """CheckpointManager with DCP calls mocked out (same seam as test_checkpoint)."""
     model = torch.nn.Linear(4, 4)
@@ -98,12 +109,7 @@ def _mock_mgr(tmp_path, monkeypatch, dp_info=None, **cfg_kwargs) -> CheckpointMa
     config = CheckpointConfig(dir=str(tmp_path), keep_last_n=5, **cfg_kwargs)
     mgr = CheckpointManager(config, model, opt, dp_info=dp_info)
     monkeypatch.setattr(mgr._async_ckpt, "save", MagicMock())
-    reader = MagicMock()
-    reader.read_metadata.return_value.state_dict_metadata = {"optimizer": None}
-    monkeypatch.setattr(
-        "kempnerforge.checkpoint.manager.dcp.FileSystemReader", MagicMock(return_value=reader)
-    )
-    monkeypatch.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+    _mock_dcp_reads(monkeypatch)
     return mgr
 
 
@@ -164,6 +170,16 @@ def _save_four_rank_ckpt(
     return events
 
 
+def _model_check_gather(world: int):
+    """A ``gather_object`` that hands rank 0 the calling rank's object as every rank's."""
+
+    def gather(obj, object_gather_list=None, dst=0, group=None):
+        if object_gather_list is not None:
+            object_gather_list[:] = [obj] * world
+
+    return gather
+
+
 def _install_fake_load_world(
     m, rank: int, layout: dict | None, ckpt_dir: Path, gathers: list, world: int = WORLD
 ):
@@ -173,7 +189,8 @@ def _install_fake_load_world(
     flag, then the train state rank 0 reads). The gather delivers every rank's current
     ``(global_rank, dp_coordinates)`` from ``layout`` and records what this
     rank contributed and on which group. The load's agreement reports no
-    failure on any other rank.
+    failure on any other rank. The model check hands rank 0 this rank's model as every
+    rank's, and its verdict delivers nothing to refuse.
     """
     m.setattr(mgr_mod.dist, "is_initialized", lambda: True)
     m.setattr(mgr_mod.dist, "get_rank", lambda group=None: rank)
@@ -182,7 +199,7 @@ def _install_fake_load_world(
     m.setattr(mgr_mod.dist, "all_reduce", lambda tensor, group=None: None)
     ts_path = ckpt_dir / "train_state.pt"
 
-    def fake_broadcast(obj_list, src=0):
+    def fake_broadcast(obj_list, src=0, group=None):
         if isinstance(obj_list[0], dict) and obj_list[0].keys() == {"dir", "layout", "error"}:
             obj_list[0] = {"dir": str(ckpt_dir), "layout": None, "error": None}
             return
@@ -198,6 +215,7 @@ def _install_fake_load_world(
 
     m.setattr(mgr_mod.dist, "broadcast_object_list", fake_broadcast)
     m.setattr(mgr_mod.dist, "all_gather_object", fake_all_gather)
+    m.setattr(mgr_mod.dist, "gather_object", _model_check_gather(world))
 
 
 def _load_in_layout(
@@ -1353,7 +1371,7 @@ class TestLoadsThatAreNotAResume:
             )
             with monkeypatch.context() as m:
                 _install_fake_load_world(m, r, layout, ckpt_dir, gathers, world=world)
-                m.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+                _mock_dcp_reads(m)
                 model = torch.nn.Linear(4, 4)
                 opt = torch.optim.SGD(model.parameters(), lr=0.1)
                 mgr = CheckpointManager(config.checkpoint, model, opt, dp_info=layout[r])
@@ -1379,10 +1397,17 @@ def _install_recording_world(
 
     Every broadcast, gather and all-reduce appends ``(rank, collective, the object it
     carries)`` to ``calls`` and changes nothing, except that rank 0's broadcast of the
-    checkpoint it resolved delivers ``resolved`` to the other ranks.
+    checkpoint it resolved delivers ``resolved`` to the other ranks. The model check's
+    gather records the index the rank reads and hands rank 0 this rank's model as every
+    rank's.
     """
+    model_check = _model_check_gather(world)
 
-    def broadcast(obj_list, src=0):
+    def gather_object(obj, object_gather_list=None, dst=0, group=None):
+        calls.append((rank, "gather_object", obj[0]))
+        model_check(obj, object_gather_list, dst, group)
+
+    def broadcast(obj_list, src=0, group=None):
         calls.append((rank, "broadcast", obj_list[0]))
         if (
             rank != 0
@@ -1396,6 +1421,7 @@ def _install_recording_world(
     m.setattr(mgr_mod.dist, "get_world_size", lambda group=None: world)
     m.setattr(mgr_mod.dist, "new_group", lambda backend=None: "GLOO_PG")
     m.setattr(mgr_mod.dist, "broadcast_object_list", broadcast)
+    m.setattr(mgr_mod.dist, "gather_object", gather_object)
     m.setattr(
         mgr_mod.dist,
         "all_gather_object",
@@ -1406,6 +1432,12 @@ def _install_recording_world(
         "all_reduce",
         lambda tensor, group=None: calls.append((rank, "all_reduce", None)),
     )
+
+
+def _model_check_calls(rank: int, ckpt_dir: Path) -> list[tuple]:
+    """The model check's collectives on ``rank``: the index it reads, gathered on rank 0,
+    and rank 0's verdict, which refuses nothing."""
+    return [(rank, "gather_object", str(ckpt_dir)), (rank, "broadcast", None)]
 
 
 def _per_rank_checkpoint(tmp_path, monkeypatch) -> Path:
@@ -1433,7 +1465,8 @@ class TestWeightsOnlyWarmStart:
     No rank restores loader or RNG state, its own entry or rank 0's copy, and no rank
     enters a collective of the train-state path (the existence and train-state broadcasts,
     the data-parallel layout gather), so the ranks cannot disagree on one; the only
-    collective is rank 0's broadcast of the checkpoint it resolved. Nothing is
+    collectives are rank 0's broadcast of the checkpoint it resolved and the model check,
+    which gathers each rank's model on rank 0 and broadcasts its verdict. Nothing is
     checked against the saved topology: the warm start begins a new run on any world size
     or layout without ``checkpoint.ignore_rank_state_mismatch``.
     """
@@ -1469,13 +1502,17 @@ class TestWeightsOnlyWarmStart:
             {"dir": str(ckpt_dir) if r == 0 else None, "layout": None, "error": None}
             for r in range(world)
         ]
-        assert calls == [(r, "broadcast", chosen[r]) for r in range(world)]
+        assert calls == [
+            call
+            for r in range(world)
+            for call in [(r, "broadcast", chosen[r]), *_model_check_calls(r, ckpt_dir)]
+        ]
 
     @TOPOLOGIES
     def test_training_entry_warm_start(self, tmp_path, monkeypatch, world, layout):
         """Through ``restore_checkpoint``, every rank's only collectives are the broadcast
-        of the resume path, which finds nothing to resume in the new run's directory, and
-        the load's broadcast of the checkpoint rank 0 resolved."""
+        of the resume path, which finds nothing to resume in the new run's directory, the
+        load's broadcast of the checkpoint rank 0 resolved, and the model check."""
         from kempnerforge.config.job import JobConfig
         from kempnerforge.training.entry import restore_checkpoint
 
@@ -1492,7 +1529,7 @@ class TestWeightsOnlyWarmStart:
             scheduler = _FakeScheduler(0.1)
             with monkeypatch.context() as m:
                 _install_recording_world(m, r, world, calls, resolved=ckpt_dir)
-                m.setattr("kempnerforge.checkpoint.manager.dcp.load", MagicMock())
+                _mock_dcp_reads(m)
                 model = torch.nn.Linear(4, 4)
                 opt = torch.optim.SGD(model.parameters(), lr=0.1)
                 mgr = CheckpointManager(config.checkpoint, model, opt, dp_info=layout[r])
@@ -1506,8 +1543,15 @@ class TestWeightsOnlyWarmStart:
             {"dir": str(ckpt_dir) if r == 0 else None, "layout": None, "error": None}
             for r in range(world)
         ]
-        expected = [[(r, "broadcast", nothing), (r, "broadcast", chosen[r])] for r in range(world)]
-        assert calls == [call for pair in expected for call in pair]
+        expected = [
+            [
+                (r, "broadcast", nothing),
+                (r, "broadcast", chosen[r]),
+                *_model_check_calls(r, ckpt_dir),
+            ]
+            for r in range(world)
+        ]
+        assert calls == [call for calls_of_rank in expected for call in calls_of_rank]
 
     def test_an_exact_resume_that_skips_it_is_refused_before_any_collective(
         self, tmp_path, monkeypatch
