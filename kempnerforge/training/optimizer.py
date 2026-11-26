@@ -420,7 +420,8 @@ class Muon(torch.optim.Optimizer):
         adam_params: Parameter groups for AdamW fallback (every other parameter).
         lr: Learning rate for Muon.
         momentum: Momentum coefficient (default 0.95).
-        weight_decay: Decoupled weight decay.
+        weight_decay: Decoupled weight decay of every param group, Muon's or the AdamW
+            fallback's, that sets no ``weight_decay`` of its own.
         adam_betas: Betas for the AdamW fallback.
         adam_eps: Epsilon for the AdamW fallback.
         ns_steps: Newton-Schulz iteration steps (default 5).
@@ -472,6 +473,7 @@ class Muon(torch.optim.Optimizer):
                 lr=adam_lr,
                 betas=adam_betas,
                 eps=adam_eps,
+                weight_decay=weight_decay,
                 fused=torch.cuda.is_available(),
             )
             if any(len(g["params"]) > 0 for g in adam_params)

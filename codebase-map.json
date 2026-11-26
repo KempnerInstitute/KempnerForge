@@ -1951,11 +1951,11 @@
       "tests/unit/test_optimizer.py": {
         "classes": [
           "TestNewtonSchulz(5)",
-          "TestMuon(31)",
+          "TestMuon(33)",
           "TestMuonRouting(6)",
           "TestAdamW(2)"
         ],
-        "count": 44
+        "count": 46
       },
       "tests/unit/test_eval.py": {
         "classes": [
