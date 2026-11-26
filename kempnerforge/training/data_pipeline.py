@@ -257,7 +257,7 @@ def _build_mixture_pipeline(
         else:
             continue
         sub_datasets.append(ds)
-        names.append(src.name or src.path or src.hf_name)
+        names.append(src.mixture_name)
         weights.append(src.weight)
 
     mixture_dataset = MixtureDataset(sub_datasets, names)

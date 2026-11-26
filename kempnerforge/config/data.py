@@ -24,6 +24,7 @@ class DatasetSource:
     Either ``path`` (pre-tokenized) or ``hf_name`` (HuggingFace) must be set.
     ``weight`` controls the relative sampling probability. ``token_dtype``
     overrides ``data.token_dtype`` for the ``.bin`` shards under ``path``.
+    The mixture knows the source by ``mixture_name``.
     """
 
     path: str = ""
@@ -38,14 +39,24 @@ class DatasetSource:
             raise ValueError(f"Dataset weight must be positive, got {self.weight}")
         check_token_dtype(self.token_dtype, "[[data.datasets]] token_dtype")
 
+    @property
+    def mixture_name(self) -> str:
+        """The name the mixture gives this source: ``name``, else ``path``, else ``hf_name``.
+
+        Its per-source metrics carry it, and a key of a phase's ``dataset_weights`` or of
+        ``anneal_weights`` must equal it to reweight the source.
+        """
+        return self.name or self.path or self.hf_name
+
 
 @dataclass
 class TrainingPhase:
     """A training phase with custom dataset weights and LR scaling.
 
     From ``start_step``, the learning rate is multiplied by ``lr_scale`` on any run, and
-    the sampler of a ``[[data.datasets]]`` mixture switches to ``dataset_weights``, which
-    ``JobConfig.validate`` refuses on a run that builds no mixture.
+    the sampler of a ``[[data.datasets]]`` mixture switches to ``dataset_weights``, keyed by
+    ``DatasetSource.mixture_name``. ``JobConfig.validate`` refuses the weights on a run that
+    builds no mixture, and a key that names no source.
     """
 
     start_step: int = 0
@@ -137,3 +148,21 @@ class DataConfig:
         if self.anneal_start_step > 0 and self.anneal_weights:
             fields.append("data.anneal_start_step and data.anneal_weights")
         return fields
+
+    def unknown_mixture_weight_keys(self) -> dict[str, list[str]]:
+        """The keys of each setting ``mixture_weight_fields`` lists that name no source.
+
+        Maps ``data.phases[i].dataset_weights``, and ``data.anneal_weights`` when
+        ``anneal_start_step`` makes it a phase, to its sorted keys that match no
+        ``DatasetSource.mixture_name`` in ``datasets``. A setting whose keys all match is left
+        out, so the result is empty when every key names a source.
+        """
+        names = {source.mixture_name for source in self.datasets}
+        settings = {
+            f"data.phases[{i}].dataset_weights": phase.dataset_weights
+            for i, phase in enumerate(self.phases)
+        }
+        if self.anneal_start_step > 0:
+            settings["data.anneal_weights"] = self.anneal_weights
+        unknown = {field: sorted(set(weights) - names) for field, weights in settings.items()}
+        return {field: keys for field, keys in unknown.items() if keys}

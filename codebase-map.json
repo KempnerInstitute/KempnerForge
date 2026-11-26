@@ -113,7 +113,10 @@
     "kempnerforge/config/data.py": {
       "classes": {
         "DatasetSource": {
-          "purpose": "Single data source in a multi-dataset mixture (path or HF, weight, name)"
+          "purpose": "Single data source in a multi-dataset mixture (path or HF, weight, name)",
+          "methods": [
+            "mixture_name (property) -> str (name, else path, else hf_name: the name the mixture, its metrics and the phase weight keys use)"
+          ]
         },
         "TrainingPhase": {
           "purpose": "Step-triggered phase with dataset weight overrides and LR scaling for data annealing"
@@ -121,7 +124,8 @@
         "DataConfig": {
           "purpose": "Data pipeline (dataset_path, HF dataset, tokenizer, packing, mixing, phases, annealing)",
           "methods": [
-            "mixture_weight_fields() -> list[str] (the phase and anneal settings that reweight a mixture, which JobConfig.validate refuses on a run without one)"
+            "mixture_weight_fields() -> list[str] (the phase and anneal settings that reweight a mixture, which JobConfig.validate refuses on a run without one)",
+            "unknown_mixture_weight_keys() -> dict[str, list[str]] (per weight setting, its keys that name no source; JobConfig.validate refuses them)"
           ]
         }
       }
@@ -199,6 +203,8 @@
         "tests/unit/test_annealing.py::TestTrainingPhase",
         "tests/unit/test_annealing.py::TestDataConfigPhases",
         "tests/unit/test_annealing.py::TestMixtureWeightsNeedAMixture",
+        "tests/unit/test_annealing.py::TestMixtureWeightsNameSources",
+        "tests/unit/test_annealing.py::TestVlmRunsBuildNoMixture",
         "tests/unit/test_fp8.py::TestFP8Config",
         "tests/unit/test_vision_config.py::TestHFEncoderPath",
         "tests/unit/test_video_config.py::TestJobConfigVideoWiring"
@@ -2074,9 +2080,11 @@
           "TestUpdateWeights(4)",
           "TestPhaseTransitionLogic(5)",
           "TestAnnealingShortcut(4)",
-          "TestMixtureWeightsNeedAMixture(7)"
+          "TestMixtureWeightsNeedAMixture(8)",
+          "TestMixtureWeightsNameSources(6)",
+          "TestVlmRunsBuildNoMixture(4)"
         ],
-        "count": 39
+        "count": 50
       },
       "tests/unit/test_hooks.py": {
         "classes": [

@@ -186,11 +186,11 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `hf_max_images` | `int` | `1` | VLM only: images a document may hold; rows holding more are skipped when the dataset is loaded, and one warning counts them. `n ≥ 2` places a document's images' tokens before its text and, without packing, lays each document out on its own row of `train.seq_len` (Joint-Decoder only, not with `train.mixed_precision = "fp8"` or, under `attention_backend = "sdpa"`, `model.sdpa_backend = "flash"`) |
 | `hf_streaming` | `bool` | `False` | use `IterableDataset` for large corpora |
 | `pack_sequences` | `bool` | `False` | document-aware packing with cross-doc isolation (feeds `doc_ids` to attention); on a Joint-Decoder VLM run, packs `train.batch_size` image-text documents per micro-batch into rows of `train.seq_len`, each document's image tokens before its text, positions restarting per document |
-| `datasets` | `list[DatasetSource]` | `[]` | multi-dataset mixture (overrides `dataset_path`/`hf_dataset_name` when non-empty) |
+| `datasets` | `list[DatasetSource]` | `[]` | multi-dataset mixture of a text run (overrides `dataset_path`/`hf_dataset_name` when non-empty); refused on a VLM run |
 | `mix_temperature` | `float` | `1.0` | weight scaling; `1.0` → as-is, larger → more uniform |
 | `phases` | `list[TrainingPhase]` | `[]` | multi-phase schedule: LR scaling on any run, weight transitions on a `datasets` mixture |
 | `anneal_start_step` | `int` | `0` | syntactic sugar for a common 2-phase annealing pattern of a `datasets` mixture (`0` = disabled) |
-| `anneal_weights` | `dict[str, float]` | `{}` | per-dataset weights applied at `anneal_start_step` |
+| `anneal_weights` | `dict[str, float]` | `{}` | per-dataset weights applied at `anneal_start_step`, keyed by source name |
 
 A `[video]` run builds its dataset from `[video]`, so every `hf_*` field keeps
 its default there; see
@@ -202,7 +202,7 @@ its default there; see
 |-------|------|---------|---------|
 | `path` | `str` | `""` | pre-tokenized directory |
 | `weight` | `float` | `1.0` | relative sampling weight (must be `> 0`) |
-| `name` | `str` | `""` | name for per-dataset metrics (auto-derived if empty) |
+| `name` | `str` | `""` | name for per-dataset metrics and phase weights; if empty, the source goes by its `path`, else its `hf_name` |
 | `hf_name` | `str` | `""` | HF dataset id |
 | `hf_config` | `str` | `""` | HF dataset config |
 | `token_dtype` | `str` | `""` | dtype of this source's `.bin` shards; `""` uses `data.token_dtype` |
@@ -214,14 +214,15 @@ Either `path` or `hf_name` must be set per source.
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
 | `start_step` | `int` | `0` | step at which the phase activates |
-| `dataset_weights` | `dict[str, float]` | `{}` | per-dataset weights for this phase; needs a `datasets` mixture |
+| `dataset_weights` | `dict[str, float]` | `{}` | per-dataset weights for this phase, keyed by source name; needs a `datasets` mixture |
 | `lr_scale` | `float` | `1.0` | multiplier applied to scheduler LR, with or without a mixture |
 
 `phases[*].start_step` must be strictly increasing; `phases` and
 `anneal_start_step` are mutually exclusive. A run without a `datasets`
 mixture, on one source or a VLM run, takes neither a phase's
-`dataset_weights` nor the annealing shortcut; see
-[Validation rules](validation-rules.md#mixture-weights-without-a-mixture).
+`dataset_weights` nor the annealing shortcut, and a VLM run takes no
+`datasets` either; every key of the weights must name a source. See
+[Validation rules](validation-rules.md#a-mixture-on-a-vlm-run).
 
 ## `[eval]`: `EvalConfig`
 
