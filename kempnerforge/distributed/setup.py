@@ -113,15 +113,24 @@ def _barrier_with_timeout(seconds: float, reason: str) -> None:
         raise RuntimeError(f"Barrier timed out after {seconds}s during {reason}.")
 
 
-def _set_seed(seed: int, rank: int, pp_rank: int = 0) -> None:
-    """Set deterministic seeds for reproducibility.
+def _set_seed(seed: int, pp_rank: int = 0) -> None:
+    """Seed the run's random number generators with ``seed + pp_rank``.
 
-    - Same seed across data-parallel replicas (for consistent dropout)
+    - Same seed across data-parallel replicas (for consistent dropout): the
+      global rank does not enter it
     - Different seed across pipeline stages (for stochastic depth variation)
     - Covers torch (CPU + all visible CUDA devices), Python's random, and
-      NumPy's legacy global RNG — matches the four generators captured by
-      ``checkpoint.state.get_rng_state`` so cold start and warm resume
+      NumPy's legacy global RNG, the four generators captured by
+      ``checkpoint.state.get_rng_state``, so cold start and warm resume
       seed the same set of generators.
+
+    Seeding makes the random draws repeat, not the arithmetic. On GPU some
+    kernels are nondeterministic, such as reductions that accumulate with
+    atomic adds, so two runs from the same seed can differ from the first step,
+    and the difference can grow over training. Bitwise repeatable GPU runs need
+    deterministic algorithms (``torch.use_deterministic_algorithms(True)``, with
+    ``CUBLAS_WORKSPACE_CONFIG`` set for cuBLAS), which cost speed and which
+    nothing in KempnerForge turns on.
     """
     effective_seed = seed + pp_rank
     torch.manual_seed(effective_seed)
@@ -166,11 +175,11 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
     Returns:
         DeviceMesh if world_size > 1, None for single-GPU.
     """
-    rank, local_rank, world_size = get_world_info()
+    _, local_rank, world_size = get_world_info()
 
     if world_size == 1:
         torch.cuda.set_device(0)
-        _set_seed(seed, rank=0)
+        _set_seed(seed)
         return None
 
     _set_nccl_env()
@@ -262,7 +271,7 @@ def init_distributed(config: DistributedConfig, seed: int = 42) -> DeviceMesh | 
     pp_rank = 0
     if "pp" in device_mesh.mesh_dim_names:  # type: ignore[reportOperatorIssue]
         pp_rank = device_mesh["pp"].get_local_rank()
-    _set_seed(seed, rank=rank, pp_rank=pp_rank)
+    _set_seed(seed, pp_rank=pp_rank)
 
     return device_mesh
 

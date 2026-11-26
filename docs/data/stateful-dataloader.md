@@ -94,9 +94,13 @@ It also keeps the dataset length and `batches_yielded`, the position in
 whole batches of this loader's size, for versions that predate the
 position: this rank's batches in the epoch in a run that never changed
 size, and the position divided by the global batch, rounded down, after a
-resize.
+resize. And it keeps `base_seed_rng_state`, the CPU generator state the
+loader's iterator drew its workers' base seed from (see
+[Worker RNG](#worker-rng)).
 
-`load_state_dict` restores the epoch and the sampler state and records
+`load_state_dict` first closes the loader, so workers started before the
+load stop and the next `__iter__` starts new ones from the loaded state.
+It restores the epoch and the sampler state and records
 the position, which the next `__iter__` applies. It logs a warning when
 the shuffle seed or the dataset length differs from the checkpoint's,
 since the position counts samples of the saved order. A checkpoint
@@ -167,7 +171,7 @@ ckpt_mgr.save(
 ```
 
 An emergency checkpoint taken mid-epoch on 64 data-parallel ranks records
-e.g. `{'epoch': 7, 'batch_size': 4, 'dataset_length': 1000000, 'global_position': 3584, 'batches_yielded': 14, 'sampler': {...}}`,
+e.g. `{'epoch': 7, 'batch_size': 4, 'dataset_length': 1000000, 'global_position': 3584, 'batches_yielded': 14, 'sampler': {...}, 'base_seed_rng_state': b'...'}`,
 and `__iter__` re-applies the position on resume, so training picks up at
 the same sample rather than at batch 0. See
 [Checkpointing § Train state](../checkpointing/train-state.md#dataloader-state).
@@ -261,15 +265,53 @@ filter.
 
 ## Worker RNG
 
-PyTorch's `DataLoader` seeds worker RNGs deterministically from the
-parent process RNG at worker init. Because
-[Checkpointing § Train state](../checkpointing/train-state.md#rng-capture)
-snapshots all four parent-process generators, workers see the same
-seeds after resume — as long as `num_workers` doesn't change.
+PyTorch's `DataLoader` seeds worker `k` with `base_seed + k`, and draws
+`base_seed` from the parent process's CPU generator each time it starts
+an iterator: at every pass with `num_workers = 0`, and with persistent
+workers at the first pass and the first after `close()`. Any other pass
+resets the running iterator, which keeps its base seed. Both loaders
+record the CPU generator state each new iterator drew its base seed
+from, and save it as `base_seed_rng_state`. After `load_state_dict`,
+the next iterator draws its base seed from the saved state through a
+generator of its own, so a resume neither draws from the CPU generator
+where the uninterrupted run did not nor gives its workers other seeds.
+With the CPU generator restored too
+([Checkpointing § Train state](../checkpointing/train-state.md#rng-capture)),
+the resumed run continues it as the uninterrupted run does. The
+exception is a position that starts the next pass of a loader without
+persistent workers: the uninterrupted run starts a new iterator there,
+drawing a new base seed, and the resume does the same.
 
-Changing `num_workers` across a resume means different worker seeds
-and different downstream shuffling, even though the sampler state is
-restored. Keep the count stable through a run.
+`close()` keeps the saved state, so the training loop's final
+checkpoint, written after it closes the loader, resumes as a run that
+never closed. The next `iter()` in the same process starts new workers
+with a base seed drawn from the CPU generator, as any start of workers
+does.
+
+When a data phase changes a mixture's weights, the training loop resets
+its stream (`BatchStream.reset()`), and the next step starts the pass
+again at the same position. The reset calls the loader's `restart()`,
+which records that restart, so a checkpoint saved before that step
+resumes as the step goes on. Without persistent workers the step's new
+iterator draws a new base seed, after one for the empty rest of an epoch
+whose last batch was already read; with them, the workers keep their
+seeds.
+
+What a resume does not reproduce:
+
+- A worker's position in its own random streams. A resumed worker
+  starts from its seed, while a persistent worker of the uninterrupted
+  run has already drawn for the samples it loaded, and the resumed
+  iterator hands batches to its workers in turn from its first batch
+  on. A dataset that draws random numbers in its workers, such as a
+  random augmentation, draws differently after a resume.
+- A run that changes `num_workers`: the count decides when a pass draws
+  a new base seed and how many workers take one, so neither the CPU
+  generator nor the workers' seeds follow the uninterrupted run. Keep
+  the count stable through a run.
+- A checkpoint saved before `base_seed_rng_state` was recorded. Its
+  resume draws a new base seed from the CPU generator, and the load
+  warns where the uninterrupted run would have drawn none.
 
 ## Shutting the workers down
 

@@ -96,9 +96,15 @@ class BatchStream:
         """Drop the iterator so the next step takes a fresh one from the loader.
 
         A ``StatefulDataLoader`` re-applies its recorded skip, so this picks up
-        inside the current epoch rather than restarting it.
+        inside the current epoch rather than restarting it. A loader with a
+        ``restart()``, as ``StatefulDataLoader`` and ``StreamingDataLoader``
+        have, is told, so a checkpoint saved before the next step records what
+        the iterator that step starts draws.
         """
         self._iter = None
+        restart = getattr(self.pipeline.dataloader, "restart", None)
+        if restart is not None:
+            restart()
 
     def close(self) -> None:
         """Drop the live iterator and shut the loader's worker processes down.

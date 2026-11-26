@@ -7,6 +7,7 @@ Wraps PyTorch DataLoader with:
   - A resume position that survives a change of data-parallel size or batch size
   - A streaming loader that resumes by replaying its stream to the saved position
   - Worker shutdown through the loader's sentinel path, from ``close()`` and at exit
+  - A resume that continues the CPU RNG and the workers' seeds of the run that saved it
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import logging
 import os
 import time
 import weakref
-from collections.abc import Callable, Sized
+from collections.abc import Callable, Iterator, Sized
 from multiprocessing.util import Finalize
 from typing import Any
 
@@ -35,6 +36,8 @@ logger = logging.getLogger(__name__)
 _SHUTDOWN_WAIT_S = 5.0
 
 _EXIT_FINALIZER_PRIORITY = 100
+
+_BASE_SEED_KEY = "base_seed_rng_state"
 
 _loaders_with_workers: weakref.WeakKeyDictionary[StatefulDataLoader | StreamingDataLoader, int] = (
     weakref.WeakKeyDictionary()
@@ -122,6 +125,79 @@ def _close_open_loaders() -> None:
             loader.close()
 
 
+class _BaseSeed:
+    """The CPU RNG state a loader's iterator drew its base seed from, for a resume to reuse.
+
+    torch draws the base seed of a ``DataLoader`` iterator from the CPU RNG each
+    time it starts one, and worker ``k`` takes ``base_seed + k``. It starts one at
+    every ``iter()`` of a loader without persistent workers, and at the first
+    ``iter()`` of a loader with them and the first after ``shutdown_workers``;
+    any other ``iter()`` resets the running iterator, which keeps its base seed.
+    ``state`` is the CPU RNG state, as bytes, that the loader's iterator drew its
+    base seed from, None when the next ``iter()`` draws a new one from the CPU
+    RNG. ``saved`` is what a checkpoint keeps: ``state``, or None while a
+    ``restart`` whose next iterator draws a new base seed is pending. After
+    ``load``, the next iterator draws its base seed from the loaded state
+    through a generator of its own, leaving the CPU RNG untouched.
+    """
+
+    def __init__(self) -> None:
+        self.state: bytes | None = None
+        self._loaded = False
+        self._restart_draws = False
+
+    @property
+    def saved(self) -> bytes | None:
+        """The state a resume's first iterator draws its base seed from; None draws anew."""
+        return None if self._restart_draws else self.state
+
+    def iterate(self, loader: DataLoader) -> Iterator[Any]:
+        """Return ``iter(loader)``, recording the CPU RNG state a new iterator draws from."""
+        reuse = self._loaded and not self._restart_draws
+        self._loaded = self._restart_draws = False
+        if loader._iterator is not None:
+            return iter(loader)
+        if not reuse or self.state is None:
+            self.state = torch.random.get_rng_state().numpy().tobytes()
+            return iter(loader)
+        generator = torch.Generator()
+        generator.set_state(torch.frombuffer(bytearray(self.state), dtype=torch.uint8))
+        loader.generator = generator
+        try:
+            return iter(loader)
+        finally:
+            loader.generator = None
+
+    def end_pass(self, loader: DataLoader) -> None:
+        """Note a pass's end, which ends a pending restart of it.
+
+        The state goes where the next pass starts a new iterator, that is
+        without persistent workers.
+        """
+        self._restart_draws = False
+        if not loader.persistent_workers:
+            self.state = None
+
+    def restart(self, draws: bool) -> None:
+        """Record that the next ``iter()`` starts the pass again, drawing if ``draws``."""
+        self._restart_draws = draws
+
+    def load(self, state: bytes | None) -> None:
+        """Have the next iterator draw its base seed from ``state``, or the CPU RNG if None."""
+        self.state = state
+        self._loaded = True
+        self._restart_draws = False
+
+
+def _warn_new_base_seed() -> None:
+    """Warn that a resume from a position saved without the base seed state draws a new one."""
+    logger.warning(
+        "This checkpoint predates the saved base seed of the data loader's iterator, so the "
+        "resumed iterator draws a new one from the CPU RNG: the workers' seeds and the CPU RNG "
+        "from here on differ from those of the run that saved it"
+    )
+
+
 class DataPositionError(ValueError):
     """A saved data position that this loader cannot resume from.
 
@@ -168,6 +244,11 @@ class StatefulDataLoader:
     The worker processes ignore SIGTERM, so ``close()`` shuts them down, and
     a process does so at exit for every loader whose workers are still alive.
 
+    The state also holds the CPU RNG state the loader's iterator drew its
+    workers' base seed from. A resumed loader draws its base seed from it
+    rather than from the CPU RNG, so the CPU RNG and the workers' seeds go on
+    as in the run that saved it, with the same ``num_workers``.
+
     Args:
         dataset: Dataset to load from.
         batch_size: Per-device micro-batch size.
@@ -210,6 +291,7 @@ class StatefulDataLoader:
         self._batches_yielded = 0
         self._start = 0
         self._iterator = None
+        self._base_seed = _BaseSeed()
 
         logger.info(
             f"StatefulDataLoader: batch_size={batch_size}, "
@@ -234,7 +316,7 @@ class StatefulDataLoader:
             self.sampler.set_position(consumed)
         elif consumed > 0:
             self.sampler.set_skip(consumed)
-        self._iterator = iter(self._dataloader)
+        self._iterator = self._base_seed.iterate(self._dataloader)
         if self._dataloader.num_workers > 0:
             _close_at_exit(self)
         return self
@@ -252,6 +334,7 @@ class StatefulDataLoader:
             self._batches_yielded = 0
             self._start = 0
             self._iterator = None
+            self._base_seed.end_pass(self._dataloader)
             raise
 
     def close(self) -> None:
@@ -261,13 +344,26 @@ class StatefulDataLoader:
         ``shutdown_workers`` stops them through the loader's sentinel path. The
         ``state_dict`` is unchanged, ``next`` raises ``StopIteration`` until the
         next ``iter()``, and that ``iter()`` starts new workers at the same
-        position. Rank-local and idempotent, with no collective. A process calls
-        it at exit for every loader whose workers are still alive, before
+        position, with a base seed it draws from the CPU RNG; a resume from the
+        unchanged state draws the closed iterator's instead, as a run that never
+        closed keeps it. Rank-local and idempotent, with no collective. A process
+        calls it at exit for every loader whose workers are still alive, before
         ``multiprocessing`` stops its workers.
         """
         self._iterator = None
         shutdown_workers(self._dataloader)
         _loaders_with_workers.pop(self, None)
+
+    def restart(self) -> None:
+        """Record that the next ``iter()`` starts again at the same position.
+
+        ``BatchStream.reset`` calls it when a data phase changes the sampler's
+        weights; the live iterator runs on until that ``iter()``. Without
+        persistent workers, that ``iter()`` starts a new iterator, which draws a
+        new base seed from the CPU RNG, so ``state_dict`` saves none until then;
+        persistent workers keep theirs. Rank-local, with no collective.
+        """
+        self._base_seed.restart(draws=not self._dataloader.persistent_workers)
 
     def __len__(self) -> int:
         return len(self._dataloader)
@@ -276,14 +372,17 @@ class StatefulDataLoader:
         """Return checkpoint state.
 
         Keys: ``epoch``, ``batch_size``, ``dataset_length``, ``sampler`` (which
-        holds the shuffle seed), the position, and ``batches_yielded``. The
-        position is ``global_position``, the samples all ranks consumed this
-        epoch, for a ``DistributedSampler``, and ``samples_consumed``, this rank's
-        samples, for any other sampler. ``batches_yielded`` is the position in
-        whole batches of this loader's size, for versions that predate the
-        position: the batches this rank took this epoch in a run that never
-        changed size, and the position divided by the global batch, rounded down,
-        after a resize.
+        holds the shuffle seed), the position, ``batches_yielded`` and
+        ``base_seed_rng_state``. The position is ``global_position``, the samples
+        all ranks consumed this epoch, for a ``DistributedSampler``, and
+        ``samples_consumed``, this rank's samples, for any other sampler.
+        ``batches_yielded`` is the position in whole batches of this loader's
+        size, for versions that predate the position: the batches this rank took
+        this epoch in a run that never changed size, and the position divided by
+        the global batch, rounded down, after a resize. ``base_seed_rng_state`` is
+        the CPU RNG state, as bytes, that the loader's iterator drew its workers'
+        base seed from, None when the next ``iter()`` draws a new one from the CPU
+        RNG; ``close()`` keeps it.
         """
         consumed = self._consumed()
         state: dict = {
@@ -291,6 +390,7 @@ class StatefulDataLoader:
             "batch_size": self.batch_size,
             "dataset_length": len(self.dataset) if isinstance(self.dataset, Sized) else None,
             "sampler": self.sampler.state_dict(),
+            _BASE_SEED_KEY: self._base_seed.saved,
         }
         if isinstance(self.sampler, DistributedSampler):
             state["global_position"] = consumed
@@ -309,9 +409,21 @@ class StatefulDataLoader:
         size counts batches, so it resumes as before, only on the saved
         data-parallel size and exact only at the saved batch size, which it does
         not record. A position with no full batch left in its epoch starts the
-        next epoch. A changed shuffle seed or dataset length is logged, since the
-        position counts samples of the saved order. ``__iter__`` applies the
-        position, so a later ``iter()`` in the same epoch stays aligned.
+        next epoch, except one saved while a ``restart`` of a loader without
+        persistent workers was pending: the saving run's next ``iter()`` starts an
+        empty pass at that position before the next epoch, so the resume keeps
+        the position and does the same. A changed shuffle seed or dataset length
+        is logged, since the position counts samples of the saved order.
+        ``__iter__`` applies the position, so a later ``iter()`` in the same epoch
+        stays aligned.
+
+        The loader first closes, so workers started before the load stop and the
+        next ``iter()`` starts new ones. That iterator draws its base seed from the
+        saved ``base_seed_rng_state`` rather than from the CPU RNG, unless the
+        position starts the next epoch on a loader without persistent workers,
+        where the saving run starts a new iterator and draws one too. A state
+        saved without ``base_seed_rng_state`` draws a new base seed, with a
+        warning when the saving run would have drawn none there.
 
         Raises:
             DataPositionError: The data-parallel size changed and the saved
@@ -319,6 +431,7 @@ class StatefulDataLoader:
                 batch size), or the state is a streaming position.
         """
         self.check_state(state)
+        self.close()
         sampler_state = state.get("sampler", {})
         replicas = self.sampler.num_replicas
         saved_replicas = sampler_state.get("num_replicas", replicas)
@@ -344,10 +457,14 @@ class StatefulDataLoader:
         self._batches_yielded = 0
         self._start = start
         sampler = self.sampler
+        persistent = self._dataloader.persistent_workers
+        saved_seed = state.get(_BASE_SEED_KEY)
+        restart_pending = _BASE_SEED_KEY in state and saved_seed is None and not persistent
         if (
             isinstance(sampler, DistributedSampler)
             and start > 0
             and sampler.samples_after(start) < self.batch_size
+            and not restart_pending
         ):
             logger.info(
                 f"Saved data position {start} leaves no full batch in epoch {epoch} on "
@@ -355,6 +472,10 @@ class StatefulDataLoader:
             )
             self._epoch = epoch + 1
             self._start = 0
+        new_iterator = self._epoch != epoch and not persistent
+        self._base_seed.load(None if new_iterator else saved_seed)
+        if _BASE_SEED_KEY not in state and not new_iterator and (epoch > 0 or start > 0):
+            _warn_new_base_seed()
         batch_changed = saved_batch is not None and saved_batch != self.batch_size
         if saved_replicas != replicas or batch_changed:
             logger.warning(
@@ -471,6 +592,10 @@ class StreamingDataLoader:
     repeat data. Either one warns, with a record every rank's log shows, since
     rank 0 holds its own position and stays silent.
 
+    As ``StatefulDataLoader``, the position carries the CPU RNG state the
+    loader's iterator drew its workers' base seed from, and a resumed loader
+    draws its base seed from it.
+
     Args:
         dataset: The streaming dataset.
         batch_size: Per-device micro-batch size.
@@ -499,6 +624,7 @@ class StreamingDataLoader:
         self._epoch = 0
         self._batches_yielded = 0
         self._iterator = None
+        self._base_seed = _BaseSeed()
 
     def _identity(self) -> dict:
         return {
@@ -511,7 +637,7 @@ class StreamingDataLoader:
         if self._iterator is not None and self._num_workers > 0:
             self._restart_workers()
         self.dataset.set_epoch(self._epoch)
-        self._iterator = iter(self._dataloader)
+        self._iterator = self._base_seed.iterate(self._dataloader)
         if self._num_workers > 0:
             _close_at_exit(self)
         if self._batches_yielded:
@@ -524,6 +650,8 @@ class StreamingDataLoader:
         A worker keeps its own copy of the dataset, and one that already finished
         its part of the pass has moved that copy to the next epoch, so it would
         read the next epoch's shuffle. New workers copy the dataset at this epoch.
+        The rebuilt loader's first iterator draws a new base seed, which the
+        loader records as it records any new iterator's.
         """
         shutdown_workers(self._dataloader)
         self._dataloader = DataLoader(self.dataset, **self._loader_kwargs)
@@ -538,6 +666,17 @@ class StreamingDataLoader:
         self._iterator = None
         shutdown_workers(self._dataloader)
         _loaders_with_workers.pop(self, None)
+
+    def restart(self) -> None:
+        """Record that the next ``iter()`` replays the pass to the same position.
+
+        As ``StatefulDataLoader.restart``. That ``iter()`` restarts the workers of
+        a pass in progress, or starts a new iterator without workers, and either
+        draws a new base seed from the CPU RNG, so ``state_dict`` saves none
+        until then.
+        """
+        draws = self._iterator is not None or not self._dataloader.persistent_workers
+        self._base_seed.restart(draws=draws)
 
     def _replay(self) -> None:
         """Discard the batches this epoch already gave training, logging progress."""
@@ -562,8 +701,9 @@ class StreamingDataLoader:
                 )
                 self._epoch += 1
                 self._batches_yielded = 0
+                self._base_seed.end_pass(self._dataloader)
                 self.dataset.set_epoch(self._epoch)
-                self._iterator = iter(self._dataloader)
+                self._iterator = self._base_seed.iterate(self._dataloader)
                 return
             if replayed % every == 0:
                 rate = replayed / max(time.monotonic() - started, 1e-9)
@@ -582,6 +722,7 @@ class StreamingDataLoader:
             self._epoch += 1
             self._batches_yielded = 0
             self._iterator = None
+            self._base_seed.end_pass(self._dataloader)
             raise
         self._batches_yielded += 1
         return batch
@@ -589,14 +730,16 @@ class StreamingDataLoader:
     def state_dict(self) -> dict:
         """Return checkpoint state.
 
-        Keys: ``epoch``, ``batches_yielded``, the ``stream`` it counts and the
-        ``data_parallel_rank`` that saved it.
+        Keys: ``epoch``, ``batches_yielded``, the ``stream`` it counts, the
+        ``data_parallel_rank`` that saved it and ``base_seed_rng_state``, as
+        ``StatefulDataLoader.state_dict`` saves it.
         """
         return {
             "epoch": self._epoch,
             "batches_yielded": self._batches_yielded,
             "stream": self._identity(),
             "data_parallel_rank": self.dataset.rank,
+            _BASE_SEED_KEY: self._base_seed.saved,
         }
 
     def check_state(self, state: dict) -> None:
@@ -628,13 +771,23 @@ class StreamingDataLoader:
     def load_state_dict(self, state: dict) -> None:
         """Restore the position; the next ``iter()`` replays the stream to it.
 
+        The loader first closes, so workers started before the load stop, and the
+        next ``iter()`` starts new ones, drawing their base seed from the saved
+        ``base_seed_rng_state`` rather than from the CPU RNG. A state saved
+        without it draws a new base seed, with a warning when the stream had
+        started.
+
         Raises:
             DataPositionError: The state is a map-style position, or something
                 that changes the stream differs from when it was saved.
         """
         self.check_state(state)
+        self.close()
         self._epoch = state.get("epoch", 0)
         self._batches_yielded = state.get("batches_yielded", 0)
+        self._base_seed.load(state.get(_BASE_SEED_KEY))
+        if _BASE_SEED_KEY not in state and (self._epoch > 0 or self._batches_yielded > 0):
+            _warn_new_base_seed()
         saved_rank = state.get("data_parallel_rank")
         if self._epoch > 0 and self.dataset.world_size > 1 and saved_rank != self.dataset.rank:
             whose = (

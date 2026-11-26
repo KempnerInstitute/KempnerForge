@@ -319,7 +319,7 @@ class TestGroupTimeouts:
         monkeypatch.setattr(setup.torch.cuda, "set_device", lambda device: None)
         monkeypatch.setattr(setup, "init_device_mesh", fake_init_device_mesh)
         monkeypatch.setattr(setup, "_barrier_with_timeout", lambda seconds, reason: None)
-        monkeypatch.setattr(setup, "_set_seed", lambda seed, rank, pp_rank=0: None)
+        monkeypatch.setattr(setup, "_set_seed", lambda seed, pp_rank=0: None)
         monkeypatch.setenv("MASTER_ADDR", "localhost")
         monkeypatch.setenv("MASTER_PORT", "29500")
 

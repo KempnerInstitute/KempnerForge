@@ -527,6 +527,208 @@ def test_close_stops_the_workers_and_keeps_the_stream_position(corpus):
         assert torch.equal(want, have)
 
 
+def _base_seed(loader: StreamingDataLoader) -> int:
+    """The base seed of the loader's iterator; worker ``k`` takes ``base_seed + k``."""
+    iterator = loader._dataloader._iterator if loader._num_workers else loader._iterator
+    assert iterator is not None
+    return iterator._base_seed
+
+
+def _resume_parity(loader, resumed, saved_after: int, then: int):
+    """Batches of ``loader`` from ``saved_after`` on, and of ``resumed`` from its saved state.
+
+    ``loader`` has taken ``saved_after`` batches of its current pass. ``resumed``
+    loads the state and the CPU RNG saved there. Returns each one's ``input_ids``,
+    CPU RNG and base seed after ``then`` more batches.
+    """
+    rng, state = torch.random.get_rng_state(), loader.state_dict()
+    assert state["batches_yielded"] == saved_after
+    expected = [next(loader)["input_ids"] for _ in range(then)]
+    uninterrupted = (expected, torch.random.get_rng_state(), _base_seed(loader))
+    torch.random.set_rng_state(rng)
+    resumed.load_state_dict(state)
+    batches = iter(resumed)
+    got = [next(batches)["input_ids"] for _ in range(then)]
+    return uninterrupted, (got, torch.random.get_rng_state(), _base_seed(resumed))
+
+
+def _assert_same_run(uninterrupted, resumed) -> None:
+    (expected, expected_rng, expected_seed), (got, got_rng, got_seed) = uninterrupted, resumed
+    assert torch.equal(got_rng, expected_rng), "the resume left the CPU RNG elsewhere"
+    assert got_seed == expected_seed
+    for want, have in zip(expected, got, strict=True):
+        assert torch.equal(want, have)
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_a_resumed_stream_continues_the_cpu_rng_and_the_base_seed(corpus, num_workers):
+    """Resumed after 5 batches, the stream draws nothing new from the CPU RNG.
+
+    Its iterator takes the uninterrupted run's base seed, from which its workers
+    take theirs.
+    """
+    if num_workers and not worker_sockets_fit():
+        pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+    torch.manual_seed(0)
+    loader = _stream_loader(corpus, num_workers=num_workers)
+    resumed = _stream_loader(corpus, num_workers=num_workers)
+    try:
+        iterator = iter(loader)
+        for _ in range(5):
+            next(iterator)
+        uninterrupted, resume = _resume_parity(loader, resumed, 5, 3)
+    finally:
+        _close(loader)
+        _close(resumed)
+    _assert_same_run(uninterrupted, resume)
+
+
+def test_a_pass_restarted_midway_draws_a_new_base_seed_that_a_resume_keeps(corpus):
+    """New workers for a pass restarted midway draw their base seed from the CPU RNG.
+
+    A resume saved after the restart gives its workers that seed.
+    """
+    if not worker_sockets_fit():
+        pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+    torch.manual_seed(0)
+    loader = _stream_loader(corpus, num_workers=2)
+    resumed = _stream_loader(corpus, num_workers=2)
+    try:
+        iterator = iter(loader)
+        for _ in range(3):
+            next(iterator)
+        first = _base_seed(loader)
+        generator = torch.Generator()
+        generator.set_state(torch.random.get_rng_state())
+        iterator = iter(loader)
+        next(iterator)
+        drawn = torch.empty((), dtype=torch.int64).random_(generator=generator).item()
+        assert _base_seed(loader) == drawn != first
+        uninterrupted, resume = _resume_parity(loader, resumed, 4, 2)
+    finally:
+        _close(loader)
+        _close(resumed)
+    _assert_same_run(uninterrupted, resume)
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_a_stream_saved_after_a_reset_resumes_as_the_run_restarts_the_pass(corpus, num_workers):
+    """Saved after ``BatchStream.reset``, the resume replays as the run's restarted pass does.
+
+    The restarted pass starts a new iterator, which draws a new base seed from the
+    CPU RNG, in the run and in the resume. The reset leaves the live iterator, and
+    its workers, to the next ``iter()``.
+    """
+    if num_workers and not worker_sockets_fit():
+        pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+    torch.manual_seed(0)
+    run = BatchStream(DataPipeline(dataloader=_stream_loader(corpus, num_workers=num_workers)))
+    resumed = BatchStream(DataPipeline(dataloader=_stream_loader(corpus, num_workers=num_workers)))
+    try:
+        resumed.reset()
+        for _ in range(4):
+            run.next_batch()
+        live = run.dataloader._iterator
+        run.reset()
+        assert run.dataloader._iterator is live is not None
+        rng, state = torch.random.get_rng_state(), run.dataloader.state_dict()
+        expected = [run.next_batch()["input_ids"] for _ in range(3)]
+        uninterrupted = (expected, torch.random.get_rng_state(), _base_seed(run.dataloader))
+        torch.random.set_rng_state(rng)
+        resumed.dataloader.load_state_dict(state)
+        got = [resumed.next_batch()["input_ids"] for _ in range(3)]
+        resume = (got, torch.random.get_rng_state(), _base_seed(resumed.dataloader))
+    finally:
+        run.close()
+        resumed.close()
+    assert state["batches_yielded"] == 4
+    assert state["base_seed_rng_state"] is None
+    _assert_same_run(uninterrupted, resume)
+
+
+def test_a_reset_whose_pass_runs_to_its_end_keeps_the_workers_base_seed(corpus):
+    """A reset stream whose live pass runs on to its end has no pass left to restart.
+
+    With persistent workers the next pass resets their iterator, which keeps its
+    base seed, so the state stays saved and a resume keeps the seed too.
+    """
+    if not worker_sockets_fit():
+        pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+    torch.manual_seed(0)
+    loader = _stream_loader(corpus, num_workers=2)
+    resumed = _stream_loader(corpus, num_workers=2)
+    try:
+        next(iter(loader))
+        loader.restart()
+        with pytest.raises(StopIteration):
+            while True:
+                next(loader)
+        rng, state = torch.random.get_rng_state(), loader.state_dict()
+        batches = iter(loader)
+        expected = [next(batches)["input_ids"] for _ in range(2)]
+        uninterrupted = (expected, torch.random.get_rng_state(), _base_seed(loader))
+        torch.random.set_rng_state(rng)
+        resumed.load_state_dict(state)
+        batches = iter(resumed)
+        got = [next(batches)["input_ids"] for _ in range(2)]
+        resume = (got, torch.random.get_rng_state(), _base_seed(resumed))
+    finally:
+        _close(loader)
+        _close(resumed)
+    assert state["epoch"] == 1 and state["base_seed_rng_state"] is not None
+    _assert_same_run(uninterrupted, resume)
+
+
+def test_a_load_into_a_running_stream_starts_new_workers_from_the_loaded_state(corpus):
+    """Workers that ran before ``load_state_dict`` stop; the next pass replays with new ones."""
+    if not worker_sockets_fit():
+        pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+    loader = _stream_loader(corpus, num_workers=2)
+    running = _stream_loader(corpus, num_workers=2)
+    try:
+        torch.manual_seed(1)
+        iterator = iter(running)
+        for _ in range(6):
+            next(iterator)
+        workers = list(running._dataloader._iterator._workers)
+        torch.manual_seed(0)
+        iterator = iter(loader)
+        for _ in range(4):
+            next(iterator)
+        uninterrupted, resume = _resume_parity(loader, running, 4, 3)
+    finally:
+        _close(loader)
+        _close(running)
+    assert not any(worker.is_alive() for worker in workers)
+    _assert_same_run(uninterrupted, resume)
+
+
+@pytest.mark.parametrize(("batches", "warns"), [(5, True), (0, False)])
+def test_a_stream_position_without_the_saved_state_resumes_as_before(
+    corpus, batches, warns, caplog, monkeypatch
+):
+    """A position saved without the state draws a new base seed from the CPU RNG.
+
+    It warns when the stream had started. The ``kempnerforge`` logger stops
+    propagation once configured, so the test lets records reach ``caplog``.
+    """
+    monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+    loader = _stream_loader(corpus)
+    iterator = iter(loader)
+    for _ in range(batches):
+        next(iterator)
+    state = {k: v for k, v in loader.state_dict().items() if k != "base_seed_rng_state"}
+    expected = next(iterator)["input_ids"]
+    resumed = _stream_loader(corpus)
+    with caplog.at_level(logging.WARNING, logger="kempnerforge.data.dataloader"):
+        resumed.load_state_dict(state)
+    before = torch.random.get_rng_state()
+    got = next(iter(resumed))["input_ids"]
+    assert not torch.equal(torch.random.get_rng_state(), before)
+    assert torch.equal(got, expected)
+    assert ("predates the saved base seed" in caplog.text) == warns
+
+
 def test_the_replay_logs_its_progress(corpus, caplog, monkeypatch):
     """The replay reports how far it got, at what rate and how long is left.
 
