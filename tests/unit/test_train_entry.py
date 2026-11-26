@@ -95,6 +95,9 @@ class FakeCheckpointManager:
         self.flushes += 1
         self.has_pending_save = False
 
+    def apply_dataloader_state(self, dataloader) -> None:
+        pass
+
     @property
     def saved_steps(self) -> list[int]:
         return [s for s, _, _ in self.saves]
@@ -1427,13 +1430,101 @@ class TestRunTraining:
             pack_vlm_samples([doc(30, 4), doc(24, 5)], seq_len=64, tokens_per_image=8, pad_id=0),
         ]
         assert [b["input_ids"].shape[0] for b in batches] == [1, 2]
-        ckpt = _stub_entry(monkeypatch, model)
-        ckpt.apply_dataloader_state = lambda _loader: None
+        _stub_entry(monkeypatch, model)
         monkeypatch.setattr(
             entry, "build_data_pipeline", lambda *_a, **_k: DataPipeline(dataloader=batches)
         )
         run_training(config)
         assert not torch.equal(before, next(model.transformer.parameters()))
+
+    def test_injected_data_fn_replaces_the_data_pipeline(self, monkeypatch):
+        """A data_fn builds the pipeline in place of build_data_pipeline, with tokens_per_image."""
+        import kempnerforge.training.entry as entry
+        from kempnerforge.data.vlm_dataset import pack_vlm_samples
+        from kempnerforge.model.vlm import build_vlm_wrapper, packed_tokens_per_image
+        from kempnerforge.training.entry import run_training
+
+        config = _vlm_config()
+        config.data.pack_sequences = True
+        config.train.max_steps = 2
+        assert config.vision_encoder is not None and config.adapter is not None
+        assert config.vlm is not None
+        model = build_vlm_wrapper(config.model, config.vision_encoder, config.adapter, config.vlm)
+        before = next(model.transformer.parameters()).detach().clone()
+        tokens = packed_tokens_per_image(model)
+        gen = torch.Generator().manual_seed(0)
+        ids = torch.randint(0, 256, (12,), generator=gen)
+        doc = {
+            "pixel_values": torch.randn(3, 16, 16, generator=gen),
+            "input_ids": ids,
+            "labels": torch.cat([ids[1:], torch.tensor([-100])]),
+            "text_len": torch.tensor(12),
+        }
+        batch = pack_vlm_samples([doc, doc], seq_len=64, tokens_per_image=tokens, pad_id=0)
+        _stub_entry(monkeypatch, model)
+        monkeypatch.setattr(
+            entry, "build_data_pipeline", lambda *_a, **_k: pytest.fail("default pipeline built")
+        )
+        calls: list[tuple] = []
+
+        def data_fn(cfg, runtime, *, tokens_per_image=None):
+            calls.append((cfg, runtime.rank, tokens_per_image))
+            return DataPipeline(dataloader=[batch, batch])
+
+        run_training(config, data_fn=data_fn)
+        assert calls == [(config, 0, tokens)]
+        assert not torch.equal(before, next(model.transformer.parameters()))
+
+    def test_a_saved_loader_position_reaches_an_injected_loader(self, monkeypatch):
+        """The stashed loader state is loaded into data_fn's loader before its first batch."""
+        from typing import cast
+
+        import kempnerforge.training.entry as entry
+        from kempnerforge.checkpoint.manager import CheckpointManager
+        from kempnerforge.training.entry import run_training
+
+        class Restoring(FakeCheckpointManager):
+            def __init__(self) -> None:
+                super().__init__()
+                self._pending_dataloader_state: dict | None = {"position": 7}
+
+            def apply_dataloader_state(self, dataloader) -> None:
+                CheckpointManager.apply_dataloader_state(cast(CheckpointManager, self), dataloader)
+
+        _stub_entry(monkeypatch, nn.Linear(4, 4))
+        ckpt = Restoring()
+        monkeypatch.setattr(entry, "build_checkpoint_manager", lambda *_a, **_k: ckpt)
+
+        class Loader:
+            def __init__(self) -> None:
+                self.loaded: list[dict] = []
+
+            def load_state_dict(self, state: dict) -> None:
+                self.loaded.append(state)
+
+            def __iter__(self):
+                raise RuntimeError(f"iterated after loading {self.loaded}")
+
+        loader = Loader()
+        config = _vlm_config()
+        with pytest.raises(RuntimeError, match=r"iterated after loading \[\{'position': 7\}\]"):
+            run_training(config, data_fn=lambda _c, _r, **_k: DataPipeline(dataloader=loader))
+        assert loader.loaded == [{"position": 7}]
+        assert ckpt._pending_dataloader_state is None
+
+    @pytest.mark.parametrize("partition", [(1, 1), (0, 2)])
+    def test_a_data_fn_with_another_partition_is_refused(self, monkeypatch, partition):
+        """A builder whose dp_rank/dp_size differ from the mesh's is refused before training."""
+        from kempnerforge.training.entry import run_training
+
+        _stub_entry(monkeypatch, nn.Linear(4, 4))
+        rank, size = partition
+
+        def data_fn(cfg, runtime, *, tokens_per_image=None):
+            return DataPipeline(dp_rank=rank, dp_size=size)
+
+        with pytest.raises(ValueError, match=rf"dp_rank={rank}, dp_size={size}, but"):
+            run_training(_vlm_config(), data_fn=data_fn)
 
     def test_defaults_to_the_registry_selected_step_body(self, monkeypatch):
         from kempnerforge.training.entry import run_training

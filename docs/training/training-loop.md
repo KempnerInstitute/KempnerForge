@@ -269,6 +269,10 @@ in order, then hands a `TrainingSession` to `run_training_loop`:
    then `restore_checkpoint(...)`, which resumes from the `latest` symlink.
 8. `MetricsTracker`, profiler, `build_data_pipeline`,
    `build_eval_dataloader`, `build_phase_state`, `HookRunner`.
+   `run_training(config, data_fn=...)` builds the training pipeline with
+   `data_fn` in place of `build_data_pipeline`, following the `DataFn`
+   contract in `kempnerforge/training/data_pipeline.py`; the eval loader
+   still comes from `build_eval_dataloader`.
 
 The full list with links lives in
 [Data flow § Startup, once](../architecture/data-flow.md#startup-once).
