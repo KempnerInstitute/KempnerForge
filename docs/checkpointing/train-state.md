@@ -176,12 +176,12 @@ Compatibility:
 |-----|-----------|------------------|
 | `python` | `random.getstate()` | Any use of the `random` module |
 | `numpy` | `np.random.get_state()` | Data loader sampling seeds, augmentations |
-| `torch_cpu` | `torch.random.get_rng_state()` | Dropout, random init on CPU |
+| `torch_cpu` | `torch.random.get_rng_state()` | Dropout, random init on CPU, the data loader workers' base seed |
 | `torch_cuda` | `torch.cuda.get_rng_state()` | Any CUDA-side randomness (dropout on GPU) |
 
-On load, `set_rng_state()` restores them all. Result: a resumed run
-produces the **exact same loss trajectory** as an uninterrupted run,
-step for step.
+On load, `set_rng_state()` restores them all, so the random draws after
+a resume, such as dropout masks, continue the uninterrupted run's
+streams.
 
 That holds only while nothing else draws from these generators after
 the restore. The MLflow backend keeps MLflow's usage telemetry off for
@@ -190,11 +190,42 @@ that reason, since it would draw from `random` on a background thread;
 lists what can still draw and how a hook keeps its own stream
 reproducible.
 
-The one thing the RNG snapshot doesn't cover: multi-process
-dataloader workers spawned by `torch.utils.data.DataLoader` have
-their own RNG state. Their seeds are set deterministically at worker
-init from the parent process's state, so they stay reproducible as
-long as `num_workers` doesn't change.
+### Data loader workers
+
+Data loader worker processes have generators of their own. torch seeds
+worker `k` with `base_seed + k`, and draws `base_seed` from the CPU
+generator each time the loader starts an iterator: every pass with
+`num_workers = 0`, and with persistent workers the first pass and the
+first after `close()`. The loader's state records the CPU generator
+state its iterator drew `base_seed` from, and a resumed loader draws
+`base_seed` from that state instead of from the CPU generator. With the
+same `num_workers`, a resume therefore leaves the CPU generator where
+the uninterrupted run has it, and gives the workers the same seeds (see
+[Stateful dataloader § Worker RNG](../data/stateful-dataloader.md#worker-rng)).
+The state travels with the data position, so a load that applies the
+position, a warm start or a carried position included, applies it too.
+
+A resumed worker starts its generators from its seed, while a
+persistent worker of the uninterrupted run has already drawn for the
+samples it loaded before the save. A dataset that draws random numbers
+in its workers, such as a random augmentation, therefore draws
+differently after a resume. A checkpoint saved before the loader
+recorded this state resumes with a new `base_seed` from the CPU
+generator, with a warning.
+
+### Bitwise reproducibility on GPU
+
+Restoring the generators makes the random draws repeat, not the
+arithmetic. On GPU some kernels are nondeterministic, such as
+reductions that accumulate with atomic adds, so two runs of the same
+configuration can differ from the first step, and the difference can
+grow over training. A resumed run differs from the uninterrupted one in
+the same way, so compare their losses against the difference between
+two runs of the same configuration, not bit for bit. Bitwise repeatable
+GPU runs need deterministic algorithms
+(`torch.use_deterministic_algorithms(True)`, with the
+`CUBLAS_WORKSPACE_CONFIG` environment variable set for cuBLAS), which
+cost speed; KempnerForge does not turn them on.
 
 ## Scheduler state
 
@@ -252,7 +283,7 @@ ckpt_mgr.save(
 ```
 
 A checkpoint taken mid-epoch on 64 data-parallel ranks carries e.g.
-`{'epoch': 7, 'batch_size': 4, 'dataset_length': 1000000, 'global_position': 3584, 'batches_yielded': 14, 'sampler': {...}}`.
+`{'epoch': 7, 'batch_size': 4, 'dataset_length': 1000000, 'global_position': 3584, 'batches_yielded': 14, 'sampler': {...}, 'base_seed_rng_state': b'...'}`.
 `global_position` counts the samples of the epoch's order that all ranks
 consumed, so on resume `StatefulDataLoader.__iter__` continues at the same
 sample rather than restarting the epoch, on this or another data-parallel
@@ -260,7 +291,9 @@ size and batch size. A mixture saves this rank's `samples_consumed` instead
 and resumes on the saved data-parallel size only (see
 [Stateful dataloader](../data/stateful-dataloader.md#resuming-on-another-data-parallel-size)).
 The streaming loader saves how many batches training took and replays its
-stream to that point. The eval loader is a plain `torch.utils.data.DataLoader`
+stream to that point. Both save `base_seed_rng_state`, the CPU generator
+state their iterator drew the workers' base seed from (see
+[Data loader workers](#data-loader-workers)). The eval loader is a plain `torch.utils.data.DataLoader`
 with no `state_dict`; it is skipped, and it reads the full eval set at every
 evaluation anyway.
 

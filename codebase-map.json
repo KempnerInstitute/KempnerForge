@@ -1088,8 +1088,8 @@
             "close() (shuts the workers down through the sentinel path and keeps the position; rank-local, no collective; a process also calls it at exit while the workers are alive)",
             "__len__()",
             "_consumed()",
-            "state_dict()",
-            "load_state_dict(state)",
+            "state_dict() (with base_seed_rng_state, the CPU RNG state its iterator drew the workers' base seed from)",
+            "load_state_dict(state) (closes first; the next iterator draws its base seed from the saved state, except where a loader without persistent workers starts the next epoch; a state without it warns where that matters)",
             "check_state(state) (raises the DataPositionError load_state_dict would, changing nothing)",
             "_refusal(state, saved_replicas, global_order)",
             "_warn_if_reordered(state, sampler_state)"
@@ -1104,9 +1104,17 @@
             "_replay()",
             "__next__()",
             "_identity()",
-            "state_dict()",
+            "state_dict() (with base_seed_rng_state, as StatefulDataLoader)",
             "check_state(state) (raises the DataPositionError load_state_dict would, changing nothing; compares the stream as this rank sees it)",
-            "load_state_dict(state)"
+            "load_state_dict(state) (closes first; the next iterator draws its base seed from the saved state)"
+          ]
+        },
+        "_BaseSeed": {
+          "purpose": "The CPU RNG state a loader's iterator drew its workers' base seed from; after load(), the next new iterator draws its base seed from the loaded state through its own generator, leaving the CPU RNG untouched, so a resume continues the CPU RNG and the workers' seeds",
+          "methods": [
+            "iterate(loader) (iter(loader), recording the state a new iterator draws from)",
+            "end_pass(loader) (drops the state when the next pass starts a new iterator: no persistent workers)",
+            "load(state)"
           ]
         }
       },
@@ -1115,13 +1123,15 @@
         "_stop_pin_memory_thread(iterator)",
         "_register_exit_finalizer(pid) (a multiprocessing finalizer, once per process)",
         "_close_at_exit(loader) (registers the atexit hook again at each start of workers)",
-        "_close_open_loaders() (closes the loaders whose workers this process started)"
+        "_close_open_loaders() (closes the loaders whose workers this process started)",
+        "_warn_new_base_seed() (a resume from a state saved without base_seed_rng_state)"
       ],
       "tested_by": [
         "tests/unit/test_data.py::TestStatefulDataLoader",
         "tests/unit/test_data_position.py",
         "tests/unit/test_streaming_resume.py",
         "tests/unit/test_dataloader_shutdown.py",
+        "tests/unit/test_dataloader_seed.py",
         "tests/integration/test_dataloader_pin_memory_shutdown.py"
       ]
     },
@@ -1204,7 +1214,7 @@
         "destroy_distributed()",
         "_detect_ib_interface() -> str | None",
         "_set_nccl_env()",
-        "_set_seed(seed, rank, pp_rank)",
+        "_set_seed(seed, pp_rank)",
         "_timeout_options(timeout) -> ProcessGroupNCCL.Options"
       ],
       "tested_by": [
@@ -1213,7 +1223,8 @@
         "tests/unit/test_distributed.py::TestGetWorldInfo",
         "tests/unit/test_collective_timeouts.py::TestGroupTimeouts",
         "tests/distributed/test_fsdp.py::TestInitDistributed",
-        "tests/distributed/test_group_timeouts.py::TestGroupTimeouts"
+        "tests/distributed/test_group_timeouts.py::TestGroupTimeouts",
+        "tests/unit/test_distributed_seed.py"
       ]
     },
     "kempnerforge/distributed/parallel.py": {
@@ -2254,7 +2265,7 @@
         "count": 4
       },
       "tests/unit/test_distributed_seed.py": {
-        "note": "Module-level pytest functions: _set_seed seeds python/numpy/torch.cpu/torch.cuda; varies with pp_rank; consistent across dp ranks; covers checkpoint surface",
+        "note": "Module-level pytest functions: _set_seed seeds python/numpy/torch.cpu/torch.cuda; varies with pp_rank; consistent across dp ranks through init_distributed, with no rank argument; covers checkpoint surface",
         "count": 4
       },
       "tests/unit/test_data_position.py": {
@@ -2262,12 +2273,16 @@
         "count": 23
       },
       "tests/unit/test_streaming_resume.py": {
-        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning on another rank's position, replay past a shorter part warning in every rank's log, mid-pass restart with workers, replay progress, check_state's verdicts; gloo CheckpointManager auto-resume with ignore_rank_state_mismatch of a stream saved as dp 2 x tp 2: each data-parallel rank's own position on the saved data-parallel size, a restart on every rank on another, a restart on every rank when one rank sees a data file at another size, every rank raising together without the flag, and every rank stopping when one rank's check fails another way; a warm start on 2 ranks restarting every rank when one rank sees a data file at another size; a process with a live stream with workers exits; close() stops the workers and keeps the stream position",
-        "count": 23
+        "note": "Module-level pytest functions (no Test* classes): streaming replay resume (0 and 2 workers), later epoch with workers, CheckpointManager round trip, changed-stream and source-file checks, map/stream refusals, replay past the end, warm start and missing-position warnings, later-pass warning on another rank's position, replay past a shorter part warning in every rank's log, mid-pass restart with workers, replay progress, check_state's verdicts; gloo CheckpointManager auto-resume with ignore_rank_state_mismatch of a stream saved as dp 2 x tp 2: each data-parallel rank's own position on the saved data-parallel size, a restart on every rank on another, a restart on every rank when one rank sees a data file at another size, every rank raising together without the flag, and every rank stopping when one rank's check fails another way; a warm start on 2 ranks restarting every rank when one rank sees a data file at another size; a process with a live stream with workers exits; close() stops the workers and keeps the stream position; a resume continuing the CPU RNG and the iterator's base seed (0 and 2 workers), a pass restarted midway drawing a new base seed that a resume keeps, a load into a running stream starting new workers from the loaded state, and a position saved without the base seed state resuming as before, warning once the stream started",
+        "count": 27
       },
       "tests/unit/test_dataloader_shutdown.py": {
         "note": "Module-level pytest functions (no Test* classes): a script, and a fork or spawn multiprocessing child, that returns, raises or takes the multiprocessing logger with a live iterator exits; close() through the sentinel, its kill fallback, the kept position and idempotence; the exit hook closing a loader whose workers are alive and leaving a loader without workers, or one another process started; the hook's order after every start of workers and the finalizer's priority; shutdown_workers on a plain DataLoader; the pin-memory thread stopping, left behind when stuck, and left alone when already stopped",
         "count": 15
+      },
+      "tests/unit/test_dataloader_seed.py": {
+        "note": "Module-level pytest functions (no Test* classes): a resumed StatefulDataLoader continues the CPU RNG and gives its workers the uninterrupted run's seeds (0 and 2 workers) mid-pass, in a later pass, after a pass's last batch, and from a state saved after close(); a load into a loader with running workers starting new ones from the loaded state; a fresh loader drawing its base seeds from the CPU RNG exactly as a plain DataLoader does; close() keeping the saved state while the next pass draws anew; a pass's end dropping the state only without persistent workers; a state saved without it resuming as before, warning where that matters",
+        "count": 9
       }
     },
     "integration": {

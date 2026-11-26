@@ -109,6 +109,15 @@ def _workers(loader: StatefulDataLoader) -> list:
     return list(loader._dataloader._iterator._workers)
 
 
+def _position(loader: StatefulDataLoader) -> dict:
+    """The loader's state without the CPU RNG state its iterator drew its base seed from.
+
+    Two loaders in one process draw their base seeds from different points of the
+    CPU RNG, so only the rest of their states can match.
+    """
+    return {k: v for k, v in loader.state_dict().items() if k != "base_seed_rng_state"}
+
+
 class _StallsAfterFirstBatch(Dataset):
     """Serves items 0 to 3 at once; a later item touches ``stalled`` and blocks."""
 
@@ -261,7 +270,7 @@ def test_close_keeps_the_position():
         assert closed.state_dict() == state
         after = [next(iter(closed)), next(closed), next(closed)]
         reference = [batch for _, batch in zip(range(6), uninterrupted, strict=False)]
-        assert closed.state_dict() == uninterrupted.state_dict()
+        assert _position(closed) == _position(uninterrupted)
     finally:
         closed.close()
         uninterrupted.close()
