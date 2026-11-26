@@ -305,6 +305,20 @@ class JobConfig:
                 f"({self.train.grad_accum_steps}) under pipeline parallelism: eval runs its "
                 f"batches through the training schedule, grad_accum_steps at a time."
             )
+
+        weighted = self.data.mixture_weight_fields()
+        if weighted and (self.is_vlm or not self.data.datasets):
+            if self.is_vlm:
+                reason, remedy = "a VLM run never builds one", "Remove the weights"
+            else:
+                reason = "this run has none (data.datasets is empty)"
+                remedy = "List the sources as [[data.datasets]] tables or remove the weights"
+            raise ValueError(
+                f"{', '.join(weighted)} would reweight a [[data.datasets]] mixture, but "
+                f"{reason}, so the weights would be ignored. {remedy}; a data phase's "
+                "lr_scale applies without a mixture."
+            )
+
         if self.train.fp32_master_weights and self.model.is_moe:
             resolved = self.distributed.resolve(world_size)
             if max(resolved.dp_replicate, resolved.dp_shard, resolved.tp, resolved.ep) == 1:

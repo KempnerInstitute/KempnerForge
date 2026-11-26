@@ -507,8 +507,9 @@ def build_phase_state(config: JobConfig, data: DataPipeline, step: int) -> Phase
     """Resolve data-annealing phases and apply each one active at ``step``, the run's first.
 
     Every phase with ``start_step <= step`` is applied in order, so a phase at step 0 sets
-    the sampler weights and ``lr_scale`` the first step of a fresh run uses, and a resume
-    re-derives the phase it stopped in.
+    the ``lr_scale``, and on a mixture the sampler weights, the first step of a fresh run
+    uses, and a resume re-derives the phase it stopped in. The ``lr_scale`` applies with or
+    without a mixture.
     """
     phases: list[TrainingPhase] = []
     if config.data.phases:
@@ -527,51 +528,49 @@ def build_phase_state(config: JobConfig, data: DataPipeline, step: int) -> Phase
         temperature=config.data.mix_temperature,
     )
 
-    mixture, sampler = data.mixture_dataset, data.mixture_sampler
-    if phases and mixture is not None and sampler is not None:
-        for i, phase in enumerate(phases):
-            if step >= phase.start_step:
-                _apply_phase(phase, state, mixture, sampler)
-                state.next_idx = i + 1
-        if state.next_idx > 0:
-            logger.info(
-                f"Starting step {step} in phase {state.next_idx - 1}, lr_scale={state.lr_scale}"
-            )
+    for i, phase in enumerate(phases):
+        if step >= phase.start_step:
+            _apply_phase(phase, state, data)
+            state.next_idx = i + 1
+    if state.next_idx > 0:
+        logger.info(
+            f"Starting step {step} in phase {state.next_idx - 1}, lr_scale={state.lr_scale}"
+        )
 
     return state
 
 
-def _apply_phase(
-    phase: TrainingPhase,
-    state: PhaseState,
-    mixture: MixtureDataset,
-    sampler: MixtureSampler,
-) -> None:
+def _apply_phase(phase: TrainingPhase, state: PhaseState, data: DataPipeline) -> bool:
+    """Make ``phase`` the active one: its ``lr_scale``, and its weights on ``data``'s mixture.
+
+    Returns whether it reweighted a mixture.
+    """
+    state.lr_scale = phase.lr_scale
+    mixture, sampler = data.mixture_dataset, data.mixture_sampler
+    if mixture is None or sampler is None:
+        return False
     new_weights = [
         phase.dataset_weights.get(name, state.original_weights[name])
         for name in mixture.dataset_names
     ]
     sampler.update_weights(new_weights, temperature=state.temperature)
-    state.lr_scale = phase.lr_scale
+    return True
 
 
 def advance_phases(state: PhaseState, data: DataPipeline, step: int) -> bool:
     """Activate every phase whose ``start_step`` has been reached.
 
-    Returns True when at least one phase fired, so the caller can drop the
-    materialized data iterator and pick up the new sampler weights.
+    Each one sets the active ``lr_scale``, with or without a mixture, and the sampler
+    weights of ``data``'s mixture. Returns True when a phase reweighted the mixture, so the
+    caller can drop the materialized data iterator and pick up the new weights; a run
+    without a mixture keeps its iterator.
     """
-    mixture, sampler = data.mixture_dataset, data.mixture_sampler
-    if not state.phases or mixture is None or sampler is None:
-        return False
-
-    fired = False
+    reweighted = False
     while state.next_idx < len(state.phases) and step >= state.phases[state.next_idx].start_step:
         phase = state.phases[state.next_idx]
-        _apply_phase(phase, state, mixture, sampler)
+        reweighted |= _apply_phase(phase, state, data)
         logger.info(
             f"Phase transition at step {step}: phase={state.next_idx}, lr_scale={state.lr_scale}"
         )
         state.next_idx += 1
-        fired = True
-    return fired
+    return reweighted

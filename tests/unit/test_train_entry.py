@@ -646,11 +646,27 @@ class TestPhaseState:
         assert state.lr_scale == 0.5
         assert data.mixture_sampler.calls[-1][0] == [9.0, 3.0]  # type: ignore[union-attr]
 
+    def test_without_a_mixture_a_resume_re_derives_the_active_lr_scale(self):
+        config = make_config()
+        config.data = DataConfig(
+            phases=[
+                TrainingPhase(start_step=5, lr_scale=0.5),
+                TrainingPhase(start_step=50, lr_scale=0.1),
+            ]
+        )
+        state = build_phase_state(config, DataPipeline(), step=10)
+        assert state.next_idx == 1
+        assert state.lr_scale == 0.5
+
 
 class TestAdvancePhases:
-    def test_noop_without_a_mixture(self):
-        state = PhaseState(phases=[TrainingPhase(start_step=1)])
+    def test_without_a_mixture_a_phase_sets_its_lr_scale_and_keeps_the_iterator(self):
+        """The phase becomes active, and ``advance_phases`` returns False: no weights changed,
+        so the caller keeps its data iterator."""
+        state = PhaseState(phases=[TrainingPhase(start_step=1, lr_scale=0.5)])
         assert advance_phases(state, DataPipeline(), 5) is False
+        assert state.next_idx == 1
+        assert state.lr_scale == 0.5
 
     def test_fires_once_then_stays_put(self):
         data = _mixture_pipeline()

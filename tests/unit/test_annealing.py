@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from kempnerforge.config.schema import DataConfig, TrainingPhase
+from kempnerforge.config.loader import load_config
+from kempnerforge.config.schema import (
+    DataConfig,
+    DatasetSource,
+    JobConfig,
+    TrainConfig,
+    TrainingPhase,
+)
 from kempnerforge.data.sampler import MixtureSampler
 
 
@@ -414,3 +421,105 @@ class TestAnnealingShortcut:
         s2.update_weights([0.3, 0.7])
 
         assert list(s1) == list(s2)
+
+
+class TestMixtureWeightsNeedAMixture:
+    """``JobConfig.validate`` refuses mixture weights on a run that builds no mixture: a phase's
+    ``dataset_weights`` and the annealing shortcut, on a run without ``[[data.datasets]]`` and on
+    a VLM run, which never builds one. A phase's ``lr_scale`` needs no mixture."""
+
+    @staticmethod
+    def _vlm(tiny_vlm_configs, data: DataConfig) -> JobConfig:
+        model, vision, adapter, vlm = tiny_vlm_configs
+        return JobConfig(
+            model=model,
+            train=TrainConfig(batch_size=1, seq_len=64),
+            data=data,
+            vision_encoder=vision,
+            adapter=adapter,
+            vlm=vlm,
+        )
+
+    def test_phase_weights_on_a_single_source_run_are_refused(self):
+        data = DataConfig(
+            dataset_path="/data/tokens",
+            phases=[
+                TrainingPhase(start_step=5, dataset_weights={"a": 2.0}),
+                TrainingPhase(start_step=9, lr_scale=0.5),
+                TrainingPhase(start_step=12, dataset_weights={"b": 1.0}),
+            ],
+        )
+        refusal = (
+            r"^data\.phases\[0\]\.dataset_weights, data\.phases\[2\]\.dataset_weights would "
+            r"reweight a \[\[data\.datasets\]\] mixture, but this run has none \(data\.datasets "
+            r"is empty\), so the weights would be ignored\. List the sources as "
+            r"\[\[data\.datasets\]\] tables or remove the weights; a data phase's lr_scale "
+            r"applies without a mixture\.$"
+        )
+        with pytest.raises(ValueError, match=refusal):
+            JobConfig(data=data).validate(world_size=1)
+
+    def test_the_annealing_shortcut_without_a_mixture_is_refused(self):
+        data = DataConfig(
+            hf_dataset_name="org/corpus", anneal_start_step=7, anneal_weights={"a": 2.0}
+        )
+        refusal = r"^data\.anneal_start_step and data\.anneal_weights would reweight"
+        with pytest.raises(ValueError, match=refusal):
+            JobConfig(data=data).validate(world_size=1)
+
+    def test_a_vlm_run_refuses_phase_weights_even_with_datasets(self, tiny_vlm_configs):
+        data = DataConfig(
+            datasets=[DatasetSource(path="/data/a", name="a")],
+            phases=[TrainingPhase(start_step=5, dataset_weights={"a": 2.0})],
+        )
+        refusal = (
+            r"^data\.phases\[0\]\.dataset_weights would reweight a \[\[data\.datasets\]\] "
+            r"mixture, but a VLM run never builds one, so the weights would be ignored\. Remove "
+            r"the weights; a data phase's lr_scale applies without a mixture\.$"
+        )
+        with pytest.raises(ValueError, match=refusal):
+            self._vlm(tiny_vlm_configs, data).validate(world_size=1)
+
+    def test_lr_scale_phases_need_no_mixture(self, tiny_vlm_configs):
+        data = DataConfig(
+            phases=[
+                TrainingPhase(start_step=0, lr_scale=0.5),
+                TrainingPhase(start_step=5, dataset_weights={}, lr_scale=0.1),
+            ]
+        )
+        JobConfig(data=data).validate(world_size=1)
+        self._vlm(tiny_vlm_configs, data).validate(world_size=1)
+
+    def test_a_mixture_takes_phase_weights_and_the_annealing_shortcut(self):
+        sources = [DatasetSource(path="/data/a", name="a"), DatasetSource(path="/data/b", name="b")]
+        phases = [TrainingPhase(start_step=5, dataset_weights={"a": 2.0})]
+        JobConfig(data=DataConfig(datasets=sources, phases=phases)).validate(world_size=1)
+        shortcut = DataConfig(datasets=sources, anneal_start_step=7, anneal_weights={"b": 3.0})
+        JobConfig(data=shortcut).validate(world_size=1)
+
+    def test_the_settings_that_set_mixture_weights(self):
+        """Each phase with ``dataset_weights``, and the annealing shortcut only when its two
+        fields make a phase."""
+        phases = [
+            TrainingPhase(start_step=0, lr_scale=0.5),
+            TrainingPhase(start_step=5, dataset_weights={"a": 2.0}),
+            TrainingPhase(start_step=9, dataset_weights={}),
+        ]
+        assert DataConfig(phases=phases).mixture_weight_fields() == [
+            "data.phases[1].dataset_weights"
+        ]
+        shortcut = DataConfig(anneal_start_step=7, anneal_weights={"a": 2.0})
+        assert shortcut.mixture_weight_fields() == [
+            "data.anneal_start_step and data.anneal_weights"
+        ]
+        assert DataConfig(anneal_weights={"a": 2.0}).mixture_weight_fields() == []
+
+    def test_the_mixture_may_come_from_the_command_line(self, tmp_path):
+        """The check reads the config after the overrides: phase weights in the TOML pass with
+        the sources given on the command line, and are refused without them."""
+        toml = tmp_path / "phases.toml"
+        toml.write_text("[[data.phases]]\nstart_step = 5\ndataset_weights = { a = 2.0 }\n")
+        sources = "--data.datasets=[{'path': '/data/a', 'name': 'a'}]"
+        load_config(str(toml), cli_args=[sources]).validate(world_size=1)
+        with pytest.raises(ValueError, match=r"^data\.phases\[0\]\.dataset_weights would"):
+            load_config(str(toml), cli_args=[]).validate(world_size=1)

@@ -119,7 +119,10 @@
           "purpose": "Step-triggered phase with dataset weight overrides and LR scaling for data annealing"
         },
         "DataConfig": {
-          "purpose": "Data pipeline (dataset_path, HF dataset, tokenizer, packing, mixing, phases, annealing)"
+          "purpose": "Data pipeline (dataset_path, HF dataset, tokenizer, packing, mixing, phases, annealing)",
+          "methods": [
+            "mixture_weight_fields() -> list[str] (the phase and anneal settings that reweight a mixture, which JobConfig.validate refuses on a run without one)"
+          ]
         }
       }
     },
@@ -195,6 +198,7 @@
         "tests/unit/test_mixing.py::TestDataConfigMixing",
         "tests/unit/test_annealing.py::TestTrainingPhase",
         "tests/unit/test_annealing.py::TestDataConfigPhases",
+        "tests/unit/test_annealing.py::TestMixtureWeightsNeedAMixture",
         "tests/unit/test_fp8.py::TestFP8Config",
         "tests/unit/test_vision_config.py::TestHFEncoderPath",
         "tests/unit/test_video_config.py::TestJobConfigVideoWiring"
@@ -1824,9 +1828,10 @@
           "TestPhaseTiming(1)",
           "TestFreezeStageAtStepZero(1)",
           "TestRestoreWithoutOptimizerState(7)",
-          "TestResumeParity(9)"
+          "TestResumeParity(9)",
+          "TestPhaseWithoutAMixture(8)"
         ],
-        "count": 18
+        "count": 26
       },
       "tests/unit/test_checkpoint.py": {
         "classes": [
@@ -2068,9 +2073,10 @@
           "TestAnnealingTomlLoading(4)",
           "TestUpdateWeights(4)",
           "TestPhaseTransitionLogic(5)",
-          "TestAnnealingShortcut(4)"
+          "TestAnnealingShortcut(4)",
+          "TestMixtureWeightsNeedAMixture(7)"
         ],
-        "count": 32
+        "count": 39
       },
       "tests/unit/test_hooks.py": {
         "classes": [

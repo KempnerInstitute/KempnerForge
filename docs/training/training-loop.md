@@ -162,17 +162,20 @@ the LR it was saved at.
 while current_phase_idx < len(active_phases) \
         and step >= active_phases[current_phase_idx].start_step:
     phase = active_phases[current_phase_idx]
-    new_weights = [phase.dataset_weights.get(name, original_weights_dict[name])
-                   for name in mixture_dataset.dataset_names]
-    sampler.update_weights(new_weights, temperature=config.data.mix_temperature)
     phase_lr_scale = phase.lr_scale
+    if mixture_dataset is not None:
+        new_weights = [phase.dataset_weights.get(name, original_weights_dict[name])
+                       for name in mixture_dataset.dataset_names]
+        sampler.update_weights(new_weights, temperature=config.data.mix_temperature)
+        data_iter = None   # force refresh so new weights take effect
     current_phase_idx += 1
-    data_iter = None   # force refresh so new weights take effect
 ```
 
 `data_iter = None` forces a fresh iterator on the next microbatch —
 without it, the already-materialized iterator would keep emitting
-batches from the old weights for one more step.
+batches from the old weights for one more step. A run without a
+mixture, on one source or a VLM run, keeps its iterator: its phases
+set only `phase_lr_scale`.
 
 ## Metrics and hooks
 

@@ -10,7 +10,9 @@ Two orthogonal features that work together:
   then 20% web + 80% books").
 
 Both are opt-in. Ignore this page unless you want multiple data
-sources in the same run.
+sources in the same run, or a phase that only scales the learning
+rate, which works on any run (see
+[Phases without a mixture](#phases-without-a-mixture)).
 
 ## Enabling mixing
 
@@ -148,6 +150,10 @@ Constraints (enforced in `DataConfig.__post_init__`):
   `dataset_weights` falls back to its original weight from
   `[[data.datasets]]`.
 
+`dataset_weights` and the annealing shortcut below need the
+`[[data.datasets]]` mixture; see
+[Phases without a mixture](#phases-without-a-mixture).
+
 ### Annealing shortcut
 
 For the common "run normally, then switch for the last N steps"
@@ -172,38 +178,59 @@ Inside `training/loop.py`:
 while (current_phase_idx < len(active_phases)
        and step >= active_phases[current_phase_idx].start_step):
     phase = active_phases[current_phase_idx]
-    new_weights = [
-        phase.dataset_weights.get(name, original_weights_dict[name])
-        for name in dataset_names
-    ]
-    sampler.update_weights(new_weights, temperature=config.data.mix_temperature)
     phase_lr_scale = phase.lr_scale
+    if sampler is not None:                   # a [[data.datasets]] mixture
+        new_weights = [
+            phase.dataset_weights.get(name, original_weights_dict[name])
+            for name in dataset_names
+        ]
+        sampler.update_weights(new_weights, temperature=config.data.mix_temperature)
     current_phase_idx += 1
 ```
 
 Two effects:
 
-- **Sampler re-weighting** — `MixtureSampler.update_weights` recomputes
-  probabilities and target counts. Takes effect on the *next*
+- **Sampler re-weighting**, with a mixture: `MixtureSampler.update_weights`
+  recomputes probabilities and target counts. Takes effect on the *next*
   `__iter__()` call (so within the current epoch, the previous weights
   are still in play; phase changes are clean at epoch boundaries).
-- **LR scale** — `phase_lr_scale` is applied to every optimizer param
-  group on each step: `pg["lr"] *= phase_lr_scale`. The base LR comes
-  from the scheduler; the phase scale is an overlay.
+- **LR scale**, on any run: `phase_lr_scale` is applied to every
+  optimizer param group on each step: `pg["lr"] *= phase_lr_scale`. The
+  base LR comes from the scheduler; the phase scale is an overlay.
+
+### Phases without a mixture
+
+A run on one source (`data.dataset_path` or `data.hf_dataset_name`) and
+every VLM run build no mixture. Their phases scale the learning rate
+from each `start_step`, at the same steps and across a resume as on a
+mixture run, and leave the data iterator alone:
+
+```toml
+[[data.phases]]
+start_step = 180_000
+lr_scale   = 0.3                       # cool down for the last steps
+```
+
+With nothing to reweight, a phase's `dataset_weights` and the annealing
+shortcut would be ignored, so `JobConfig.validate` refuses them on such
+a run, before the process group starts, with an error that names each
+field (see
+[Validation rules](../configuration/validation-rules.md#mixture-weights-without-a-mixture)).
 
 ### Resume into the right phase
 
 At startup, `build_phase_state` replays the phase activations
 against the step the run starts at, the resumed step or a fresh run's
-step 0, so the sampler and LR scale are correct before the training
-loop starts:
+step 0, so the LR scale, and the sampler of a mixture, are correct
+before the training loop starts:
 
 ```python
 # On load — re-derive phase state
 for i, phase in enumerate(active_phases):
     if step >= phase.start_step:
-        sampler.update_weights([...], temperature=...)
         phase_lr_scale = phase.lr_scale
+        if sampler is not None:
+            sampler.update_weights([...], temperature=...)
         current_phase_idx = i + 1
 ```
 

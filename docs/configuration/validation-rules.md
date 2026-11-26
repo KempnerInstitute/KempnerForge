@@ -135,6 +135,9 @@ File:
 - `anneal_start_step ≥ 0`.
 - `phases` and `anneal_start_step > 0` are mutually exclusive.
 
+Weights for a mixture the run does not build are refused by
+[`JobConfig.validate`](#mixture-weights-without-a-mixture).
+
 `DatasetSource`:
 
 - `weight > 0`.
@@ -343,6 +346,23 @@ eval.enabled && distributed.pp > 1 && eval.steps % train.grad_accum_steps != 0  
 
 Eval runs its batches through the training schedule, `grad_accum_steps` at a
 time, so each eval microbatch has the shape the stages were built for.
+
+### Mixture weights without a mixture
+
+```
+(some data.phases[i].dataset_weights is nonempty
+ || data.anneal_start_step > 0 && data.anneal_weights is nonempty)
+&& (vlm set || data.datasets is empty)  →  ValueError
+```
+
+Only a text run with `[[data.datasets]]` builds a mixture; a run on
+`data.dataset_path` or `data.hf_dataset_name` and every VLM run build none, so
+weights for one would be dropped silently. The error names each field and asks
+for the sources as `[[data.datasets]]` tables (not offered on a VLM run) or the
+weights' removal. A phase's `lr_scale` needs no mixture: it scales the LR on
+any run. The check runs here, on the config after the CLI overrides, so a TOML
+can leave the sources to `--data.datasets`. `DataConfig.mixture_weight_fields`
+lists the fields.
 
 ### VLM architectures under tensor parallelism
 

@@ -883,8 +883,8 @@ def _apply_step_transitions(session: TrainingSession, step: int) -> None:
 
     Runs right after the step counter advances, on a step skipped for a
     non-finite loss too, so a transition lands on its configured step. A
-    phase that fires drops the data iterator, so the next batch is drawn
-    with the new sampler weights.
+    phase that reweights the mixture drops the data iterator, so the next
+    batch is drawn with the new sampler weights.
     """
     _apply_freeze_stages(session, step)
     if advance_phases(session.phases, session.data, step):

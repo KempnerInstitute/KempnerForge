@@ -184,6 +184,7 @@ each step (see
 The scheduler computes the base LR; the phase scales it. So a cosine
 schedule with `phase.lr_scale = 0.5` in a curriculum phase halves the
 cosine LR for that phase without touching the scheduler's own state.
+This works on any run, with or without a `[[data.datasets]]` mixture.
 
 ## See also
 
