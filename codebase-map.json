@@ -1090,7 +1090,7 @@
             "__len__()",
             "_consumed()",
             "state_dict() (with base_seed_rng_state, the CPU RNG state its iterator drew the workers' base seed from)",
-            "load_state_dict(state) (closes first; the next iterator draws its base seed from the saved state, except where a loader without persistent workers starts the next epoch; a state without it warns where that matters)",
+            "load_state_dict(state) (closes first; the next iterator draws its base seed from the saved state, except where a loader without persistent workers starts the next epoch; a position saved with such a loader's restart pending stays put, so the resume starts the same empty pass; a state without it warns where that matters)",
             "check_state(state) (raises the DataPositionError load_state_dict would, changing nothing)",
             "_refusal(state, saved_replicas, global_order)",
             "_warn_if_reordered(state, sampler_state)"
@@ -1112,13 +1112,13 @@
           ]
         },
         "_BaseSeed": {
-          "purpose": "The CPU RNG state a loader's iterator drew its workers' base seed from; saved is what a checkpoint keeps (None while a restart whose next iterator draws is pending); after load(), the next new iterator draws its base seed from the loaded state through its own generator, leaving the CPU RNG untouched, unless a restart comes first; load() itself draws the base seed of an empty pass the saving run would start",
+          "purpose": "The CPU RNG state a loader's iterator drew its workers' base seed from; saved is what a checkpoint keeps (None while a restart whose next iterator draws is pending); after load(), the next new iterator draws its base seed from the loaded state through its own generator, leaving the CPU RNG untouched, unless a restart comes first",
           "methods": [
             "saved (property)",
             "iterate(loader) (iter(loader), recording the state a new iterator draws from)",
             "end_pass(loader) (ends a pending restart; drops the state when the next pass starts a new iterator: no persistent workers)",
             "restart(draws) (records a pending restart of the pass)",
-            "load(state, empty_pass)"
+            "load(state)"
           ]
         }
       },
@@ -2285,8 +2285,8 @@
         "count": 15
       },
       "tests/unit/test_dataloader_seed.py": {
-        "note": "Module-level pytest functions (no Test* classes): a resumed StatefulDataLoader continues the CPU RNG and gives its workers the uninterrupted run's seeds (0 and 2 workers) mid-pass, in a later pass, after a pass's last batch, from a state saved after close(), and after a BatchStream.reset, mid-pass and after a pass's last batch, also then closed; a reset before the first pass after a load; a loaded end-of-pass reset saved again before its first pass; restart() leaving the live iterator to the next iter(); a load into a loader with running workers starting new ones from the loaded state; a fresh loader drawing its base seeds from the CPU RNG exactly as a plain DataLoader does; close() keeping the saved state while the next pass draws anew; a pass's end dropping the state only without persistent workers; a state saved without it resuming as before, warning where that matters",
-        "count": 13
+        "note": "Module-level pytest functions (no Test* classes): a resumed StatefulDataLoader continues the CPU RNG and gives its workers the uninterrupted run's seeds (0 and 2 workers) mid-pass, in a later pass, after a pass's last batch, from a state saved after close(), and after a BatchStream.reset, mid-pass and after a pass's last batch, also then closed; a reset before the first pass after a load; a loaded end-of-pass reset saved again before its first pass; a reset saved and loaded through CheckpointManager.load(dataloader=...); restart() leaving the live iterator to the next iter(); a load into a loader with running workers starting new ones from the loaded state; a fresh loader drawing its base seeds from the CPU RNG exactly as a plain DataLoader does; close() keeping the saved state while the next pass draws anew; a pass's end dropping the state only without persistent workers; a state saved without it resuming as before, warning where that matters",
+        "count": 14
       }
     },
     "integration": {

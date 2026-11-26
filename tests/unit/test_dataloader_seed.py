@@ -237,6 +237,41 @@ def test_a_loaded_end_of_pass_reset_saved_again_before_its_first_pass_resumes_ex
     _assert_resumed(expected, expected_rng, got, got_rng, 0)
 
 
+@pytest.mark.parametrize("saved_after", [3, BATCHES_PER_PASS])
+@pytest.mark.parametrize("workers", [0, 2])
+def test_a_reset_saved_by_the_checkpoint_manager_resumes_exactly(tmp_path, workers, saved_after):
+    """``CheckpointManager.load(dataloader=...)`` applies the loader's state before the RNG.
+
+    A reset saved mid-pass or after a pass's last batch still resumes as the run goes on.
+    """
+    from kempnerforge.checkpoint.manager import CheckpointManager
+    from kempnerforge.config.schema import CheckpointConfig
+
+    _skip_without_worker_sockets(workers)
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    config = CheckpointConfig(dir=str(tmp_path / "ckpt"))
+    torch.manual_seed(0)
+    run = _stream(workers)
+    try:
+        _take(run, saved_after)
+        run.reset()
+        CheckpointManager(config, model, optimizer).save(step=1, dataloader=run.dataloader)
+        expected = _take(run, 3)
+        expected_rng = torch.random.get_rng_state()
+    finally:
+        run.close()
+    torch.manual_seed(1)
+    resumed = _stream(workers)
+    try:
+        CheckpointManager(config, model, optimizer).load(dataloader=resumed.dataloader)
+        got = _take(resumed, 3)
+        got_rng = torch.random.get_rng_state()
+    finally:
+        resumed.close()
+    _assert_resumed(expected, expected_rng, got, got_rng, workers)
+
+
 @pytest.mark.parametrize("workers", [0, 2])
 def test_restart_leaves_the_live_iterator_to_the_next_iter(workers):
     """``restart()`` only records the restart: the live iterator runs on until ``iter()``.

@@ -182,14 +182,8 @@ class _BaseSeed:
         """Record that the next ``iter()`` starts the pass again, drawing if ``draws``."""
         self._restart_draws = draws
 
-    def load(self, state: bytes | None, empty_pass: bool = False) -> None:
-        """Have the next iterator draw its base seed from ``state``, or the CPU RNG if None.
-
-        With ``empty_pass``, first draws from the CPU RNG the base seed that the
-        saving run's iterator for the empty rest of its pass draws.
-        """
-        if empty_pass:
-            torch.empty((), dtype=torch.int64).random_()
+    def load(self, state: bytes | None) -> None:
+        """Have the next iterator draw its base seed from ``state``, or the CPU RNG if None."""
         self.state = state
         self._loaded = True
         self._restart_draws = False
@@ -415,19 +409,21 @@ class StatefulDataLoader:
         size counts batches, so it resumes as before, only on the saved
         data-parallel size and exact only at the saved batch size, which it does
         not record. A position with no full batch left in its epoch starts the
-        next epoch. A changed shuffle seed or dataset length is logged, since the
-        position counts samples of the saved order. ``__iter__`` applies the
-        position, so a later ``iter()`` in the same epoch stays aligned.
+        next epoch, except one saved while a ``restart`` of a loader without
+        persistent workers was pending: the saving run's next ``iter()`` starts an
+        empty pass at that position before the next epoch, so the resume keeps
+        the position and does the same. A changed shuffle seed or dataset length
+        is logged, since the position counts samples of the saved order.
+        ``__iter__`` applies the position, so a later ``iter()`` in the same epoch
+        stays aligned.
 
         The loader first closes, so workers started before the load stop and the
         next ``iter()`` starts new ones. That iterator draws its base seed from the
         saved ``base_seed_rng_state`` rather than from the CPU RNG, unless the
-        position starts the next epoch on a loader without persistent workers:
-        the saving run starts a new iterator there and draws one too. When a
-        ``restart`` was pending there, which saves the state as None, that run
-        first draws one for the empty rest of the epoch, and the load draws it
-        at once. A state saved without ``base_seed_rng_state`` draws a new base
-        seed, with a warning when the saving run would have drawn none there.
+        position starts the next epoch on a loader without persistent workers,
+        where the saving run starts a new iterator and draws one too. A state
+        saved without ``base_seed_rng_state`` draws a new base seed, with a
+        warning when the saving run would have drawn none there.
 
         Raises:
             DataPositionError: The data-parallel size changed and the saved
@@ -461,10 +457,14 @@ class StatefulDataLoader:
         self._batches_yielded = 0
         self._start = start
         sampler = self.sampler
+        persistent = self._dataloader.persistent_workers
+        saved_seed = state.get(_BASE_SEED_KEY)
+        restart_pending = _BASE_SEED_KEY in state and saved_seed is None and not persistent
         if (
             isinstance(sampler, DistributedSampler)
             and start > 0
             and sampler.samples_after(start) < self.batch_size
+            and not restart_pending
         ):
             logger.info(
                 f"Saved data position {start} leaves no full batch in epoch {epoch} on "
@@ -472,10 +472,8 @@ class StatefulDataLoader:
             )
             self._epoch = epoch + 1
             self._start = 0
-        new_iterator = self._epoch != epoch and not self._dataloader.persistent_workers
-        saved_seed = state.get(_BASE_SEED_KEY)
-        empty_pass = new_iterator and _BASE_SEED_KEY in state and saved_seed is None
-        self._base_seed.load(None if new_iterator else saved_seed, empty_pass=empty_pass)
+        new_iterator = self._epoch != epoch and not persistent
+        self._base_seed.load(None if new_iterator else saved_seed)
         if _BASE_SEED_KEY not in state and not new_iterator and (epoch > 0 or start > 0):
             _warn_new_base_seed()
         batch_changed = saved_batch is not None and saved_batch != self.batch_size
