@@ -1493,6 +1493,7 @@ class CheckpointManager:
     def _check_model_fits(
         self,
         model_state: Mapping[str, Any],
+        every_rank: Iterable[str],
         dcp_dir: Path,
         restaged: bool,
         saved_keys: Mapping[str, Any],
@@ -1500,13 +1501,15 @@ class CheckpointManager:
         """Refuse, on every rank before any tensor is read, a checkpoint of another model.
 
         ``model_state`` is the model entry a load reads from ``dcp_dir``, as the checkpoint
-        holds it (see ``_present_experts``). Every rank sends rank 0 the index it reads with the
-        global shape of each entry; rank 0 reads each index once, or takes ``saved_keys``, its
-        own read of ``dcp_dir``, and compares it with what the ranks that read it load together,
-        so the experts of every expert-parallel rank count and, when ``restaged``, the layers of
-        every pipeline stage. A model tensor the index holds that none of them loads, as a
-        deeper model's layer, or a tensor of another size refuses the load, and rank 0
-        broadcasts the verdict, so every rank raises the same error or goes on. A pipeline
+        holds it (see ``_present_experts``), and ``every_rank`` names, as the checkpoint does,
+        the experts that every expert-parallel rank of this rank's layers holds. Every rank
+        sends rank 0 the index it reads with the global shape of each entry; rank 0 reads each
+        index once, or takes ``saved_keys``, its own read of ``dcp_dir``, and compares it with
+        what the ranks that read it load together: every expert-parallel rank's experts and,
+        when ``restaged``, every pipeline stage's layers. A model tensor the index holds that
+        none of them loads, as a deeper model's layer, or a tensor of another size refuses the
+        load, and rank 0 broadcasts the verdict, so every rank raises the same error or goes
+        on. A pipeline
         stage that loads a checkpoint saved without pipeline parallelism outside a process
         group holds only its own layers, so only their sizes are compared. With
         ``checkpoint.ignore_extra_model_tensors``, rank 0 warns of the tensors no rank loads,
@@ -1520,6 +1523,8 @@ class CheckpointManager:
         for name, value in model_state.items():
             shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
             held[f"{_MODEL_PREFIX}{name}"] = shape
+        for name in every_rank:
+            held.setdefault(f"{_MODEL_PREFIX}{name}", None)
         mine = (str(dcp_dir), held)
         distributed = dist.is_initialized()
         gathered: list[Any] | None = [mine]
@@ -1551,7 +1556,10 @@ class CheckpointManager:
         """
         held_by_index: dict[str, dict[str, tuple[int, ...] | None]] = {}
         for index, held in gathered:
-            held_by_index.setdefault(index, {}).update(held)
+            merged = held_by_index.setdefault(index, {})
+            for key, shape in held.items():
+                if merged.get(key) is None:
+                    merged[key] = shape
         refusals: list[str] = []
         for index, held in held_by_index.items():
             try:
@@ -2365,9 +2373,13 @@ class CheckpointManager:
         layout: ExpertLayout | None = None
         restore_error: BaseException | None = None
         if dcp_state:
+            local_names = list(dcp_state.get("model", ()))
             dcp_state, layout = self._present_experts(dcp_state, dcp_dir, saved_keys)
             if load_model:
-                self._check_model_fits(dcp_state["model"], dcp_dir, restaged, saved_keys)
+                every_rank = layout.group_names(local_names) if layout is not None else ()
+                self._check_model_fits(
+                    dcp_state["model"], every_rank, dcp_dir, restaged, saved_keys
+                )
             saved_left_out, saved_template_groups = left_out, template_groups
             if layout is not None:
                 saved_left_out = set(layout.global_names(left_out))
