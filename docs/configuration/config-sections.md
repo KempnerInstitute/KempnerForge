@@ -202,12 +202,14 @@ its default there; see
 |-------|------|---------|---------|
 | `path` | `str` | `""` | pre-tokenized directory |
 | `weight` | `float` | `1.0` | relative sampling weight (must be `> 0`) |
-| `name` | `str` | `""` | name for per-dataset metrics and phase weights; if empty, the source goes by its `path`, else its `hf_name` |
+| `name` | `str` | `""` | name for per-dataset metrics and phase weights, one per source; if empty, the source goes by its `path`, else its `hf_name` |
 | `hf_name` | `str` | `""` | HF dataset id |
 | `hf_config` | `str` | `""` | HF dataset config |
 | `token_dtype` | `str` | `""` | dtype of this source's `.bin` shards; `""` uses `data.token_dtype` |
 
-Either `path` or `hf_name` must be set per source.
+Either `path` or `hf_name` must be set per source, and no two sources may go
+by one name; see
+[Validation rules](validation-rules.md#mixture-sources-that-share-a-name).
 
 ### `TrainingPhase`
 

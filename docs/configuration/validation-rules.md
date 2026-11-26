@@ -139,6 +139,8 @@ File:
 ([A mixture on a VLM run](#a-mixture-on-a-vlm-run)), weights for a mixture
 the run does not build
 ([Mixture weights without a mixture](#mixture-weights-without-a-mixture)),
+sources that go by one name
+([Mixture sources that share a name](#mixture-sources-that-share-a-name)),
 and a weight for a source the mixture does not have
 ([Mixture weights for unknown sources](#mixture-weights-for-unknown-sources)).
 
@@ -381,6 +383,22 @@ sources as `[[data.datasets]]` tables or the weights' removal. A phase's
 `lr_scale` needs no mixture: it scales the LR on any run.
 `DataConfig.mixture_weight_fields` lists the fields.
 
+### Mixture sources that share a name
+
+```
+two data.datasets sources have one DatasetSource.mixture_name  →  ValueError
+```
+
+The mixture names each source by its `name`, else its `path`, else its
+`hf_name`, and keeps one declared weight per name. Once a data phase or the
+annealing shortcut starts, the sources that share a name would take one
+weight, the one a phase key with that name sets, else the last such source's
+declared weight, and their `loss/{name}` and `data/{name}/tokens` metrics
+would share one name. Two unnamed sources share a name when they list one
+`path`, or one `hf_name` with different `hf_config` values. The error gives
+each shared name with the sources that go by it, by their index in
+`data.datasets`. `DataConfig.duplicate_mixture_names` finds them.
+
 ### Mixture weights for unknown sources
 
 ```
@@ -394,7 +412,7 @@ name, so a key that matches none would be ignored and the source would keep
 its declared weight. The error names each field with its unknown keys and
 lists the sources' names. `DataConfig.unknown_mixture_weight_keys` finds them.
 
-These three checks run here, on the config after the CLI overrides, so a
+These four checks run here, on the config after the CLI overrides, so a
 TOML can leave the sources to `--data.datasets` or the weights to
 `--data.anneal_weights`.
 

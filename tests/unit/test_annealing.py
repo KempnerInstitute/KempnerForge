@@ -553,14 +553,31 @@ def _cpu_runtime() -> RuntimeContext:
     )
 
 
-def _share_after_the_phase(config: JobConfig, data: DataPipeline, source: int) -> float:
-    """The share of the draws from source ``source`` once the step-1 phase is active."""
+def _share(data: DataPipeline, source: int) -> float:
+    """The share of one pass of the mixture sampler's draws that come from source ``source``."""
     assert data.mixture_dataset is not None and data.mixture_sampler is not None
-    state = build_phase_state(config, data, step=0)
-    advance_phases(state, data, step=1)
     drawn = list(data.mixture_sampler)
     first, end = data.mixture_dataset.cumulative_sizes[source : source + 2]
     return sum(first <= index < end for index in drawn) / len(drawn)
+
+
+def _share_after_the_phase(config: JobConfig, data: DataPipeline, source: int) -> float:
+    """The share of the draws from source ``source`` once the step-1 phase is active."""
+    state = build_phase_state(config, data, step=0)
+    advance_phases(state, data, step=1)
+    return _share(data, source)
+
+
+def _text_mixture(sources: list[DatasetSource], **schedule) -> JobConfig:
+    """A tiny text run over ``sources``, each a directory of 500 tokens written here."""
+    for source in sources:
+        Path(source.path).mkdir(parents=True, exist_ok=True)
+        np.save(Path(source.path, "tokens.npy"), np.arange(500, dtype=np.uint16) % 16)
+    return JobConfig(
+        model=ModelConfig(dim=8, n_layers=1, n_heads=1, vocab_size=16, max_seq_len=64),
+        train=TrainConfig(batch_size=2, seq_len=4, max_steps=4, compile_model=False),
+        data=DataConfig(num_workers=0, pin_memory=False, datasets=sources, **schedule),
+    )
 
 
 class TestMixtureWeightsNameSources:
@@ -569,24 +586,13 @@ class TestMixtureWeightsNameSources:
     listing the sources. A source goes by its ``name``, else its ``path``, else its ``hf_name``
     (``DatasetSource.mixture_name``), the name the mixture builder gives it."""
 
-    @staticmethod
-    def _config(sources: list[DatasetSource], **schedule) -> JobConfig:
-        for source in sources:
-            Path(source.path).mkdir(parents=True, exist_ok=True)
-            np.save(Path(source.path, "tokens.npy"), np.arange(500, dtype=np.uint16) % 16)
-        return JobConfig(
-            model=ModelConfig(dim=8, n_layers=1, n_heads=1, vocab_size=16, max_seq_len=64),
-            train=TrainConfig(batch_size=2, seq_len=4, max_steps=4, compile_model=False),
-            data=DataConfig(num_workers=0, pin_memory=False, datasets=sources, **schedule),
-        )
-
     def test_the_issue_reproduction(self, tmp_path):
         """Two sources of one size at equal weights, and a phase at step 1 that sets ``code`` to
         9.0: spelled right, the config validates and ``code`` takes 0.90 of the draws after the
         phase; misspelled ``cod``, in a phase or in the annealing shortcut, it is refused."""
         sources = [DatasetSource(name=name, path=str(tmp_path / name)) for name in ("web", "code")]
         right = [TrainingPhase(start_step=1, dataset_weights={"code": 9.0})]
-        config = self._config(sources, phases=right)
+        config = _text_mixture(sources, phases=right)
         config.validate(world_size=1)
         data = build_data_pipeline(config, _cpu_runtime())
         assert _share_after_the_phase(config, data, 1) == pytest.approx(0.9, abs=0.01)
@@ -605,7 +611,7 @@ class TestMixtureWeightsNameSources:
                 r"and a weight for an unknown source would be ignored\.$"
             )
             with pytest.raises(ValueError, match=refusal):
-                self._config(sources, **schedule).validate(world_size=1)
+                _text_mixture(sources, **schedule).validate(world_size=1)
 
     def test_each_field_is_named_with_its_unknown_keys(self):
         sources = [DatasetSource(name="web", path="/data/web"), DatasetSource(path="/data/code")]
@@ -630,7 +636,7 @@ class TestMixtureWeightsNameSources:
             DatasetSource(path=str(tmp_path / "code")),
         ]
         phases = [TrainingPhase(start_step=1, dataset_weights={str(tmp_path / "code"): 9.0})]
-        config = self._config(sources, phases=phases)
+        config = _text_mixture(sources, phases=phases)
         config.validate(world_size=1)
         data = build_data_pipeline(config, _cpu_runtime())
         assert data.mixture_dataset is not None
@@ -680,6 +686,107 @@ class TestMixtureWeightsNameSources:
         refusal = r"^data\.anneal_weights names unknown sources \['wbe'\]; the .* \['web'\] "
         with pytest.raises(ValueError, match=refusal):
             load_config(str(sources), cli_args=anneal).validate(world_size=1)
+
+
+class TestMixtureSourcesHaveDistinctNames:
+    """``JobConfig.validate`` refuses ``[[data.datasets]]`` sources that go by one
+    ``DatasetSource.mixture_name``, naming each shared name with the sources that go by it. The
+    mixture keeps one declared weight per name, so once a data phase starts the sources that
+    share a name would take one weight, and their per-source metrics would share one name."""
+
+    REASON = (
+        r"; the mixture knows each \[\[data\.datasets\]\] source by its name \(a source without "
+        r"a name goes by its path or hf_name\), so these sources would take one weight once a "
+        r"data phase starts, and their per-source metrics would share one name\. Give each "
+        r"source its own name\.$"
+    )
+
+    def test_the_issue_reproduction(self, tmp_path):
+        """Two sources of one size, both named ``web``, at weights 1.0 and 3.0, and a phase at
+        step 1 that sets only ``lr_scale``: the config validated, and the weight-3.0 source's
+        share of the draws fell from 0.75 to 0.50 when the phase fired. It is refused, naming
+        both sources; with a name each, that source keeps 0.75 across the phase."""
+        paths = [str(tmp_path / "a"), str(tmp_path / "b")]
+        phases = [TrainingPhase(start_step=1, lr_scale=0.5)]
+        twins = [
+            DatasetSource(name="web", path=paths[0], weight=1.0),
+            DatasetSource(name="web", path=paths[1], weight=3.0),
+        ]
+        shared = r"^data\.datasets\[0\] and data\.datasets\[1\] share the name 'web'"
+        with pytest.raises(ValueError, match=shared + self.REASON):
+            _text_mixture(twins, phases=phases).validate(world_size=1)
+
+        apart = [twins[0], DatasetSource(name="code", path=paths[1], weight=3.0)]
+        config = _text_mixture(apart, phases=phases)
+        config.validate(world_size=1)
+        data = build_data_pipeline(config, _cpu_runtime())
+        state = build_phase_state(config, data, step=0)
+        assert _share(data, 1) == pytest.approx(0.75, abs=0.01)
+        advance_phases(state, data, step=1)
+        assert _share(data, 1) == pytest.approx(0.75, abs=0.01)
+
+    def test_unnamed_sources_go_by_their_path_or_hf_name(self):
+        """Two configs of one HF dataset share its ``hf_name``, and one directory listed twice
+        shares its ``path``. Each shared name is given once with every source that goes by it,
+        and a mixture without phases is refused too."""
+        configs = [DatasetSource(hf_name="org/corpus", hf_config=c) for c in ("en", "de")]
+        shared = r"^data\.datasets\[0\] and data\.datasets\[1\] share the name 'org/corpus'"
+        with pytest.raises(ValueError, match=shared + self.REASON):
+            JobConfig(data=DataConfig(datasets=configs)).validate(world_size=1)
+
+        sources = [
+            DatasetSource(name="web", path="/data/web"),
+            DatasetSource(path="/data/code"),
+            DatasetSource(name="web", path="/data/web-2"),
+            DatasetSource(path="/data/code", weight=2.0),
+            DatasetSource(name="web", hf_name="org/web"),
+            DatasetSource(name="books", path="/data/books"),
+        ]
+        shared = (
+            r"^data\.datasets\[0\] and data\.datasets\[2\] and data\.datasets\[4\] share the "
+            r"name 'web', data\.datasets\[1\] and data\.datasets\[3\] share the name '/data/code'"
+        )
+        with pytest.raises(ValueError, match=shared + self.REASON):
+            JobConfig(data=DataConfig(datasets=sources)).validate(world_size=1)
+
+    def test_the_names_two_or_more_sources_go_by(self):
+        """Each maps to the indices of its sources, in order. A ``name`` one source sets and a
+        ``path`` another goes by are one name."""
+        sources = [
+            DatasetSource(name="web", path="/data/web"),
+            DatasetSource(path="/data/code"),
+            DatasetSource(name="web", path="/data/web-2"),
+            DatasetSource(name="/data/code", hf_name="org/code"),
+            DatasetSource(name="books", path="/data/books"),
+        ]
+        assert DataConfig(datasets=sources).duplicate_mixture_names() == {
+            "web": [0, 2],
+            "/data/code": [1, 3],
+        }
+        assert DataConfig(datasets=sources[:2] + sources[4:]).duplicate_mixture_names() == {}
+        assert DataConfig().duplicate_mixture_names() == {}
+
+    def test_the_sources_may_come_from_the_command_line(self, tmp_path):
+        """The check reads the config after the overrides: TOML sources that share a name are
+        refused and pass once the command line renames one, and command-line sources that share
+        a name are refused."""
+        toml = tmp_path / "twins.toml"
+        toml.write_text(
+            '[[data.datasets]]\nname = "web"\npath = "/data/a"\n\n'
+            '[[data.datasets]]\nname = "web"\npath = "/data/b"\n'
+        )
+        shared = r"^data\.datasets\[0\] and data\.datasets\[1\] share the name 'web'"
+        with pytest.raises(ValueError, match=shared + self.REASON):
+            load_config(str(toml), cli_args=[]).validate(world_size=1)
+        renamed = (
+            "--data.datasets=[{'path': '/data/a', 'name': 'web'}, "
+            "{'path': '/data/b', 'name': 'code'}]"
+        )
+        load_config(str(toml), cli_args=[renamed]).validate(world_size=1)
+        twins = "--data.datasets=[{'path': '/data/a'}, {'path': '/data/a', 'weight': 2.0}]"
+        shared = r"^data\.datasets\[0\] and data\.datasets\[1\] share the name '/data/a'"
+        with pytest.raises(ValueError, match=shared + self.REASON):
+            load_config(str(toml), cli_args=[twins]).validate(world_size=1)
 
 
 class TestVlmRunsBuildNoMixture:

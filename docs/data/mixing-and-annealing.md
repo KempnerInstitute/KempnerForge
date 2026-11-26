@@ -43,7 +43,12 @@ Each source can be either a mmap directory (`path`) or a HuggingFace
 dataset (`hf_name`). `DataConfig.__post_init__` rejects a
 `DatasetSource` that has neither. A source goes by its `name`, else its
 `path`, else its `hf_name`: its per-dataset metrics carry that name, and
-phase weights name the source by it.
+phase weights name the source by it. No two sources may go by one name,
+so `JobConfig.validate` refuses them, naming each shared name and its
+sources (see
+[Validation rules](../configuration/validation-rules.md#mixture-sources-that-share-a-name)).
+Two sources of one `hf_name`, under different `hf_config` values, need a
+`name` each.
 
 Only a text run builds the mixture. A VLM run reads its data from
 `data.hf_dataset_name` or `[video]`, so `JobConfig.validate` refuses

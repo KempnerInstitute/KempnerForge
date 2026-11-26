@@ -48,7 +48,7 @@ Each `[[data.datasets]]` block is a
 
 | Field | Meaning |
 |-------|---------|
-| `name`   | Label for per-dataset metrics and the key of the source's phase weights. Auto-filled from `path`/`hf_name` if empty. |
+| `name`   | Label for per-dataset metrics and the key of the source's phase weights, one per source. Auto-filled from `path`/`hf_name` if empty. |
 | `path`   | Pre-tokenized directory (use with `file_pattern`). |
 | `hf_name` | HuggingFace dataset ID (alternative to `path`). |
 | `hf_config` | HF dataset config (e.g. `"wikitext-103-raw-v1"`). |
@@ -56,7 +56,10 @@ Each `[[data.datasets]]` block is a
 | `token_dtype` | Dtype of the raw `.bin` shards under `path`, `"uint16"` or `"uint32"`. Empty uses `data.token_dtype`; either must agree with a `metadata.yaml` beside the shards (see [Memory-mapped dataset](../data/memory-mapped.md)). |
 
 At least one of `path` / `hf_name` must be set per source, enforced by
-`DataConfig.__post_init__`.
+`DataConfig.__post_init__`. `JobConfig.validate` refuses two sources that
+go by one name, since a phase would give them one weight and their
+metrics would share one label; two configs of one `hf_name` need a `name`
+each.
 
 When any `[[data.datasets]]` is present, `build_data_pipeline` builds a
 [`MixtureDataset`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/data/dataset.py)

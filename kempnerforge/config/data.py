@@ -24,7 +24,8 @@ class DatasetSource:
     Either ``path`` (pre-tokenized) or ``hf_name`` (HuggingFace) must be set.
     ``weight`` controls the relative sampling probability. ``token_dtype``
     overrides ``data.token_dtype`` for the ``.bin`` shards under ``path``.
-    The mixture knows the source by ``mixture_name``.
+    The mixture knows the source by ``mixture_name``, which no other source of
+    the mixture may share.
     """
 
     path: str = ""
@@ -166,3 +167,14 @@ class DataConfig:
             settings["data.anneal_weights"] = self.anneal_weights
         unknown = {field: sorted(set(weights) - names) for field, weights in settings.items()}
         return {field: keys for field, keys in unknown.items() if keys}
+
+    def duplicate_mixture_names(self) -> dict[str, list[int]]:
+        """Each ``DatasetSource.mixture_name`` that two or more ``datasets`` sources go by.
+
+        Maps each such name, in the order the names first appear, to the indices of its
+        sources in ``datasets``. The result is empty when every source has a name of its own.
+        """
+        indices: dict[str, list[int]] = {}
+        for i, source in enumerate(self.datasets):
+            indices.setdefault(source.mixture_name, []).append(i)
+        return {name: shared for name, shared in indices.items() if len(shared) > 1}

@@ -125,7 +125,8 @@
           "purpose": "Data pipeline (dataset_path, HF dataset, tokenizer, packing, mixing, phases, annealing)",
           "methods": [
             "mixture_weight_fields() -> list[str] (the phase and anneal settings that reweight a mixture, which JobConfig.validate refuses on a run without one)",
-            "unknown_mixture_weight_keys() -> dict[str, list[str]] (per weight setting, its keys that name no source; JobConfig.validate refuses them)"
+            "unknown_mixture_weight_keys() -> dict[str, list[str]] (per weight setting, its keys that name no source; JobConfig.validate refuses them)",
+            "duplicate_mixture_names() -> dict[str, list[int]] (each mixture name two or more sources go by, with their indices; JobConfig.validate refuses them)"
           ]
         }
       }
@@ -204,6 +205,7 @@
         "tests/unit/test_annealing.py::TestDataConfigPhases",
         "tests/unit/test_annealing.py::TestMixtureWeightsNeedAMixture",
         "tests/unit/test_annealing.py::TestMixtureWeightsNameSources",
+        "tests/unit/test_annealing.py::TestMixtureSourcesHaveDistinctNames",
         "tests/unit/test_annealing.py::TestVlmRunsBuildNoMixture",
         "tests/unit/test_fp8.py::TestFP8Config",
         "tests/unit/test_vision_config.py::TestHFEncoderPath",
@@ -2082,9 +2084,10 @@
           "TestAnnealingShortcut(4)",
           "TestMixtureWeightsNeedAMixture(8)",
           "TestMixtureWeightsNameSources(6)",
+          "TestMixtureSourcesHaveDistinctNames(4)",
           "TestVlmRunsBuildNoMixture(4)"
         ],
-        "count": 50
+        "count": 54
       },
       "tests/unit/test_hooks.py": {
         "classes": [
