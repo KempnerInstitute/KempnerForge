@@ -438,3 +438,112 @@ class TestPipelineParallelEquivalence:
         assert all(g.dtype == torch.float32 and torch.isfinite(g).all() for g in grads)
         if rank == world - 1:
             assert losses and all(torch.isfinite(loss) for loss in losses), f"losses: {losses}"
+
+
+@pytest.mark.skipif(os.environ.get("WORLD_SIZE") != "4", reason="pp=2 x dp_shard=2 needs 4 ranks")
+class TestStageReshardPolicy:
+    """Keeping a stage gathered between microbatches moves its all-gathers, not its numbers."""
+
+    def test_stages_match_the_resharding_wrap_bit_for_bit(self, monkeypatch) -> None:
+        """``build_model``'s pp=2 x dp_shard=2 stages train, evaluate at the schedule-free point
+        and train on to the same losses, eval loss and weights, bit for bit, as stages wrapped
+        with ``reshard_after_forward=True``. The math attention kernel makes each run
+        deterministic."""
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        import kempnerforge.training.entry as entry
+        from kempnerforge.config.schema import (
+            DistributedConfig,
+            JobConfig,
+            OptimizerConfig,
+            TrainConfig,
+        )
+        from kempnerforge.distributed.setup import init_distributed
+        from kempnerforge.training.eval import run_eval
+        from kempnerforge.training.loss import build_loss_fn
+        from kempnerforge.training.optimizer import build_optimizer, evaluation_point
+        from kempnerforge.training.runtime import RuntimeContext
+
+        rank = int(os.environ["RANK"])
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        distributed = DistributedConfig(pp=2, dp_shard=2)
+        mesh = init_distributed(distributed, seed=42)
+        assert mesh is not None
+        config = JobConfig(
+            model=CONFIG,
+            train=TrainConfig(batch_size=2, seq_len=SEQ, grad_accum_steps=4, compile_model=False),
+            optimizer=OptimizerConfig(name="schedule_free_adamw", lr=1e-2, fused=False),
+            distributed=distributed,
+        )
+        runtime = RuntimeContext(
+            rank=rank, local_rank=rank, world_size=4, device=device, device_mesh=mesh
+        )
+        loss_fn = build_loss_fn(config.train)
+        pp_rank, dp_rank = mesh.get_local_rank("pp"), mesh.get_local_rank("dp_shard")
+        micro, n_micro = config.train.batch_size, config.train.grad_accum_steps
+
+        def batches(seed: int) -> list[dict[str, torch.Tensor]]:
+            gen = torch.Generator().manual_seed(100 * seed + dp_rank)
+            return [
+                {
+                    "input_ids": torch.randint(0, CONFIG.vocab_size, (micro, SEQ), generator=gen),
+                    "labels": torch.randint(0, CONFIG.vocab_size, (micro, SEQ), generator=gen),
+                }
+                for _ in range(n_micro)
+            ]
+
+        def run() -> tuple[list[torch.Tensor], float, list[torch.Tensor]]:
+            torch.manual_seed(0)
+            model, pipeline = entry.build_model(config, runtime, loss_fn)
+            assert pipeline is not None
+            optimizer = build_optimizer(model, config.optimizer)
+            losses: list[torch.Tensor] = []
+
+            def train_step(seed: int) -> None:
+                group = batches(seed)
+                tokens = torch.cat([b["input_ids"] for b in group]).to(device)
+                labels = torch.cat([b["labels"] for b in group]).to(device)
+                step_losses: list[torch.Tensor] = []
+                if pp_rank == 0:
+                    pipeline.schedule.step(tokens, target=labels, losses=step_losses)
+                else:
+                    pipeline.schedule.step(target=labels, losses=step_losses)
+                optimizer.step()
+                optimizer.zero_grad()
+                losses.extend(loss.detach().clone() for loss in step_losses)
+
+            train_step(1)
+            train_step(2)
+            with evaluation_point(optimizer, model):
+                metrics = run_eval(
+                    model,
+                    batches(0),
+                    loss_fn,
+                    device,
+                    n_micro,
+                    pp_schedule=pipeline.schedule,
+                    pp_rank=pp_rank,
+                    pp_size=2,
+                    pp_group=mesh["pp"].get_group(),
+                    pp_n_microbatches=n_micro,
+                )
+            train_step(3)
+            train_step(4)
+            weights = [p.to_local().detach().clone() for p in model.parameters()]
+            return losses, metrics["eval/loss"], weights
+
+        with sdpa_kernel(SDPBackend.MATH):
+            losses, eval_loss, weights = run()
+            apply_fsdp2 = entry.apply_fsdp2
+            monkeypatch.setattr(
+                entry,
+                "apply_fsdp2",
+                lambda *a, **k: apply_fsdp2(*a, **{**k, "reshard_after_forward": True}),
+            )
+            ref_losses, ref_eval_loss, ref_weights = run()
+
+        assert len(losses) == (4 * n_micro if pp_rank == 1 else 0)
+        assert all(torch.equal(a, b) for a, b in zip(losses, ref_losses, strict=True))
+        assert eval_loss == ref_eval_loss
+        assert all(torch.equal(a, b) for a, b in zip(weights, ref_weights, strict=True))

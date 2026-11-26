@@ -123,9 +123,11 @@ remaining parameters (embedding, final norm, output head).
 - Default mixed-precision policy: `param_dtype=bf16, reduce_dtype=fp32`
   (bf16 compute, fp32 gradient reduction).
 - `reshard_after_forward=True` frees the all-gathered parameters after
-  each forward pass (default — smallest memory footprint). Set to
-  `False` or a bucket size when pipeline parallelism reuses parameters
-  across microbatches.
+  each forward pass (the default, with the smallest memory footprint).
+  `False` keeps them gathered; pipeline stages use it to reuse them
+  across microbatches. An integer `N` reshards them to groups of `N`
+  ranks, a divisor of the `dp_shard` size, so the backward all-gather
+  runs within a group.
 
 **EP-MoE special case.** When a block contains MoE with `ep_world_size >
 1`, FSDP2 wraps `layer.attention` and `layer.mlp` as separate units

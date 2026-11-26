@@ -2651,6 +2651,31 @@ class TestBuildModel:
         entry.build_model(config, _pp_runtime(FakeMesh(dims)), "LOSS")
         assert {p.dtype for p in stage.parameters()} == {dtype}
 
+    @pytest.mark.parametrize("dims", [("pp", "dp_shard"), ("pp", "tp")])
+    def test_pp_stage_keeps_its_parameters_gathered_after_forward(
+        self, monkeypatch, dims: tuple[str, str]
+    ) -> None:
+        """A stage runs every microbatch of a step, so it stays gathered after each forward."""
+        import inspect
+
+        from kempnerforge.distributed.parallel import apply_fsdp2
+
+        stage, calls = FakeStageModule(), {}
+        entry = _stub_pp(monkeypatch, stage, calls)
+        signature = inspect.signature(apply_fsdp2)
+        wraps: list[dict[str, Any]] = []
+
+        def record(*args: Any, **kwargs: Any) -> None:
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            wraps.append(bound.arguments)
+
+        monkeypatch.setattr(entry, "apply_fsdp2", record)
+        config = make_config()
+        config.distributed.pp = 2
+        entry.build_model(config, _pp_runtime(FakeMesh(dims)), "LOSS")
+        assert [(w["model"], w["reshard_after_forward"]) for w in wraps] == [(stage, False)]
+
     def test_pp_without_a_mesh_raises_rather_than_asserting(self, monkeypatch):
         stage, calls = FakeStageModule(), {}
         entry = _stub_pp(monkeypatch, stage, calls)

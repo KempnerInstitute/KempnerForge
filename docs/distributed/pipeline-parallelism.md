@@ -164,17 +164,30 @@ the broadcast. See
 
 ## FSDP2 interaction
 
-When PP is on, the training loop calls `apply_fsdp2(model, device_mesh,
-mp_policy=mp_policy)` without overriding `reshard_after_forward`, so
-FSDP2 uses its default (`True`).
+With a data-parallel dimension, `build_model` wraps each stage with
+`apply_fsdp2(stage_mod, device_mesh, mp_policy=mp_policy,
+reshard_after_forward=False)`.
 
-That's not ideal: 1F1B sends many microbatches through each stage, and
-resharding between them triggers a fresh all-gather every
-microbatch. The docstring on `pipeline_parallel.py` recommends
-`reshard_after_forward=False` for PP to amortize the all-gather over
-`n_microbatches`, but the current `build_model` doesn't thread
-the flag through. If you're running PP at scale and can't fit the
-extra all-gathers, pass it manually. See [FSDP2](fsdp2.md) — the
+The schedule sends every microbatch of a step through each stage. With
+FSDP2's default, `True`, a unit reshards after every microbatch's
+forward, so the backward or forward that follows all-gathers its
+parameters again. With `False` it stays gathered after each forward, so
+the next forward or backward through it does not all-gather again. A
+stage that is not compiled is then all-gathered once per step: the
+schedule keeps it gathered through the step's backwards and reshards it
+after the last one. A compiled stage (`train.compile_model`) reaches the
+schedule as a wrapper the schedule does not treat as FSDP, so FSDP2
+reshards it after each microbatch's backward; `False` then saves only
+the all-gather of a forward or backward that directly follows a
+forward, about half of them, and a backward that follows another
+backward still all-gathers. The cost is memory: a unit holds its
+unsharded parameters, in the param dtype, from its first forward until
+it reshards.
+
+The training loop evaluates inside `evaluation_point(optimizer, model)`,
+which reshards every unit around the schedule-free swap, so a unit left
+gathered by an eval forward does not hand the averaged weights `x` to
+the next training step. See [FSDP2](fsdp2.md), the
 **`reshard_after_forward`** section.
 
 ## Checkpointing

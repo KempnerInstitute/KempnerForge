@@ -77,7 +77,11 @@ def build_model(
 
     With ``distributed.pp > 1`` this builds this rank's pipeline stage plus
     its schedule (which is why ``loss_fn`` is needed here); otherwise it
-    delegates to ``build_parallel_model`` and returns no pipeline.
+    delegates to ``build_parallel_model`` and returns no pipeline. A stage
+    is wrapped with FSDP2's ``reshard_after_forward=False``: the schedule
+    sends every microbatch of a step through it, and its parameters stay
+    gathered after each forward, so the next forward or backward through it
+    does not all-gather them again.
     """
     tc = config.train
     device = runtime.device
@@ -122,7 +126,7 @@ def build_model(
         if tc.is_fp8:
             apply_float8(stage_mod)
         apply_ac(stage_mod, tc.activation_checkpointing)
-        apply_fsdp2(stage_mod, device_mesh, mp_policy=mp_policy)
+        apply_fsdp2(stage_mod, device_mesh, mp_policy=mp_policy, reshard_after_forward=False)
         stage_mod.to_empty(device=device)
         stage_mod.init_weights_and_freqs()
         stage_mod.to(dtype=tc.master_dtype)
@@ -136,7 +140,7 @@ def build_model(
         if tc.is_fp8:
             apply_float8(stage_mod)
         apply_ac(stage_mod, tc.activation_checkpointing)
-        apply_fsdp2(stage_mod, device_mesh, mp_policy=mp_policy)
+        apply_fsdp2(stage_mod, device_mesh, mp_policy=mp_policy, reshard_after_forward=False)
 
     model: torch.nn.Module = stage_mod
     if tc.compile_model:

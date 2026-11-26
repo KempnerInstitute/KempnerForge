@@ -164,15 +164,15 @@ apply_fsdp2(model, device_mesh, reshard_after_forward=True)
 |-------|----------|-------------|
 | `True` (default) | All-gather on forward, reshard after, all-gather again on backward | Maximum memory savings; every forward pass reshards |
 | `False` | All-gather once, keep gathered across the step | Pipeline parallel: `1F1B` schedule sends many microbatches through each stage; resharding between them would be wasted work |
-| `int` | Rate-limit concurrency: keep at most `N` blocks gathered at once | Rarely used; middle-ground for memory tuning |
+| `int` (`N`) | Reshard to groups of `N` ranks after forward: each rank keeps `1/N` of every unit, and the backward all-gather runs within its group | Memory between `True` and `False`; `N` must divide the `dp_shard` size |
 
 [`training/entry.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/entry.py)
-calls `apply_fsdp2(model, device_mesh, mp_policy=mp_policy)` on all
-paths without overriding `reshard_after_forward`, so both dense and
-PP runs default to `True`. The docstring on `pipeline_parallel.py`
-recommends `False` for PP (to amortize the all-gather over
-microbatches), but that's not currently wired through the training
-script — pass it manually if you need it.
+passes `reshard_after_forward=False` for pipeline stages and keeps the
+default `True` on every other path; no config field sets it. A pipeline
+schedule sends every microbatch of a step through a stage, so keeping
+the stage gathered after a forward saves the all-gathers that would
+follow it. See
+[Pipeline parallelism § FSDP2 interaction](pipeline-parallelism.md#fsdp2-interaction).
 
 ## EP-MoE: per-sub-module wrapping
 
