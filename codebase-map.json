@@ -2065,9 +2065,9 @@
           "TestExtractRepresentations(5)",
           "TestSaveActivations(3)",
           "TestActivationStoreIntegration(3)",
-          "TestActivationStoreParallel(7)"
+          "TestActivationStoreParallel(11)"
         ],
-        "count": 36
+        "count": 40
       },
       "tests/unit/test_additional_optimizers.py": {
         "classes": [

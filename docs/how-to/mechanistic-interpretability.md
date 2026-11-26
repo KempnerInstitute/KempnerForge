@@ -278,16 +278,24 @@ captures add eager-mode overhead.
 load (as shown in the quick path: build the model, `dcp.load` the
 weights, run on one GPU). FSDP2 alone shards parameters, not module
 outputs: each rank captures full activations for its own batch. Under
-tensor parallelism, the outputs of whole blocks, their `attention` and
-`mlp`, the norms and the output head are stored as the full tensor on
-every rank, a `DTensor` output being gathered first. The gather is a
-collective, so every rank of the tensor-parallel group must enable the
-store and run the same forward.
-A module inside an attention or MLP block, such as `q_proj`, `o_proj`,
-`down_proj` or `q_norm`, returns only this rank's slice of the
-activation, with nothing marking it as a slice, so `enable()` refuses
-it with a `ValueError` naming the module. Capture the enclosing block
-instead, or load the model in a single process.
+tensor parallelism every capture is stored as the full tensor on every
+rank. A `DTensor` output (a block, its `attention` or `mlp`, a norm) is
+gathered first. A projection such as `q_proj`, `o_proj`, `down_proj` or
+`output_head.proj` holds weights sharded over the `tp` mesh dimension,
+and a forward hook that tensor parallelism installs on it turns its
+output into this rank's shard. The store hooks the projection ahead of
+that hook and gathers its output too, at one collective over the
+tensor-parallel group per captured projection and forward. Because the
+gathers are collectives, every rank of that group must enable the store
+and run the same forward.
+`q_norm` and `k_norm` run on this rank's heads only, with nothing
+marking their output as a slice, so `enable()` refuses them with a
+`ValueError` naming the module. The rule goes by where a module sits:
+a module next to a projection with sharded weights is refused unless it
+holds such weights itself, so in a custom model with such a projection
+directly under the root, every other module is refused, even one whose
+output is full. Capture the enclosing block instead, or load the model
+in a single process.
 
 ## Troubleshooting
 

@@ -30,11 +30,17 @@ class ActivationStore:
     Captured tensors are moved to CPU to avoid GPU memory pressure.
     Use :meth:`enable` / :meth:`disable` to control when hooks are active.
 
-    Under tensor parallelism, an output that is a ``DTensor`` (a block, its
-    attention or MLP, a norm) is gathered to the full tensor before it is
-    stored. The gather is a collective over the tensor-parallel group, so every
-    rank of that group must enable the store and run the same forward. Targets
-    whose output is a rank's local shard are refused by :meth:`enable`.
+    Under tensor parallelism every capture is stored as the full tensor. An
+    output that is a ``DTensor`` (a block, its attention or MLP, a norm) is
+    gathered before it is stored. A module holding a parameter sharded over the
+    ``tp`` mesh dimension, such as a projection, is hooked ahead of its other
+    forward hooks, among them the tensor-parallel one that turns its
+    ``DTensor`` output into this rank's local shard, so its output is gathered
+    too. Each gather is one collective over the tensor-parallel group per
+    captured module and forward, so every rank of that group must enable the
+    store and run the same forward. A module that may run on a local shard
+    without holding such a parameter, as ``q_norm`` and ``k_norm`` do, is
+    refused by :meth:`enable`.
 
     Args:
         model: The model to instrument.
@@ -66,12 +72,13 @@ class ActivationStore:
         """Register forward hooks on all target layers.
 
         Raises:
-            ValueError: If a target is not a module of the model, or if its
-                output under tensor parallelism is this rank's local shard: the
-                target holds a parameter sharded over the ``tp`` mesh dimension,
-                or sits inside a module that directly contains one that does,
-                as ``q_norm`` sits next to ``q_proj`` inside
-                ``layers.N.attention``. No hook is registered when it raises.
+            ValueError: If a target is not a module of the model, or if under
+                tensor parallelism it may run on this rank's local shard: it
+                holds no parameter sharded over the ``tp`` mesh dimension but
+                sits inside a module that directly contains one that does, the
+                model root included, as ``q_norm`` sits next to ``q_proj``
+                inside ``layers.N.attention``. No hook is registered when it
+                raises.
         """
         if self._enabled:
             return
@@ -83,9 +90,12 @@ class ActivationStore:
                     f"Module '{name}' not found in model. "
                     f"Available: {sorted(module_map.keys())[:20]}..."
                 )
-        _refuse_local_shard_targets(module_map, self._layers)
+        owners = _tp_shard_owners(module_map)
+        _refuse_local_shard_targets(owners, self._layers)
         for name in self._layers:
-            hook = module_map[name].register_forward_hook(self._make_hook(name))
+            hook = module_map[name].register_forward_hook(
+                self._make_hook(name), prepend=name in owners
+            )
             self._hooks.append(hook)
         self._enabled = True
 
@@ -136,29 +146,36 @@ def _shards_over_tp(param: torch.Tensor) -> bool:
     return "tp" in names and param.placements[names.index("tp")].is_shard()
 
 
-def _refuse_local_shard_targets(modules: dict[str, nn.Module], targets: list[str]) -> None:
-    """Raise ``ValueError`` naming the first target whose output is a local TP shard.
-
-    ``modules`` maps every module name of the model to its module. A module that
-    holds a parameter sharded over the ``tp`` mesh dimension returns this rank's
-    shard, and so does every other module inside its parent, the model root
-    included.
-    """
-    owners = [
+def _tp_shard_owners(modules: dict[str, nn.Module]) -> list[str]:
+    """Names, in ``modules`` order, of the modules that hold a parameter sharded over ``tp``."""
+    return [
         name
         for name, module in modules.items()
         if any(_shards_over_tp(p) for p in module.parameters(recurse=False))
     ]
+
+
+def _refuse_local_shard_targets(owners: list[str], targets: list[str]) -> None:
+    """Raise ``ValueError`` naming the first target that may run on a local TP shard.
+
+    ``owners`` names the modules holding a parameter sharded over the ``tp``
+    mesh dimension, whose outputs the store gathers. Any other module inside an
+    owner's parent, the model root included, may run on the owner's local shard
+    with nothing marking it as one, as ``q_norm`` does next to ``q_proj``.
+    """
     for target in targets:
-        for owner in [target] if target in owners else owners:
+        if target in owners:
+            continue
+        for owner in owners:
             region = owner.rpartition(".")[0]
             inside = target.startswith(f"{region}.") if region else target != ""
-            if target == owner or inside:
+            if inside:
                 hint = f" Capture '{region}' or a module enclosing it instead." if region else ""
                 raise ValueError(
-                    f"Cannot capture '{target}': under tensor parallelism its output is this "
-                    f"rank's local shard, because '{owner}' holds parameters sharded over the "
-                    f"'tp' mesh dimension.{hint}"
+                    f"Cannot capture '{target}': under tensor parallelism it may run on this "
+                    f"rank's local shard, with nothing marking it as one, because it sits next "
+                    f"to '{owner}', which holds parameters sharded over the 'tp' mesh "
+                    f"dimension.{hint}"
                 )
 
 
