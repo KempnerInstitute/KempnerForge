@@ -19,9 +19,11 @@ from pathlib import Path
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
+import kempnerforge.checkpoint.manager as manager_module
 import kempnerforge.training.entry as entry
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.adapter import AdapterConfig
@@ -224,6 +226,50 @@ class TestNestedEntries:
         assert load()[0] == STEP
         assert model.loaded is not None and set(model.loaded) == {"kept"}
 
+    def test_an_entry_saved_whole_before_torch_2_4_loads(self, tmp_path, monkeypatch):
+        """Before torch 2.4, DCP saved a nested entry that holds no tensor as one value under
+        its own key, and its load planner still reads one saved that way."""
+        from torch.distributed.checkpoint import _version
+
+        torch.manual_seed(0)
+        model = _Counter(7)
+        monkeypatch.setattr(_version, "_derived_version", "2_3")
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, _stepped(model)).save(STEP)
+        monkeypatch.setattr(_version, "_derived_version", None)
+        index = dcp.FileSystemReader(str(tmp_path / f"step_{STEP}")).read_metadata()
+        assert "model._extra_state" in index.state_dict_metadata
+        loaded = _Counter(0)
+        manager = CheckpointManager(
+            CheckpointConfig(dir=str(tmp_path)), loaded, torch.optim.AdamW(loaded.parameters())
+        )
+        assert manager.load(exclude_keys=["optimizer"])[0] == STEP
+        assert loaded.counter == 7
+
+    def test_a_state_that_does_not_flatten_raises_its_own_error(self, tmp_path):
+        self._save(tmp_path, {"kept": 2})
+        model = _ExtraState({"kept": 2})
+        model.get_extra_state = lambda: {"a.b": torch.ones(1), "a": {"b": torch.ones(1)}}
+        manager = CheckpointManager(
+            CheckpointConfig(dir=str(tmp_path)), model, torch.optim.AdamW(model.parameters())
+        )
+        with pytest.raises(ValueError, match="duplicated flatten key"):
+            manager.load()
+
+
+class _Counter(torch.nn.Module):
+    """A module whose extra state is a dict that holds no tensor."""
+
+    def __init__(self, counter: int) -> None:
+        super().__init__()
+        self.proj = torch.nn.Linear(2, 2)
+        self.counter = counter
+
+    def get_extra_state(self) -> dict[str, int]:
+        return {"counter": self.counter}
+
+    def set_extra_state(self, state: dict) -> None:
+        self.counter = state["counter"]
+
 
 class TestFreezeWarningsOnRankZero:
     @pytest.mark.parametrize("ignore", [False, True], ids=["unread", "ignored-mismatch"])
@@ -281,6 +327,39 @@ def _check_every_rank_refuses_alike(rank: int, world: int, port: int, root: str)
         assert messages == [messages[0]] * world
         assert "model.layers.2." in messages[0]
         assert all(torch.equal(value, before[key]) for key, value in _local(shallow).items())
+
+
+def _check_a_rank_that_cannot_list_its_model_fails_every_rank(
+    rank: int, world: int, port: int, root: str
+):
+    """Rank 1's state does not flatten. It raises its own error and rank 0 one naming it, and
+    neither waits for the other in the model check's collectives."""
+    with gloo_group(rank, world, port):
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
+        model = _fsdp(MODEL, mesh)
+        CheckpointManager(CheckpointConfig(dir=root), model, _stepped(model)).save(
+            STEP, tokens_seen=TOKENS
+        )
+        if rank == 1:
+
+            def duplicated(_state):
+                raise ValueError("duplicated flatten key model.a.b")
+
+            manager_module.flatten_state_dict = duplicated
+        reloaded = _fsdp(MODEL, mesh)
+        optimizer = torch.optim.AdamW(reloaded.parameters(), lr=0.1)
+        manager = CheckpointManager(CheckpointConfig(dir=root), reloaded, optimizer)
+        outcome = None
+        try:
+            manager.load()
+        except (ValueError, RuntimeError) as error:
+            outcome = (type(error).__name__, str(error))
+        outcomes: list = [None] * world
+        dist.all_gather_object(outcomes, outcome)
+        assert outcomes[1] == ("ValueError", "duplicated flatten key model.a.b")
+        assert outcomes[0] is not None and outcomes[0][0] == "RuntimeError", outcomes
+        expected = "failed on ranks [1]: rank 1: ValueError: duplicated flatten key model.a.b"
+        assert expected in outcomes[0][1]
 
 
 def _vlm_job(root: str) -> JobConfig:
@@ -369,3 +448,6 @@ class TestAcrossRanks:
 
     def test_a_rank_that_misses_the_record_resumes_as_rank_0_read_it(self, tmp_path):
         spawn(_check_a_rank_that_misses_the_record_resumes_alike, 2, str(tmp_path))
+
+    def test_a_rank_that_cannot_list_its_model_fails_every_rank(self, tmp_path):
+        spawn(_check_a_rank_that_cannot_list_its_model_fails_every_rank, 2, str(tmp_path))

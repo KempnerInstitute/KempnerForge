@@ -58,6 +58,7 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import _CHECKPOINT_PREFIX
 from torch.distributed.checkpoint import DefaultLoadPlanner, DefaultSavePlanner
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
+from torch.distributed.checkpoint._traverse import traverse_state_dict_v_2_3
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -480,13 +481,42 @@ def _dcp_keys(dcp_dir: Path) -> dict[str, Any]:
     return dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata
 
 
+def _held_model_entries(
+    model_state: Mapping[str, Any], every_rank: Iterable[str]
+) -> dict[str, tuple[int, ...] | None]:
+    """The entries a load reads into the model, by every key a DCP index can hold them under.
+
+    Each entry of the load's ``{"model": ...}`` state is keyed as DCP flattens it, with its
+    global shape, None for one that is not a tensor. A checkpoint saved before DCP flattened a
+    nested entry that holds no tensor keeps it whole under the entry's own key, which DCP's
+    load planner still reads, so that key is listed too, with no shape. So is each name in
+    ``every_rank``.
+
+    Raises:
+        ValueError: The state flattens to the same key twice.
+    """
+    state = {"model": dict(model_state)}
+    flat, _ = flatten_state_dict(state)
+    held: dict[str, tuple[int, ...] | None] = {}
+    for key, value in flat.items():
+        held[key] = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+
+    def whole(path: tuple[str | int, ...], _value: Any) -> None:
+        held.setdefault(".".join(map(str, path)), None)
+
+    traverse_state_dict_v_2_3(state, whole)
+    for name in every_rank:
+        held.setdefault(f"{_MODEL_PREFIX}{name}", None)
+    return held
+
+
 def _model_misfit(
     held: Mapping[str, tuple[int, ...] | None], saved: Mapping[str, Any]
 ) -> tuple[list[str], list[str]]:
     """Compare the model entries a load reads from a DCP index with what the index holds.
 
-    ``held`` maps the key of each entry, as DCP flattens the load's ``{"model": ...}`` state,
-    to its global shape, None for an entry that is not a tensor; ``saved`` is the index's
+    ``held`` maps each key the entries can be held under to its global shape, None for an
+    entry that is not a tensor (see ``_held_model_entries``); ``saved`` is the index's
     ``state_dict_metadata``.
 
     Returns:
@@ -1496,7 +1526,7 @@ class CheckpointManager:
         holds it (see ``_present_experts``), and ``every_rank`` names, as the checkpoint does,
         the experts that every expert-parallel rank of this rank's layers holds. Every rank
         sends rank 0 the index it reads with the global shape of each entry, keyed as DCP
-        flattens it, so a nested entry counts by its leaves. Rank 0 reads each index once, or
+        flattens it (see ``_held_model_entries``). Rank 0 reads each index once, or
         takes ``saved_keys``, its own read of ``dcp_dir``, and compares it with what the ranks
         that read it load together: every expert-parallel rank's experts and, when
         ``restaged``, every pipeline stage's layers. A model tensor the index holds that none
@@ -1507,16 +1537,21 @@ class CheckpointManager:
         ``checkpoint.ignore_extra_model_tensors``, rank 0 warns of the tensors no rank loads,
         which stay unread, and only a size change refuses.
 
+        A rank that cannot list its entries still enters every collective, sending why in
+        their place; it raises its own error and every other rank a ``RuntimeError`` naming it.
+
         Raises:
             ValueError: The checkpoint does not fit the model.
-            RuntimeError: Rank 0 could not read an index.
+            RuntimeError: Rank 0 could not read an index, or another rank could not list its
+                entries.
         """
-        flat, _ = flatten_state_dict({"model": dict(model_state)})
-        held: dict[str, tuple[int, ...] | None] = {}
-        for key, value in flat.items():
-            held[key] = tuple(value.shape) if isinstance(value, torch.Tensor) else None
-        for name in every_rank:
-            held.setdefault(f"{_MODEL_PREFIX}{name}", None)
+        local_error: Exception | None = None
+        held: dict[str, tuple[int, ...] | None] | str
+        try:
+            held = _held_model_entries(model_state, every_rank)
+        except Exception as e:
+            local_error = e
+            held = f"{type(e).__name__}: {_error_text(e)}"
         mine = (str(dcp_dir), held)
         distributed = dist.is_initialized()
         gathered: list[Any] | None = [mine]
@@ -1529,25 +1564,35 @@ class CheckpointManager:
             outcome[0] = self._model_misfit_error(gathered, known, restaged and not distributed)
         if distributed:
             dist.broadcast_object_list(outcome, src=0, group=self._sync_group)
+        if local_error is not None:
+            raise local_error
         error = outcome[0]
         if error is not None:
             raise error
 
     def _model_misfit_error(
         self,
-        gathered: Iterable[tuple[str, Mapping[str, tuple[int, ...] | None]]],
+        gathered: Sequence[tuple[str, Mapping[str, tuple[int, ...] | None] | str]],
         known: Mapping[str, Mapping[str, Any]],
         lone_stage: bool,
     ) -> Exception | None:
         """Rank 0's verdict for ``_check_model_fits``: the error every rank raises, or None.
 
-        ``gathered`` holds each rank's index and the shapes of the model entries it loads from
-        it, ``known`` the indexes already read, by directory. With ``lone_stage`` the entries
-        are one pipeline stage's part of the model the index holds, so tensors none of them
-        loads are expected and not counted.
+        ``gathered`` holds, by rank, each rank's index and the shapes of the model entries it
+        loads from it, or why it could not list them; ``known`` holds the indexes already read,
+        by directory. With ``lone_stage`` the entries are one pipeline stage's part of the
+        model the index holds, so tensors none of them loads are expected and not counted.
         """
+        failed = {rank: held for rank, (_, held) in enumerate(gathered) if isinstance(held, str)}
+        if failed:
+            first = min(failed)
+            return RuntimeError(
+                f"Comparing the model with the checkpoint failed on ranks {sorted(failed)}: "
+                f"rank {first}: {failed[first]}"
+            )
+        listed = [(index, held) for index, held in gathered if not isinstance(held, str)]
         held_by_index: dict[str, dict[str, tuple[int, ...] | None]] = {}
-        for index, held in gathered:
+        for index, held in listed:
             merged = held_by_index.setdefault(index, {})
             for key, shape in held.items():
                 if merged.get(key) is None:
