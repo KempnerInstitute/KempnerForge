@@ -42,6 +42,8 @@ MODEL = ModelConfig(dim=32, n_layers=4, n_heads=4, vocab_size=64, max_seq_len=16
 FP32 = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
 STEP = 3
 TOKENS = 96
+GROUP_TIMEOUT_S = 30
+COMPARISON_FAILURE = "cannot compare the saved sizes"
 EXTRA = r"holds \d+ model tensors this run's model does not have, such as \['model\.layers\.2\."
 OVERRIDE = r"checkpoint\.ignore_extra_model_tensors = true"
 
@@ -170,6 +172,21 @@ class TestModelAgainstTheCheckpoint:
         monkeypatch.setattr("kempnerforge.checkpoint.manager._dcp_keys", unreadable)
         with pytest.raises(RuntimeError, match="Rank 0 could not read the DCP index"):
             manager.load(exclude_keys=["optimizer"])
+
+    def test_a_comparison_that_fails_without_a_process_group_raises_its_error(
+        self, tmp_path, monkeypatch
+    ):
+        _save(tmp_path)
+        model, _, manager = _run(tmp_path)
+        before = _snapshot(model)
+        monkeypatch.setattr("kempnerforge.checkpoint.manager._model_misfit", _failing_comparison)
+        with pytest.raises(TypeError, match=COMPARISON_FAILURE):
+            manager.load()
+        assert _holds(model, before)
+
+
+def _failing_comparison(_held, _saved):
+    raise TypeError(COMPARISON_FAILURE)
 
 
 class _ExtraState(torch.nn.Module):
@@ -362,6 +379,42 @@ def _check_a_rank_that_cannot_list_its_model_fails_every_rank(
         assert expected in outcomes[0][1]
 
 
+def _check_a_comparison_that_fails_on_rank_0_fails_every_rank(
+    rank: int, world: int, port: int, root: str
+):
+    """Rank 0's comparison raises. Rank 0 raises that error and rank 1 one naming it, and
+    neither waits for the other: the loading manager's group gives up after
+    ``GROUP_TIMEOUT_S``, so a rank left waiting for the verdict raises that timeout instead."""
+    with gloo_group(rank, world, port):
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("dp_shard",))
+        model = _fsdp(MODEL, mesh)
+        CheckpointManager(CheckpointConfig(dir=root), model, _stepped(model)).save(
+            STEP, tokens_seen=TOKENS
+        )
+        if rank == 0:
+            manager_module._model_misfit = _failing_comparison
+        reloaded = _fsdp(MODEL, mesh)
+        optimizer = torch.optim.AdamW(reloaded.parameters(), lr=0.1)
+        manager = CheckpointManager(
+            CheckpointConfig(dir=root), reloaded, optimizer, group_timeout_sec=GROUP_TIMEOUT_S
+        )
+        before = _local(reloaded)
+        outcome = None
+        try:
+            manager.load()
+        except Exception as error:
+            outcome = (type(error).__name__, str(error))
+        outcomes: list = [None] * world
+        dist.all_gather_object(outcomes, outcome)
+        assert outcomes[0] == ("TypeError", COMPARISON_FAILURE), outcomes
+        expected = (
+            "Rank 0 could not compare the checkpoint with this run's model: "
+            f"TypeError: {COMPARISON_FAILURE}"
+        )
+        assert outcomes[1] == ("RuntimeError", expected), outcomes
+        assert all(torch.equal(value, before[key]) for key, value in _local(reloaded).items())
+
+
 def _vlm_job(root: str) -> JobConfig:
     """A VLM run that freezes the vision encoder until step 5 and trains it from then on."""
     return JobConfig(
@@ -451,3 +504,6 @@ class TestAcrossRanks:
 
     def test_a_rank_that_cannot_list_its_model_fails_every_rank(self, tmp_path):
         spawn(_check_a_rank_that_cannot_list_its_model_fails_every_rank, 2, str(tmp_path))
+
+    def test_a_comparison_that_fails_on_rank_0_fails_every_rank(self, tmp_path):
+        spawn(_check_a_comparison_that_fails_on_rank_0_fails_every_rank, 2, str(tmp_path))

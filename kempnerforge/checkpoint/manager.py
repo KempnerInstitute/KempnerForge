@@ -1538,12 +1538,16 @@ class CheckpointManager:
         which stay unread, and only a size change refuses.
 
         A rank that cannot list its entries still enters every collective, sending why in
-        their place; it raises its own error and every other rank a ``RuntimeError`` naming it.
+        their place, and rank 0 still broadcasts a verdict when comparing them fails, with why
+        in its place: the rank that failed raises its own error and every other rank a
+        ``RuntimeError`` naming it.
 
         Raises:
             ValueError: The checkpoint does not fit the model.
-            RuntimeError: Rank 0 could not read an index, or another rank could not list its
-                entries.
+            Exception: On a rank that could not list its entries, or on rank 0 when comparing
+                them failed, that error.
+            RuntimeError: On every other rank, naming the ranks that failed; on every rank when
+                rank 0 could not read an index.
         """
         local_error: Exception | None = None
         held: dict[str, tuple[int, ...] | None] | str
@@ -1559,14 +1563,20 @@ class CheckpointManager:
             gathered = [None] * dist.get_world_size(self._sync_group) if self._rank == 0 else None
             dist.gather_object(mine, gathered, dst=0, group=self._sync_group)
         outcome: list[Exception | None] = [None]
+        comparison_error: Exception | None = None
         if gathered is not None:
-            known = {str(dcp_dir): saved_keys} if saved_keys else {}
-            outcome[0] = self._model_misfit_error(gathered, known, restaged and not distributed)
+            try:
+                known = {str(dcp_dir): saved_keys} if saved_keys else {}
+                outcome[0] = self._model_misfit_error(gathered, known, restaged and not distributed)
+            except Exception as e:
+                comparison_error = e
+                outcome[0] = RuntimeError(
+                    "Rank 0 could not compare the checkpoint with this run's model: "
+                    f"{type(e).__name__}: {_error_text(e)}"
+                )
         if distributed:
             dist.broadcast_object_list(outcome, src=0, group=self._sync_group)
-        if local_error is not None:
-            raise local_error
-        error = outcome[0]
+        error = local_error or comparison_error or outcome[0]
         if error is not None:
             raise error
 
