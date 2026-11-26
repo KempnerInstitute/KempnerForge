@@ -34,8 +34,7 @@ else:
 if self.drop_last:
     indices = indices[: self.total_size]   # total = num_samples * num_replicas
 else:
-    padding = self.total_size - len(indices)
-    indices += indices[:padding]
+    indices = _pad_to_multiple(indices, self.num_replicas)
 
 # Stride partition
 indices = indices[self.rank : self.total_size : self.num_replicas]
@@ -65,6 +64,13 @@ else:
     self.num_samples = math.ceil(total / num_replicas)
     self.total_size  = self.num_samples * num_replicas      # padded by wrap-around
 ```
+
+Without `drop_last`, the padding repeats the shuffled list from its
+start, as many times as it takes to reach `total_size`, so even a
+dataset with fewer samples than half the ranks gives every rank
+`num_samples` indices (torch's `DistributedSampler` pads the same way).
+`MixtureSampler` pads each sub-dataset this way before it takes the
+rank's stride slice.
 
 KempnerForge defaults to `drop_last=True` in every call site. Losing
 a handful of samples per epoch at world sizes of 16-64 is a

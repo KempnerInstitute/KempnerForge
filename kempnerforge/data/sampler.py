@@ -91,6 +91,16 @@ def _pick(count: int, unseen: list[int], pool: list[int]) -> list[int]:
     return unseen + (pool * (extra // len(pool) + 1))[:extra]
 
 
+def _pad_to_multiple(indices: list[int], multiple: int) -> list[int]:
+    """``indices`` extended to a multiple of ``multiple`` entries by repeating it from its start.
+
+    A list shorter than its padding repeats as many times as needed, so the
+    ``multiple`` strided shares of the result all have the same length.
+    """
+    padding = -len(indices) % multiple
+    return indices + [indices[i % len(indices)] for i in range(padding)]
+
+
 class DistributedSampler(Sampler[int]):
     """Deterministic distributed sampler with skip-ahead support.
 
@@ -180,8 +190,7 @@ class DistributedSampler(Sampler[int]):
         if self.drop_last:
             indices = indices[: self.total_size]
         else:
-            padding = self.total_size - len(indices)
-            indices += indices[:padding]
+            indices = _pad_to_multiple(indices, self.num_replicas)
 
         indices = indices[self.rank : self.total_size : self.num_replicas]
         assert len(indices) == self.num_samples
@@ -320,8 +329,7 @@ class MixtureSampler(Sampler[int]):
         if self.drop_last:
             indices = indices[: size - size % self.num_replicas]
         else:
-            padding = (self.num_replicas - len(indices) % self.num_replicas) % self.num_replicas
-            indices = indices + indices[:padding]
+            indices = _pad_to_multiple(indices, self.num_replicas)
         return indices[self.rank :: self.num_replicas]
 
     def _first_order(
@@ -379,8 +387,7 @@ class MixtureSampler(Sampler[int]):
 
         The draws after a change of weights use a generator of their own, seeded
         by the seed and epoch alone, so the rank shares of the datasets the
-        epoch's start did not draw from are the same split on every rank, even
-        when the ranks' lists differ in length.
+        epoch's start did not draw from are the same split on every rank.
         """
         g = torch.Generator().manual_seed(self.seed + self._epoch)
         targets = _apportion(self._total_per_rank, self._epoch_weights[0][1])

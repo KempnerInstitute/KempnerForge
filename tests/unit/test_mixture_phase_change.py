@@ -193,7 +193,7 @@ def _reference(
         if drop_last:
             indices = indices[: size - size % replicas]
         else:
-            indices += indices[: (replicas - size % replicas) % replicas]
+            indices += [indices[k % size] for k in range(-size % replicas)]
         share = indices[rank::replicas]
         if share:
             order.extend(offset + share[k % len(share)] for k in range(target))
@@ -297,17 +297,17 @@ def test_several_changes_never_repeat_a_dataset_no_weighting_oversamples():
     ("cumulative", "replicas", "drop_last", "position", "after", "lengths", "drawn"),
     [
         ([0, 60, 120, 180], 2, True, 30, [2.0, 2.0, 1.0], [90, 90], 24),
-        ([0, 1, 61, 121], 3, False, 5, [1.0, 1.0, 1.0], [41, 41, 20], 29),
+        ([0, 1, 61, 121], 3, False, 5, [1.0, 1.0, 1.0], [41, 41, 41], 36),
     ],
-    ids=["even", "uneven_lists"],
+    ids=["even", "one_sample_dataset"],
 )
 def test_a_dataset_entering_mid_epoch_draws_each_ranks_own_share(
     cumulative, replicas, drop_last, position, after, lengths, drawn
 ):
     """The last dataset has weight 0 until ``position``, then draws disjoint shares.
 
-    With one sample padded across three ranks, one rank's list is shorter than
-    the others', which must not change how the new dataset is split.
+    A dataset of one sample padded across three ranks gives every rank a share
+    of it, so the ranks' lists keep the same length through the change.
     """
     entering: list[int] = []
     for rank in range(replicas):
