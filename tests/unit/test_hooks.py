@@ -2,17 +2,56 @@
 
 from __future__ import annotations
 
+import copy
+import math
+import re
+import tempfile
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.parallel import ColwiseParallel, parallelize_module
 
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.distributed.parallel import apply_fsdp2, default_mp_policy
+from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 from kempnerforge.model.attention import Attention
 from kempnerforge.model.hooks import ActivationStore, extract_representations, save_activations
 from kempnerforge.model.position import precompute_rope_frequencies
 from kempnerforge.model.transformer import Transformer
+from tests.gloo_ranks import gloo_group, spawn
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+WHOLE_BLOCK_TARGETS = [
+    "token_embedding",
+    "layers.0",
+    "layers.0.attention_norm",
+    "layers.0.attention",
+    "layers.1.mlp_norm",
+    "layers.1.mlp",
+    "norm",
+    "output_head",
+]
+LOCAL_SHARD_TARGETS = [
+    "layers.0.attention.q_proj",
+    "layers.0.attention.k_proj",
+    "layers.0.attention.v_proj",
+    "layers.0.attention.o_proj",
+    "layers.0.attention.q_norm",
+    "layers.0.attention.k_norm",
+    "layers.1.mlp.gate_proj",
+    "layers.1.mlp.up_proj",
+    "layers.1.mlp.down_proj",
+]
+TP_LAYOUTS = {
+    "tp2": (("tp",), (2,), False),
+    "tp2_tied": (("tp",), (2,), True),
+    "dp_shard2_tp2": (("dp_shard", "tp"), (2, 2), False),
+}
 
 
 @pytest.fixture
@@ -148,6 +187,32 @@ class TestActivationStore:
         small_model(tokens)
         act = store.get("layers.2.mlp")
         assert act.shape == (4, 8, small_config.dim)
+        store.disable()
+
+    def test_tuple_output_stores_its_first_element(self):
+        """A module returning a tuple has its first element captured; an empty one, nothing."""
+
+        class _Pair(torch.nn.Module):
+            def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+                return (x + 1, x) if x.numel() else ()
+
+        class _Holder(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.pair = _Pair()
+                self.empty = _Pair()
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                self.empty(x[:0])
+                return self.pair(x)[0]
+
+        model = _Holder()
+        store = ActivationStore(model, layers=["pair", "empty"])
+        store.enable()
+        x = torch.randn(2, 3)
+        model(x)
+        assert torch.equal(store.get("pair"), x + 1)
+        assert store.get("empty") is None
         store.disable()
 
 
@@ -348,3 +413,110 @@ class TestActivationStoreIntegration:
         store.disable()
 
         assert len(store._hooks) == 0
+
+
+def _parallel_model(
+    mesh_dims: tuple[str, ...], mesh_sizes: tuple[int, ...], tie_embeddings: bool
+) -> tuple[Transformer, Transformer, DeviceMesh]:
+    """A seeded Transformer parallelized over a CPU mesh, an unparallelized copy, and the mesh."""
+    torch.manual_seed(0)
+    config = ModelConfig(
+        dim=64,
+        n_layers=2,
+        n_heads=4,
+        vocab_size=128,
+        max_seq_len=32,
+        qk_norm=True,
+        tie_embeddings=tie_embeddings,
+    )
+    model = Transformer(config)
+    reference = copy.deepcopy(model)
+    mesh = init_device_mesh("cpu", mesh_sizes, mesh_dim_names=mesh_dims)
+    if "tp" in mesh_dims:
+        apply_tensor_parallel(model, mesh)
+    if "dp_shard" in mesh_dims:
+        apply_fsdp2(model, mesh, mp_policy=default_mp_policy(torch.float32))
+    return model, reference, mesh
+
+
+def _tokens(seed: int) -> torch.Tensor:
+    return torch.randint(0, 128, (2, 16), generator=torch.Generator().manual_seed(seed))
+
+
+def _capture(
+    model: torch.nn.Module, layers: list[str], tokens: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    store = ActivationStore(model, layers=layers)
+    store.enable()
+    with torch.no_grad():
+        model(tokens)
+    store.disable()
+    return store.activations
+
+
+def _check_whole_block_outputs_gathered(rank: int, world: int, port: int, layout: str) -> None:
+    mesh_dims, mesh_sizes, tie_embeddings = TP_LAYOUTS[layout]
+    with gloo_group(rank, world, port):
+        model, reference, _ = _parallel_model(mesh_dims, mesh_sizes, tie_embeddings)
+        tokens = _tokens(rank // mesh_sizes[-1])
+        captured = _capture(model, WHOLE_BLOCK_TARGETS, tokens)
+        expected = _capture(reference, WHOLE_BLOCK_TARGETS, tokens)
+        for name in WHOLE_BLOCK_TARGETS:
+            assert not isinstance(captured[name], DTensor), name
+            torch.testing.assert_close(captured[name], expected[name], msg=name)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "acts.npz")
+            save_activations(captured, path)
+            with np.load(path) as loaded:
+                for name in WHOLE_BLOCK_TARGETS:
+                    np.testing.assert_array_equal(loaded[name], captured[name].numpy())
+
+
+def _check_local_shard_targets_refused(rank: int, world: int, port: int, layout: str) -> None:
+    mesh_dims, mesh_sizes, tie_embeddings = TP_LAYOUTS[layout]
+    with gloo_group(rank, world, port):
+        model, _, mesh = _parallel_model(mesh_dims, mesh_sizes, tie_embeddings)
+        refused = LOCAL_SHARD_TARGETS + ([] if tie_embeddings else ["output_head.proj"])
+        for name in refused:
+            store = ActivationStore(model, layers=["layers.0", name])
+            with pytest.raises(ValueError, match=re.escape(f"Cannot capture '{name}'")):
+                store.enable()
+            assert not store.enabled
+            with torch.no_grad():
+                model(_tokens(rank // mesh_sizes[-1]))
+            assert store.activations == {}, name
+        linear = parallelize_module(torch.nn.Linear(8, 8), mesh["tp"], ColwiseParallel())
+        with pytest.raises(ValueError, match=re.escape("Cannot capture ''")):
+            ActivationStore(linear, layers=[""]).enable()
+
+
+def _check_fsdp_targets_not_refused(rank: int, world: int, port: int) -> None:
+    with gloo_group(rank, world, port):
+        model, reference, _ = _parallel_model(("dp_shard",), (world,), False)
+        layers = [*WHOLE_BLOCK_TARGETS, *LOCAL_SHARD_TARGETS, "output_head.proj"]
+        tokens = _tokens(rank)
+        captured = _capture(model, layers, tokens)
+        expected = _capture(reference, layers, tokens)
+        for name in layers:
+            assert torch.equal(captured[name], expected[name]), name
+
+
+class TestActivationStoreParallel:
+    """Captures on a parallelized Transformer over gloo CPU ranks.
+
+    A module output that is a ``DTensor`` is stored as the full tensor on every rank. A
+    target whose output is this rank's local tensor-parallel shard (a projection, or a
+    module beside one such as ``q_norm``) is refused by ``enable()`` before any hook is
+    registered. FSDP2 alone shards parameters, not outputs, so it refuses nothing.
+    """
+
+    @pytest.mark.parametrize("layout", sorted(TP_LAYOUTS))
+    def test_whole_block_outputs_are_gathered_to_the_full_tensor(self, layout: str) -> None:
+        spawn(_check_whole_block_outputs_gathered, math.prod(TP_LAYOUTS[layout][1]), layout)
+
+    @pytest.mark.parametrize("layout", sorted(TP_LAYOUTS))
+    def test_local_shard_targets_are_refused(self, layout: str) -> None:
+        spawn(_check_local_shard_targets_refused, math.prod(TP_LAYOUTS[layout][1]), layout)
+
+    def test_fsdp_only_targets_are_not_refused(self) -> None:
+        spawn(_check_fsdp_targets_not_refused, 2)

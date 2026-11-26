@@ -734,7 +734,8 @@
         "tests/unit/test_hooks.py::TestAttentionWeightCapture",
         "tests/unit/test_hooks.py::TestExtractRepresentations",
         "tests/unit/test_hooks.py::TestSaveActivations",
-        "tests/unit/test_hooks.py::TestActivationStoreIntegration"
+        "tests/unit/test_hooks.py::TestActivationStoreIntegration",
+        "tests/unit/test_hooks.py::TestActivationStoreParallel"
       ]
     },
     "kempnerforge/training/loss.py": {
@@ -2059,13 +2060,14 @@
       },
       "tests/unit/test_hooks.py": {
         "classes": [
-          "TestActivationStore(11)",
+          "TestActivationStore(12)",
           "TestAttentionWeightCapture(6)",
           "TestExtractRepresentations(5)",
           "TestSaveActivations(3)",
-          "TestActivationStoreIntegration(3)"
+          "TestActivationStoreIntegration(3)",
+          "TestActivationStoreParallel(7)"
         ],
-        "count": 28
+        "count": 36
       },
       "tests/unit/test_additional_optimizers.py": {
         "classes": [

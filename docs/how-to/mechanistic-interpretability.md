@@ -276,9 +276,18 @@ captures add eager-mode overhead.
 
 **FSDP2 / TP.** Extraction is meant for a single-process inference-time
 load (as shown in the quick path: build the model, `dcp.load` the
-weights, run on one GPU). Running it on a fully-sharded model works
-but captures per-rank shards of each tensor, which is almost never
-what you want for analysis.
+weights, run on one GPU). FSDP2 alone shards parameters, not module
+outputs: each rank captures full activations for its own batch. Under
+tensor parallelism, the outputs of whole blocks, their `attention` and
+`mlp`, the norms and the output head are stored as the full tensor on
+every rank, a `DTensor` output being gathered first. The gather is a
+collective, so every rank of the tensor-parallel group must enable the
+store and run the same forward.
+A module inside an attention or MLP block, such as `q_proj`, `o_proj`,
+`down_proj` or `q_norm`, returns only this rank's slice of the
+activation, with nothing marking it as a slice, so `enable()` refuses
+it with a `ValueError` naming the module. Capture the enclosing block
+instead, or load the model in a single process.
 
 ## Troubleshooting
 
