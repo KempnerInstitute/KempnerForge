@@ -98,8 +98,8 @@ class BatchStream:
         A ``StatefulDataLoader`` re-applies its recorded skip, so this picks up
         inside the current epoch rather than restarting it. A loader with a
         ``restart()``, as ``StatefulDataLoader`` and ``StreamingDataLoader``
-        have, drops its iterator too, so a checkpoint saved before the next step
-        records the new iterator that step starts.
+        have, is told, so a checkpoint saved before the next step records what
+        the iterator that step starts draws.
         """
         self._iter = None
         restart = getattr(self.pipeline.dataloader, "restart", None)

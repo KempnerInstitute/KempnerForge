@@ -180,6 +180,64 @@ def test_a_checkpoint_saved_after_a_reset_resumes_as_the_run_restarts_the_pass(
 
 
 @pytest.mark.parametrize("workers", [0, 2])
+def test_a_reset_before_the_first_pass_after_a_load_starts_it_as_the_run_does(workers):
+    """A loaded loader reset before its first ``iter()`` restarts the pass as the run does.
+
+    Without persistent workers the run's restarted pass draws a new base seed
+    from the CPU RNG rather than taking the saved one; with them, the workers
+    keep the saved seed.
+    """
+    _skip_without_worker_sockets(workers)
+    torch.manual_seed(0)
+    run = _stream(workers)
+    try:
+        _take(run, 3)
+        rng, state = torch.random.get_rng_state(), run.dataloader.state_dict()
+        run.reset()
+        expected = _take(run, 3)
+        expected_rng = torch.random.get_rng_state()
+    finally:
+        run.close()
+    torch.random.set_rng_state(rng)
+    resumed = _stream(workers)
+    try:
+        resumed.dataloader.load_state_dict(state)
+        resumed.reset()
+        got = _take(resumed, 3)
+        got_rng = torch.random.get_rng_state()
+    finally:
+        resumed.close()
+    _assert_resumed(expected, expected_rng, got, got_rng, workers)
+
+
+def test_a_loaded_end_of_pass_reset_saved_again_before_its_first_pass_resumes_exactly():
+    """The draw a load replays for an emptied pass is in the CPU RNG a second save keeps."""
+    torch.manual_seed(0)
+    run = _stream(0)
+    try:
+        _take(run, BATCHES_PER_PASS)
+        run.reset()
+        rng, state = torch.random.get_rng_state(), run.dataloader.state_dict()
+        expected = _take(run, 3)
+        expected_rng = torch.random.get_rng_state()
+    finally:
+        run.close()
+    torch.random.set_rng_state(rng)
+    first = _loader(0)
+    first.load_state_dict(state)
+    rng, state = torch.random.get_rng_state(), first.state_dict()
+    torch.random.set_rng_state(rng)
+    resumed = _stream(0)
+    try:
+        resumed.dataloader.load_state_dict(state)
+        got = _take(resumed, 3)
+        got_rng = torch.random.get_rng_state()
+    finally:
+        resumed.close()
+    _assert_resumed(expected, expected_rng, got, got_rng, 0)
+
+
+@pytest.mark.parametrize("workers", [0, 2])
 def test_restart_leaves_the_live_iterator_to_the_next_iter(workers):
     """``restart()`` only records the restart: the live iterator runs on until ``iter()``.
 

@@ -145,7 +145,6 @@ class _BaseSeed:
         self.state: bytes | None = None
         self._loaded = False
         self._restart_draws = False
-        self._empty_pass = False
 
     @property
     def saved(self) -> bytes | None:
@@ -154,14 +153,11 @@ class _BaseSeed:
 
     def iterate(self, loader: DataLoader) -> Iterator[Any]:
         """Return ``iter(loader)``, recording the CPU RNG state a new iterator draws from."""
-        loaded, self._loaded = self._loaded, False
-        self._restart_draws = False
+        reuse = self._loaded and not self._restart_draws
+        self._loaded = self._restart_draws = False
         if loader._iterator is not None:
             return iter(loader)
-        if self._empty_pass:
-            self._empty_pass = False
-            torch.empty((), dtype=torch.int64).random_()
-        if not loaded or self.state is None:
+        if not reuse or self.state is None:
             self.state = torch.random.get_rng_state().numpy().tobytes()
             return iter(loader)
         generator = torch.Generator()
@@ -173,7 +169,12 @@ class _BaseSeed:
             loader.generator = None
 
     def end_pass(self, loader: DataLoader) -> None:
-        """Drop the state at the end of a pass whose next pass starts a new iterator."""
+        """Note a pass's end, which ends a pending restart of it.
+
+        The state goes where the next pass starts a new iterator, that is
+        without persistent workers.
+        """
+        self._restart_draws = False
         if not loader.persistent_workers:
             self.state = None
 
@@ -184,13 +185,14 @@ class _BaseSeed:
     def load(self, state: bytes | None, empty_pass: bool = False) -> None:
         """Have the next iterator draw its base seed from ``state``, or the CPU RNG if None.
 
-        With ``empty_pass``, it first draws one base seed from the CPU RNG, as the
-        saving run's iterator for the empty rest of its pass does.
+        With ``empty_pass``, first draws from the CPU RNG the base seed that the
+        saving run's iterator for the empty rest of its pass draws.
         """
+        if empty_pass:
+            torch.empty((), dtype=torch.int64).random_()
         self.state = state
         self._loaded = True
         self._restart_draws = False
-        self._empty_pass = empty_pass
 
 
 def _warn_new_base_seed() -> None:
@@ -421,11 +423,11 @@ class StatefulDataLoader:
         next ``iter()`` starts new ones. That iterator draws its base seed from the
         saved ``base_seed_rng_state`` rather than from the CPU RNG, unless the
         position starts the next epoch on a loader without persistent workers:
-        the saving run starts a new iterator there and draws one too, after one
-        for the empty rest of the epoch when a ``restart`` was pending, which
-        saves the state as None. A state saved without ``base_seed_rng_state``
-        draws a new base seed, with a warning when the saving run would have
-        drawn none there.
+        the saving run starts a new iterator there and draws one too. When a
+        ``restart`` was pending there, which saves the state as None, that run
+        first draws one for the empty rest of the epoch, and the load draws it
+        at once. A state saved without ``base_seed_rng_state`` draws a new base
+        seed, with a warning when the saving run would have drawn none there.
 
         Raises:
             DataPositionError: The data-parallel size changed and the saved

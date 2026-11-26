@@ -646,6 +646,39 @@ def test_a_stream_saved_after_a_reset_resumes_as_the_run_restarts_the_pass(corpu
     _assert_same_run(uninterrupted, resume)
 
 
+def test_a_reset_whose_pass_runs_to_its_end_keeps_the_workers_base_seed(corpus):
+    """A reset stream whose live pass runs on to its end has no pass left to restart.
+
+    With persistent workers the next pass resets their iterator, which keeps its
+    base seed, so the state stays saved and a resume keeps the seed too.
+    """
+    if not worker_sockets_fit():
+        pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+    torch.manual_seed(0)
+    loader = _stream_loader(corpus, num_workers=2)
+    resumed = _stream_loader(corpus, num_workers=2)
+    try:
+        next(iter(loader))
+        loader.restart()
+        with pytest.raises(StopIteration):
+            while True:
+                next(loader)
+        rng, state = torch.random.get_rng_state(), loader.state_dict()
+        batches = iter(loader)
+        expected = [next(batches)["input_ids"] for _ in range(2)]
+        uninterrupted = (expected, torch.random.get_rng_state(), _base_seed(loader))
+        torch.random.set_rng_state(rng)
+        resumed.load_state_dict(state)
+        batches = iter(resumed)
+        got = [next(batches)["input_ids"] for _ in range(2)]
+        resume = (got, torch.random.get_rng_state(), _base_seed(resumed))
+    finally:
+        _close(loader)
+        _close(resumed)
+    assert state["epoch"] == 1 and state["base_seed_rng_state"] is not None
+    _assert_same_run(uninterrupted, resume)
+
+
 def test_a_load_into_a_running_stream_starts_new_workers_from_the_loaded_state(corpus):
     """Workers that ran before ``load_state_dict`` stop; the next pass replays with new ones."""
     if not worker_sockets_fit():
