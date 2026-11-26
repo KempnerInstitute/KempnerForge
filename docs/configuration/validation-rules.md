@@ -221,8 +221,9 @@ File:
 - Every `module` in `freeze` and in each `FreezeStage` is a module alias, a key of
   `module_patterns`, or a parameter pattern, which holds a dot or one of `*?[`; a key
   resolves as its alias first, dot or not. A bare word that is neither, such as a typo of
-  an alias, fails when the config loads. The check runs once the TOML is applied and again
-  once the CLI overrides land, so a name the TOML gets wrong must be fixed in the TOML.
+  an alias, fails when the config loads. The check reads the TOML with the CLI overrides
+  laid over it, so the alias a spec names may be a `module_patterns` key set on the
+  command line.
 - The VLM build refuses a pattern in `freeze` or in a `FreezeStage` that matches no
   parameter of the built model, and names it.
 
@@ -252,12 +253,11 @@ File:
 
   A plugin adapter whose builder reads a `**kwargs` and registers no
   `accepts` accepts every field.
-  The check runs once the TOML is applied and again once the CLI overrides
-  land, so a setting the adapter would drop stops the run before
-  `init_distributed`. The first run sees the TOML alone, so its adapter
-  fields must fit its own `type`, and a type switched on the command line
-  needs the fields it does not use reset there too
-  (for example `--adapter.hidden_dim=0 --adapter.pre_norm=`); see
+  The check reads the TOML with the CLI overrides laid over it, so a
+  setting the adapter would drop stops the run before `init_distributed`,
+  whichever layer sets it. An override never restores a default, so a type
+  switched on the command line needs the fields it does not use reset there
+  too (for example `--adapter.hidden_dim=0 --adapter.pre_norm=`); see
   [Config sections](config-sections.md#adapter-adapterconfig).
 
 ## Cross-section rules in `JobConfig.__post_init__`

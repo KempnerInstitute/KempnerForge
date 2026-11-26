@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import random
 import re
@@ -37,6 +38,7 @@ from kempnerforge.config.schema import (
     VLMConfig,
 )
 from kempnerforge.config.video import VideoConfig
+from kempnerforge.config.vlm import DEFAULT_MODULE_PATTERNS
 
 
 class TestModelConfig:
@@ -2338,6 +2340,353 @@ class TestDottedDictOverrides:
         assert tables.nested["a"] == {"x": 2, "y": 2} and type(tables.nested["a"]["x"]) is int
         with pytest.raises(ValueError, match=r"^Tables\.nested: key 'a': key 'x': expected an int"):
             self._tables_with(["--nested.a.x=2.5"])
+
+
+_VLM_SECTIONS: dict[str, typing.Any] = {
+    "vision_encoder.type": "random",
+    "vlm.arch": "joint_decoder",
+}
+_EXTRA_MODULE_PATTERNS = {**DEFAULT_MODULE_PATTERNS, "extra": ["extra.*"]}
+
+_SPLIT_RULES: dict[str, tuple[dict[str, typing.Any], ...]] = {
+    "profiling-end-after-start": ({}, {"profiling.start_step": 20}, {"profiling.end_step": 30}),
+    "model-dim-over-heads": ({}, {"model.dim": 80}, {"model.head_dim_override": 64}),
+    "model-even-head-dim": (
+        {},
+        {"model.dim": 4128},
+        {"model.n_heads": 16, "model.n_kv_heads": 16},
+    ),
+    "model-heads-over-kv-heads": (
+        {},
+        {"model.n_kv_heads": 6},
+        {"model.n_heads": 12, "model.dim": 1536},
+    ),
+    "model-flex-head-dim": (
+        {},
+        {"model.attention_backend": "flex", "model.dim": 256},
+        {"model.n_heads": 8, "model.n_kv_heads": 8},
+    ),
+    "model-top-k-within-experts": ({}, {"model.num_experts": 1}, {"model.moe_top_k": 1}),
+    **{
+        f"model-{field}-with-experts": (
+            {},
+            {"model.num_experts": 4, f"model.{field}": refused},
+            {f"model.{field}": accepted},
+        )
+        for field, refused, accepted in (
+            ("moe_top_k", 0, 1),
+            ("moe_frequency", 0, 2),
+            ("moe_sequence_aux_loss_weight", -1.0, 0.001),
+            ("moe_bias_schedule", "step", "cosine_decay"),
+            ("moe_expert_ffn_multiplier", 0.0, 0.5),
+            ("moe_shared_experts", -1, 1),
+            ("moe_router_z_loss_weight", -1.0, 0.001),
+        )
+    },
+    "train-fp32-master-weights": (
+        {},
+        {"train.fp32_master_weights": True, "train.mixed_precision": "fp32"},
+        {"train.mixed_precision": "bf16"},
+    ),
+    "train-fp32-cross-entropy": (
+        {},
+        {"train.fp32_cross_entropy": True, "train.loss_fn": "plugin_loss"},
+        {"train.loss_fn": "chunked_cross_entropy"},
+    ),
+    "data-phases-or-anneal": (
+        {},
+        {"data.phases": [{"start_step": 0}], "data.anneal_start_step": 100},
+        {"data.anneal_start_step": 0},
+    ),
+    "checkpoint-window-stop-after-start": (
+        {},
+        {"checkpoint.dyn_ckpt_window.start": 600},
+        {"checkpoint.dyn_ckpt_window.stop": 1000},
+    ),
+    "metrics-registration-needs-mlflow": (
+        {},
+        {"metrics.mlflow_register_checkpoints": True},
+        {"metrics.enable_mlflow": True},
+    ),
+    "metrics-databricks-experiment-path": (
+        {},
+        {"metrics.enable_mlflow": True, "metrics.mlflow_experiment": "proj"},
+        {"metrics.mlflow_tracking_uri": "file:./mlruns"},
+    ),
+    "video-min-frames-within-max": (
+        {**_VLM_SECTIONS, "video.data_root": "root"},
+        {"video.min_frames": 20},
+        {"video.max_frames": 32},
+    ),
+    "adapter-fields-of-its-type": ({}, {"adapter.pool_window": 3}, {"adapter.type": "avgpool"}),
+    "vlm-freeze-names-a-module": (
+        _VLM_SECTIONS,
+        {"vlm.freeze": [{"module": "extra"}]},
+        {"vlm.module_patterns": _EXTRA_MODULE_PATTERNS},
+    ),
+    "vlm-mot-warm-start-path": (
+        {**_VLM_SECTIONS, "vlm.arch": "mot"},
+        {"vlm.mot_warm_start_from_text": True},
+        {"vlm.mot_warm_start_path": "text.pt"},
+    ),
+    "vlm-moma-experts-per-modality": (
+        {**_VLM_SECTIONS, "vlm.arch": "moma"},
+        {"vlm.moma_modalities": ["image", "text", "audio"]},
+        {"vlm.moma_experts_per_modality": {"image": 4, "text": 4, "audio": 2}},
+    ),
+    "job-max-images-on-a-vlm": ({}, {"data.hf_max_images": 2}, _VLM_SECTIONS),
+    "job-max-images-on-joint-decoder": (
+        {"vision_encoder.type": "random"},
+        {"vlm.arch": "mot", "data.hf_max_images": 2},
+        {"data.hf_max_images": 1},
+    ),
+    "job-max-images-without-fp8": (
+        _VLM_SECTIONS,
+        {"data.hf_max_images": 2, "train.mixed_precision": "fp8"},
+        {"train.mixed_precision": "bf16"},
+    ),
+    "job-max-images-without-flash": (
+        _VLM_SECTIONS,
+        {"data.hf_max_images": 2, "model.sdpa_backend": "flash"},
+        {"model.sdpa_backend": "auto"},
+    ),
+    "job-video-on-a-vlm": ({}, {"video.data_root": "root"}, _VLM_SECTIONS),
+    "job-video-without-tiles": (
+        _VLM_SECTIONS,
+        {"video.data_root": "root", "vlm.tile_grid": 2},
+        {"vlm.tile_grid": 0},
+    ),
+    "job-vlm-with-an-encoder": (
+        {},
+        {"vlm.arch": "joint_decoder"},
+        {"vision_encoder.type": "random"},
+    ),
+    "job-image-tokens-within-max-seq-len": (
+        _VLM_SECTIONS,
+        {"vision_encoder.num_tokens": 4096},
+        {"model.max_seq_len": 8192},
+    ),
+    "job-vlm-packing-without-video": (
+        _VLM_SECTIONS,
+        {"data.pack_sequences": True, "video.data_root": "root"},
+        {"data.pack_sequences": False},
+    ),
+    "job-vlm-packing-on-joint-decoder": (
+        {"vision_encoder.type": "random"},
+        {"data.pack_sequences": True, "vlm.arch": "mot"},
+        {"data.pack_sequences": False},
+    ),
+    "job-vlm-packing-without-fp8": (
+        _VLM_SECTIONS,
+        {"data.pack_sequences": True, "train.mixed_precision": "fp8"},
+        {"train.mixed_precision": "bf16"},
+    ),
+    "job-lr-multipliers-on-a-vlm": (
+        {},
+        {"optimizer.lr_multipliers": {"adapter": 2.0}},
+        _VLM_SECTIONS,
+    ),
+    "job-lr-multipliers-name-modules": (
+        _VLM_SECTIONS,
+        {"optimizer.lr_multipliers": {"extra": 2.0}},
+        {"vlm.module_patterns": _EXTRA_MODULE_PATTERNS},
+    ),
+    "job-flex-seq-len": (
+        {},
+        {"model.attention_backend": "flex", "train.seq_len": 64},
+        {"train.seq_len": 256},
+    ),
+}
+
+
+def _toml_value(value: typing.Any) -> str:
+    """``value`` written as a TOML value, a dict as an inline table."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        pairs = (f"{json.dumps(key)} = {_toml_value(item)}" for key, item in value.items())
+        return "{" + ", ".join(pairs) + "}"
+    return repr(value)
+
+
+def _layered(
+    tmp_path: Path, toml: dict[str, typing.Any], cli: dict[str, typing.Any]
+) -> JobConfig | str:
+    """What ``load_config`` gives for the dotted settings ``toml`` in a TOML and ``cli`` on the
+    command line: the config, or the message of the ``ValueError`` it raises."""
+    sections: dict[str, list[str]] = {}
+    for key, value in toml.items():
+        section, name = key.rsplit(".", 1)
+        sections.setdefault(section, []).append(f"{name} = {_toml_value(value)}\n")
+    path = tmp_path / "layered.toml"
+    path.write_text(
+        "".join(f"[{section}]\n" + "".join(lines) for section, lines in sections.items())
+    )
+    try:
+        return load_config(path, cli_args=[f"--{key}={value!r}" for key, value in cli.items()])
+    except ValueError as e:
+        return str(e)
+
+
+class TestChecksReadTheMergedLayers:
+    """``load_config`` merges the TOML and the command-line overrides before it builds the
+    config, so a check reads the merged config whichever layer sets each field."""
+
+    def test_a_toml_start_step_and_an_override_end_step_load_together(self, tmp_path):
+        path = tmp_path / "layer.toml"
+        path.write_text("[profiling]\nstart_step = 20\n")
+        split = load_config(path, cli_args=["--profiling.end_step=30"]).profiling
+        together = load_config(cli_args=["--profiling.start_step=20", "--profiling.end_step=30"])
+        assert split == together.profiling == ProfilingConfig(start_step=20, end_step=30)
+
+    @pytest.mark.parametrize(
+        ("base", "first", "second"),
+        [pytest.param(*case, id=name) for name, case in _SPLIT_RULES.items()],
+    )
+    def test_a_split_gives_what_its_merged_settings_give_in_one_layer(
+        self, tmp_path, monkeypatch, base, first, second
+    ):
+        """``first`` and ``second`` meet in one rule and ``base`` stays in the TOML. Each part
+        goes in the TOML with the other on the command line, and the outcome, a config or a
+        refusal, is what the merged settings give from the TOML alone and from the command
+        line alone. In one of the two splits the TOML is refused on its own and the split
+        loads."""
+        monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+        rescued = False
+        for toml, cli in ((first, second), (second, first)):
+            split = _layered(tmp_path, {**base, **toml}, cli)
+            assert split == _layered(tmp_path, {**base, **toml, **cli}, {})
+            assert split == _layered(tmp_path, base, {**toml, **cli})
+            alone = _layered(tmp_path, {**base, **toml}, {})
+            rescued |= isinstance(split, JobConfig) and isinstance(alone, str)
+        assert rescued
+
+    @pytest.mark.parametrize(
+        ("toml", "args", "refusal"),
+        [
+            pytest.param(
+                "[profiling]\nstart_step = 20\n",
+                ["--profiling.end_step=10"],
+                "end_step must be greater than start_step",
+                id="profiling",
+            ),
+            pytest.param(
+                '[adapter]\ntype = "avgpool"\n',
+                ["--adapter.pool_heads=8"],
+                "adapter.type = 'avgpool' does not use adapter.pool_heads = 8; with these "
+                "settings it uses hidden_dim, pool_window. Leave unused fields at their "
+                "defaults (pool_heads = 16).",
+                id="adapter",
+            ),
+            pytest.param(
+                "[model]\nnum_experts = 4\n",
+                ["--model.moe_frequency=0"],
+                "moe_frequency must be positive",
+                id="moe",
+            ),
+            pytest.param(
+                '[train]\nmixed_precision = "fp32"\n',
+                ["--train.fp32_master_weights=true"],
+                "train.fp32_master_weights has no effect with mixed_precision='fp32': the "
+                "weights are already fp32. Use it with 'bf16' or 'fp8', or turn it off.",
+                id="train",
+            ),
+        ],
+    )
+    def test_a_split_the_merge_leaves_invalid_is_refused_as_before(
+        self, tmp_path, toml, args, refusal
+    ):
+        path = tmp_path / "layer.toml"
+        path.write_text(toml)
+        with pytest.raises(ValueError) as excinfo:
+            load_config(path, cli_args=args)
+        assert str(excinfo.value) == refusal
+
+    def test_an_unknown_override_key_is_refused_below_a_toml_section(self, tmp_path):
+        path = tmp_path / "layer.toml"
+        path.write_text("[model]\ndim = 512\n")
+        with pytest.raises(ValueError, match=r"^Unknown config keys in ModelConfig: \['dimm'\]\."):
+            load_config(path, cli_args=["--model.dimm=512"])
+
+    def test_an_arch_override_keeps_the_class_of_the_toml_vlm_section(self, tmp_path):
+        """The ``[vlm]`` table's own arch picks the class its other keys were written for."""
+        toml = {**_VLM_SECTIONS, "vlm.max_text_len": 32}
+        same = _layered(tmp_path, toml, {"vlm.arch": "joint_decoder", "vlm.max_text_len": 16})
+        assert isinstance(same, JobConfig)
+        assert same.vlm == VLMConfig.for_arch("joint_decoder", max_text_len=16)
+        assert _layered(tmp_path, toml, {"vlm.arch": "mot"}) == (
+            "vlm.arch='mot' cannot be applied as an override: the [vlm] section was built as "
+            "JointDecoderConfig (arch 'joint_decoder'), and an override keeps that class. Set "
+            'arch = "mot" in the TOML\'s [vlm] section instead.'
+        )
+
+    def test_a_check_reads_the_table_an_override_leaves_below_a_toml_table(self, tmp_path):
+        """A dotted key adds to the TOML's ``module_patterns`` and a literal replaces it, and
+        ``optimizer.lr_multipliers`` is checked against the table that results."""
+        toml = {**_VLM_SECTIONS, "vlm.module_patterns": _EXTRA_MODULE_PATTERNS}
+        dotted = _layered(
+            tmp_path,
+            toml,
+            {"vlm.module_patterns.more": ["more.*"], "optimizer.lr_multipliers": {"extra": 2.0}},
+        )
+        assert isinstance(dotted, JobConfig) and dotted.vlm is not None
+        assert dotted.vlm.module_patterns == {**_EXTRA_MODULE_PATTERNS, "more": ["more.*"]}
+        replaced = _layered(
+            tmp_path,
+            toml,
+            {
+                "vlm.module_patterns": dict(DEFAULT_MODULE_PATTERNS),
+                "optimizer.lr_multipliers": {"extra": 2.0},
+            },
+        )
+        assert replaced == (
+            "optimizer.lr_multipliers names unknown modules ['extra']; the modules of "
+            f"vlm.module_patterns are {sorted(DEFAULT_MODULE_PATTERNS)}"
+        )
+
+    @pytest.mark.parametrize(
+        ("toml", "cli", "logger", "fragment"),
+        [
+            pytest.param(
+                {"model.attention_backend": "flex", "model.sdpa_backend": "flash"},
+                {"model.sdpa_backend": "auto"},
+                "kempnerforge.config.model",
+                "is ignored when attention_backend='flex'",
+                id="flex-cleared",
+            ),
+            pytest.param(
+                {"model.attention_backend": "flex", "model.sdpa_backend": "flash"},
+                {"model.n_layers": 2},
+                "kempnerforge.config.model",
+                "is ignored when attention_backend='flex'",
+                id="flex-once",
+            ),
+            pytest.param(
+                {**_VLM_SECTIONS, "vision_encoder.type": "siglip2", "vision_encoder.num_tokens": 8},
+                {"vision_encoder.num_tokens": 0},
+                "kempnerforge.config.job",
+                "is HF-backed and probes its own dims",
+                id="encoder-dims-cleared",
+            ),
+        ],
+    )
+    def test_a_warning_reads_the_merged_config_once(
+        self, tmp_path, monkeypatch, caplog, toml, cli, logger, fragment
+    ):
+        monkeypatch.setattr(logging.getLogger("kempnerforge"), "propagate", True)
+
+        def warnings(toml_part, cli_part):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger=logger):
+                assert isinstance(_layered(tmp_path, toml_part, cli_part), JobConfig)
+            return [record for record in caplog.records if fragment in record.getMessage()]
+
+        assert warnings(toml, {})
+        assert len(warnings(toml, cli)) == len(warnings({**toml, **cli}, {}))
 
 
 class TestEvalConfig:

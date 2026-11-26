@@ -3,8 +3,8 @@
 Loading pipeline:
   1. Start with default JobConfig
   2. Import the modules listed in the `plugins` key (registry side effects)
-  3. Load TOML file (if provided) and overlay
-  4. Apply CLI overrides (--model.dim=512 style)
+  3. Load TOML file (if provided) and lay the CLI overrides (--model.dim=512 style) over it
+  4. Build the config from the merged layers once, so each check reads them together
   5. Return JobConfig instance (call .validate(world_size) at distributed setup time)
 """
 
@@ -312,33 +312,61 @@ def _resolve_vlm_subclass(data: dict[str, Any]) -> type:
         ) from e
 
 
-def _check_vlm_arch_override(current: VLMConfig, arch: Any) -> None:
-    """Reject an ``arch`` override whose registered config class is not ``current``'s.
+def _check_vlm_arch_override(built: type[VLMConfig], arch: Any) -> None:
+    """Reject an ``arch`` override whose registered config class is not ``built``.
 
-    Applying a dict keeps the class the ``[vlm]`` section was built with, so such
-    an override would build one arch's blocks behind another arch's strategy.
+    ``built`` is the class the ``[vlm]`` table's own ``arch`` selects, and the
+    table's other keys were written for it, so an override keeps that class.
     """
     target = _resolve_vlm_subclass({"arch": arch})
-    if target is not type(current):
+    if target is not built:
         raise ValueError(
             f"vlm.arch={arch!r} cannot be applied as an override: the [vlm] section was "
-            f"built as {type(current).__name__} (arch {type(current).declared_arch()!r}), and an "
+            f"built as {built.__name__} (arch {built.declared_arch()!r}), and an "
             f'override keeps that class. Set arch = "{arch}" in the TOML\'s [vlm] '
             "section instead."
         )
 
 
+def _overlay(dc_type: type, base: dict[str, Any], top: dict[str, Any]) -> dict[str, Any]:
+    """``base``, a table for a ``dc_type``, with the parsed overrides ``top`` laid over it.
+
+    The result holds what ``_apply_dict_to_dataclass`` would make of ``top`` over a
+    ``dc_type`` built from ``base``: a dict below a dataclass field merges key by key into
+    ``base``'s table for it, a dotted key below a dict-valued field sets that key in
+    ``base``'s table, and any other value replaces ``base``'s. A key ``base`` does not hold
+    keeps ``top``'s value as it is, so building the config lays dotted keys over the
+    field's default. Nothing is built, so no ``__post_init__`` check runs here.
+
+    Raises:
+        ValueError: ``base`` is a ``[vlm]`` table whose ``arch`` is not registered, or
+            ``top`` sets an ``arch`` that needs another config class than ``base``'s.
+    """
+    if dc_type is VLMConfig:
+        dc_type = _resolve_vlm_subclass(base)
+        if "arch" in top:
+            _check_vlm_arch_override(dc_type, top["arch"])
+    type_hints = _get_type_hints(dc_type)
+    merged = dict(base)
+    for key, value in top.items():
+        below = merged.get(key)
+        if isinstance(value, dict) and isinstance(below, dict) and key in type_hints:
+            inner = _dataclass_type_from_hint(type_hints[key])
+            if inner is not None:
+                value = _overlay(inner, below, value)
+            elif isinstance(value, _DottedKeys):
+                value = _with_dotted_keys(below, value)
+        merged[key] = value
+    return merged
+
+
 def _apply_dict_to_dataclass(dc: Any, data: dict[str, Any]) -> Any:
     """Recursively apply a dict to a dataclass, creating a new instance.
 
-    Raises ValueError on unknown keys to catch typos early, and on an ``arch``
-    for a ``VLMConfig`` that needs a different config class than ``dc``'s.
+    Raises ValueError on unknown keys to catch typos early.
     """
     if not is_dataclass(dc):
         return dc
-
-    if isinstance(dc, VLMConfig) and "arch" in data:
-        _check_vlm_arch_override(dc, data["arch"])
 
     dc_type = type(dc)
     type_hints = _get_type_hints(dc_type)
@@ -488,6 +516,8 @@ def load_config(
     """Load a JobConfig from optional TOML file + CLI overrides.
 
     The returned config has all sub-config __post_init__ validations applied.
+    They run once, on the TOML with the CLI overrides laid over it, so a check
+    that compares fields reads them whichever layer sets each.
     Cross-config validation (e.g., parallelism vs world_size) requires calling
     config.validate(world_size=...) separately at distributed setup time.
 
@@ -513,10 +543,7 @@ def load_config(
     if plugins is not None:
         _import_plugins(plugins)
 
-    if config_path is not None:
-        config = _apply_dict_to_dataclass(config, toml_data)
-
-    if overrides:
-        config = _apply_dict_to_dataclass(config, overrides)
+    if config_path is not None or overrides:
+        config = _apply_dict_to_dataclass(config, _overlay(JobConfig, toml_data, overrides))
 
     return config

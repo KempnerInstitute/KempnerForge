@@ -295,6 +295,38 @@ class TestPluginMlpInMoE:
             "do not support (num_experts=2)"
         )
 
+    @pytest.mark.parametrize(
+        ("override", "activation", "num_experts"),
+        [("--model.num_experts=0", None, 0), ("--model.activation=silu", Activation.silu, 2)],
+    )
+    def test_an_override_that_drops_one_of_the_pair_loads(
+        self, tmp_path, write_plugin, override, activation, num_experts
+    ):
+        """The rule reads the model after the overrides, so a TOML that pairs the plugin's
+        MLP with experts loads once the command line drops either one."""
+        module = write_plugin("kf_split_layers")
+        path = tmp_path / "job.toml"
+        path.write_text(
+            f'plugins = ["{module}"]\n[model]\nactivation = "{module}_mlp"\n'
+            "num_experts = 2\nmoe_top_k = 1\n"
+        )
+        model = load_config(str(path), cli_args=[override]).model
+        assert (model.activation, model.num_experts) == (
+            activation or f"{module}_mlp",
+            num_experts,
+        )
+
+    def test_experts_an_override_adds_are_rejected(self, tmp_path, write_plugin):
+        module = write_plugin("kf_split_layers")
+        path = tmp_path / "job.toml"
+        path.write_text(f'plugins = ["{module}"]\n[model]\nactivation = "{module}_mlp"\n')
+        with pytest.raises(ValueError) as excinfo:
+            load_config(str(path), cli_args=["--model.num_experts=2", "--model.moe_top_k=1"])
+        assert str(excinfo.value).startswith(
+            f"activation='{module}_mlp' selects a plugin-registered MLP, which MoE experts "
+            "do not support (num_experts=2)"
+        )
+
     def test_rejected_with_moe_when_the_config_is_built_directly(self):
         with pytest.raises(ValueError, match="^activation='kf250_direct' selects a plugin"):
             ModelConfig(**TINY_MODEL, activation="kf250_direct", num_experts=2, moe_top_k=1)

@@ -422,11 +422,10 @@ value sets the empty string. For a TOML with `type = "mlp_2layer"`,
 --adapter.type=attentional_pool --adapter.hidden_dim=0 --adapter.pre_norm=
 ```
 
-The TOML is checked on its own before the overrides apply, so its fields must
-fit its own `type`. A TOML with `type = "attentional_pool"` and
-`hidden_dim = 1152` fails to load even with `--adapter.type=avgpool`: set the
-type and its fields in the same layer, both in the TOML or both on the
-command line.
+The check reads the TOML with the overrides laid over it, so a field and the
+type that uses it may sit in different layers: a TOML with
+`type = "attentional_pool"` and `hidden_dim = 1152` loads with
+`--adapter.type=avgpool`, which uses `hidden_dim`.
 
 ## Where to read next
 

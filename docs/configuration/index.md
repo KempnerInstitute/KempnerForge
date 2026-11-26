@@ -31,6 +31,9 @@ limits of VLM packing).
    layered dict. `ast.literal_eval` parses ints, floats, lists, tuples,
    and booleans; anything unparseable stays as a string.
 
+The config is built once, from the merged layers, so every
+`__post_init__` check reads the TOML and the overrides together.
+
 ## Pages
 
 ```{toctree}
