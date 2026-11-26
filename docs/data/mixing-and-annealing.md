@@ -193,9 +193,10 @@ Two effects:
 
 ### Resume into the right phase
 
-On auto-resume, `build_phase_state` replays the phase activations
-against the current `step` so the sampler and LR scale are correct
-before the training loop starts:
+At startup, `build_phase_state` replays the phase activations
+against the step the run starts at, the resumed step or a fresh run's
+step 0, so the sampler and LR scale are correct before the training
+loop starts:
 
 ```python
 # On load — re-derive phase state

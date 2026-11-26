@@ -972,7 +972,7 @@
         "pipeline_step(session, step) -> StepResult",
         "checkpoint_extra(config, step, phases, documents_seen) -> dict",
         "_apply_stage_specs(model, specs, pattern_map) -> dict (one FreezeStage: refreshes the FSDP2 dtypes of what it unfreezes and resets a compiled model when it unfreezes parameters)",
-        "_start_lr_schedule(session) (an optimizer that holds no state starts at the scheduler's last rate times the active lr_scale)",
+        "_start_lr_schedule(session) (an optimizer the checkpointer did not restore starts at the scheduler's last rate times the active lr_scale)",
         "_batch_counts(batch, image_positions) -> (documents, image_tokens, text_tokens, encoder_images)",
         "_step_counts(session, result) -> (tokens, documents, encoder_images) over the DP ranks"
       ],
@@ -1387,6 +1387,7 @@
             "_position_refusals(dataloader, state) -> (refusals, world) (each rank's check_state verdict, gathered on every rank on the gloo group; a check that fails another way raises on every rank)",
             "claim_dir() (rank 0 claims <dir>/.owner through claim_checkpoint_dir; every rank agrees on the outcome)",
             "release_dir() (marks the <dir>/.owner record this rank's claim_dir wrote released, at a clean exit)",
+            "restored_optimizer (property: whether the last load restored this rank's optimizer state; the loop starts any other optimizer on its schedule)",
             "restored_extra (property: the extra keys the last load restored)",
             "_resolve_load_path(path)",
             "_agreed_load_dir(path, fall_back) -> Path | None (every load: rank 0 resolves the checkpoint, on an exact resume that reads shards takes the newest step_N beside it that every stage saved when that one is not, and broadcasts its choice or its error)",
@@ -1822,10 +1823,10 @@
         "classes": [
           "TestPhaseTiming(1)",
           "TestFreezeStageAtStepZero(1)",
-          "TestRestoreWithoutOptimizerState(6)",
+          "TestRestoreWithoutOptimizerState(7)",
           "TestResumeParity(9)"
         ],
-        "count": 17
+        "count": 18
       },
       "tests/unit/test_checkpoint.py": {
         "classes": [

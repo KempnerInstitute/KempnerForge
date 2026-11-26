@@ -791,19 +791,18 @@ def _log_dataset_metrics(
 
 
 def _start_lr_schedule(session: TrainingSession) -> None:
-    """Give an optimizer that holds no state the LR its schedule sets for the first step.
+    """Give an optimizer no checkpoint restored the LR its schedule sets for the first step.
 
     Such an optimizer has the rate its scheduler wrote when it was built: in a fresh run,
     after a checkpoint saved before the first update, and after a ``load_path`` warm start
     that leaves the optimizer out. Each param group then gets the scheduler's last rate for
     it, restored with the checkpoint's schedule, times the active phase's ``lr_scale``. An
-    optimizer that holds state, its inner ones included, keeps the rate it was saved at.
+    optimizer whose state ``session.checkpointer`` restored keeps the rate it was saved at.
     """
-    optimizer = session.optimizer
-    if any(opt.state for opt in (optimizer, *getattr(optimizer, "inner_optimizers", ()))):
+    if session.checkpointer.restored_optimizer:
         return
     rates = session.scheduler.get_last_lr()
-    for group, rate in zip(optimizer.param_groups, rates, strict=True):
+    for group, rate in zip(session.optimizer.param_groups, rates, strict=True):
         group["lr"] = rate * session.phases.lr_scale
 
 
@@ -970,8 +969,9 @@ def run_training_loop(
     checkpoint before returning so the caller can tear down the process
     group safely. ``session.data`` is read once and must stay fixed for the
     duration; only its ``dataloader`` may be swapped mid-run. An optimizer
-    that holds no state starts at the rate its scheduler last set, times the
-    active phase's ``lr_scale``; one that holds state keeps its rate.
+    whose state ``session.checkpointer`` did not restore starts at the rate
+    its scheduler last set, times the active phase's ``lr_scale``; a restored
+    one keeps its rate.
 
     Every rank must call it: the shutdown and NCCL-health stops are agreed
     over ``session.control_group``. When that is ``None`` the loop makes the

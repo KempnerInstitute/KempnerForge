@@ -1168,6 +1168,7 @@ class CheckpointManager:
         self._pending_dataloader_carried = False
         self._pending_dataloader_missing = False
         self._restored_extra: dict[str, Any] = {}
+        self._restored_optimizer = False
         self._pending_finalize: tuple[int, Path] | None = None
         self._inflight_dir: Path | None = None
         self._tracking_source: TrackingSource | None = None
@@ -1952,6 +1953,7 @@ class CheckpointManager:
         out or never stepped, and before any state is set; every rank enters it too, also a
         pipeline stage whose checkpoint holds no optimizer state.
         """
+        self._restored_optimizer = False
         if exclude_keys is not None:
             validate_exclude_keys(exclude_keys, "exclude_keys")
         if exact_resume and is_weights_only(exclude_keys):
@@ -2240,6 +2242,7 @@ class CheckpointManager:
         elif fresh_optimizer:
             logger.info(f"{dcp_dir} holds no optimizer state; the optimizer starts fresh")
         self._restored_extra = dict(extra)
+        self._restored_optimizer = load_optim
         return step, tokens_seen, extra
 
     def _train_state_exists(self, path: Path) -> bool:
@@ -2500,6 +2503,15 @@ class CheckpointManager:
         Empty before a load, and after one that restored no train state.
         """
         return dict(self._restored_extra)
+
+    @property
+    def restored_optimizer(self) -> bool:
+        """Whether the last ``load()`` restored this rank's optimizer state, its rates included.
+
+        False before a load, and after one that left the optimizer out or found no optimizer
+        state in the checkpoint, as one saved before the first update holds none.
+        """
+        return self._restored_optimizer
 
     def apply_dataloader_state(self, dataloader: Any) -> None:
         """Apply any dataloader state stashed during load().

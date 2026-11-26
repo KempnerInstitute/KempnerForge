@@ -148,8 +148,9 @@ schedule stays on the step counter. It runs after the transitions of
 the new step, so the step that starts at a phase's `start_step` runs at
 that phase's `lr_scale` as well as on its weights.
 
-Before the first step, an optimizer that holds no state, as in a fresh
-run, after a checkpoint saved before the first update, or after a
+Before the first step, an optimizer whose state no checkpoint restored
+(`CheckpointManager.restored_optimizer` is False), as in a fresh run,
+after a checkpoint saved before the first update, or after a
 `load_path` warm start that leaves the optimizer out, gets the LR its
 scheduler last set, restored with the checkpoint's schedule, times the
 active phase's `lr_scale`. An optimizer restored with its state keeps

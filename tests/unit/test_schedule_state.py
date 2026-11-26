@@ -2,9 +2,10 @@
 
 The step that starts at a data phase's ``start_step`` draws with the phase's ``dataset_weights``
 and runs at its ``lr_scale``, and a ``FreezeStage`` applies from its ``start_step``, step 0
-included. An optimizer that holds no state, as after a checkpoint saved before the first update
-or a ``load_path`` warm start that leaves the optimizer out, steps at the restored schedule's
-rate. A resumed run steps with the rate, weights and frozen parameters of the uninterrupted one.
+included. An optimizer whose state no checkpoint restored, as after a checkpoint saved before
+the first update or a ``load_path`` warm start that leaves the optimizer out, steps at the
+restored schedule's rate. A resumed run steps with the rate, weights and frozen parameters of
+the uninterrupted one.
 """
 
 from __future__ import annotations
@@ -166,6 +167,7 @@ class TestRestoreWithoutOptimizerState:
             step = tokens = 0
             if resume:
                 step, tokens, _ = session.checkpointer.load(scheduler=scheduler)
+                assert not session.checkpointer.restored_optimizer
             run_training_loop(session, step=step, tokens_seen=tokens)
             return lrs
 
@@ -213,9 +215,9 @@ class TestRestoreWithoutOptimizerState:
 
         model, optimizer, scheduler = build()
         built_at = optimizer.param_groups[0]["lr"]
-        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer).load(
-            path=str(tmp_path / "step_20"), scheduler=scheduler, exclude_keys=exclude
-        )
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        manager.load(path=str(tmp_path / "step_20"), scheduler=scheduler, exclude_keys=exclude)
+        assert manager.restored_optimizer is (exclude is None)
         scheduled = scheduler.get_last_lr()[0]
         applied: list[float] = []
 
@@ -229,29 +231,106 @@ class TestRestoreWithoutOptimizerState:
             optimizer=optimizer,
             scheduler=scheduler,
             step_fn=recording_step,
+            checkpointer=manager,
         )
         run_training_loop(session, step=20)
         assert scheduled == pytest.approx(6.5e-4 if warmup_steps else 5.5e-4, rel=1e-3)
         assert built_at != pytest.approx(scheduled)
         assert applied == [scheduled]
 
-    def test_an_optimizer_with_state_keeps_the_rate_it_holds(self):
-        """A restored optimizer carries the rate it was saved at, which the loop leaves as is."""
-        session = make_session(make_config(max_steps=1))
-        session.optimizer.param_groups[0]["momentum"] = 0.9
-        session.model(torch.zeros(1, 1, dtype=torch.long)).sum().backward()
-        session.optimizer.step()
-        session.optimizer.zero_grad()
-        session.optimizer.param_groups[0]["lr"] = 0.123
+    def test_a_restored_optimizer_keeps_the_rate_it_was_saved_at(self, tmp_path):
+        """Its checkpoint holds the optimizer at a rate other than the schedule's, 0.123 for
+        0.05: the loop steps at the restored rate."""
+        config = make_config(max_steps=2)
+        first = make_session(config)
+        first.optimizer.param_groups[0]["momentum"] = 0.9
+        first.model(torch.zeros(1, 1, dtype=torch.long)).sum().backward()
+        first.optimizer.step()
+        first.optimizer.zero_grad()
+        first.scheduler.step()
+        first.optimizer.param_groups[0]["lr"] = 0.123
+        saving = CheckpointManager(
+            CheckpointConfig(dir=str(tmp_path)), first.model, first.optimizer
+        )
+        saving.save(1, scheduler=first.scheduler)
+
+        second = make_session(config)
+        manager = CheckpointManager(
+            CheckpointConfig(dir=str(tmp_path)), second.model, second.optimizer
+        )
+        step, tokens, _ = manager.load(path=str(tmp_path / "step_1"), scheduler=second.scheduler)
+        assert manager.restored_optimizer
         applied: list[float] = []
 
-        def step_fn(s: TrainingSession, step: int) -> StepResult:
-            applied.append(s.optimizer.param_groups[0]["lr"])
-            return text_step(s, step)
+        def step_fn(session: TrainingSession, step: int) -> StepResult:
+            applied.append(session.optimizer.param_groups[0]["lr"])
+            return text_step(session, step)
 
-        session.step_fn = step_fn
-        run_training_loop(session)
+        second.step_fn = step_fn
+        second.checkpointer = manager
+        run_training_loop(second, step=step, tokens_seen=tokens)
         assert applied == [0.123]
+
+    def test_an_optimizer_that_holds_state_when_built_starts_on_the_schedule(self, tmp_path):
+        """``torch.optim.Adagrad`` holds state from construction. A fresh run with a phase at
+        step 0 starts at the phase's scale, and a warm start that leaves the optimizer out at
+        the restored schedule's rate, 0.025 over a 4-step warmup to 0.05 at step 2."""
+
+        def adagrad(factor: Any) -> tuple[nn.Module, torch.optim.Optimizer, Any]:
+            torch.manual_seed(0)
+            model = TinyTextModel()
+            optimizer = torch.optim.Adagrad(model.parameters(), lr=0.05)
+            return model, optimizer, torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+
+        def first_rate(session: TrainingSession, step: int) -> float:
+            applied: list[float] = []
+
+            def step_fn(s: TrainingSession, i: int) -> StepResult:
+                applied.append(s.optimizer.param_groups[0]["lr"])
+                return text_step(s, i)
+
+            session.step_fn = step_fn
+            run_training_loop(session, step=step)
+            return applied[0]
+
+        config = make_config(max_steps=3)
+        config.data = DataConfig(phases=[TrainingPhase(start_step=0, lr_scale=0.5)])
+        data = _mixture_pipeline()
+        model, optimizer, scheduler = adagrad(lambda _s: 1.0)
+        assert optimizer.state
+        fresh = make_session(
+            config,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            data=data,
+            phases=build_phase_state(config, data, step=0),
+        )
+        assert first_rate(fresh, 0) == pytest.approx(0.025)
+
+        model, optimizer, scheduler = adagrad(lambda s: s / 4)
+        for _ in range(2):
+            model(torch.zeros(1, 1, dtype=torch.long)).sum().backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer).save(
+            2, scheduler=scheduler
+        )
+        model, optimizer, scheduler = adagrad(lambda s: s / 4)
+        manager = CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, optimizer)
+        step, _, _ = manager.load(
+            path=str(tmp_path / "step_2"), scheduler=scheduler, exclude_keys=["optimizer"]
+        )
+        warm = make_session(
+            make_config(max_steps=3),
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            checkpointer=manager,
+        )
+        assert optimizer.state and not manager.restored_optimizer
+        assert first_rate(warm, step) == pytest.approx(0.025)
 
 
 class _Model(nn.Module):

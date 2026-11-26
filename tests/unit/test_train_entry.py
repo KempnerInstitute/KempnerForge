@@ -77,6 +77,7 @@ class FakeCheckpointManager:
         self.checkpoint_registrar = None
         self.has_pending_save = False
         self.restored_extra: dict = {}
+        self.restored_optimizer = False
 
     def save(self, step, tokens_seen=0, scheduler=None, dataloader=None, extra=None) -> None:
         self.saves.append((step, tokens_seen, dict(extra or {})))
