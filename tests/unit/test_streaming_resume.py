@@ -616,8 +616,8 @@ def test_a_stream_saved_after_a_reset_resumes_as_the_run_restarts_the_pass(corpu
     """Saved after ``BatchStream.reset``, the resume replays as the run's restarted pass does.
 
     The restarted pass starts a new iterator, which draws a new base seed from the
-    CPU RNG, in the run and in the resume. A stream that has not started has no
-    iterator to restart.
+    CPU RNG, in the run and in the resume. The reset leaves the live iterator, and
+    its workers, to the next ``iter()``.
     """
     if num_workers and not worker_sockets_fit():
         pytest.skip("the temp directory path is too long for DataLoader worker sockets")
@@ -628,7 +628,9 @@ def test_a_stream_saved_after_a_reset_resumes_as_the_run_restarts_the_pass(corpu
         resumed.reset()
         for _ in range(4):
             run.next_batch()
+        live = run.dataloader._iterator
         run.reset()
+        assert run.dataloader._iterator is live is not None
         rng, state = torch.random.get_rng_state(), run.dataloader.state_dict()
         expected = [run.next_batch()["input_ids"] for _ in range(3)]
         uninterrupted = (expected, torch.random.get_rng_state(), _base_seed(run.dataloader))

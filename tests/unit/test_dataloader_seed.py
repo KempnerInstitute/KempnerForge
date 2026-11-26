@@ -160,20 +160,53 @@ def test_a_checkpoint_saved_after_close_resumes_the_run_that_never_closed(worker
 
 
 @pytest.mark.parametrize("close_before_save", [False, True])
+@pytest.mark.parametrize("saved_after", [3, BATCHES_PER_PASS])
 @pytest.mark.parametrize("workers", [0, 2])
 def test_a_checkpoint_saved_after_a_reset_resumes_as_the_run_restarts_the_pass(
-    workers, close_before_save
+    workers, saved_after, close_before_save
 ):
     """Saved after ``BatchStream.reset``, the resume starts the pass again as the run does.
 
     Without persistent workers the run's next iterator draws a new base seed from
-    the CPU RNG, and so does the resume's; with them, both keep the workers' seeds.
+    the CPU RNG, and so does the resume's. After a pass's last batch, that iterator
+    finds the pass empty, and the next pass's draws another. With persistent
+    workers, both runs keep the workers' seeds.
     """
     _skip_without_worker_sockets(workers)
     resumed = _run_and_resume(
-        workers, 3, 3, close_before_save=close_before_save, reset_before_save=True
+        workers, saved_after, 3, close_before_save=close_before_save, reset_before_save=True
     )
     _assert_resumed(*resumed, workers)
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_restart_leaves_the_live_iterator_to_the_next_iter(workers):
+    """``restart()`` only records the restart: the live iterator runs on until ``iter()``.
+
+    While it is pending, ``state_dict`` saves no base seed state where the next
+    ``iter()`` draws a new one, that is without persistent workers. That
+    ``iter()`` picks up where the live iterator stopped.
+    """
+    _skip_without_worker_sockets(workers)
+    reference, loader = _loader(workers), _loader(workers)
+    try:
+        batches = iter(reference)
+        expected = [next(batches) for _ in range(4)]
+        batches = iter(loader)
+        got = [next(batches), next(batches)]
+        saved = loader.state_dict()[KEY]
+        loader.restart()
+        got.append(next(loader))
+        pending = loader.state_dict()[KEY]
+        again = torch.random.get_rng_state()
+        got.append(next(iter(loader)))
+        after = loader.state_dict()[KEY]
+    finally:
+        reference.close()
+        loader.close()
+    assert _order(got) == _order(expected)
+    assert pending == (None if workers == 0 else saved)
+    assert after == (again.numpy().tobytes() if workers == 0 else saved)
 
 
 def test_a_load_into_a_loader_with_running_workers_starts_new_ones_from_the_loaded_state():
