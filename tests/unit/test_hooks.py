@@ -560,6 +560,23 @@ def _check_fsdp_targets_not_refused(rank: int, world: int, port: int) -> None:
             assert torch.equal(captured[name], expected[name]), name
 
 
+def _check_attention_weights_gathered(rank: int, world: int, port: int, layout: str) -> None:
+    mesh_dims, mesh_sizes, tie_embeddings = TP_LAYOUTS[layout]
+    with gloo_group(rank, world, port):
+        model, reference = _parallel_model(mesh_dims, mesh_sizes, tie_embeddings)
+        tokens = _tokens(rank // mesh_sizes[-1])
+        for each in (model, reference):
+            for layer in each.layers.values():
+                layer.attention.capture_attention_weights = True
+            with torch.no_grad():
+                each(tokens)
+        for name, layer in model.layers.items():
+            weights = layer.attention.last_attention_weights
+            assert weights.shape == (2, 4, 16, 16), name
+            expected = reference.layers[name].attention.last_attention_weights
+            torch.testing.assert_close(weights, expected, msg=name)
+
+
 class TestActivationStoreParallel:
     """Captures on a parallelized Transformer over gloo CPU ranks.
 
@@ -594,3 +611,16 @@ class TestActivationStoreParallel:
 
     def test_fsdp_only_targets_are_not_refused(self) -> None:
         spawn(_check_fsdp_targets_not_refused, 2)
+
+
+class TestAttentionWeightCaptureParallel:
+    """Attention weights captured on a tensor-parallel Transformer over gloo CPU ranks.
+
+    Each rank computes one block of heads; the blocks are gathered over the tensor-parallel
+    group, so every rank stores every head in the model's order, equal to the TP=1 capture,
+    with and without sequence parallelism and under FSDP2.
+    """
+
+    @pytest.mark.parametrize("layout", sorted(TP_LAYOUTS))
+    def test_every_head_is_gathered_to_the_tp1_capture(self, layout: str) -> None:
+        spawn(_check_attention_weights_gathered, math.prod(TP_LAYOUTS[layout][1]), layout)

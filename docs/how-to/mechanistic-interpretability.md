@@ -197,6 +197,12 @@ FlexAttention block mask (packed documents or attention groups) raises
 `NotImplementedError`, because the fused kernel never forms the weight
 matrix.
 
+On a tensor-parallel model each rank computes only its own block of
+heads. `last_attention_weights` still holds every head, in the model's
+order, on every rank: the blocks are gathered over the tensor-parallel
+group, one collective per captured layer and forward. Set the flag on
+the same layers on every rank of that group, and run the same forward.
+
 ## Performance and memory
 
 Activation extraction is expensive. A 7B model at `seq_len=4096`,
