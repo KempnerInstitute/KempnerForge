@@ -69,8 +69,8 @@ class ActivationStore:
             ValueError: If a target is not a module of the model, or if its
                 output under tensor parallelism is this rank's local shard: the
                 target holds a parameter sharded over the ``tp`` mesh dimension,
-                or sits inside a non-root module that directly contains one that
-                does, as ``q_norm`` sits next to ``q_proj`` inside
+                or sits inside a module that directly contains one that does,
+                as ``q_norm`` sits next to ``q_proj`` inside
                 ``layers.N.attention``. No hook is registered when it raises.
         """
         if self._enabled:
@@ -141,8 +141,8 @@ def _refuse_local_shard_targets(modules: dict[str, nn.Module], targets: list[str
 
     ``modules`` maps every module name of the model to its module. A module that
     holds a parameter sharded over the ``tp`` mesh dimension returns this rank's
-    shard, and so does every other module inside its parent, unless that parent
-    is the model root.
+    shard, and so does every other module inside its parent, the model root
+    included.
     """
     owners = [
         name
@@ -150,9 +150,10 @@ def _refuse_local_shard_targets(modules: dict[str, nn.Module], targets: list[str
         if any(_shards_over_tp(p) for p in module.parameters(recurse=False))
     ]
     for target in targets:
-        for owner in owners:
+        for owner in [target] if target in owners else owners:
             region = owner.rpartition(".")[0]
-            if target == owner or (region and target.startswith(f"{region}.")):
+            inside = target.startswith(f"{region}.") if region else target != ""
+            if target == owner or inside:
                 hint = f" Capture '{region}' or a module enclosing it instead." if region else ""
                 raise ValueError(
                     f"Cannot capture '{target}': under tensor parallelism its output is this "

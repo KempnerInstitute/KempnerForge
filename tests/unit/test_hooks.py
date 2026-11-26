@@ -485,6 +485,16 @@ def _check_local_shard_targets_refused(rank: int, world: int, port: int, layout:
             with torch.no_grad():
                 model(_tokens(rank // mesh_sizes[-1]))
             assert store.activations == {}, name
+        reason = (
+            "because 'layers.0.attention.k_proj' holds parameters sharded over the 'tp' mesh "
+            "dimension. Capture 'layers.0.attention' or a module enclosing it instead."
+        )
+        with pytest.raises(ValueError, match=re.escape(reason)):
+            ActivationStore(model, layers=["layers.0.attention.k_proj"]).enable()
+        attention = model.get_submodule("layers.0.attention")
+        for name in ("q_norm", "k_norm", "q_proj"):
+            with pytest.raises(ValueError, match=re.escape(f"Cannot capture '{name}'")):
+                ActivationStore(attention, layers=[name]).enable()
         linear = parallelize_module(torch.nn.Linear(8, 8), mesh["tp"], ColwiseParallel())
         with pytest.raises(ValueError, match=re.escape("Cannot capture ''")):
             ActivationStore(linear, layers=[""]).enable()
