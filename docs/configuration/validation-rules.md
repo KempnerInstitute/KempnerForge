@@ -52,9 +52,9 @@ File:
   so it is documented rather than guarded.
 - `attention_backend = "flex"` with an `sdpa_backend` other than `"auto"` logs a
   warning: only a forward given a `BlockMask` (document or attention-group ids
-  without a key padding mask) runs FlexAttention, which ignores `sdpa_backend`;
-  every other forward runs SDPA exactly as under `attention_backend = "sdpa"`,
-  `sdpa_backend` included.
+  without a key padding mask) runs FlexAttention, which ignores `sdpa_backend`.
+  Every other forward runs exactly as with `attention_backend = "sdpa"`, and
+  `sdpa_backend` applies to it as it does there.
 - `attention_backend = "flex"` requires `train.seq_len ≥ 128`, checked by
   `JobConfig` since it reads `[train]`. Below that an
   Inductor-compiled model silently leaks attention across document boundaries.

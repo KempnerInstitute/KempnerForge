@@ -1355,8 +1355,9 @@ class TestVLMParallelismSupport:
 
 class TestFlexSdpaBackendWarning:
     """Under ``attention_backend="flex"`` only a forward given a ``BlockMask`` runs
-    FlexAttention; every other forward runs SDPA as under ``attention_backend="sdpa"``,
-    ``sdpa_backend`` included, so the warning names the forwards that ignore it.
+    FlexAttention, and every other forward runs exactly as under
+    ``attention_backend="sdpa"``, so the warning names the forwards that ignore
+    ``sdpa_backend`` instead of calling it ignored.
 
     ``kempnerforge.metrics.logger._configure_root`` sets ``propagate = False``
     on the ``kempnerforge`` logger, which blocks pytest's caplog (attached at
@@ -1381,10 +1382,10 @@ class TestFlexSdpaBackendWarning:
 
     def test_warning_names_the_forwards_that_ignore_sdpa_backend(self, caplog):
         assert self._messages(caplog, attention_backend="flex", sdpa_backend="math") == [
-            "attention_backend='flex' runs FlexAttention, which ignores sdpa_backend='math', "
-            "only for a forward given a BlockMask (document or attention-group ids without a "
-            "key padding mask); every other forward runs SDPA exactly as under "
-            "attention_backend='sdpa', sdpa_backend included."
+            "With attention_backend='flex', only a forward given a BlockMask (document or "
+            "attention-group ids without a key padding mask) runs FlexAttention, which ignores "
+            "sdpa_backend='math'. Every other forward runs exactly as with "
+            "attention_backend='sdpa', and sdpa_backend applies to it as it does there."
         ]
 
     @pytest.mark.parametrize(

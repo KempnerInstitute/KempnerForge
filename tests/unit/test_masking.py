@@ -621,8 +621,8 @@ def _enabled_sdpa_backends() -> set[str]:
 
 class TestSdpaBackendUnderFlex:
     """Under ``attention_backend="flex"`` only a forward given a ``BlockMask`` runs
-    FlexAttention. Every other forward, without ids, with a key padding mask, or
-    against a KV cache, runs SDPA with only the ``sdpa_backend`` kernel enabled."""
+    FlexAttention. A forward without ids, with a key padding mask, or against a KV
+    cache runs SDPA with only the ``sdpa_backend`` kernel enabled."""
 
     DOCS = torch.tensor([[0, 0, 0, 0, 0, 1, 1, 1]])
 

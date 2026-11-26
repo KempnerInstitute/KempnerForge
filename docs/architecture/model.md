@@ -154,9 +154,9 @@ the configs that build one (see
 Capturing attention weights computes attention without SDPA and is not
 affected.
 
-Under `attention_backend = "flex"`, `sdpa_backend` still selects the kernel
-of every forward that gets no `BlockMask`; only a forward given one runs
-FlexAttention, which `sdpa_backend` does not select.
+Under `attention_backend = "flex"`, only a forward given a `BlockMask` runs
+FlexAttention, which `sdpa_backend` does not select. Every other forward runs
+exactly as under `"sdpa"`, and `sdpa_backend` applies to it as it does there.
 
 ## MLP
 

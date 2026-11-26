@@ -145,11 +145,11 @@ class ModelConfig:
                 import logging
 
                 logging.getLogger(__name__).warning(
-                    "attention_backend='flex' runs FlexAttention, which ignores "
-                    "sdpa_backend=%r, only for a forward given a BlockMask (document or "
-                    "attention-group ids without a key padding mask); every other forward "
-                    "runs SDPA exactly as under attention_backend='sdpa', sdpa_backend "
-                    "included.",
+                    "With attention_backend='flex', only a forward given a BlockMask "
+                    "(document or attention-group ids without a key padding mask) runs "
+                    "FlexAttention, which ignores sdpa_backend=%r. Every other forward runs "
+                    "exactly as with attention_backend='sdpa', and sdpa_backend applies to "
+                    "it as it does there.",
                     self.sdpa_backend,
                 )
 
