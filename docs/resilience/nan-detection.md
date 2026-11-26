@@ -24,9 +24,9 @@ if not nan_detector.check_loss(result.loss, step, grad_norm=result.grad_norm):
     if nan_detector.rollback_recommended:    # stops without a checkpoint; no rollback
         logger.error(f"Too many consecutive NaNs at step {step}: stopping ...")
         break
-    _advance_lr_schedule(session)            # scheduler.step(), then the phase lr_scale
     step += 1
     _apply_step_transitions(session, step)   # FreezeStages and data phases due at step
+    _advance_lr_schedule(session)            # scheduler.step(), then the phase lr_scale
     if _shutdown_if_requested(               # saves only finite weights
         session, step, tokens_seen, saved_this_step=False, nan_skipped=True
     ):
@@ -69,8 +69,8 @@ tick except the shutdown check are dropped:
 |------|-------------------|
 | Optimizer update | Skipped. Gradients are zeroed and the sigmoid routers' expert counts dropped; weights, optimizer state and the routers' balancing state stay as they were. |
 | `tokens_seen`, metrics, `on_step_end` hooks | Skipped. |
-| LR schedule | Advanced: `scheduler.step()`, then the active phase's `lr_scale`, so warmup and decay stay on the step counter. |
 | `FreezeStage` and data phases due at the new step | Applied. A `FreezeStage` waits behind the same async-save fence as on a finite step. |
+| LR schedule | Advanced: `scheduler.step()`, then the `lr_scale` of the phase active at the new step, so warmup and decay stay on the step counter. |
 | Shutdown check | Run. A pending SIGTERM / SIGUSR1 writes the emergency checkpoint at the new step, unless the weights are not finite (see [A shutdown after a bad update](#a-shutdown-after-a-bad-update)), then the loop stops. |
 | Eval, NCCL health check, scheduled checkpoint | Skipped until their next interval. |
 | Profiler step | Skipped; the profiler steps on the next finite step. |
@@ -78,19 +78,17 @@ tick except the shutdown check are dropped:
 The checkpoint holds the weights as the skipped step left them, and the
 schedule, freeze state, data phase and data position are all those of
 the new step, so resuming from that emergency checkpoint continues as
-the uninterrupted run would have, with two exceptions:
+the uninterrupted run would have, with one exception:
 
 - **Partway through a run of NaN steps.** The consecutive-NaN count is
   not checkpointed, so the resumed run counts from zero and allows a
   full `max_consecutive` more before it stops. Tracked in
   [#480](https://github.com/KempnerInstitute/KempnerForge/issues/480).
-- **Before the run's first optimizer update.** The checkpoint holds no
-  optimizer state, so the resumed optimizer keeps the LR the scheduler
-  set at step 0 (0 under the default warmup) for its first update. That
-  update still advances the optimizer's moments and step count, so the
-  resumed run does not rejoin the uninterrupted one, though its LR
-  follows the schedule from the next step on. Tracked in
-  [#481](https://github.com/KempnerInstitute/KempnerForge/issues/481).
+
+A checkpoint written before the run's first optimizer update holds no
+optimizer state. The resumed optimizer starts fresh, as the
+uninterrupted run's still is at that step, and at the LR the restored
+schedule sets for the step, times the active phase's `lr_scale`.
 
 Two edge cases:
 

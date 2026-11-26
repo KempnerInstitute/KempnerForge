@@ -790,11 +790,30 @@ def _log_dataset_metrics(
         session.tracker.log_eval(ds_metrics, step)
 
 
+def _start_lr_schedule(session: TrainingSession) -> None:
+    """Give an optimizer that holds no state the LR its schedule sets for the first step.
+
+    Such an optimizer has the rate its scheduler wrote when it was built: in a fresh run,
+    after a checkpoint saved before the first update, and after a ``load_path`` warm start
+    that leaves the optimizer out. Each param group then gets the scheduler's last rate for
+    it, restored with the checkpoint's schedule, times the active phase's ``lr_scale``. An
+    optimizer that holds state, its inner ones included, keeps the rate it was saved at.
+    """
+    optimizer = session.optimizer
+    if any(opt.state for opt in (optimizer, *getattr(optimizer, "inner_optimizers", ()))):
+        return
+    rates = session.scheduler.get_last_lr()
+    for group, rate in zip(optimizer.param_groups, rates, strict=True):
+        group["lr"] = rate * session.phases.lr_scale
+
+
 def _advance_lr_schedule(session: TrainingSession) -> None:
     """Step the scheduler, then scale the new LR by the active phase's ``lr_scale``.
 
     Runs once per step, a step skipped for a non-finite loss included, so
-    the schedule stays aligned with the step counter.
+    the schedule stays aligned with the step counter. It runs after the
+    phases due at the new step have fired, so the step that starts at a
+    phase's ``start_step`` runs at that phase's ``lr_scale``.
     """
     session.scheduler.step()
     if session.phases.lr_scale != 1.0:
@@ -950,7 +969,9 @@ def run_training_loop(
     Returns the final ``(step, tokens_seen)``. Drains any pending async
     checkpoint before returning so the caller can tear down the process
     group safely. ``session.data`` is read once and must stay fixed for the
-    duration; only its ``dataloader`` may be swapped mid-run.
+    duration; only its ``dataloader`` may be swapped mid-run. An optimizer
+    that holds no state starts at the rate its scheduler last set, times the
+    active phase's ``lr_scale``; one that holds state keeps its rate.
 
     Every rank must call it: the shutdown and NCCL-health stops are agreed
     over ``session.control_group``. When that is ``None`` the loop makes the
@@ -984,6 +1005,7 @@ def run_training_loop(
     if phases.phases:
         logger.info(f"Phase scheduling: {len(phases.phases)} phase(s) configured")
 
+    _start_lr_schedule(session)
     model.train()
     hooks.on_train_begin(config)
 
@@ -1032,9 +1054,9 @@ def run_training_loop(
                         "an earlier step_N"
                     )
                     break
-                _advance_lr_schedule(session)
                 step += 1
                 _apply_step_transitions(session, step)
+                _advance_lr_schedule(session)
                 if _shutdown_if_requested(
                     session, step, tokens_seen, saved_this_step=False, nan_skipped=True
                 ):
@@ -1045,7 +1067,6 @@ def run_training_loop(
             applied_module_lrs = module_learning_rates(optimizer)
             optimizer.step()
             _route_balance(session, step_ran=True)
-            _advance_lr_schedule(session)
 
             optimizer.zero_grad()
 
@@ -1055,6 +1076,7 @@ def run_training_loop(
                 session.documents_seen = (session.documents_seen or 0) + documents_in_step
 
             _apply_step_transitions(session, step)
+            _advance_lr_schedule(session)
 
             loss = dp_mean(result.loss, session.dp_groups, runtime.device)
             step_metrics = tracker.end_step(

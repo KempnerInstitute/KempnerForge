@@ -504,7 +504,12 @@ class _EvalTensorDataset(torch.utils.data.Dataset):
 
 
 def build_phase_state(config: JobConfig, data: DataPipeline, step: int) -> PhaseState:
-    """Resolve data-annealing phases and re-derive the active one on resume."""
+    """Resolve data-annealing phases and apply each one active at ``step``, the run's first.
+
+    Every phase with ``start_step <= step`` is applied in order, so a phase at step 0 sets
+    the sampler weights and ``lr_scale`` the first step of a fresh run uses, and a resume
+    re-derives the phase it stopped in.
+    """
     phases: list[TrainingPhase] = []
     if config.data.phases:
         phases = sorted(config.data.phases, key=lambda p: p.start_step)
@@ -523,13 +528,15 @@ def build_phase_state(config: JobConfig, data: DataPipeline, step: int) -> Phase
     )
 
     mixture, sampler = data.mixture_dataset, data.mixture_sampler
-    if step > 0 and phases and mixture is not None and sampler is not None:
+    if phases and mixture is not None and sampler is not None:
         for i, phase in enumerate(phases):
             if step >= phase.start_step:
                 _apply_phase(phase, state, mixture, sampler)
                 state.next_idx = i + 1
         if state.next_idx > 0:
-            logger.info(f"Resumed into phase {state.next_idx - 1}, lr_scale={state.lr_scale}")
+            logger.info(
+                f"Starting step {step} in phase {state.next_idx - 1}, lr_scale={state.lr_scale}"
+            )
 
     return state
 

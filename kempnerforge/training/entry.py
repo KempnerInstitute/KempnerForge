@@ -363,6 +363,16 @@ def _tag_warm_start_run(config: JobConfig, extra: dict) -> None:
     metrics.mlflow_tags = {**tags, **metrics.mlflow_tags}
 
 
+def _apply_effective_freeze(model: torch.nn.Module, vlm_cfg: VLMConfig | None, step: int) -> None:
+    """Under a freeze schedule, apply ``vlm.freeze`` and every ``FreezeStage`` up to ``step``."""
+    if vlm_cfg is None or not vlm_cfg.freeze_schedule:
+        return
+    valid_modules = set(vlm_cfg.module_patterns.keys())
+    specs = effective_freeze(step, vlm_cfg.freeze, vlm_cfg.freeze_schedule, valid_modules)
+    apply_freeze_specs(model, specs, vlm_cfg.module_patterns)
+    logger.info(f"Starting at step={step}; applied effective freeze ({len(specs)} specs)")
+
+
 def restore_checkpoint(
     config: JobConfig,
     model: torch.nn.Module,
@@ -374,7 +384,8 @@ def restore_checkpoint(
     Returns ``(step, tokens_seen)`` — ``(0, 0)`` when there is nothing to
     resume from. Also restores the metrics run ids, runs the MoT text warm
     start when no checkpoint supplied the model weights and the run starts at
-    step 0, and re-applies the effective freeze at the resumed step. A module
+    step 0, and applies the effective freeze at the step it returns, a fresh
+    run's step 0 and the ``FreezeStage`` there included. A module
     that a freeze stage unfreezes gets its saved optimizer state back, or
     empty state when the saved optimizer had none for it.
 
@@ -399,6 +410,7 @@ def restore_checkpoint(
     vlm_cfg = config.vlm
     if not resume_path and not config.checkpoint.load_path:
         _mot_text_warm_start(vlm_cfg, model, ckpt_mgr.agree)
+        _apply_effective_freeze(model, vlm_cfg, 0)
         return 0, 0
     rank_zero = not dist.is_initialized() or dist.get_rank() == 0
     if (
@@ -441,12 +453,7 @@ def restore_checkpoint(
     if warm_start_exclude is not None and "model" in warm_start_exclude:
         _mot_text_warm_start(vlm_cfg, model, ckpt_mgr.agree)
 
-    if vlm_cfg is not None and vlm_cfg.freeze_schedule:
-        valid_modules = set(vlm_cfg.module_patterns.keys())
-        specs = effective_freeze(step, vlm_cfg.freeze, vlm_cfg.freeze_schedule, valid_modules)
-        apply_freeze_specs(model, specs, vlm_cfg.module_patterns)
-        logger.info(f"Resumed at step={step}; applied effective freeze ({len(specs)} specs)")
-
+    _apply_effective_freeze(model, vlm_cfg, step)
     return step, tokens_seen
 
 
