@@ -874,10 +874,13 @@
     },
     "kempnerforge/training/grad.py": {
       "functions": [
-        "maybe_no_sync(model, micro_step, grad_accum_steps)"
+        "maybe_no_sync(model, micro_step, grad_accum_steps) (on intermediate micro-steps every FSDP2 unit skips its reduce-scatter and HSDP all-reduce, also in a VLMWrapper, whose root is not an FSDP2 module)",
+        "_gradient_sync_switch(model) -> Callable[[bool], None] | None (the model's own set_requires_gradient_sync, else one that switches each FSDPModule it holds with recurse=False, also behind torch.compile; None when it holds none)"
       ],
       "tested_by": [
-        "tests/unit/test_training.py::TestGradUtils"
+        "tests/unit/test_training.py::TestGradUtils",
+        "tests/unit/test_grad_sync.py::TestGradientSyncUnderAccumulation",
+        "tests/distributed/test_vlm_fsdp.py::TestGradientAccumulation"
       ]
     },
     "kempnerforge/training/hooks.py": {
@@ -1770,6 +1773,12 @@
         ],
         "count": 19
       },
+      "tests/unit/test_grad_sync.py": {
+        "classes": [
+          "TestGradientSyncUnderAccumulation(2)"
+        ],
+        "count": 2
+      },
       "tests/unit/test_data.py": {
         "classes": [
           "TestMemoryMappedDataset(9)",
@@ -2383,7 +2392,8 @@
           "TestVariableLengthRankConsistency(1)",
           "TestDtypeCombinatorics(1)",
           "TestInnerTransformerUnderCompileAndFsdp(1)",
-          "TestCheckpointRoundtrip(1)"
+          "TestCheckpointRoundtrip(1)",
+          "TestGradientAccumulation(1)"
         ],
         "note": "VLM Joint-Decoder FSDP2"
       },
