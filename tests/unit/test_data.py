@@ -255,6 +255,54 @@ class TestDistributedSampler:
         assert len(list(s_drop)) == 33
         assert len(list(s_pad)) == 34
 
+    def test_a_dataset_smaller_than_half_the_ranks_reaches_every_rank(self):
+        """One sample on three ranks without drop_last: every rank yields it."""
+        for rank in range(3):
+            sampler = DistributedSampler(
+                [0], num_replicas=3, rank=rank, shuffle=False, drop_last=False
+            )
+            assert list(sampler) == [0]
+            assert len(sampler) == 1
+
+    @pytest.mark.parametrize("num_replicas", [2, 3, 5, 8, 16])
+    def test_every_rank_yields_what_the_torch_sampler_yields(self, num_replicas):
+        """Without drop_last, every rank yields ``len()`` samples, padded the way torch pads.
+
+        The sizes run past twice the rank count, so the lists shorter than
+        their padding repeat as many times as needed.
+        """
+        for size in range(1, 2 * num_replicas + 2):
+            for shuffle in (True, False):
+                for rank in range(num_replicas):
+                    options = {
+                        "num_replicas": num_replicas,
+                        "rank": rank,
+                        "shuffle": shuffle,
+                        "seed": 3,
+                        "drop_last": False,
+                    }
+                    sampler = DistributedSampler(range(size), **options)
+                    reference = torch.utils.data.DistributedSampler(range(size), **options)
+                    sampler.set_epoch(2)
+                    reference.set_epoch(2)
+                    drawn = list(sampler)
+                    assert len(drawn) == len(sampler)
+                    assert drawn == list(reference)
+
+    def test_a_list_that_covers_its_padding_pads_as_before(self):
+        """Without drop_last, a list at least as long as its padding repeats its own start once."""
+        for num_replicas in (2, 3, 4, 7):
+            for size in range(1, 3 * num_replicas):
+                padding = -size % num_replicas
+                if padding > size:
+                    continue
+                perm = torch.randperm(size, generator=torch.Generator().manual_seed(5)).tolist()
+                for rank in range(num_replicas):
+                    sampler = DistributedSampler(
+                        range(size), num_replicas=num_replicas, rank=rank, seed=5, drop_last=False
+                    )
+                    assert list(sampler) == (perm + perm[:padding])[rank::num_replicas]
+
 
 class TestStatefulDataLoader:
     def test_basic_iteration(self, mmap_data_dir):

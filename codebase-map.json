@@ -1765,13 +1765,13 @@
       "tests/unit/test_data.py": {
         "classes": [
           "TestMemoryMappedDataset(9)",
-          "TestDistributedSampler(8)",
+          "TestDistributedSampler(11)",
           "TestStatefulDataLoader(3)",
           "TestHuggingFaceDataset(6)",
           "TestTextReadersReadOnlyTheText(2)",
           "TestStreamingHuggingFaceDataset(8)"
         ],
-        "count": 36
+        "count": 39
       },
       "tests/unit/test_distributed.py": {
         "classes": [
@@ -2027,16 +2027,16 @@
       },
       "tests/unit/test_mixing.py": {
         "classes": [
-          "TestDatasetSource(5)",
+          "TestDatasetSource(7)",
           "TestDataConfigMixing(4)",
           "TestMixingTomlLoading(3)",
           "TestMixtureDataset(10)",
-          "TestMixtureSampler(9)",
+          "TestMixtureSampler(13)",
           "TestTemperatureScaling(3)",
           "TestMixtureSamplerWithDataset(2)",
           "TestMixtureSamplerZeroWeights(8)"
         ],
-        "count": 44
+        "count": 50
       },
       "tests/unit/test_annealing.py": {
         "classes": [
@@ -2239,7 +2239,7 @@
         "count": 23
       },
       "tests/unit/test_mixture_phase_change.py": {
-        "note": "Module-level pytest functions (no Test* classes): a data phase that changes the mixture weights inside an epoch draws the rest of the epoch from the undrawn samples, with no repeat for a dataset no weighting oversamples (pipeline, loop-style reset); resumes before, at and after two changes in one epoch and in the next epoch match the uninterrupted run; resume at another batch size; no new sampler state without a change; fixed-weight lists against a reference of the sampler's draw; undrawn-first order, caps and overflow, several changes, a dataset entering mid-epoch split the same way on every rank, also when the ranks' lists differ in length; the epoch_weights record (pending, applied, cleared), its replay with and without a temperature, a state without it, and one for another dataset count; the change and a resume with dataloader workers; a change at the largest seed",
+        "note": "Module-level pytest functions (no Test* classes): a data phase that changes the mixture weights inside an epoch draws the rest of the epoch from the undrawn samples, with no repeat for a dataset no weighting oversamples (pipeline, loop-style reset); resumes before, at and after two changes in one epoch and in the next epoch match the uninterrupted run; resume at another batch size; no new sampler state without a change; fixed-weight lists against a reference of the sampler's draw; undrawn-first order, caps and overflow, several changes, a dataset entering mid-epoch split the same way on every rank, also beside a one-sample dataset padded across three ranks; the epoch_weights record (pending, applied, cleared), its replay with and without a temperature, a state without it, and one for another dataset count; the change and a resume with dataloader workers; a change at the largest seed",
         "count": 17
       },
       "tests/unit/test_streaming_resume.py": {

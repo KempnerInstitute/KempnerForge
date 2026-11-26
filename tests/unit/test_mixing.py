@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
+from collections import Counter
+
 import numpy as np
 import pytest
 
@@ -310,6 +313,81 @@ class TestMixtureSampler:
         indices = list(sampler)
         ds0_indices = [i for i in indices if i < 10]
         assert len(ds0_indices) > 100
+
+    def test_a_dataset_smaller_than_half_the_ranks_is_drawn_on_every_rank(self):
+        """1 and 60 samples with equal weights on 3 ranks without drop_last."""
+        for rank in range(3):
+            sampler = MixtureSampler(
+                [0, 1, 61], [1.0, 1.0], num_replicas=3, rank=rank, seed=5, drop_last=False
+            )
+            drawn = list(sampler)
+            assert len(drawn) == len(sampler) == 21
+            assert drawn.count(0) == 11
+
+    @pytest.mark.parametrize("shuffle", [True, False])
+    @pytest.mark.parametrize("num_replicas", [2, 3, 4, 5, 8, 16])
+    def test_every_rank_yields_len_samples_from_small_datasets(self, num_replicas, shuffle):
+        """Datasets of 1, 2, 3 and 7 samples beside one of 50, without drop_last.
+
+        Every rank yields ``len()`` samples and draws as many from each dataset
+        as every other rank.
+        """
+        cumulative = [0, 1, 3, 6, 13, 63]
+        for weights in ([1.0] * 5, [5.0, 1.0, 0.5, 2.0, 1.0]):
+            counts = []
+            for rank in range(num_replicas):
+                sampler = MixtureSampler(
+                    cumulative,
+                    weights,
+                    num_replicas,
+                    rank,
+                    shuffle=shuffle,
+                    seed=1,
+                    drop_last=False,
+                )
+                drawn = list(sampler)
+                assert len(drawn) == len(sampler)
+                counts.append(Counter(bisect_right(cumulative, i) - 1 for i in drawn))
+            assert all(count == counts[0] for count in counts)
+
+    def test_datasets_that_cover_their_padding_are_split_as_before(self):
+        """Without drop_last, a dataset at least as long as its padding repeats its own start once.
+
+        Weights in proportion to each rank's share make every target the share,
+        so an unshuffled rank yields its share of each dataset in order.
+        """
+        sizes, cumulative, num_replicas = [2, 5, 6, 12], [0, 2, 7, 13, 25], 4
+        weights = [float(-(-size // num_replicas)) for size in sizes]
+        for rank in range(num_replicas):
+            sampler = MixtureSampler(
+                cumulative, weights, num_replicas, rank, shuffle=False, drop_last=False
+            )
+            expected: list[int] = []
+            for size, offset in zip(sizes, cumulative, strict=False):
+                padded = list(range(size)) + list(range(size))[: -size % num_replicas]
+                expected += [offset + i for i in padded[rank::num_replicas]]
+            assert list(sampler) == expected
+
+    def test_a_small_dataset_keeps_the_ranks_in_step_through_a_mid_epoch_change(self):
+        """1, 60 and 60 samples on 3 ranks without drop_last; the third joins at 5.
+
+        Every rank yields ``len()`` samples across the change, and a resume from
+        the saved state draws what the uninterrupted epoch draws.
+        """
+        cumulative = [0, 1, 61, 121]
+        for rank in range(3):
+            sampler = MixtureSampler(cumulative, [1.0, 1.0, 0.0], 3, rank, seed=5, drop_last=False)
+            epoch = list(sampler)[:5]
+            sampler.update_weights([1.0, 1.0, 1.0])
+            sampler.set_skip(5)
+            epoch += list(sampler)
+            resumed = MixtureSampler(cumulative, [1.0, 1.0, 0.0], 3, rank, seed=5, drop_last=False)
+            resumed.load_state_dict(sampler.state_dict())
+            resumed.update_weights([1.0, 1.0, 1.0])
+            resumed.set_skip(20)
+
+            assert len(epoch) == len(sampler) == 41
+            assert list(resumed) == epoch[20:]
 
 
 class TestTemperatureScaling:
