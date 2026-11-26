@@ -1179,7 +1179,7 @@ class TestNanSkippedStep:
         monkeypatch.setattr(ckpt, "save", save)
         step, tokens_seen = run_training_loop(session)
         assert step == 2
-        assert ckpt.saves == [(2, tokens_seen, {"plugins": []})]
+        assert ckpt.saves == [(2, tokens_seen, {"plugins": [], "consecutive_nans": 1})]
         assert ckpt.waits == 1
         assert epochs == [2]
         assert handler.finished is False
@@ -5717,7 +5717,8 @@ class TestFreezeStageFence:
         run_training_loop(session)
         assert order == ["flush", "freeze", "save"]
         freeze = freeze_meta_at_step(2, session.config.vlm)
-        assert saved == [(2, {"plugins": [], "documents_seen": 2, "vlm_freeze": freeze})]
+        extra = {"plugins": [], "documents_seen": 2, "vlm_freeze": freeze, "consecutive_nans": 1}
+        assert saved == [(2, extra)]
 
 
 class TestBatchStreamGuard:

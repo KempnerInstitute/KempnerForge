@@ -1810,9 +1810,9 @@
       "tests/unit/test_shutdown_agreement.py": {
         "classes": [
           "TestAnyRank(4)",
-          "TestLoopStopsOnEveryRank(6)"
+          "TestLoopStopsOnEveryRank(7)"
         ],
-        "count": 10
+        "count": 11
       },
       "tests/unit/test_checkpoint.py": {
         "classes": [
