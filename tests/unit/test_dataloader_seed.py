@@ -72,19 +72,28 @@ def _seeds(batches: list[torch.Tensor]) -> dict[int, int]:
 
 
 def _run_and_resume(
-    workers: int, saved_after: int, then: int, *, close_before_save: bool = False
+    workers: int,
+    saved_after: int,
+    then: int,
+    *,
+    close_before_save: bool = False,
+    reset_before_save: bool = False,
 ) -> tuple[list[torch.Tensor], torch.Tensor, list[torch.Tensor], torch.Tensor]:
     """An uninterrupted run's batches ``saved_after`` to ``saved_after + then`` and a resume's.
 
     Both start from ``torch.manual_seed(0)``. The resume restores the CPU RNG and the
-    loader state saved after ``saved_after`` batches, closing the loader first when
-    ``close_before_save``, as the training loop does before its final save. Returns
-    each run's batches and its CPU RNG state after them.
+    loader state saved after ``saved_after`` batches. With ``reset_before_save`` both
+    runs reset the stream there, as a data phase does, and with ``close_before_save``
+    the saving run closes the loader first, as the training loop does before its
+    final save. Returns each run's batches and its CPU RNG state after them.
     """
     torch.manual_seed(0)
     uninterrupted = _stream(workers)
     try:
-        expected = _take(uninterrupted, saved_after + then)[saved_after:]
+        _take(uninterrupted, saved_after)
+        if reset_before_save:
+            uninterrupted.reset()
+        expected = _take(uninterrupted, then)
         expected_rng = torch.random.get_rng_state()
     finally:
         uninterrupted.close()
@@ -92,6 +101,8 @@ def _run_and_resume(
     saving = _stream(workers)
     try:
         _take(saving, saved_after)
+        if reset_before_save:
+            saving.reset()
         if close_before_save:
             saving.close()
         rng, state = torch.random.get_rng_state(), saving.dataloader.state_dict()
@@ -146,6 +157,23 @@ def test_a_checkpoint_saved_after_close_resumes_the_run_that_never_closed(worker
     """``close()`` keeps the saved state, so the loop's final save resumes exactly."""
     _skip_without_worker_sockets(workers)
     _assert_resumed(*_run_and_resume(workers, 3, 3, close_before_save=True), workers)
+
+
+@pytest.mark.parametrize("close_before_save", [False, True])
+@pytest.mark.parametrize("workers", [0, 2])
+def test_a_checkpoint_saved_after_a_reset_resumes_as_the_run_restarts_the_pass(
+    workers, close_before_save
+):
+    """Saved after ``BatchStream.reset``, the resume starts the pass again as the run does.
+
+    Without persistent workers the run's next iterator draws a new base seed from
+    the CPU RNG, and so does the resume's; with them, both keep the workers' seeds.
+    """
+    _skip_without_worker_sockets(workers)
+    resumed = _run_and_resume(
+        workers, 3, 3, close_before_save=close_before_save, reset_before_save=True
+    )
+    _assert_resumed(*resumed, workers)
 
 
 def test_a_load_into_a_loader_with_running_workers_starts_new_ones_from_the_loaded_state():

@@ -162,7 +162,11 @@ class _BaseSeed:
     def end_pass(self, loader: DataLoader) -> None:
         """Drop the state at the end of a pass whose next pass starts a new iterator."""
         if not loader.persistent_workers:
-            self.state = None
+            self.drop()
+
+    def drop(self) -> None:
+        """Drop the state: the next iterator draws a new base seed from the CPU RNG."""
+        self.state = None
 
     def load(self, state: bytes | None) -> None:
         """Have the next iterator draw its base seed from ``state``, or the CPU RNG if None."""
@@ -334,6 +338,18 @@ class StatefulDataLoader:
         self._iterator = None
         shutdown_workers(self._dataloader)
         _loaders_with_workers.pop(self, None)
+
+    def restart(self) -> None:
+        """Drop the live iterator; the next ``iter()`` starts again at the same position.
+
+        ``BatchStream.reset`` calls it when a data phase changes the sampler's
+        weights. Persistent workers keep running, and the next ``iter()`` resets
+        their iterator, which keeps its base seed. Without them, that ``iter()``
+        starts a new iterator, which draws a new base seed from the CPU RNG, so
+        ``state_dict`` saves none until then. Rank-local, with no collective.
+        """
+        self._iterator = None
+        self._base_seed.end_pass(self._dataloader)
 
     def __len__(self) -> int:
         return len(self._dataloader)
@@ -628,6 +644,19 @@ class StreamingDataLoader:
         self._iterator = None
         shutdown_workers(self._dataloader)
         _loaders_with_workers.pop(self, None)
+
+    def restart(self) -> None:
+        """Drop the live iterator; the next ``iter()`` replays the pass to the same position.
+
+        As ``StatefulDataLoader.restart``. A pass in progress stops its workers,
+        as ``close()`` does, since a pass restarted midway needs new ones, and the
+        next ``iter()`` starts a new iterator, which draws a new base seed from the
+        CPU RNG, so ``state_dict`` saves none until then.
+        """
+        if self._iterator is None:
+            return
+        self.close()
+        self._base_seed.drop()
 
     def _replay(self) -> None:
         """Discard the batches this epoch already gave training, logging progress."""

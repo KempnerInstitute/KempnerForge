@@ -611,6 +611,39 @@ def test_a_pass_restarted_midway_draws_a_new_base_seed_that_a_resume_keeps(corpu
     _assert_same_run(uninterrupted, resume)
 
 
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_a_stream_saved_after_a_reset_resumes_as_the_run_restarts_the_pass(corpus, num_workers):
+    """Saved after ``BatchStream.reset``, the resume replays as the run's restarted pass does.
+
+    The restarted pass starts a new iterator, which draws a new base seed from the
+    CPU RNG, in the run and in the resume. A stream that has not started has no
+    iterator to restart.
+    """
+    if num_workers and not worker_sockets_fit():
+        pytest.skip("the temp directory path is too long for DataLoader worker sockets")
+    torch.manual_seed(0)
+    run = BatchStream(DataPipeline(dataloader=_stream_loader(corpus, num_workers=num_workers)))
+    resumed = BatchStream(DataPipeline(dataloader=_stream_loader(corpus, num_workers=num_workers)))
+    try:
+        resumed.reset()
+        for _ in range(4):
+            run.next_batch()
+        run.reset()
+        rng, state = torch.random.get_rng_state(), run.dataloader.state_dict()
+        expected = [run.next_batch()["input_ids"] for _ in range(3)]
+        uninterrupted = (expected, torch.random.get_rng_state(), _base_seed(run.dataloader))
+        torch.random.set_rng_state(rng)
+        resumed.dataloader.load_state_dict(state)
+        got = [resumed.next_batch()["input_ids"] for _ in range(3)]
+        resume = (got, torch.random.get_rng_state(), _base_seed(resumed.dataloader))
+    finally:
+        run.close()
+        resumed.close()
+    assert state["batches_yielded"] == 4
+    assert state["base_seed_rng_state"] is None
+    _assert_same_run(uninterrupted, resume)
+
+
 def test_a_load_into_a_running_stream_starts_new_workers_from_the_loaded_state(corpus):
     """Workers that ran before ``load_state_dict`` stop; the next pass replays with new ones."""
     if not worker_sockets_fit():

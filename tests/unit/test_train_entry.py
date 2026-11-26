@@ -283,6 +283,28 @@ class TestBatchStream:
         stream.reset()
         assert int(stream.next_batch()["input_ids"]) == 0
 
+    def test_reset_hands_the_restart_to_the_loader(self):
+        """A loader with ``restart()`` drops its own iterator, so its saved state follows."""
+
+        class _Loader:
+            def __init__(self):
+                self.restarted = 0
+
+            def __iter__(self):
+                return iter(_fake_batches(3))
+
+            def restart(self):
+                self.restarted += 1
+
+        loader = _Loader()
+        stream = BatchStream(DataPipeline(dataloader=loader))
+        stream.next_batch()
+
+        stream.reset()
+
+        assert loader.restarted == 1
+        assert int(stream.next_batch()["input_ids"]) == 0
+
     def test_close_is_safe_without_a_loader(self):
         BatchStream(DataPipeline()).close()
 

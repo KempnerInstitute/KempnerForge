@@ -288,6 +288,13 @@ never closed. The next `iter()` in the same process starts new workers
 with a base seed drawn from the CPU generator, as any start of workers
 does.
 
+When a data phase changes a mixture's weights, the training loop resets
+its stream (`BatchStream.reset()`), and the next step starts the pass
+again at the same position. The reset calls the loader's `restart()`,
+which drops the loader's iterator, so a checkpoint saved before that step
+records what the step's new iterator draws: a new base seed without
+persistent workers, or the running workers' seeds with them.
+
 What a resume does not reproduce:
 
 - A worker's position in its own random streams. A resumed worker
