@@ -609,6 +609,90 @@ class TestKVCacheDecode:
         assert caches[0].seq_len == 0
 
 
+def _enabled_sdpa_backends() -> set[str]:
+    flags = {
+        "cudnn": torch.backends.cuda.cudnn_sdp_enabled(),
+        "efficient": torch.backends.cuda.mem_efficient_sdp_enabled(),
+        "flash": torch.backends.cuda.flash_sdp_enabled(),
+        "math": torch.backends.cuda.math_sdp_enabled(),
+    }
+    return {name for name, enabled in flags.items() if enabled}
+
+
+class TestSdpaBackendUnderFlex:
+    """Under ``attention_backend="flex"`` only a forward given a ``BlockMask`` runs
+    FlexAttention. Every other forward, without ids, with a key padding mask, or
+    against a KV cache, runs SDPA with only the ``sdpa_backend`` kernel enabled."""
+
+    DOCS = torch.tensor([[0, 0, 0, 0, 0, 1, 1, 1]])
+
+    @staticmethod
+    def _model() -> Transformer:
+        torch.manual_seed(0)
+        return Transformer(
+            ModelConfig(
+                dim=64,
+                n_layers=2,
+                n_heads=4,
+                vocab_size=64,
+                max_seq_len=16,
+                attention_backend="flex",
+                sdpa_backend="math",
+            )
+        ).eval()
+
+    @staticmethod
+    def _record_sdpa_backends(monkeypatch) -> list[set[str]]:
+        calls: list[set[str]] = []
+        real = F.scaled_dot_product_attention
+
+        def record(*args, **kwargs):
+            calls.append(_enabled_sdpa_backends())
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(F, "scaled_dot_product_attention", record)
+        return calls
+
+    @staticmethod
+    def _assert_ran_under_math_only(calls: list[set[str]], expected_calls: int) -> None:
+        assert calls == [{"math"}] * expected_calls
+        assert {"math"} < _enabled_sdpa_backends()
+
+    def test_a_forward_without_ids_runs_sdpa_under_sdpa_backend(self, monkeypatch):
+        model = self._model()
+        calls = self._record_sdpa_backends(monkeypatch)
+        with torch.no_grad():
+            model(torch.zeros(1, 8, dtype=torch.long))
+        self._assert_ran_under_math_only(calls, len(model.layers))
+
+    def test_a_key_padding_mask_runs_sdpa_under_sdpa_backend(self, monkeypatch):
+        """Key validity is not folded into a ``BlockMask``, so documents with padding
+        take the dense mask."""
+        model = self._model()
+        padding = torch.tensor([[True] * 6 + [False] * 2])
+        modality = ModalityContext(inputs_embeds=torch.randn(1, 8, 64), key_padding_mask=padding)
+        calls = self._record_sdpa_backends(monkeypatch)
+        with torch.no_grad():
+            model(modality=modality, doc_ids=self.DOCS)
+        self._assert_ran_under_math_only(calls, len(model.layers))
+
+    def test_kv_cache_prefill_and_decode_run_sdpa_under_sdpa_backend(self, monkeypatch):
+        model = self._model()
+        caches = TestKVCacheDecode._caches(model, max_seq_len=16)
+        calls = self._record_sdpa_backends(monkeypatch)
+        with torch.no_grad():
+            model(torch.zeros(1, 8, dtype=torch.long), kv_caches=caches)
+            model(torch.zeros(1, 1, dtype=torch.long), kv_caches=caches)
+        self._assert_ran_under_math_only(calls, 2 * len(model.layers))
+
+    def test_a_block_mask_forward_runs_flex_attention_without_sdpa(self, monkeypatch):
+        model = self._model()
+        calls = self._record_sdpa_backends(monkeypatch)
+        with torch.no_grad():
+            model(torch.zeros(1, 8, dtype=torch.long), doc_ids=self.DOCS)
+        assert calls == []
+
+
 def _moma_model(backend: str) -> Transformer:
     torch.manual_seed(0)
     return Transformer(

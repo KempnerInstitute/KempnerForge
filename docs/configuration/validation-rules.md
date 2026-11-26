@@ -45,12 +45,16 @@ File:
 - `sdpa_backend ∈ {"auto", "flash", "efficient", "cudnn", "math"}`.
 - `attention_backend ∈ {"sdpa", "flex"}`.
 - `attention_backend = "flex"` requires `dim // n_heads ≥ 16` (below that the
-  Triton template fails to lower), and warns that `sdpa_backend` is ignored when
-  set. There is no upper bound — head_dim 256/320/384/512 are all verified
-  working. Note the usable set is not an interval: head_dim 192 fails to compile
-  on H200 / torch 2.11 while 128 and 256 are fine. That surfaces as a loud
-  compile-time error, not silent corruption, so it is documented rather than
-  guarded.
+  Triton template fails to lower). There is no upper bound: head_dim
+  256/320/384/512 are all verified working. Note the usable set is not an
+  interval: head_dim 192 fails to compile on H200 / torch 2.11 while 128 and 256
+  are fine. That surfaces as a loud compile-time error, not silent corruption,
+  so it is documented rather than guarded.
+- `attention_backend = "flex"` with an `sdpa_backend` other than `"auto"` logs a
+  warning: only a forward given a `BlockMask` (document or attention-group ids
+  without a key padding mask) runs FlexAttention, which ignores `sdpa_backend`;
+  every other forward runs SDPA exactly as under `attention_backend = "sdpa"`,
+  `sdpa_backend` included.
 - `attention_backend = "flex"` requires `train.seq_len ≥ 128`, checked by
   `JobConfig` since it reads `[train]`. Below that an
   Inductor-compiled model silently leaks attention across document boundaries.

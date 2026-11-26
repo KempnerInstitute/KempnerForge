@@ -145,8 +145,11 @@ class ModelConfig:
                 import logging
 
                 logging.getLogger(__name__).warning(
-                    "sdpa_backend=%r is ignored when attention_backend='flex' -- the flex "
-                    "path does not route through the SDPA kernel selector.",
+                    "attention_backend='flex' runs FlexAttention, which ignores "
+                    "sdpa_backend=%r, only for a forward given a BlockMask (document or "
+                    "attention-group ids without a key padding mask); every other forward "
+                    "runs SDPA exactly as under attention_backend='sdpa', sdpa_backend "
+                    "included.",
                     self.sdpa_backend,
                 )
 
