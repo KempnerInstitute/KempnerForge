@@ -31,8 +31,12 @@ limits of VLM packing).
    layered dict. `ast.literal_eval` parses ints, floats, lists, tuples,
    and booleans; anything unparseable stays as a string.
 
-The config is built once, from the merged layers, so every
-`__post_init__` check reads the TOML and the overrides together.
+The config is built once, from the dataclass defaults and the merged
+layers, so every `__post_init__` check reads the TOML and the overrides
+together. A default that `__post_init__` derives from other fields
+follows them whichever layer sets them: an unset `model.n_kv_heads` takes
+the merged `model.n_heads`, and a `[vlm]` run without `[adapter]` gets
+the default adapter.
 
 ## Pages
 

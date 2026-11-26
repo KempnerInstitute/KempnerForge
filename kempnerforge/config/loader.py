@@ -1,10 +1,11 @@
 """Config loading: TOML files → dataclass configs with CLI overrides.
 
 Loading pipeline:
-  1. Start with default JobConfig
+  1. Start from the dataclass field defaults
   2. Import the modules listed in the `plugins` key (registry side effects)
   3. Load TOML file (if provided) and lay the CLI overrides (--model.dim=512 style) over it
-  4. Build the config from the merged layers once, so each check reads them together
+  4. Build the config once from the field defaults and the merged layers, so each check,
+     and each default that __post_init__ derives from other fields, reads them together
   5. Return JobConfig instance (call .validate(world_size) at distributed setup time)
 """
 
@@ -258,14 +259,21 @@ def _instantiate_from_dict(dc_type: type, data: dict[str, Any]) -> Any:
     """Construct a dataclass directly from a dict, without first building a
     default instance.
 
-    Used for nested Optional[dataclass] fields (e.g. ``JobConfig.vlm``)
-    where the parent's default is ``None`` and the nested dataclass's
-    ``__post_init__`` may reject an empty-default instance.
+    A field ``data`` leaves out takes its declared default, so a default that
+    ``__post_init__`` derives from other fields, such as ``ModelConfig.n_kv_heads``
+    from ``n_heads``, reads the values ``data`` gives them. A dataclass field that
+    ``data`` gives a dict is built the same way; ``load_config`` builds the whole
+    config with this function.
 
     When ``dc_type`` is ``VLMConfig`` (the discriminated-union base),
     dispatch on the ``arch`` field to the registered subclass before
     populating fields, so subclass-specific fields (e.g.
     ``cross_attention_every_n_layers``) are recognized.
+
+    Raises:
+        ValueError: ``data`` holds a key ``dc_type`` does not declare, which catches
+            typos early, a value its field cannot take, or settings a
+            ``__post_init__`` check refuses.
     """
     if dc_type is VLMConfig:
         dc_type = _resolve_vlm_subclass(data)
@@ -331,12 +339,11 @@ def _check_vlm_arch_override(built: type[VLMConfig], arch: Any) -> None:
 def _overlay(dc_type: type, base: dict[str, Any], top: dict[str, Any]) -> dict[str, Any]:
     """``base``, a table for a ``dc_type``, with the parsed overrides ``top`` laid over it.
 
-    The result holds what ``_apply_dict_to_dataclass`` would make of ``top`` over a
-    ``dc_type`` built from ``base``: a dict below a dataclass field merges key by key into
-    ``base``'s table for it, a dotted key below a dict-valued field sets that key in
-    ``base``'s table, and any other value replaces ``base``'s. A key ``base`` does not hold
-    keeps ``top``'s value as it is, so building the config lays dotted keys over the
-    field's default. Nothing is built, so no ``__post_init__`` check runs here.
+    A dict below a dataclass field merges key by key into ``base``'s table for it, a dotted
+    key below a dict-valued field sets that key in ``base``'s table, and any other value
+    replaces ``base``'s. A key ``base`` does not hold keeps ``top``'s value as it is, so
+    building the config lays dotted keys over the field's default. Nothing is built, so no
+    ``__post_init__`` check runs here.
 
     Raises:
         ValueError: ``base`` is a ``[vlm]`` table whose ``arch`` is not registered, or
@@ -358,47 +365,6 @@ def _overlay(dc_type: type, base: dict[str, Any], top: dict[str, Any]) -> dict[s
                 value = _with_dotted_keys(below, value)
         merged[key] = value
     return merged
-
-
-def _apply_dict_to_dataclass(dc: Any, data: dict[str, Any]) -> Any:
-    """Recursively apply a dict to a dataclass, creating a new instance.
-
-    Raises ValueError on unknown keys to catch typos early.
-    """
-    if not is_dataclass(dc):
-        return dc
-
-    dc_type = type(dc)
-    type_hints = _get_type_hints(dc_type)
-    field_names = {f.name for f in fields(dc)}
-
-    unknown = set(data.keys()) - field_names
-    if unknown:
-        raise ValueError(
-            f"Unknown config keys in {dc_type.__name__}: {sorted(unknown)}. "
-            f"Valid keys: {sorted(field_names)}"
-        )
-
-    kwargs = {}
-    for f in fields(dc):
-        current_val = getattr(dc, f.name)
-        if f.name in data:
-            raw = data[f.name]
-            hint = type_hints[f.name]
-            inner = _dataclass_type_from_hint(hint)
-            if is_dataclass(current_val) and isinstance(raw, dict):
-                kwargs[f.name] = _apply_dict_to_dataclass(current_val, raw)
-            elif isinstance(raw, dict) and inner is not None and current_val is None:
-                kwargs[f.name] = _instantiate_from_dict(inner, raw)
-            elif isinstance(raw, dict) and inner is None:
-                table = _dict_field_value(raw, current_val)
-                kwargs[f.name] = _coerce_field(dc_type, f.name, hint, table)
-            else:
-                kwargs[f.name] = _coerce_field(dc_type, f.name, hint, raw)
-        else:
-            kwargs[f.name] = current_val
-
-    return dc_type(**kwargs)
 
 
 def _parse_cli_overrides(args: list[str]) -> dict[str, Any]:
@@ -517,7 +483,10 @@ def load_config(
 
     The returned config has all sub-config __post_init__ validations applied.
     They run once, on the TOML with the CLI overrides laid over it, so a check
-    that compares fields reads them whichever layer sets each.
+    that compares fields reads them whichever layer sets each. Each section is
+    built from its field defaults and the merged layers, so a default that
+    ``__post_init__`` derives from other fields, such as ``model.n_kv_heads``
+    from ``model.n_heads``, follows them whichever layer sets them.
     Cross-config validation (e.g., parallelism vs world_size) requires calling
     config.validate(world_size=...) separately at distributed setup time.
 
@@ -531,8 +500,6 @@ def load_config(
     Returns:
         A JobConfig with layered defaults → TOML → CLI overrides.
     """
-    config = JobConfig()
-
     toml_data: dict[str, Any] = load_toml(config_path) if config_path is not None else {}
 
     if cli_args is None:
@@ -543,7 +510,4 @@ def load_config(
     if plugins is not None:
         _import_plugins(plugins)
 
-    if config_path is not None or overrides:
-        config = _apply_dict_to_dataclass(config, _overlay(JobConfig, toml_data, overrides))
-
-    return config
+    return _instantiate_from_dict(JobConfig, _overlay(JobConfig, toml_data, overrides))

@@ -264,7 +264,7 @@
         "load_toml(path) -> dict",
         "load_config(config_path, cli_args) -> JobConfig",
         "_parse_cli_overrides(args) -> dict (dotted paths build _DottedKeys)",
-        "_apply_dict_to_dataclass(dc, data)",
+        "_instantiate_from_dict(dc_type, data) (the one build of the config from the field defaults and the merged table, so a default __post_init__ derives reads the configured fields)",
         "_overlay(dc_type, base, top) -> dict (the CLI overrides laid over the TOML table before the one build, so every check reads both layers)",
         "_with_dotted_keys(table, keys) -> dict (a dotted override's keys set on a dict-valued field's table, the rest kept)",
         "_dict_field_value(raw, current) -> dict (a dotted override merges into current, a literal replaces it)",
@@ -1760,9 +1760,10 @@
           "TestRegistry(12)",
           "TestEvalConfig(7)",
           "TestDottedDictOverrides(13)",
-          "TestChecksReadTheMergedLayers(7)"
+          "TestChecksReadTheMergedLayers(7)",
+          "TestDerivedDefaultsFollowTheMergedLayers(3)"
         ],
-        "count": 166
+        "count": 169
       },
       "tests/unit/test_training.py": {
         "classes": [

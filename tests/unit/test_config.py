@@ -2220,7 +2220,7 @@ class TestDottedDictOverrides:
             )
             tree: dict[str, typing.Any] = field(default_factory=dict)
 
-        return loader._apply_dict_to_dataclass(Tables(), _parse_cli_overrides(args))
+        return loader._instantiate_from_dict(Tables, _parse_cli_overrides(args))
 
     @staticmethod
     def _toml(tmp_path: Path, body: str) -> str:
@@ -2687,6 +2687,56 @@ class TestChecksReadTheMergedLayers:
 
         assert warnings(toml, {})
         assert len(warnings(toml, cli)) == len(warnings({**toml, **cli}, {}))
+
+
+class TestDerivedDefaultsFollowTheMergedLayers:
+    """A field whose ``None`` default ``__post_init__`` derives from other fields reads the
+    configured fields, whichever layer sets them: ``load_config`` builds each section from its
+    field defaults and the merged layers, never over a section built from the defaults."""
+
+    def test_n_heads_alone_gives_as_many_kv_heads_from_either_layer(self, tmp_path):
+        assert ModelConfig(n_heads=64).n_kv_heads == 64
+        assert load_config(None, cli_args=["--model.n_heads=64"]).model.n_kv_heads == 64
+        for n_heads in (64, 16):
+            path = tmp_path / "model.toml"
+            path.write_text(f"[model]\nn_heads = {n_heads}\n")
+            assert load_config(path, cli_args=[]).model.n_kv_heads == n_heads
+
+    @pytest.mark.parametrize(
+        ("toml", "cli", "n_kv_heads"),
+        [
+            pytest.param({"model.n_heads": 64}, {}, 64, id="n_heads-in-toml"),
+            pytest.param({}, {"model.n_heads": 64}, 64, id="n_heads-on-cli"),
+            pytest.param({"model.dim": 2048}, {}, 32, id="n_heads-unset"),
+            pytest.param({"model.n_heads": 64}, {"model.n_kv_heads": 8}, 8, id="n_kv_heads-on-cli"),
+            pytest.param(
+                {"model.n_kv_heads": 8}, {"model.n_heads": 64}, 8, id="n_kv_heads-in-toml"
+            ),
+        ],
+    )
+    def test_n_kv_heads_follows_the_merged_n_heads(self, tmp_path, toml, cli, n_kv_heads):
+        config = _layered(tmp_path, toml, cli)
+        assert isinstance(config, JobConfig)
+        settings = {key.removeprefix("model."): value for key, value in {**toml, **cli}.items()}
+        assert config.model == ModelConfig(**settings)
+        assert config.model.n_kv_heads == n_kv_heads
+
+    @pytest.mark.parametrize(
+        ("toml", "cli", "adapter"),
+        [
+            pytest.param(_VLM_SECTIONS, {}, {}, id="vlm-in-toml"),
+            pytest.param({}, _VLM_SECTIONS, {}, id="vlm-on-cli"),
+            pytest.param({"vision_encoder.type": "random"}, {}, None, id="vlm-unset"),
+            pytest.param(_VLM_SECTIONS, {"vlm": None}, None, id="vlm-cleared-on-cli"),
+            pytest.param(
+                _VLM_SECTIONS, {"adapter.type": "avgpool"}, {"type": "avgpool"}, id="adapter-on-cli"
+            ),
+        ],
+    )
+    def test_adapter_follows_the_merged_vlm(self, tmp_path, toml, cli, adapter):
+        config = _layered(tmp_path, toml, cli)
+        assert isinstance(config, JobConfig)
+        assert config.adapter == (None if adapter is None else AdapterConfig(**adapter))
 
 
 class TestEvalConfig:
