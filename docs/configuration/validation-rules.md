@@ -24,7 +24,8 @@ involved, unless noted otherwise.
 File:
 [`kempnerforge/config/model.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/config/model.py).
 
-- `n_kv_heads` defaults to `n_heads` if left `None` (MHA).
+- `n_kv_heads` defaults to `n_heads` if left `None` (MHA), whichever layer
+  sets `n_heads`.
 - `dim`, `n_layers`, `n_heads`, `vocab_size`, `n_kv_heads` must all be
   positive.
 - `head_dim_override` must be non-negative and even; `0` infers the head

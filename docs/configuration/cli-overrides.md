@@ -158,7 +158,7 @@ MoE expert kernels compute core's MLPs from the expert weights.
 
 ## Unknown keys
 
-`_apply_dict_to_dataclass` rejects keys not declared on the dataclass.
+The loader rejects keys not declared on the dataclass.
 A typo surfaces immediately:
 
 ```bash
