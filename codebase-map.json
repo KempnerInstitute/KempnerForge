@@ -491,7 +491,8 @@
           "methods": [
             "forward(x, rope_cos, rope_sin, *, kv_cache, attn_mask) (refuses a dense attn_mask under sdpa_backend=flash on CUDA)",
             "_sdpa_context()",
-            "_attention_with_weights(q, k, v, seq_len, attn_mask, kv_cache)"
+            "_attention_with_weights(q, k, v, seq_len, attn_mask, kv_cache)",
+            "_every_head(weights) (gathers the captured weights' heads over the tp mesh dimension under tensor parallelism)"
           ],
           "properties": [
             "capture_attention_weights",
@@ -503,7 +504,8 @@
         "tests/unit/test_model.py::TestAttention",
         "tests/unit/test_generate.py::TestKVCache",
         "tests/unit/test_packing.py::TestPackedAttentionMask",
-        "tests/unit/test_hooks.py::TestAttentionWeightCapture"
+        "tests/unit/test_hooks.py::TestAttentionWeightCapture",
+        "tests/unit/test_hooks.py::TestAttentionWeightCaptureParallel"
       ]
     },
     "kempnerforge/model/masking.py": {
@@ -734,7 +736,9 @@
         "tests/unit/test_hooks.py::TestAttentionWeightCapture",
         "tests/unit/test_hooks.py::TestExtractRepresentations",
         "tests/unit/test_hooks.py::TestSaveActivations",
-        "tests/unit/test_hooks.py::TestActivationStoreIntegration"
+        "tests/unit/test_hooks.py::TestActivationStoreIntegration",
+        "tests/unit/test_hooks.py::TestActivationStoreParallel",
+        "tests/unit/test_hooks.py::TestAttentionWeightCaptureParallel"
       ]
     },
     "kempnerforge/training/loss.py": {
@@ -2059,13 +2063,15 @@
       },
       "tests/unit/test_hooks.py": {
         "classes": [
-          "TestActivationStore(11)",
+          "TestActivationStore(12)",
           "TestAttentionWeightCapture(6)",
           "TestExtractRepresentations(5)",
           "TestSaveActivations(3)",
-          "TestActivationStoreIntegration(3)"
+          "TestActivationStoreIntegration(3)",
+          "TestActivationStoreParallel(11)",
+          "TestAttentionWeightCaptureParallel(3)"
         ],
-        "count": 28
+        "count": 43
       },
       "tests/unit/test_additional_optimizers.py": {
         "classes": [

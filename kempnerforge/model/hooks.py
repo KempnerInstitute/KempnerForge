@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -28,6 +29,18 @@ class ActivationStore:
 
     Captured tensors are moved to CPU to avoid GPU memory pressure.
     Use :meth:`enable` / :meth:`disable` to control when hooks are active.
+
+    Under tensor parallelism every capture is stored as the full tensor. An
+    output that is a ``DTensor`` (a block, its attention or MLP, a norm) is
+    gathered before it is stored. A module holding a parameter sharded over the
+    ``tp`` mesh dimension, such as a projection, is hooked ahead of its other
+    forward hooks, among them the tensor-parallel one that hands on only this
+    rank's local tensor, a shard unless the output layout is replicated, so the
+    store sees the ``DTensor`` output and gathers it too. Each gather is one
+    collective over the tensor-parallel group per captured module and forward,
+    so every rank of that group must enable the store and run the same forward.
+    A module that may run on a local shard without holding such a parameter, as
+    ``q_norm`` and ``k_norm`` do, is refused by :meth:`enable`.
 
     Args:
         model: The model to instrument.
@@ -56,19 +69,33 @@ class ActivationStore:
         return dict(self._activations)
 
     def enable(self) -> None:
-        """Register forward hooks on all target layers."""
+        """Register forward hooks on all target layers.
+
+        Raises:
+            ValueError: If a target is not a module of the model, or if under
+                tensor parallelism it may run on this rank's local shard: it
+                holds no parameter sharded over the ``tp`` mesh dimension but
+                sits inside a module that directly contains one that does, the
+                model root included, as ``q_norm`` sits next to ``q_proj``
+                inside ``layers.N.attention``. No hook is registered when it
+                raises.
+        """
         if self._enabled:
             return
         self._remove_hooks()
         module_map = dict(self._model.named_modules())
         for name in self._layers:
-            module = module_map.get(name)
-            if module is None:
+            if name not in module_map:
                 raise ValueError(
                     f"Module '{name}' not found in model. "
                     f"Available: {sorted(module_map.keys())[:20]}..."
                 )
-            hook = module.register_forward_hook(self._make_hook(name))
+        owners = _tp_shard_owners(module_map)
+        _refuse_local_shard_targets(owners, self._layers)
+        for name in self._layers:
+            hook = module_map[name].register_forward_hook(
+                self._make_hook(name), prepend=name in owners
+            )
             self._hooks.append(hook)
         self._enabled = True
 
@@ -88,9 +115,9 @@ class ActivationStore:
     def _make_hook(self, name: str):
         def hook(_module, _input, output):
             if isinstance(output, torch.Tensor):
-                self._activations[name] = output.detach().cpu()
+                self._activations[name] = _full_on_cpu(output)
             elif isinstance(output, tuple) and len(output) > 0:
-                self._activations[name] = output[0].detach().cpu()
+                self._activations[name] = _full_on_cpu(output[0])
 
         return hook
 
@@ -101,6 +128,55 @@ class ActivationStore:
 
     def __del__(self) -> None:
         self._remove_hooks()
+
+
+def _full_on_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` detached and on CPU, a ``DTensor`` gathered to its full value first."""
+    tensor = tensor.detach()
+    if isinstance(tensor, DTensor):
+        tensor = tensor.full_tensor()
+    return tensor.cpu()
+
+
+def _shards_over_tp(param: torch.Tensor) -> bool:
+    """Whether ``param`` is a ``DTensor`` sharded over a mesh dimension named ``tp``."""
+    if not isinstance(param, DTensor):
+        return False
+    names = param.device_mesh.mesh_dim_names or ()
+    return "tp" in names and param.placements[names.index("tp")].is_shard()
+
+
+def _tp_shard_owners(modules: dict[str, nn.Module]) -> list[str]:
+    """Names, in ``modules`` order, of the modules that hold a parameter sharded over ``tp``."""
+    return [
+        name
+        for name, module in modules.items()
+        if any(_shards_over_tp(p) for p in module.parameters(recurse=False))
+    ]
+
+
+def _refuse_local_shard_targets(owners: list[str], targets: list[str]) -> None:
+    """Raise ``ValueError`` naming the first target that may run on a local TP shard.
+
+    ``owners`` names the modules holding a parameter sharded over the ``tp``
+    mesh dimension, whose outputs the store gathers. Any other module inside an
+    owner's parent, the model root included, may run on the owner's local shard
+    with nothing marking it as one, as ``q_norm`` does next to ``q_proj``.
+    """
+    for target in targets:
+        if target in owners:
+            continue
+        for owner in owners:
+            region = owner.rpartition(".")[0]
+            inside = target.startswith(f"{region}.") if region else target != ""
+            if inside:
+                hint = f" Capture '{region}' or a module enclosing it instead." if region else ""
+                raise ValueError(
+                    f"Cannot capture '{target}': under tensor parallelism it may run on this "
+                    f"rank's local shard, with nothing marking it as one, because it sits next "
+                    f"to '{owner}', which holds parameters sharded over the 'tp' mesh "
+                    f"dimension.{hint}"
+                )
 
 
 def extract_representations(
@@ -115,6 +191,8 @@ def extract_representations(
 
     Returns a dict mapping layer names to tensors of shape
     ``(num_samples, seq_len, hidden_dim)`` (or whatever the layer outputs).
+    On a tensor-parallel model every rank of the tensor-parallel group must
+    call it with the same dataset, as :class:`ActivationStore` requires.
 
     Args:
         model: Model to extract from (should already be on ``device``).

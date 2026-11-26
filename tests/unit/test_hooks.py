@@ -2,17 +2,56 @@
 
 from __future__ import annotations
 
+import copy
+import math
+import re
+import tempfile
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor.parallel import ColwiseParallel, parallelize_module
 
 from kempnerforge.config.schema import ModelConfig
+from kempnerforge.distributed.parallel import apply_fsdp2, default_mp_policy
+from kempnerforge.distributed.tensor_parallel import apply_tensor_parallel
 from kempnerforge.model.attention import Attention
 from kempnerforge.model.hooks import ActivationStore, extract_representations, save_activations
 from kempnerforge.model.position import precompute_rope_frequencies
 from kempnerforge.model.transformer import Transformer
+from tests.gloo_ranks import gloo_group, spawn
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+WHOLE_BLOCK_TARGETS = [
+    "token_embedding",
+    "layers.0",
+    "layers.0.attention_norm",
+    "layers.0.attention",
+    "layers.1.mlp_norm",
+    "layers.1.mlp",
+    "norm",
+    "output_head",
+]
+PROJECTION_TARGETS = [
+    "layers.0.attention.q_proj",
+    "layers.0.attention.k_proj",
+    "layers.0.attention.v_proj",
+    "layers.0.attention.o_proj",
+    "layers.1.mlp.gate_proj",
+    "layers.1.mlp.up_proj",
+    "layers.1.mlp.down_proj",
+    "output_head.proj",
+]
+LOCAL_HEAD_SHARD_TARGETS = ["layers.0.attention.q_norm", "layers.0.attention.k_norm"]
+TP_LAYOUTS = {
+    "tp2": (("tp",), (2,), False),
+    "tp2_tied": (("tp",), (2,), True),
+    "dp_shard2_tp2": (("dp_shard", "tp"), (2, 2), False),
+}
 
 
 @pytest.fixture
@@ -148,6 +187,32 @@ class TestActivationStore:
         small_model(tokens)
         act = store.get("layers.2.mlp")
         assert act.shape == (4, 8, small_config.dim)
+        store.disable()
+
+    def test_tuple_output_stores_its_first_element(self):
+        """A module returning a tuple has its first element captured; an empty one, nothing."""
+
+        class _Pair(torch.nn.Module):
+            def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+                return (x + 1, x) if x.numel() else ()
+
+        class _Holder(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.pair = _Pair()
+                self.empty = _Pair()
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                self.empty(x[:0])
+                return self.pair(x)[0]
+
+        model = _Holder()
+        store = ActivationStore(model, layers=["pair", "empty"])
+        store.enable()
+        x = torch.randn(2, 3)
+        model(x)
+        assert torch.equal(store.get("pair"), x + 1)
+        assert store.get("empty") is None
         store.disable()
 
 
@@ -348,3 +413,214 @@ class TestActivationStoreIntegration:
         store.disable()
 
         assert len(store._hooks) == 0
+
+
+def _parallel_model(
+    mesh_dims: tuple[str, ...], mesh_sizes: tuple[int, ...], tie_embeddings: bool
+) -> tuple[Transformer, Transformer]:
+    """A seeded GQA Transformer parallelized over a CPU mesh, and an unparallelized copy."""
+    torch.manual_seed(0)
+    config = ModelConfig(
+        dim=64,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        vocab_size=128,
+        max_seq_len=32,
+        qk_norm=True,
+        tie_embeddings=tie_embeddings,
+    )
+    model = Transformer(config)
+    reference = copy.deepcopy(model)
+    mesh = init_device_mesh("cpu", mesh_sizes, mesh_dim_names=mesh_dims)
+    if "tp" in mesh_dims:
+        apply_tensor_parallel(model, mesh)
+    if "dp_shard" in mesh_dims:
+        apply_fsdp2(model, mesh, mp_policy=default_mp_policy(torch.float32))
+    return model, reference
+
+
+def _tokens(seed: int) -> torch.Tensor:
+    return torch.randint(0, 128, (2, 16), generator=torch.Generator().manual_seed(seed))
+
+
+def _capture(
+    model: torch.nn.Module, layers: list[str], inputs: torch.Tensor
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """What a store over ``layers`` captures in one forward on ``inputs``, and the output."""
+    store = ActivationStore(model, layers=layers)
+    store.enable()
+    with torch.no_grad():
+        output = model(inputs)
+    store.disable()
+    return store.activations, output
+
+
+def _assert_full_and_saved(
+    captured: dict[str, torch.Tensor], expected: dict[str, torch.Tensor]
+) -> None:
+    """Each capture is a plain tensor equal to the TP=1 one and survives an ``.npz`` save."""
+    for name, value in expected.items():
+        assert not isinstance(captured[name], DTensor), name
+        torch.testing.assert_close(captured[name], value, msg=name)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory, "acts.npz")
+        save_activations(captured, path)
+        with np.load(path) as loaded:
+            for name in expected:
+                np.testing.assert_array_equal(loaded[name], captured[name].numpy())
+
+
+def _check_whole_block_outputs_gathered(rank: int, world: int, port: int, layout: str) -> None:
+    mesh_dims, mesh_sizes, tie_embeddings = TP_LAYOUTS[layout]
+    with gloo_group(rank, world, port):
+        model, reference = _parallel_model(mesh_dims, mesh_sizes, tie_embeddings)
+        tokens = _tokens(rank // mesh_sizes[-1])
+        captured, _ = _capture(model, WHOLE_BLOCK_TARGETS, tokens)
+        expected, _ = _capture(reference, WHOLE_BLOCK_TARGETS, tokens)
+        _assert_full_and_saved(captured, expected)
+
+
+def _check_projection_outputs_gathered(rank: int, world: int, port: int, layout: str) -> None:
+    mesh_dims, mesh_sizes, tie_embeddings = TP_LAYOUTS[layout]
+    with gloo_group(rank, world, port):
+        model, reference = _parallel_model(mesh_dims, mesh_sizes, tie_embeddings)
+        tokens = _tokens(rank // mesh_sizes[-1])
+        with torch.no_grad():
+            logits = model(tokens)
+        captured, captured_logits = _capture(model, PROJECTION_TARGETS, tokens)
+        expected, _ = _capture(reference, PROJECTION_TARGETS, tokens)
+        _assert_full_and_saved(captured, expected)
+        assert torch.equal(captured_logits, logits)
+
+
+def _check_local_head_shards_refused(rank: int, world: int, port: int, layout: str) -> None:
+    mesh_dims, mesh_sizes, tie_embeddings = TP_LAYOUTS[layout]
+    with gloo_group(rank, world, port):
+        model, reference = _parallel_model(mesh_dims, mesh_sizes, tie_embeddings)
+        tokens = _tokens(rank // mesh_sizes[-1])
+        for name in LOCAL_HEAD_SHARD_TARGETS:
+            store = ActivationStore(model, layers=["layers.0", name])
+            with pytest.raises(ValueError, match=re.escape(f"Cannot capture '{name}'")):
+                store.enable()
+            assert not store.enabled
+            with torch.no_grad():
+                model(tokens)
+            assert store.activations == {}, name
+        reason = (
+            "because it sits next to 'layers.0.attention.q_proj', which holds parameters "
+            "sharded over the 'tp' mesh dimension. Capture 'layers.0.attention' or a module "
+            "enclosing it instead."
+        )
+        with pytest.raises(ValueError, match=re.escape(reason)):
+            ActivationStore(model, layers=["layers.0.attention.k_norm"]).enable()
+        attention = model.get_submodule("layers.0.attention")
+        for name in ("q_norm", "k_norm"):
+            with pytest.raises(ValueError, match=re.escape(f"Cannot capture '{name}'")):
+                ActivationStore(attention, layers=[name]).enable()
+        store = ActivationStore(attention, layers=["k_proj"])
+        store.enable()
+        with torch.no_grad():
+            model(tokens)
+        store.disable()
+        expected, _ = _capture(reference, ["layers.0.attention.k_proj"], tokens)
+        torch.testing.assert_close(store.get("k_proj"), expected["layers.0.attention.k_proj"])
+
+
+def _check_top_level_tp_linears(rank: int, world: int, port: int) -> None:
+    with gloo_group(rank, world, port):
+        mesh = init_device_mesh("cpu", (world,), mesh_dim_names=("tp",))
+        torch.manual_seed(0)
+        linear = torch.nn.Linear(8, 6)
+        pair = torch.nn.Sequential(torch.nn.Linear(8, 6), torch.nn.Identity())
+        reference_linear, reference_pair = copy.deepcopy(linear), copy.deepcopy(pair)
+        parallelize_module(linear, mesh, ColwiseParallel())
+        parallelize_module(pair, mesh, {"0": ColwiseParallel(output_layouts=Replicate())})
+        x = torch.randn(3, 8, generator=torch.Generator().manual_seed(1))
+        with torch.no_grad():
+            captured, output = _capture(linear, [""], x)
+            assert output.shape == (3, 6 // world)
+            torch.testing.assert_close(captured[""], reference_linear(x))
+            captured, _ = _capture(pair, ["0", ""], x)
+            torch.testing.assert_close(captured["0"], reference_pair(x))
+            torch.testing.assert_close(captured[""], reference_pair(x))
+        reason = "Cannot capture '1': under tensor parallelism it may run on this rank's local"
+        with pytest.raises(ValueError, match=re.escape(reason) + ".* next to '0', which holds"):
+            ActivationStore(pair, layers=["1"]).enable()
+
+
+def _check_fsdp_targets_not_refused(rank: int, world: int, port: int) -> None:
+    with gloo_group(rank, world, port):
+        model, reference = _parallel_model(("dp_shard",), (world,), False)
+        layers = [*WHOLE_BLOCK_TARGETS, *PROJECTION_TARGETS, *LOCAL_HEAD_SHARD_TARGETS]
+        tokens = _tokens(rank)
+        captured, _ = _capture(model, layers, tokens)
+        expected, _ = _capture(reference, layers, tokens)
+        for name in layers:
+            assert torch.equal(captured[name], expected[name]), name
+
+
+def _check_attention_weights_gathered(rank: int, world: int, port: int, layout: str) -> None:
+    mesh_dims, mesh_sizes, tie_embeddings = TP_LAYOUTS[layout]
+    with gloo_group(rank, world, port):
+        model, reference = _parallel_model(mesh_dims, mesh_sizes, tie_embeddings)
+        tokens = _tokens(rank // mesh_sizes[-1])
+        for each in (model, reference):
+            for layer in each.layers.values():
+                layer.attention.capture_attention_weights = True
+            with torch.no_grad():
+                each(tokens)
+        for name, layer in model.layers.items():
+            weights = layer.attention.last_attention_weights
+            assert weights.shape == (2, 4, 16, 16), name
+            expected = reference.layers[name].attention.last_attention_weights
+            torch.testing.assert_close(weights, expected, msg=name)
+
+
+class TestActivationStoreParallel:
+    """Captures on a parallelized Transformer over gloo CPU ranks.
+
+    Every capture is stored as the full tensor on every rank, equal to the TP=1 capture. A
+    ``DTensor`` output is gathered. A projection, whose weights are sharded over ``tp``, is
+    hooked ahead of the tensor-parallel hook that hands on only this rank's local tensor,
+    and is gathered too, leaving the model's own output untouched. The layouts cover each
+    style the tensor-parallel plan uses: ``tp2`` runs sequence parallelism (column-parallel
+    projections on sequence-sharded inputs, row-parallel ones with sequence-sharded outputs,
+    a column-parallel output head with a replicated output), ``tp2_tied`` runs without it
+    (replicated inputs and row-parallel outputs, an output head left unsharded), and
+    ``dp_shard2_tp2`` adds FSDP2. A module that may run on a local shard without such
+    weights (``q_norm``, ``k_norm``, or any module beside a top-level projection) is refused
+    by ``enable()`` before any hook is registered. FSDP2 alone shards parameters, not
+    outputs, so it refuses nothing.
+    """
+
+    @pytest.mark.parametrize("layout", sorted(TP_LAYOUTS))
+    def test_whole_block_outputs_are_gathered_to_the_full_tensor(self, layout: str) -> None:
+        spawn(_check_whole_block_outputs_gathered, math.prod(TP_LAYOUTS[layout][1]), layout)
+
+    @pytest.mark.parametrize("layout", sorted(TP_LAYOUTS))
+    def test_projection_outputs_are_gathered_to_the_tp1_capture(self, layout: str) -> None:
+        spawn(_check_projection_outputs_gathered, math.prod(TP_LAYOUTS[layout][1]), layout)
+
+    @pytest.mark.parametrize("layout", sorted(TP_LAYOUTS))
+    def test_local_head_shard_targets_are_refused(self, layout: str) -> None:
+        spawn(_check_local_head_shards_refused, math.prod(TP_LAYOUTS[layout][1]), layout)
+
+    def test_top_level_tp_linear_is_gathered_and_its_siblings_refused(self) -> None:
+        spawn(_check_top_level_tp_linears, 2)
+
+    def test_fsdp_only_targets_are_not_refused(self) -> None:
+        spawn(_check_fsdp_targets_not_refused, 2)
+
+
+class TestAttentionWeightCaptureParallel:
+    """Attention weights captured on a tensor-parallel Transformer over gloo CPU ranks.
+
+    Each rank computes one block of heads; the blocks are gathered over the tensor-parallel
+    group, so every rank stores every head in the model's order, equal to the TP=1 capture,
+    with and without sequence parallelism and under FSDP2.
+    """
+
+    @pytest.mark.parametrize("layout", sorted(TP_LAYOUTS))
+    def test_every_head_is_gathered_to_the_tp1_capture(self, layout: str) -> None:
+        spawn(_check_attention_weights_gathered, math.prod(TP_LAYOUTS[layout][1]), layout)

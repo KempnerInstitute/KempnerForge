@@ -13,6 +13,7 @@ import contextlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor, Shard
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.bias import causal_lower_right
 from torch.nn.attention.flex_attention import BlockMask
@@ -27,6 +28,12 @@ _SDPA_BACKENDS = {
     "cudnn": SDPBackend.CUDNN_ATTENTION,
     "math": SDPBackend.MATH,
 }
+
+
+def _sharded_over_tp(weight: DTensor) -> bool:
+    """Whether ``weight`` is sharded over a mesh dimension named ``tp``."""
+    names = weight.device_mesh.mesh_dim_names or ()
+    return "tp" in names and weight.placements[names.index("tp")].is_shard()
 
 
 class KVCache:
@@ -231,7 +238,7 @@ class Attention(nn.Module):
             )
         elif self.capture_attention_weights:
             out, attn_weights = self._attention_with_weights(q, k, v, seq_len, attn_mask, kv_cache)
-            self.last_attention_weights = attn_weights.detach().cpu()
+            self.last_attention_weights = self._every_head(attn_weights.detach()).cpu()
         elif attn_mask is not None:
             with self._sdpa_context():
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
@@ -248,6 +255,21 @@ class Attention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
 
         return self.o_proj(out)
+
+    def _every_head(self, weights: torch.Tensor) -> torch.Tensor:
+        """``weights``, shaped (batch, heads, seq_q, seq_k), extended to every head of the model.
+
+        Under tensor parallelism ``q_proj`` holds a weight sharded over the ``tp``
+        mesh dimension and this rank computes one contiguous block of heads. The
+        blocks are gathered along the head dimension in rank order, a collective
+        over the tensor-parallel group. Otherwise ``weights`` already holds every
+        head and is returned as is.
+        """
+        weight = self.q_proj.weight
+        if not isinstance(weight, DTensor) or not _sharded_over_tp(weight):
+            return weights
+        heads = DTensor.from_local(weights, weight.device_mesh["tp"], [Shard(1)], run_check=False)
+        return heads.full_tensor()
 
     def _attention_with_weights(
         self,

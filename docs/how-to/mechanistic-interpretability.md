@@ -197,6 +197,12 @@ FlexAttention block mask (packed documents or attention groups) raises
 `NotImplementedError`, because the fused kernel never forms the weight
 matrix.
 
+On a tensor-parallel model each rank computes only its own block of
+heads. `last_attention_weights` still holds every head, in the model's
+order, on every rank: the blocks are gathered over the tensor-parallel
+group, one collective per captured layer and forward. Set the flag on
+the same layers on every rank of that group, and run the same forward.
+
 ## Performance and memory
 
 Activation extraction is expensive. A 7B model at `seq_len=4096`,
@@ -276,9 +282,27 @@ captures add eager-mode overhead.
 
 **FSDP2 / TP.** Extraction is meant for a single-process inference-time
 load (as shown in the quick path: build the model, `dcp.load` the
-weights, run on one GPU). Running it on a fully-sharded model works
-but captures per-rank shards of each tensor, which is almost never
-what you want for analysis.
+weights, run on one GPU). FSDP2 alone shards parameters, not module
+outputs: each rank captures full activations for its own batch. Under
+tensor parallelism every capture is stored as the full tensor on every
+rank. A `DTensor` output (a block, its `attention` or `mlp`, a norm) is
+gathered first. A projection such as `q_proj`, `o_proj`, `down_proj` or
+`output_head.proj` holds weights sharded over the `tp` mesh dimension,
+and a forward hook that tensor parallelism installs on it hands on only
+this rank's local tensor, a shard unless the output layout is
+replicated. The store hooks the projection ahead of that hook and
+gathers its output too, at one collective over the tensor-parallel group
+per captured projection and forward. Because the
+gathers are collectives, every rank of that group must enable the store
+and run the same forward.
+`q_norm` and `k_norm` run on this rank's heads only, with nothing
+marking their output as a slice, so `enable()` refuses them with a
+`ValueError` naming the module. The rule goes by where a module sits:
+a module next to a projection with sharded weights is refused unless it
+holds such weights itself, so in a custom model with such a projection
+directly under the root, every other module is refused, even one whose
+output is full. Capture the enclosing block instead, or load the model
+in a single process.
 
 ## Troubleshooting
 
