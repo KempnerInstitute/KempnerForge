@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import cast
 
@@ -393,7 +394,10 @@ def restore_checkpoint(
     checkpoint and the MLflow run that saved it (``_tag_warm_start_run``).
 
     A checkpoint saved with another ``plugins`` list is refused before any state is read
-    (see ``CheckpointManager.load``'s ``plugins_expected``).
+    (see ``CheckpointManager.load``'s ``plugins_expected``). A VLM run, unless it warm starts
+    from the weights alone, compares the freeze the checkpoint records with its own at the step
+    the checkpoint records, for the checkpoint ``load`` settles on (see its
+    ``vlm_freeze_expected``).
     """
     num_stages = config.distributed.pp if config.distributed.pp > 1 else None
     if dist.is_initialized():
@@ -420,8 +424,7 @@ def restore_checkpoint(
     vlm_freeze_expected = None
     if config.is_vlm and not weights_only:
         assert vlm_cfg is not None
-        probe_step = ckpt_mgr.peek_saved_step(str(resume_path) if resume_path else None) or 0
-        vlm_freeze_expected = freeze_meta_at_step(probe_step, vlm_cfg)
+        vlm_freeze_expected = partial(freeze_meta_at_step, config=vlm_cfg)
 
     with _trainable_for_the_run(model, config) as unfrozen_later:
         step, tokens_seen, ckpt_extra_loaded = ckpt_mgr.load(

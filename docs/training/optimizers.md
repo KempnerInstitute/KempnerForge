@@ -32,10 +32,12 @@ restore saved optimizer state, on any rank, stops on every rank, before loading
 anything, when the checkpoint was saved under a different scope; the error names both
 scopes. A checkpoint that holds no optimizer state, such as one converted from Hugging
 Face or one saved before the first step, loads under either scope with a fresh
-optimizer. A checkpoint that does not record a scope was written under
-`"exclude_norms_and_biases"`, the only grouping that existed before the scope was
-recorded. To change the scope, continue from the checkpoint with a fresh
-optimizer: set `checkpoint.load_path` to it and
+optimizer. A checkpoint whose `metadata.json` does not record a scope was written
+under `"exclude_norms_and_biases"`, the only grouping that existed before the scope
+was recorded. A checkpoint without `metadata.json`, as one whose save stopped
+before writing it, records no scope, so such a resume is refused under either
+scope, naming the route below. To change the scope, continue from the checkpoint
+with a fresh optimizer: set `checkpoint.load_path` to it and
 `checkpoint.exclude_from_loading = ["optimizer"]` (add `"train_state"` to also
 restart the step, schedule and data position), with a `checkpoint.dir` that holds
 no checkpoint. Training auto-resumes from a checkpoint in `checkpoint.dir` in place of

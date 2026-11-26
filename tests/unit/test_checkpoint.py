@@ -1003,6 +1003,22 @@ class TestPeekSavedStep:
         (ckpt_dir / "metadata.json").write_text(json.dumps({"tokens_seen": 1024}))
         assert mgr.peek_saved_step(path=str(ckpt_dir)) is None
 
+    @pytest.mark.parametrize(
+        "content",
+        [b"null", b"[]", b'"step"', b"\xff\xfe", b'{"step": "7"}', b'{"step": true}'],
+        ids=["null", "list", "string", "bad-encoding", "step-as-text", "step-as-bool"],
+    )
+    def test_returns_none_for_a_record_that_is_not_an_object_with_an_integer_step(
+        self, tmp_path, monkeypatch, content
+    ):
+        """Valid JSON that is not an object, or bytes that are not UTF-8, used to escape as
+        AttributeError or UnicodeDecodeError instead of the documented None."""
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        ckpt_dir = tmp_path / "step_2"
+        ckpt_dir.mkdir()
+        (ckpt_dir / "metadata.json").write_bytes(content)
+        assert mgr.peek_saved_step(path=str(ckpt_dir)) is None
+
 
 class TestFlushPendingSave:
     def test_delegates_to_async_wait(self, tmp_path, monkeypatch):
@@ -2137,7 +2153,70 @@ class TestLoadVLMFreezeCompare:
         finally:
             target.removeHandler(capture)
         assert step == 1
-        assert any("Could not read" in rec.getMessage() for rec in records)
+        assert any("VLM freeze is not compared" in rec.getMessage() for rec in records)
+
+    @pytest.mark.parametrize(
+        "content", [b"null", b"[]", b"\xff\xfe"], ids=["null", "list", "bad-encoding"]
+    )
+    def test_a_record_that_is_not_an_object_is_not_compared(self, tmp_path, monkeypatch, content):
+        """Such a record used to raise AttributeError or UnicodeDecodeError on the rank that
+        read it."""
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=1, extra={"vlm_freeze": _freeze_meta(("vision_encoder", True))})
+        (tmp_path / "step_1" / "metadata.json").write_bytes(content)
+        mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
+        (step, _, _), warnings = _manager_warnings(
+            lambda: mgr2.load(
+                path=str(tmp_path / "step_1"),
+                vlm_freeze_expected=_freeze_meta(("vision_encoder", False)),
+            )
+        )
+        assert step == 1
+        assert any("VLM freeze is not compared" in w for w in warnings), warnings
+
+    def test_a_checkpoint_without_a_record_is_not_compared(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=1, extra={"vlm_freeze": _freeze_meta(("vision_encoder", True))})
+        (tmp_path / "step_1" / "metadata.json").unlink()
+        mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
+        (step, _, _), warnings = _manager_warnings(
+            lambda: mgr2.load(
+                path=str(tmp_path / "step_1"),
+                vlm_freeze_expected=_freeze_meta(("vision_encoder", False)),
+            )
+        )
+        assert step == 1
+        assert any("not compared" in w and "has no metadata.json" in w for w in warnings)
+
+    def test_an_expectation_of_the_step_takes_the_recorded_one(self, tmp_path, monkeypatch):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=4, extra={"vlm_freeze": _freeze_meta(("vision_encoder", True))})
+        steps: list[int] = []
+
+        def expected(step):
+            steps.append(step)
+            return _freeze_meta(("vision_encoder", step < 5))
+
+        mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
+        assert mgr2.load(path=str(tmp_path / "step_4"), vlm_freeze_expected=expected)[0] == 4
+        assert steps == [4]
+
+    @pytest.mark.parametrize("recorded", ["4", None, -1, True], ids=["text", "null", "neg", "bool"])
+    def test_an_expectation_of_the_step_needs_a_recorded_step(
+        self, tmp_path, monkeypatch, recorded
+    ):
+        mgr = _make_mock_mgr(tmp_path, monkeypatch)
+        mgr.save(step=4, extra={"vlm_freeze": _freeze_meta(("vision_encoder", True))})
+        meta = tmp_path / "step_4" / "metadata.json"
+        meta.write_text(json.dumps({**json.loads(meta.read_text()), "step": recorded}))
+        steps: list[int] = []
+        mgr2 = _make_mock_mgr(tmp_path, monkeypatch)
+        (step, _, _), warnings = _manager_warnings(
+            lambda: mgr2.load(path=str(tmp_path / "step_4"), vlm_freeze_expected=steps.append)
+        )
+        assert step == 4
+        assert steps == []
+        assert any("VLM freeze is not compared" in w and "step=" in w for w in warnings)
 
     def test_cross_arch_extra_expected_key_drops_out(self, tmp_path, monkeypatch):
         """Saved {vision_encoder=True}; expected adds a future-arch key.
@@ -5228,10 +5307,9 @@ class TestScheduleFreeCheckpoint:
 
 class TestComponentSwapOnResume:
     def test_resume_into_a_different_component_is_rejected(self, tmp_path):
-        """A resume that builds a component with other parameter names fails the load
-        rather than training a mismatched model."""
+        """A resume that builds a component with other parameter names is refused before
+        any tensor is read, rather than training a mismatched model."""
         import pytest
-        from torch.distributed.checkpoint.api import CheckpointException
 
         from kempnerforge.checkpoint.manager import CheckpointManager
         from kempnerforge.config.schema import AdapterConfig
@@ -5244,14 +5322,13 @@ class TestComponentSwapOnResume:
 
         resumed = build_adapter(AdapterConfig(type="mlp_2layer"), in_dim=8, out_dim=4)
         opt2 = build_optimizer(resumed, OptimizerConfig(lr=1e-3, fused=False))
-        with pytest.raises(CheckpointException, match="Missing key in checkpoint"):
+        with pytest.raises(ValueError, match="model tensors this run's model does not have"):
             CheckpointManager(CheckpointConfig(dir=ckpt_dir), resumed, opt2).load()
 
-    def test_resume_into_a_subset_component_is_refused_by_the_plugins_list(
-        self, tmp_path, monkeypatch
-    ):
-        """A component whose parameter names are a subset of the saved ones loads silently,
-        so a resume with another plugins list is refused (#180)."""
+    def test_resume_into_a_subset_component_is_refused(self, tmp_path):
+        """A component whose parameter names are a subset of the saved ones used to load
+        silently, caught only when the plugins list differed. The model check refuses it
+        whatever the list; another list is refused first, by the plugins check."""
         import pytest
 
         import kempnerforge.training.entry as entry
@@ -5277,11 +5354,14 @@ class TestComponentSwapOnResume:
 
         small = Small()
         resumed = CheckpointManager(config.checkpoint, small, torch.optim.AdamW(small.parameters()))
-        assert resumed.load()[0] == 7
+        extra = r"holds 2 model tensors this run's model does not have, such as \['model\.proj2\."
+        with pytest.raises(ValueError, match=extra):
+            resumed.load()
         with pytest.raises(ValueError, match="saved with plugins"):
             entry.restore_checkpoint(config, small, None, resumed)
         config.plugins = ["pkg.big_components"]
-        assert entry.restore_checkpoint(config, small, None, resumed) == (7, 0)
+        with pytest.raises(ValueError, match=extra):
+            entry.restore_checkpoint(config, small, None, resumed)
 
     def test_resume_into_a_superset_component_is_refused_before_dcp_reads_it(self, tmp_path):
         """DCP fails on a parameter the checkpoint lacks, so the plugins list is compared
@@ -5439,11 +5519,39 @@ class TestWeightDecayScopeOnResume:
         with pytest.raises(ValueError, match=f"weight_decay_scope='{DEFAULT_SCOPE}'"):
             self._resume(tmp_path, "muon", ALL_SCOPE)[2].load()
 
-    def test_a_missing_metadata_file_counts_as_the_default(self, tmp_path):
-        """A checkpoint with optimizer state and no ``metadata.json`` resumes under the default."""
-        (self._save(tmp_path, "adamw", DEFAULT_SCOPE) / "metadata.json").unlink()
-        step, _, _ = self._resume(tmp_path, "adamw", DEFAULT_SCOPE)[2].load()
-        assert step == 3
+    @pytest.mark.parametrize("resumed", [DEFAULT_SCOPE, ALL_SCOPE])
+    @pytest.mark.parametrize("saved", [DEFAULT_SCOPE, ALL_SCOPE])
+    @pytest.mark.parametrize("name", ["adamw", "muon"])
+    def test_a_missing_metadata_file_is_refused_without_naming_a_scope(
+        self, tmp_path, name, saved, resumed
+    ):
+        """A save stopped before ``metadata.json``, or a copy without it, records no scope.
+        It used to count as the legacy scope, so a resume under the scope it was saved with
+        was refused and the suggested one broke the optimizer: AdamW's first step raised
+        KeyError 'betas', and Muon decayed the norms and biases."""
+        (self._save(tmp_path, name, saved) / "metadata.json").unlink()
+        model, _, manager = self._resume(tmp_path, name, resumed)
+        before = [p.detach().clone() for p in model.parameters()]
+        with pytest.raises(ValueError, match="has no metadata.json") as caught:
+            manager.load()
+        assert "was saved with" not in str(caught.value)
+        assert 'exclude_from_loading=["optimizer"]' in str(caught.value)
+        for b, p in zip(before, model.parameters(), strict=True):
+            assert torch.equal(b, p), "a refused load changed the model"
+        assert not any(o.state for o in manager.checkpointed_optimizers)
+
+    @pytest.mark.parametrize("name", ["adamw", "muon"])
+    def test_the_route_a_missing_metadata_file_names_keeps_the_runs_groups(self, tmp_path, name):
+        """Its weights with a fresh optimizer: every group as this run builds it."""
+        (self._save(tmp_path, name, ALL_SCOPE) / "metadata.json").unlink()
+        model, opt, manager = self._resume(tmp_path, name, DEFAULT_SCOPE)
+        assert manager.load(exclude_keys=["optimizer"])[0] == 3
+        decay, _ = self._by_name(model, manager)
+        assert decay == {
+            n: WEIGHT_DECAY if _should_decay(n, p, DEFAULT_SCOPE) else 0.0
+            for n, p in model.named_parameters()
+        }
+        self._train(model, opt, 1)
 
     @pytest.mark.parametrize(
         "content",

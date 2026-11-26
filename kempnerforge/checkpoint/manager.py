@@ -57,7 +57,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import _CHECKPOINT_PREFIX
 from torch.distributed.checkpoint import DefaultLoadPlanner, DefaultSavePlanner
-from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
+from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
@@ -107,12 +107,14 @@ _OPTIM_PARAM_GROUPS_PREFIX = "optimizer.param_groups."
 _NEVER_STEPPED_KEY = "optimizer_never_stepped"
 _NEVER_STEPPED_PREFIX = f"{_NEVER_STEPPED_KEY}."
 _OPTIM_PREFIX = "optimizer."
+_MODEL_PREFIX = "model."
 _UNRECORDED_WEIGHT_DECAY_SCOPE = "exclude_norms_and_biases"
 _TRANSIENT_REMOVE_ERRNOS = frozenset({errno.ENOTEMPTY, errno.EBUSY, errno.ENOENT})
 _REMOVE_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4)
 TrackingSource = Callable[[], list[dict[str, str]]]
 CheckpointRecord = Callable[[str, dict[str, str]], None]
 _MetadataOutcome = tuple[dict[str, Any] | None, str | None]
+_FreezeExpectation = list[dict[str, Any]] | Callable[[int], list[dict[str, Any]]]
 
 
 class CheckpointRegistrar(Protocol):
@@ -477,15 +479,72 @@ def _dcp_keys(dcp_dir: Path) -> dict[str, Any]:
     return dcp.FileSystemReader(str(dcp_dir)).read_metadata().state_dict_metadata
 
 
+def _model_misfit(
+    held: Mapping[str, tuple[int, ...] | None], saved: Mapping[str, Any]
+) -> tuple[list[str], list[str]]:
+    """Compare the model entries a load reads from a DCP index with what the index holds.
+
+    ``held`` maps the DCP key of each entry, ``model.<name>``, to its global shape, None for an
+    entry that is not a tensor; ``saved`` is the index's ``state_dict_metadata``. A saved key
+    belongs to a held entry when it, or a dotted prefix of it, is held, as DCP flattens an entry
+    that nests.
+
+    Returns:
+        The model keys of the index that no held entry takes, sorted, and a description of each
+        held tensor the index holds at another size, in key order.
+    """
+    extra = []
+    for key in saved:
+        if not key.startswith(_MODEL_PREFIX):
+            continue
+        name = key
+        while name and name not in held:
+            name = name.rpartition(".")[0]
+        if not name:
+            extra.append(key)
+    resized = []
+    for key, shape in sorted(held.items()):
+        meta = saved.get(key)
+        if shape is None or not isinstance(meta, TensorStorageMetadata):
+            continue
+        if tuple(meta.size) != shape:
+            resized.append(f"{key} (saved {list(meta.size)}, this run {list(shape)})")
+    return sorted(extra), resized
+
+
+def _misfit_message(where: Path, extra: Sequence[str], resized: Sequence[str]) -> str:
+    """Why the DCP index in ``where`` does not fit the model a load would read into it."""
+    found = []
+    if extra:
+        found.append(
+            f"{len(extra)} model tensors this run's model does not have, such as {list(extra[:5])}"
+        )
+    if resized:
+        examples = ", ".join(resized[:5])
+        found.append(f"{len(resized)} model tensors of another size, such as {examples}")
+    route = ""
+    if not resized:
+        route = (
+            ", or, to start this model from the tensors it shares with the checkpoint and leave "
+            "the others unread, set checkpoint.ignore_extra_model_tensors = true"
+        )
+    return (
+        f"{where} holds {' and '.join(found)}, so it was saved from another model than this run "
+        "builds (another model config, plugins list or component), and nothing is loaded. Resume "
+        f"or warm start it with the model it was saved from{route}."
+    )
+
+
 def _read_metadata(ckpt_dir: Path) -> dict[str, Any]:
-    """Return the JSON object a checkpoint's ``metadata.json`` holds, empty when it has none.
+    """Return the JSON object a checkpoint's ``metadata.json`` holds.
 
     Raises:
-        ValueError: ``metadata.json`` exists but cannot be read, or does not hold a JSON object.
+        ValueError: ``metadata.json`` is absent or cannot be read, or does not hold a JSON
+            object.
     """
     metadata_path = ckpt_dir / _METADATA_FILE
     if not metadata_path.exists():
-        return {}
+        raise ValueError(f"{ckpt_dir} has no {_METADATA_FILE}")
     try:
         meta = json.loads(metadata_path.read_text())
     except (OSError, ValueError) as e:
@@ -496,8 +555,8 @@ def _read_metadata(ckpt_dir: Path) -> dict[str, Any]:
 
 
 def _metadata_outcome(ckpt_dir: Path) -> _MetadataOutcome:
-    """A read of a checkpoint's ``metadata.json``: the JSON object it holds, or why it could not
-    be read, as ``(None, reason)``."""
+    """A read of a checkpoint's ``metadata.json``: the JSON object it holds, or why there is
+    none, as ``(None, reason)``, the file being absent, unreadable or not a JSON object."""
     try:
         return _read_metadata(ckpt_dir), None
     except ValueError as e:
@@ -522,6 +581,26 @@ def _recorded_weight_decay_scope(meta: Mapping[str, Any], metadata_path: Path) -
             f"{WEIGHT_DECAY_SCOPES}"
         )
     return scope
+
+
+def _recorded_step(meta: Mapping[str, Any]) -> int | None:
+    """The step a checkpoint's metadata ``meta`` records, None unless a non-negative integer."""
+    step = meta.get("step")
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        return None
+    return step
+
+
+def _fresh_optimizer_route(ckpt_dir: Path) -> str:
+    """How to continue from ``ckpt_dir`` with a fresh optimizer, as a refusal names it."""
+    return (
+        f"continue from the checkpoint with a fresh optimizer: "
+        f"checkpoint.load_path={str(ckpt_dir)!r} with "
+        f'checkpoint.exclude_from_loading=["optimizer"] (add "train_state" to also restart the '
+        f"step, schedule and data position) and a checkpoint.dir that holds no checkpoint, "
+        f"since training auto-resumes from a checkpoint there in place of load_path, optimizer "
+        f"state included."
+    )
 
 
 @contextlib.contextmanager
@@ -1131,8 +1210,9 @@ class CheckpointManager:
             rank raises ``ValueError`` on every rank, before anything is loaded, when the
             checkpoint was saved under a different scope. A checkpoint that holds no optimizer
             state, such as a converted one or one saved before the first step, loads under any
-            scope with a fresh optimizer. A checkpoint that does not record a scope counts as
-            ``"exclude_norms_and_biases"``.
+            scope with a fresh optimizer. A checkpoint whose ``metadata.json`` records no scope
+            counts as ``"exclude_norms_and_biases"``, and one without the file is refused, since
+            it records nothing.
         lr_multipliers: The run's ``optimizer.lr_multipliers``. When set, every save records
             a non-empty one in ``metadata.json``, with the patterns of its modules and, without
             pipeline parallelism, the module each optimizer param group names. A load of a
@@ -1409,6 +1489,91 @@ class CheckpointManager:
         what = "Checkpoint save" if load_from is None else "Checkpoint load"
         self.agree(_attempt(lambda: presented.append(present())), what)
         return presented[0], layout
+
+    def _check_model_fits(
+        self,
+        model_state: Mapping[str, Any],
+        dcp_dir: Path,
+        restaged: bool,
+        saved_keys: Mapping[str, Any],
+    ) -> None:
+        """Refuse, on every rank before any tensor is read, a checkpoint of another model.
+
+        ``model_state`` is the model entry a load reads from ``dcp_dir``, as the checkpoint
+        holds it (see ``_present_experts``). Every rank sends rank 0 the index it reads with the
+        global shape of each entry; rank 0 reads each index once, or takes ``saved_keys``, its
+        own read of ``dcp_dir``, and compares it with what the ranks that read it load together,
+        so the experts of every expert-parallel rank count and, when ``restaged``, the layers of
+        every pipeline stage. A model tensor the index holds that none of them loads, as a
+        deeper model's layer, or a tensor of another size refuses the load, and rank 0
+        broadcasts the verdict, so every rank raises the same error or goes on. A pipeline
+        stage that loads a checkpoint saved without pipeline parallelism outside a process
+        group holds only its own layers, so only their sizes are compared. With
+        ``checkpoint.ignore_extra_model_tensors``, rank 0 warns of the tensors no rank loads,
+        which stay unread, and only a size change refuses.
+
+        Raises:
+            ValueError: The checkpoint does not fit the model.
+            RuntimeError: Rank 0 could not read an index.
+        """
+        held: dict[str, tuple[int, ...] | None] = {}
+        for name, value in model_state.items():
+            shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+            held[f"{_MODEL_PREFIX}{name}"] = shape
+        mine = (str(dcp_dir), held)
+        distributed = dist.is_initialized()
+        gathered: list[Any] | None = [mine]
+        if distributed:
+            gathered = [None] * dist.get_world_size(self._sync_group) if self._rank == 0 else None
+            dist.gather_object(mine, gathered, dst=0, group=self._sync_group)
+        outcome: list[Exception | None] = [None]
+        if gathered is not None:
+            known = {str(dcp_dir): saved_keys} if saved_keys else {}
+            outcome[0] = self._model_misfit_error(gathered, known, restaged and not distributed)
+        if distributed:
+            dist.broadcast_object_list(outcome, src=0, group=self._sync_group)
+        error = outcome[0]
+        if error is not None:
+            raise error
+
+    def _model_misfit_error(
+        self,
+        gathered: Iterable[tuple[str, Mapping[str, tuple[int, ...] | None]]],
+        known: Mapping[str, Mapping[str, Any]],
+        lone_stage: bool,
+    ) -> Exception | None:
+        """Rank 0's verdict for ``_check_model_fits``: the error every rank raises, or None.
+
+        ``gathered`` holds each rank's index and the shapes of the model entries it loads from
+        it, ``known`` the indexes already read, by directory. With ``lone_stage`` the entries
+        are one pipeline stage's part of the model the index holds, so tensors none of them
+        loads are expected and not counted.
+        """
+        held_by_index: dict[str, dict[str, tuple[int, ...] | None]] = {}
+        for index, held in gathered:
+            held_by_index.setdefault(index, {}).update(held)
+        refusals: list[str] = []
+        for index, held in held_by_index.items():
+            try:
+                saved = known.get(index) or _dcp_keys(Path(index))
+            except Exception as e:
+                return RuntimeError(
+                    f"Rank 0 could not read the DCP index in {index} to compare it with this "
+                    f"run's model: {type(e).__name__}: {_error_text(e)}"
+                )
+            extra, resized = _model_misfit(held, saved)
+            if lone_stage:
+                extra = []
+            elif extra and self.config.ignore_extra_model_tensors:
+                logger.warning(
+                    f"{index} holds {len(extra)} model tensors this run's model does not have, "
+                    f"such as {extra[:5]}; they are left unread, since "
+                    "checkpoint.ignore_extra_model_tensors is set"
+                )
+                extra = []
+            if extra or resized:
+                refusals.append(_misfit_message(Path(index), extra, resized))
+        return ValueError(" ".join(refusals)) if refusals else None
 
     def set_tracking_source(self, source: TrackingSource | None) -> None:
         """Record the logging runs ``source`` reports in every later ``metadata.json``.
@@ -1917,25 +2082,18 @@ class CheckpointManager:
         self.agree(self._drain_pending_finalize(error=error))
 
     def peek_saved_step(self, path: str | None = None) -> int | None:
-        """Read ``step`` from a candidate checkpoint's metadata.json.
+        """Read ``step`` from a candidate checkpoint's ``metadata.json``, on this rank alone.
 
-        Returns ``None`` if no checkpoint resolves or the metadata is
-        missing/unreadable. Used by the training loop on resume to
-        compute the expected freeze list (which depends on
-        ``saved_step``) before calling ``load``.
+        Returns ``None`` if no checkpoint resolves, or its ``metadata.json`` is absent, cannot
+        be read, does not hold a JSON object, or records no step that is a non-negative
+        integer. ``load`` does not use it: a load takes the step its checks need from rank 0's
+        read of the checkpoint it settles on (see ``vlm_freeze_expected``).
         """
         ckpt_dir = self._resolve_load_path(path)
         if ckpt_dir is None:
             return None
-        metadata_path = ckpt_dir / _METADATA_FILE
-        if not metadata_path.exists():
-            return None
-        try:
-            saved_meta = json.loads(metadata_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return None
-        step = saved_meta.get("step")
-        return int(step) if step is not None else None
+        meta, _ = _metadata_outcome(ckpt_dir)
+        return None if meta is None else _recorded_step(meta)
 
     def load(
         self,
@@ -1943,7 +2101,7 @@ class CheckpointManager:
         scheduler: Any | None = None,
         dataloader: Any | None = None,
         exclude_keys: list[str] | None = None,
-        vlm_freeze_expected: list[dict[str, Any]] | None = None,
+        vlm_freeze_expected: _FreezeExpectation | None = None,
         fresh_if_unheld: Iterable[str] = (),
         warm_start: bool = False,
         exact_resume: bool = False,
@@ -1968,11 +2126,16 @@ class CheckpointManager:
                 schedule, data order and freeze. ``"train_state"`` in any other
                 combination raises ``ValueError``.
             vlm_freeze_expected: Canonical freeze metadata (output of
-                ``canonical_freeze_meta``) for the current run's VLMConfig.
-                When both the saved metadata and this argument are set,
-                a mismatch raises ``ValueError`` unless the checkpoint
-                config has ``ignore_freeze_mismatch=True``, in which case
-                the load proceeds with a warning.
+                ``canonical_freeze_meta``) for the current run's VLMConfig, or a
+                function that gives it for a step, such as ``freeze_meta_at_step``
+                with that config, which is called with the step the checkpoint's
+                ``metadata.json`` records. It is compared with the freeze that file
+                records, both from rank 0's read of the checkpoint the load settles
+                on (see ``_check_vlm_freeze``), so every rank raises or goes on
+                together; every rank must pass it or none. A mismatch raises
+                ``ValueError`` unless the checkpoint config has
+                ``ignore_freeze_mismatch=True``, in which case the load proceeds
+                with a warning.
             fresh_if_unheld: Names of parameters the saved optimizer may not hold,
                 the ones a freeze stage unfreezes after the build froze them. One
                 with neither saved state nor a never-stepped record resumes with
@@ -2035,12 +2198,17 @@ class CheckpointManager:
                 pipeline degree (see ``pp_size`` in ``__init__``); or it was saved without
                 pipeline parallelism, this run is pipeline-parallel, and the load would
                 restore the optimizer state it holds. Each message names both layouts and
-                the way to carry the weights over.
+                the way to carry the weights over. And, for a load that reads the model,
+                before any tensor is read: the checkpoint holds model tensors this run's
+                model does not have, unless ``checkpoint.ignore_extra_model_tensors`` is
+                set, or one of another size (see ``_check_model_fits``). It also records
+                another VLM freeze (see ``vlm_freeze_expected``).
             RuntimeError: The saved optimizer state does not fit this run's optimizers, as
                 when a name in ``fresh_if_unheld`` with neither saved state nor a
                 never-stepped record is listed in the saved param groups, or no saved
                 param group fits it, or the checkpoint holds fewer param groups than the
-                optimizer and the missing ones are not groups of such names.
+                optimizer and the missing ones are not groups of such names. Also, on every
+                rank, when rank 0 could not read a DCP index to compare it with the model.
 
         A load that restores optimizer state refuses it on every rank together, before any
         state is loaded: each rank checks its own part of the checkpoint, and one all-reduce
@@ -2088,52 +2256,13 @@ class CheckpointManager:
                 "applies the new run's freeze"
             )
 
-        if vlm_freeze_expected is not None and load_train_state:
-            metadata_path = ckpt_dir / _METADATA_FILE
-            if metadata_path.exists():
-                try:
-                    saved_meta = json.loads(metadata_path.read_text())
-                except (OSError, json.JSONDecodeError) as e:
-                    logger.warning(f"Could not read {metadata_path}: {e}")
-                    saved_meta = {}
-                saved_vlm_freeze = saved_meta.get("vlm_freeze")
-                if saved_vlm_freeze is not None:
-                    saved_filt, expected_filt = _intersect_freeze_meta_by_module(
-                        saved_vlm_freeze, vlm_freeze_expected
-                    )
-                    if saved_filt != expected_filt:
-                        dropped_from_saved = sorted(
-                            {e["module"] for e in saved_vlm_freeze}
-                            - {e["module"] for e in saved_filt}
-                        )
-                        dropped_from_expected = sorted(
-                            {e["module"] for e in vlm_freeze_expected}
-                            - {e["module"] for e in expected_filt}
-                        )
-                        cross_arch_note = ""
-                        if dropped_from_saved or dropped_from_expected:
-                            cross_arch_note = (
-                                f" (cross-arch keys ignored: "
-                                f"saved-only={dropped_from_saved}, "
-                                f"current-only={dropped_from_expected})"
-                            )
-                        msg = (
-                            f"VLM freeze mismatch at {ckpt_dir}: "
-                            f"saved={saved_filt}, current={expected_filt}"
-                            f"{cross_arch_note}"
-                        )
-                        if getattr(self.config, "ignore_freeze_mismatch", False):
-                            logger.warning(
-                                msg + "; proceeding because checkpoint.ignore_freeze_mismatch=True"
-                            )
-                        else:
-                            raise ValueError(
-                                msg + " (set checkpoint.ignore_freeze_mismatch=true to override)"
-                            )
-
         metadata: _MetadataOutcome | None = None
-        if plugins_expected is not None and load_train_state:
+        if vlm_freeze_expected is not None and load_train_state:
             metadata = self._broadcast_metadata(ckpt_dir, metadata_read)
+            self._check_vlm_freeze(metadata, ckpt_dir, vlm_freeze_expected)
+        if plugins_expected is not None and load_train_state:
+            if metadata is None:
+                metadata = self._broadcast_metadata(ckpt_dir, metadata_read)
             self._check_plugins(metadata, ckpt_dir, plugins_expected)
 
         load_model = exclude_keys is None or "model" not in exclude_keys
@@ -2237,6 +2366,8 @@ class CheckpointManager:
         restore_error: BaseException | None = None
         if dcp_state:
             dcp_state, layout = self._present_experts(dcp_state, dcp_dir, saved_keys)
+            if load_model:
+                self._check_model_fits(dcp_state["model"], dcp_dir, restaged, saved_keys)
             saved_left_out, saved_template_groups = left_out, template_groups
             if layout is not None:
                 saved_left_out = set(layout.global_names(left_out))
@@ -2508,15 +2639,73 @@ class CheckpointManager:
             "build no part of the model, set checkpoint.ignore_plugins_mismatch = true."
         )
 
+    def _check_vlm_freeze(
+        self,
+        metadata: _MetadataOutcome,
+        ckpt_dir: Path,
+        expected: _FreezeExpectation,
+    ) -> None:
+        """Refuse a checkpoint whose recorded VLM freeze differs from the run's.
+
+        ``metadata`` is what ``_broadcast_metadata`` returned on every rank, so every rank
+        compares the same record and raises or goes on together, and rank 0 alone warns.
+        ``expected`` is the run's canonical freeze metadata, or a function that gives it for a
+        step, called with the step the record holds. Only the modules both freezes name are
+        compared (see ``_intersect_freeze_meta_by_module``). A record that cannot be read, a
+        checkpoint without one included, or that holds no step for ``expected`` to take, is not
+        compared, with a warning; one that records no freeze is not compared.
+
+        Raises:
+            ValueError: The freezes differ and ``checkpoint.ignore_freeze_mismatch`` is off.
+        """
+        meta, error = metadata
+        saved = None if meta is None else meta.get("vlm_freeze")
+        step = None if meta is None else _recorded_step(meta)
+        if meta is not None and saved is not None and callable(expected) and step is None:
+            error = f"its {_METADATA_FILE} records step={meta.get('step')!r}, which is not a step"
+        if error is not None:
+            if self._rank == 0:
+                logger.warning(f"The VLM freeze is not compared with {ckpt_dir}: {error}")
+            return
+        if saved is None:
+            return
+        wanted = expected(cast(int, step)) if callable(expected) else expected
+        saved_filt, expected_filt = _intersect_freeze_meta_by_module(saved, wanted)
+        if saved_filt == expected_filt:
+            return
+        dropped_from_saved = sorted(
+            {e["module"] for e in saved} - {e["module"] for e in saved_filt}
+        )
+        dropped_from_expected = sorted(
+            {e["module"] for e in wanted} - {e["module"] for e in expected_filt}
+        )
+        cross_arch_note = ""
+        if dropped_from_saved or dropped_from_expected:
+            cross_arch_note = (
+                f" (cross-arch keys ignored: saved-only={dropped_from_saved}, "
+                f"current-only={dropped_from_expected})"
+            )
+        msg = (
+            f"VLM freeze mismatch at {ckpt_dir}: saved={saved_filt}, current={expected_filt}"
+            f"{cross_arch_note}"
+        )
+        if getattr(self.config, "ignore_freeze_mismatch", False):
+            if self._rank == 0:
+                logger.warning(msg + "; proceeding because checkpoint.ignore_freeze_mismatch=True")
+            return
+        raise ValueError(msg + " (set checkpoint.ignore_freeze_mismatch=true to override)")
+
     def _check_weight_decay_scope(self, metadata: _MetadataOutcome, ckpt_dir: Path) -> None:
         """Refuse a checkpoint saved under a weight-decay scope other than this manager's.
 
         ``metadata`` is what ``_broadcast_metadata`` returned on every rank, so every rank
-        raises or proceeds together.
+        raises or proceeds together. A checkpoint without ``metadata.json``, as one whose save
+        stopped before writing it or a copy that lost it, records no scope, so it is refused
+        like one whose record cannot be read, never taken for the legacy scope.
 
         Raises:
-            ValueError: The checkpoint's scope differs from this manager's, or its
-                ``metadata.json`` does not hold a valid scope record.
+            ValueError: The checkpoint's scope differs from this manager's, or it has no
+                ``metadata.json`` holding a valid scope record.
         """
         meta, error = metadata
         saved: str | None = None
@@ -2526,18 +2715,20 @@ class CheckpointManager:
             except ValueError as e:
                 error = str(e)
         if error is not None:
-            raise ValueError(f"Cannot check the weight_decay_scope of {ckpt_dir}: {error}")
+            raise ValueError(
+                f"Cannot check the weight_decay_scope of {ckpt_dir}: {error}. A checkpoint's "
+                f"{_METADATA_FILE} records the scope its optimizer state was saved under, which "
+                f"decides the optimizer's param groups, so that state is not loaded without a "
+                f"valid record. Restore the file as the save wrote it, or "
+                f"{_fresh_optimizer_route(ckpt_dir)}"
+            )
         if saved != self._weight_decay_scope:
             raise ValueError(
                 f"{ckpt_dir} was saved with optimizer.weight_decay_scope={saved!r}, but this "
                 f"run uses {self._weight_decay_scope!r}. The scope decides the optimizer's "
                 f"param groups, so the saved optimizer state cannot be loaded into this run's "
-                f"groups. Resume with weight_decay_scope={saved!r}, or continue from the "
-                f"checkpoint with a fresh optimizer: checkpoint.load_path={str(ckpt_dir)!r} "
-                f'with checkpoint.exclude_from_loading=["optimizer"] (add "train_state" to '
-                f"also restart the step, schedule and data position) and a checkpoint.dir "
-                f"that holds no checkpoint, since training auto-resumes from a checkpoint "
-                f"there in place of load_path, optimizer state included."
+                f"groups. Resume with weight_decay_scope={saved!r}, or "
+                f"{_fresh_optimizer_route(ckpt_dir)}"
             )
 
     def _check_lr_multipliers(

@@ -2993,7 +2993,9 @@ class TestRestoreCheckpoint:
         (line,) = [m for m in seen if m.startswith("Warm start from")]
         assert "mlflow_run_id=FROM-SIDECAR" in line
 
-    def test_vlm_resume_computes_expected_freeze_at_the_saved_step(self, monkeypatch, tmp_path):
+    def test_vlm_resume_expects_the_freeze_at_the_step_load_settles_on(self, monkeypatch, tmp_path):
+        """No rank reads the saved step on its own before load: load calls the expectation
+        with the step of the checkpoint it settles on, as rank 0 read it."""
         import kempnerforge.training.entry as entry
         from kempnerforge.training.freeze import freeze_meta_at_step
 
@@ -3001,8 +3003,10 @@ class TestRestoreCheckpoint:
         config = _vlm_config()
         mgr = FakeResumeManager(saved_step=11)
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
-        assert mgr.peeked == [str(tmp_path / "s")]
-        assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(11, config.vlm)
+        assert mgr.peeked == []
+        expected = mgr.load_kwargs["vlm_freeze_expected"]
+        assert expected(11) == freeze_meta_at_step(11, config.vlm)
+        assert expected(0) == freeze_meta_at_step(0, config.vlm)
 
     def test_vlm_resume_takes_parameter_patterns(self, monkeypatch, tmp_path):
         """A resume compares and reapplies a freeze that names parameter patterns."""
@@ -3023,7 +3027,7 @@ class TestRestoreCheckpoint:
         )
         mgr = FakeResumeManager(step=9, saved_step=9)
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
-        expected = mgr.load_kwargs["vlm_freeze_expected"]
+        expected = mgr.load_kwargs["vlm_freeze_expected"](9)
         assert expected == freeze_meta_at_step(9, config.vlm)
         assert {"module": "adapter.*", "frozen": True} in expected
         assert applied == [
@@ -3244,9 +3248,9 @@ class TestRestoreCheckpoint:
         with pytest.raises(RuntimeError, match="Rank 0 could not find the checkpoint to resume"):
             entry.restore_checkpoint(make_config(), TinyTextModel(), None, FakeResumeManager())
 
-    def test_warm_start_exclude_leaves_the_vlm_freeze_probe_alone(self, monkeypatch):
-        """Excluding state keys does not skip the freeze-metadata check; a
-        weights-only checkpoint has no metadata.json, so the probe yields 0."""
+    def test_warm_start_exclude_leaves_the_vlm_freeze_check_alone(self, monkeypatch):
+        """Excluding state keys does not skip the freeze-metadata check: load compares the
+        freeze at the step the checkpoint records."""
         import kempnerforge.training.entry as entry
         from kempnerforge.training.freeze import freeze_meta_at_step
 
@@ -3256,11 +3260,11 @@ class TestRestoreCheckpoint:
         config.checkpoint.exclude_from_loading = ["model"]
         mgr = FakeResumeManager(step=0, tokens=0, saved_step=None)
         entry.restore_checkpoint(config, TinyTextModel(), None, mgr)
-        assert mgr.peeked == [None]
-        assert mgr.load_kwargs["vlm_freeze_expected"] == freeze_meta_at_step(0, config.vlm)
+        assert mgr.peeked == []
+        assert mgr.load_kwargs["vlm_freeze_expected"](0) == freeze_meta_at_step(0, config.vlm)
         assert mgr.load_kwargs["exclude_keys"] == ["model"]
 
-    def test_weights_only_warm_start_skips_the_freeze_probe(self, monkeypatch):
+    def test_weights_only_warm_start_skips_the_freeze_check(self, monkeypatch):
         import kempnerforge.training.entry as entry
 
         monkeypatch.setattr(entry, "resolve_resume_path", lambda _d, _n=None: None)

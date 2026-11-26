@@ -255,6 +255,7 @@ dcp_state = {
     "optimizer": get_optimizer_state_dict(self.model, self.checkpointed_optimizers),
 }
 dcp_state, layout = self._present_experts(dcp_state, dcp_dir, saved_keys)
+self._check_model_fits(dcp_state["model"], dcp_dir, restaged, saved_keys)
 dcp.load(dcp_state, checkpoint_id=str(dcp_dir), process_group=self._process_group)
 if layout is not None:
     dcp_state = layout.to_local(dcp_state)
@@ -270,6 +271,14 @@ gives the setters this rank's names and tensors back. For any model with
 MoE layers it first refuses a checkpoint that holds fewer experts than
 the model. See
 [Expert parallelism § Checkpoints](../distributed/expert-parallelism.md#checkpoints).
+
+Before `dcp.load` reads anything, `_check_model_fits` compares the model
+entry with the checkpoint's DCP index, which lists each tensor's global
+size. Every rank sends rank 0 the index it reads and the shape of each
+model tensor it loads; rank 0 reads each index once and broadcasts one
+verdict, so every rank refuses alike a checkpoint that holds a model
+tensor none of them loads, or one of another size. See
+[Resharding § What to check if resharding fails](resharding.md#what-to-check-if-resharding-fails).
 
 A Muon checkpoint saved before the inner AdamW was checkpointed is the
 one exception: the load passes Muon alone — see

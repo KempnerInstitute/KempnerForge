@@ -407,6 +407,54 @@ def _check_rank_zero_decides(rank: int, world: int, port: int, root: str):
         _assert_holds(loaded, saved)
 
 
+def _save_deeper(rank: int, world: int, mesh: DeviceMesh, ckpt_dir: str) -> None:
+    """Save a model two layers deeper than ``MODEL`` on ``mesh``, after a step."""
+    config, runtime, pipeline = _job(rank, world, mesh, ckpt_dir)
+    deeper = replace(MODEL, n_layers=MODEL.n_layers + 2)
+    torch.manual_seed(0)
+    if pipeline is not None:
+        model = build_stage_module(deeper, pipeline.rank, pipeline.size)
+    else:
+        model = Transformer(deeper)
+    apply_fsdp2(model, mesh, mp_policy=FP32)
+    manager = build_checkpoint_manager(config, runtime, model, _stepped(model), pipeline)
+    manager.save(STEP, tokens_seen=TOKENS)
+    manager.wait()
+
+
+def _refusals(world: int, call) -> list[str | None]:
+    """Each rank's ``ValueError`` message from ``call``, None where it raised none."""
+    message = None
+    try:
+        call()
+    except ValueError as error:
+        message = str(error)
+    messages: list[str | None] = [None] * world
+    dist.all_gather_object(messages, message)
+    return messages
+
+
+def _check_a_deeper_checkpoint_is_refused_by_every_stage(
+    rank: int, world: int, port: int, root: str
+):
+    """A pp=2 run of ``MODEL`` refuses a model two layers deeper, on every rank alike: saved
+    without pipeline parallelism, its last two layers belong to no stage; saved at pp=2, each
+    stage directory holds layers its stage does not have."""
+    with gloo_group(rank, world, port):
+        staged = _mesh((2, world // 2), ("pp", "dp_shard"))
+        _save_deeper(rank, world, _mesh((world,), ("dp_shard",)), f"{root}/flat")
+        _save_deeper(rank, world, staged, f"{root}/staged")
+        warm = {"load_path": f"{root}/flat/step_{STEP}", "exclude_from_loading": ["optimizer"]}
+        messages = _refusals(world, lambda: _restore(rank, world, staged, f"{root}/warm", **warm))
+        assert messages[0] is not None and messages == [messages[0]] * world
+        assert f"flat/step_{STEP} holds" in messages[0]
+        assert "such as ['model.layers.4." in messages[0]
+        messages = _refusals(world, lambda: _restore(rank, world, staged, f"{root}/staged"))
+        assert messages[0] is not None and messages == [messages[0]] * world
+        assert f"step_{STEP}/pp0 holds" in messages[0]
+        assert f"step_{STEP}/pp1 holds" in messages[0]
+
+
 class TestAcrossRanks:
     def test_a_flat_checkpoint_warm_starts_every_stage(self, tmp_path):
         """dp_shard=4 save; a pp=2 x dp_shard=2 run loads each stage's layers from it, and
@@ -441,3 +489,6 @@ class TestAcrossRanks:
 
     def test_every_rank_loads_the_layout_rank_0_read(self, tmp_path):
         spawn(_check_rank_zero_decides, 2, str(tmp_path))
+
+    def test_every_stage_refuses_a_deeper_checkpoint_alike(self, tmp_path):
+        spawn(_check_a_deeper_checkpoint_is_refused_by_every_stage, 4, str(tmp_path))
