@@ -34,13 +34,13 @@ class ActivationStore:
     output that is a ``DTensor`` (a block, its attention or MLP, a norm) is
     gathered before it is stored. A module holding a parameter sharded over the
     ``tp`` mesh dimension, such as a projection, is hooked ahead of its other
-    forward hooks, among them the tensor-parallel one that turns its
-    ``DTensor`` output into this rank's local shard, so its output is gathered
-    too. Each gather is one collective over the tensor-parallel group per
-    captured module and forward, so every rank of that group must enable the
-    store and run the same forward. A module that may run on a local shard
-    without holding such a parameter, as ``q_norm`` and ``k_norm`` do, is
-    refused by :meth:`enable`.
+    forward hooks, among them the tensor-parallel one that hands on only this
+    rank's local tensor, a shard unless the output layout is replicated, so the
+    store sees the ``DTensor`` output and gathers it too. Each gather is one
+    collective over the tensor-parallel group per captured module and forward,
+    so every rank of that group must enable the store and run the same forward.
+    A module that may run on a local shard without holding such a parameter, as
+    ``q_norm`` and ``k_norm`` do, is refused by :meth:`enable`.
 
     Args:
         model: The model to instrument.

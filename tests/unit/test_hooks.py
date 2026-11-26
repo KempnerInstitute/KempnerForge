@@ -582,7 +582,7 @@ class TestActivationStoreParallel:
 
     Every capture is stored as the full tensor on every rank, equal to the TP=1 capture. A
     ``DTensor`` output is gathered. A projection, whose weights are sharded over ``tp``, is
-    hooked ahead of the tensor-parallel hook that turns its output into this rank's shard,
+    hooked ahead of the tensor-parallel hook that hands on only this rank's local tensor,
     and is gathered too, leaving the model's own output untouched. The layouts cover each
     style the tensor-parallel plan uses: ``tp2`` runs sequence parallelism (column-parallel
     projections on sequence-sharded inputs, row-parallel ones with sequence-sharded outputs,

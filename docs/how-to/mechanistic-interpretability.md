@@ -288,10 +288,11 @@ tensor parallelism every capture is stored as the full tensor on every
 rank. A `DTensor` output (a block, its `attention` or `mlp`, a norm) is
 gathered first. A projection such as `q_proj`, `o_proj`, `down_proj` or
 `output_head.proj` holds weights sharded over the `tp` mesh dimension,
-and a forward hook that tensor parallelism installs on it turns its
-output into this rank's shard. The store hooks the projection ahead of
-that hook and gathers its output too, at one collective over the
-tensor-parallel group per captured projection and forward. Because the
+and a forward hook that tensor parallelism installs on it hands on only
+this rank's local tensor, a shard unless the output layout is
+replicated. The store hooks the projection ahead of that hook and
+gathers its output too, at one collective over the tensor-parallel group
+per captured projection and forward. Because the
 gathers are collectives, every rank of that group must enable the store
 and run the same forward.
 `q_norm` and `k_norm` run on this rank's heads only, with nothing
