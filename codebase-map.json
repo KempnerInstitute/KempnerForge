@@ -265,6 +265,7 @@
         "load_config(config_path, cli_args) -> JobConfig",
         "_parse_cli_overrides(args) -> dict (dotted paths build _DottedKeys)",
         "_apply_dict_to_dataclass(dc, data)",
+        "_overlay(dc_type, base, top) -> dict (the CLI overrides laid over the TOML table before the one build, so every check reads both layers)",
         "_with_dotted_keys(table, keys) -> dict (a dotted override's keys set on a dict-valued field's table, the rest kept)",
         "_dict_field_value(raw, current) -> dict (a dotted override merges into current, a literal replaces it)",
         "_coerce_value(field_type, value) (refuses a value that cannot stand for the type; a dict's values take its value type)",
@@ -278,6 +279,7 @@
         "tests/unit/test_config.py::TestCliOverrides",
         "tests/unit/test_config.py::TestCliParsing",
         "tests/unit/test_config.py::TestDottedDictOverrides",
+        "tests/unit/test_config.py::TestChecksReadTheMergedLayers",
         "tests/unit/test_config.py::TestScalarCoercion",
         "tests/unit/test_mixing.py::TestMixingTomlLoading",
         "tests/unit/test_annealing.py::TestAnnealingTomlLoading"
@@ -1757,9 +1759,10 @@
           "TestCliParsing(6)",
           "TestRegistry(12)",
           "TestEvalConfig(7)",
-          "TestDottedDictOverrides(13)"
+          "TestDottedDictOverrides(13)",
+          "TestChecksReadTheMergedLayers(7)"
         ],
-        "count": 159
+        "count": 166
       },
       "tests/unit/test_training.py": {
         "classes": [
