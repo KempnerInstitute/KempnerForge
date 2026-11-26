@@ -100,8 +100,9 @@ before RoPE. Stabilizes attention logits at scale (Gemma, DeepSeek-V3).
    to the model): `kempnerforge.model.masking.build_attention_mask` combines
    document isolation, bidirectional visibility groups and key validity into one
    mask, built once per forward at the Transformer or pipeline-stage boundary in
-   the form the configured backend consumes (a dense boolean mask for SDPA, a
-   `BlockMask` for flex). Every block receives it as `attn_mask`.
+   the form the configured backend consumes (a dense boolean mask for SDPA; for
+   flex a `BlockMask`, or the dense mask when a key padding mask applies). Every
+   block receives it as `attn_mask`.
 2. **Standard causal** (training and prefill into an empty cache, no mask
    inputs): SDPA with `is_causal=True`.
 3. **Single-token decode** (`seq_len == 1` with a KV cache): no mask, so the
@@ -152,6 +153,10 @@ the configs that build one (see
 [Validation rules](../configuration/validation-rules.md#flash-attention-and-masked-runs)).
 Capturing attention weights computes attention without SDPA and is not
 affected.
+
+Under `attention_backend = "flex"`, only a forward given a `BlockMask` runs
+FlexAttention, which `sdpa_backend` does not select. Every other forward runs
+exactly as under `"sdpa"`, and `sdpa_backend` applies to it as it does there.
 
 ## MLP
 

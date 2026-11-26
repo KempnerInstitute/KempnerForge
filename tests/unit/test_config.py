@@ -1354,8 +1354,10 @@ class TestVLMParallelismSupport:
 
 
 class TestFlexSdpaBackendWarning:
-    """``sdpa_backend`` selects an SDPA kernel, which the flex path never uses,
-    so setting both is a silent no-op worth warning about.
+    """Under ``attention_backend="flex"`` only a forward given a ``BlockMask`` runs
+    FlexAttention, and every other forward runs exactly as under
+    ``attention_backend="sdpa"``, so the warning names the forwards that ignore
+    ``sdpa_backend`` instead of calling it ignored.
 
     ``kempnerforge.metrics.logger._configure_root`` sets ``propagate = False``
     on the ``kempnerforge`` logger, which blocks pytest's caplog (attached at
@@ -1372,17 +1374,26 @@ class TestFlexSdpaBackendWarning:
     def teardown_method(self):
         self._kf_logger.propagate = self._old_propagate
 
-    def test_warns_when_sdpa_backend_set_under_flex(self, caplog):
+    @staticmethod
+    def _messages(caplog, **overrides) -> list[str]:
         with caplog.at_level(logging.WARNING, logger="kempnerforge.config.model"):
-            ModelConfig(attention_backend="flex", sdpa_backend="flash")
-        assert any(
-            "ignored when attention_backend='flex'" in r.getMessage() for r in caplog.records
-        )
+            ModelConfig(**overrides)
+        return [r.getMessage() for r in caplog.records if r.name == "kempnerforge.config.model"]
 
-    def test_silent_when_sdpa_backend_set_under_sdpa(self, caplog):
-        with caplog.at_level(logging.WARNING, logger="kempnerforge.config.model"):
-            ModelConfig(attention_backend="sdpa", sdpa_backend="flash")
-        assert not any("ignored when attention_backend" in r.getMessage() for r in caplog.records)
+    def test_warning_names_the_forwards_that_ignore_sdpa_backend(self, caplog):
+        assert self._messages(caplog, attention_backend="flex", sdpa_backend="math") == [
+            "With attention_backend='flex', only a forward given a BlockMask (document or "
+            "attention-group ids without a key padding mask) runs FlexAttention, which ignores "
+            "sdpa_backend='math'. Every other forward runs exactly as with "
+            "attention_backend='sdpa', and sdpa_backend applies to it as it does there."
+        ]
+
+    @pytest.mark.parametrize(
+        ("attention_backend", "sdpa_backend"), [("sdpa", "flash"), ("flex", "auto")]
+    )
+    def test_silent_unless_both_are_set(self, caplog, attention_backend, sdpa_backend):
+        overrides = {"attention_backend": attention_backend, "sdpa_backend": sdpa_backend}
+        assert self._messages(caplog, **overrides) == []
 
 
 class TestHfEncoderOverrideWarning:
