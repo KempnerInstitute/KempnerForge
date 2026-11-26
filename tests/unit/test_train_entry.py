@@ -621,7 +621,7 @@ class TestPhaseState:
     def test_legacy_anneal_fields_become_one_phase(self):
         config = make_config()
         config.data = DataConfig(anneal_start_step=7, anneal_weights={"a": 2.0})
-        state = build_phase_state(config, _mixture_pipeline(), step=0)
+        state = build_phase_state(config, DataPipeline(), step=0)
         assert len(state.phases) == 1
         assert state.phases[0].start_step == 7
         assert state.phases[0].dataset_weights == {"a": 2.0}
@@ -657,35 +657,6 @@ class TestPhaseState:
         state = build_phase_state(config, DataPipeline(), step=10)
         assert state.next_idx == 1
         assert state.lr_scale == 0.5
-
-    @pytest.mark.parametrize(
-        ("data_config", "fields"),
-        [
-            (
-                DataConfig(
-                    phases=[
-                        TrainingPhase(start_step=0, lr_scale=0.5),
-                        TrainingPhase(start_step=5, dataset_weights={"a": 9.0}),
-                    ]
-                ),
-                r"data\.phases\[1\]\.dataset_weights",
-            ),
-            (
-                DataConfig(anneal_start_step=7, anneal_weights={"a": 2.0}),
-                r"data\.anneal_start_step and data\.anneal_weights",
-            ),
-        ],
-        ids=["phase", "anneal_shortcut"],
-    )
-    def test_mixture_weights_need_a_pipeline_with_a_mixture(self, data_config, fields):
-        """Whichever builder made the pipeline, weights it cannot apply are refused, not
-        dropped; a pipeline with a mixture takes them."""
-        config = make_config()
-        config.data = data_config
-        refusal = rf"^{fields} would reweight a mixture, but the training data pipeline has none"
-        with pytest.raises(ValueError, match=refusal):
-            build_phase_state(config, DataPipeline(dataloader=[]), step=0)
-        build_phase_state(config, _mixture_pipeline(), step=0)
 
 
 class TestAdvancePhases:

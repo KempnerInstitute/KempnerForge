@@ -121,7 +121,7 @@
         "DataConfig": {
           "purpose": "Data pipeline (dataset_path, HF dataset, tokenizer, packing, mixing, phases, annealing)",
           "methods": [
-            "mixture_weight_fields() -> list[str] (the phase and anneal settings that reweight a mixture; JobConfig.validate and build_phase_state refuse them without one)"
+            "mixture_weight_fields() -> list[str] (the phase and anneal settings that reweight a mixture, which JobConfig.validate refuses on a run without one)"
           ]
         }
       }

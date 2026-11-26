@@ -216,8 +216,6 @@ shortcut would be ignored, so `JobConfig.validate` refuses them on such
 a run, before the process group starts, with an error that names each
 field (see
 [Validation rules](../configuration/validation-rules.md#mixture-weights-without-a-mixture)).
-`build_phase_state` refuses them as well when the pipeline it gets has no
-mixture.
 
 ### Resume into the right phase
 
