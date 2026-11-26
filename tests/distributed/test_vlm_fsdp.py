@@ -10,6 +10,8 @@ Covers:
   - Dtype combinatorics: vision encoder fp32, adapter bf16, transformer bf16.
   - torch.compile + fully_shard + ``inner_transformer(compiled_wrapper)``.
   - DCP checkpoint round-trip with freeze metadata.
+  - Gradient accumulation: every FSDP2 unit reduces once, on the last micro-step,
+    under FSDP and HSDP.
 """
 
 from __future__ import annotations
@@ -19,6 +21,9 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor.debug import CommDebugMode
 
 from kempnerforge.checkpoint.manager import CheckpointManager
 from kempnerforge.config.adapter import AdapterConfig
@@ -29,6 +34,7 @@ from kempnerforge.config.vlm import FreezeSpec, VLMConfig
 from kempnerforge.distributed.parallel import build_parallel_model
 from kempnerforge.model.vlm import VLMWrapper, inner_transformer
 from kempnerforge.training.freeze import canonical_freeze_meta
+from kempnerforge.training.grad import maybe_no_sync
 from kempnerforge.training.loss import cross_entropy_loss
 from kempnerforge.training.optimizer import build_optimizer
 
@@ -36,6 +42,8 @@ pytestmark = pytest.mark.skipif(
     "RANK" not in os.environ,
     reason="Requires torchrun launcher (RANK not set)",
 )
+
+MICRO_STEPS = 4
 
 
 def _tiny_cfg(
@@ -194,3 +202,52 @@ class TestCheckpointRoundtrip:
 
             meta = json.loads((Path(path_str) / "step_1" / "metadata.json").read_text())
             assert meta["vlm_freeze"] == freeze
+
+
+def _reductions(comm: CommDebugMode) -> tuple[int, int]:
+    """The reduce-scatters and the all-reduces ``comm`` counted."""
+    counts = {str(op): n for op, n in comm.get_comm_counts().items()}
+    reduce_scatters = sum(n for op, n in counts.items() if "reduce_scatter" in op)
+    all_reduces = sum(n for op, n in counts.items() if "allreduce" in op)
+    return reduce_scatters, all_reduces
+
+
+class TestGradientAccumulation:
+    @pytest.mark.parametrize("layout", ["dp_shard", "dp_replicate_dp_shard"])
+    def test_each_unit_reduces_once_per_accumulation(self, distributed_env, layout):
+        """Over four micro-steps every FSDP2 unit of a ``VLMWrapper`` reduce-scatters, and
+        under HSDP all-reduces, on the last micro-step only, and the gradients match those
+        of a wrapper that reduces on every micro-step."""
+        world = dist.get_world_size()
+        mesh = distributed_env
+        if layout == "dp_replicate_dp_shard":
+            if world < 4 or world % 2:
+                pytest.skip("HSDP with two ranks per shard group needs an even world of 4 or more")
+            mesh = init_device_mesh(
+                "cuda", (2, world // 2), mesh_dim_names=("dp_replicate", "dp_shard")
+            )
+        torch.manual_seed(0)
+        wrapper = _build(_tiny_cfg(), mesh, param_dtype=torch.float32)
+        torch.manual_seed(0)
+        reference = _build(_tiny_cfg(), mesh, param_dtype=torch.float32)
+        batches = [_dummy_batch(wrapper) for _ in range(MICRO_STEPS)]
+        units = sum(isinstance(module, FSDPModule) for module in wrapper.modules())
+
+        counted = []
+        for micro_step, (pixels, ids, labels) in enumerate(batches):
+            with CommDebugMode() as comm, maybe_no_sync(wrapper, micro_step, MICRO_STEPS):
+                logits, labels_out = wrapper(pixels, ids, labels)
+                (cross_entropy_loss(logits, labels_out) / MICRO_STEPS).backward()
+            counted.append(_reductions(comm))
+        for pixels, ids, labels in batches:
+            logits, labels_out = reference(pixels, ids, labels)
+            (cross_entropy_loss(logits, labels_out) / MICRO_STEPS).backward()
+
+        replicated = units if layout == "dp_replicate_dp_shard" else 0
+        assert units >= 4
+        assert counted == [(0, 0)] * (MICRO_STEPS - 1) + [(units, replicated)], counted
+        pairs = zip(wrapper.named_parameters(), reference.parameters(), strict=True)
+        for (name, param), expected in pairs:
+            got, want = param.grad.full_tensor(), expected.grad.full_tensor()
+            gap = (got - want).abs().max().item()
+            assert gap <= 1e-5 * want.abs().max().item(), (name, gap)
