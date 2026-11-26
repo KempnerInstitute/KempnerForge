@@ -192,6 +192,9 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `anneal_start_step` | `int` | `0` | syntactic sugar for a common 2-phase annealing pattern (`0` = disabled) |
 | `anneal_weights` | `dict[str, float]` | `{}` | per-dataset weights applied at `anneal_start_step` |
 
+For text training without a dataset mixture, set at most one of `data.dataset_path`
+and `data.hf_dataset_name`.
+
 A `[video]` run builds its dataset from `[video]`, so every `hf_*` field keeps
 its default there; see
 [Validation rules](validation-rules.md#video-and-the-data-hugging-face-fields).
@@ -237,8 +240,8 @@ In-loop evaluation. Disabled by default.
 | `hf_dataset_config` | `str \| None` | `None` | HF dataset config |
 | `hf_dataset_split` | `str` | `"validation"` | HF split |
 
-If `enabled=True`, at least one of `dataset_path` / `hf_dataset_name`
-must be set; `validate()` rejects the combination otherwise.
+Choose at most one of `eval.dataset_path` and `eval.hf_dataset_name`.
+Enabling evaluation requires exactly one.
 
 ## `[distributed]`: `DistributedConfig`
 

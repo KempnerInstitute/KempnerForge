@@ -289,6 +289,17 @@ class JobConfig:
                 "(embedding and output head must be on different stages)"
             )
 
+        if (
+            not self.is_vlm
+            and not self.data.datasets
+            and self.data.dataset_path
+            and self.data.hf_dataset_name
+        ):
+            raise ValueError("Set only one of data.dataset_path and data.hf_dataset_name.")
+
+        if self.eval.dataset_path and self.eval.hf_dataset_name:
+            raise ValueError("Set only one of eval.dataset_path and eval.hf_dataset_name.")
+
         if self.eval.enabled and not self.eval.dataset_path and not self.eval.hf_dataset_name:
             raise ValueError(
                 "eval.enabled is True but no eval data source is configured. "
