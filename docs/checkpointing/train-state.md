@@ -211,7 +211,8 @@ samples it loaded before the save. A dataset that draws random numbers
 in its workers, such as a random augmentation, therefore draws
 differently after a resume. A checkpoint saved before the loader
 recorded this state resumes with a new `base_seed` from the CPU
-generator, with a warning.
+generator, and the load warns where the uninterrupted run would have
+drawn none.
 
 ### Bitwise reproducibility on GPU
 
