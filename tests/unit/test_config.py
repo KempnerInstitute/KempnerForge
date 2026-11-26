@@ -700,6 +700,28 @@ class TestProfilingConfig:
 
 
 class TestJobConfig:
+    @pytest.mark.parametrize("section", ["data", "eval"])
+    def test_conflicting_dataset_sources(self, tmp_path, section):
+        toml = tmp_path / "job.toml"
+        toml.write_text(f'[{section}]\ndataset_path = "/shards"\n')
+        args = [f"--{section}.hf_dataset_name=corpus"]
+        if section == "eval":
+            args.append("--eval.enabled=true")
+
+        with pytest.raises(
+            ValueError, match=rf"{section}\.dataset_path.*{section}\.hf_dataset_name"
+        ):
+            load_config(str(toml), cli_args=args).validate()
+        load_config(str(toml), cli_args=[*args, f"--{section}.dataset_path="]).validate()
+
+    def test_dataset_mixture_takes_precedence_over_single_sources(self, tmp_path):
+        toml = tmp_path / "mixture.toml"
+        toml.write_text(
+            '[data]\ndataset_path = "/shards"\nhf_dataset_name = "corpus"\n'
+            '[[data.datasets]]\npath = "/mixture/shards"\n'
+        )
+        load_config(str(toml), cli_args=[]).validate()
+
     def test_validate_seq_len_exceeds_max(self):
         config = JobConfig(
             model=ModelConfig(max_seq_len=512),
