@@ -517,6 +517,7 @@ def run_training(
 
         eval_dataloader = build_eval_dataloader(config, runtime)
         phases = build_phase_state(config, data, step)
+        nan_detector.state.consecutive_nans = ckpt_mgr.restored_extra.get("consecutive_nans", 0)
 
         session = TrainingSession(
             config=config,

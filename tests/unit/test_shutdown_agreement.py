@@ -3,11 +3,13 @@
 A shutdown or a failed NCCL check seen on one rank stops every rank (#307), a rank
 that the vote stops arms its own forced-exit timer, the loop destroys only the
 control group it made, and a NaN loss on one rank skips the step on every rank
-(#375).
+(#375). A run resumed partway through a run of NaN steps restores the same NaN
+count on every rank, so every rank stops at the step the uninterrupted run stops at.
 
-Two gloo ranks run the real ``run_training_loop`` and only one of them sees the
-event. The loop tests start the ranks with CUDA hidden, so ``NaNDetector.check_loss``
-reduces its flag on the CPU and the NaN case runs the loop's real cross-rank check.
+Two gloo ranks run the real ``run_training_loop``, or ``run_training`` for the
+resume, and only one of them sees the event. The loop tests start the ranks with
+CUDA hidden, so ``NaNDetector.check_loss`` reduces its flag on the CPU and the NaN
+cases run the loop's real cross-rank check.
 """
 
 from __future__ import annotations
@@ -154,6 +156,55 @@ def _run_loop(rank: int, world: int, port: int, case: str, root: str, out_dir: s
         write_outcome(out_dir, rank, outcome)
 
 
+def _train_through_nans(
+    rank: int, world: int, port: int, case: str, root: str, out_dir: str
+) -> None:
+    """Run ``run_training`` on one rank and write each step it ran and the NaN count it met.
+
+    Rank 0 alone sees a NaN loss, in every step, and three in a row stop the run. In
+    ``"save"`` rank 1 alone asks to shut down after two steps, so the run saves step 2 with
+    two NaN steps counted; ``"resume"`` resumes that checkpoint.
+    """
+    with gloo_group(rank, world, port, timeout=timedelta(seconds=PG_TIMEOUT_S)):
+        try:
+            import kempnerforge.training.entry as entry
+            from kempnerforge.training.loop import text_step
+            from tests.unit.test_train_entry import (
+                FakeShutdownHandler,
+                TinyTextModel,
+                _nan_on,
+                _runtime,
+                _stub_entry,
+                make_config,
+            )
+
+            config = make_config(max_steps=10, nan_max_consecutive=3)
+            config.checkpoint.dir = root
+            config.checkpoint.interval = 100
+            config.distributed.nccl_timeout_sec = PG_TIMEOUT_S
+            runtime = dataclasses.replace(_runtime(), rank=rank, local_rank=rank, world_size=world)
+            shutdown_after = 2 if case == "save" and rank == 1 else None
+            body = _nan_on(set(range(10))) if rank == 0 else text_step
+            seen: list[tuple[int, int]] = []
+
+            def step_fn(session, step):
+                seen.append((step, session.nan_detector.state.consecutive_nans))
+                return body(session, step)
+
+            with pytest.MonkeyPatch.context() as patch:
+                _stub_entry(patch, TinyTextModel(), real_checkpoints=True)
+                patch.setattr(entry, "setup_distributed", lambda _config: runtime)
+                patch.setattr(
+                    entry, "ShutdownHandler", lambda **_kw: FakeShutdownHandler(shutdown_after)
+                )
+                mark(out_dir, rank)
+                entry.run_training(config, step_fn=step_fn)
+            outcome = f"steps={[s for s, _ in seen]} counts={[c for _, c in seen]}"
+        except BaseException as e:
+            outcome = f"{type(e).__name__}: {e}"
+        write_outcome(out_dir, rank, outcome)
+
+
 def _outcomes(
     tmp_path: Path, case: str, target=_run_loop, part: str = "run_training_loop()"
 ) -> dict[int, str]:
@@ -237,3 +288,28 @@ class TestLoopStopsOnEveryRank:
         """Rank 0's NaN loss makes both ranks skip step 1, and both still finish (#375)."""
         outcomes = _outcomes(tmp_path, "nan")
         assert outcomes == {r: "step=6 saves=[6] nans=1" for r in range(WORLD)}
+
+    @pytest.mark.timeout(720)
+    def test_a_resume_in_a_nan_run_stops_every_rank_where_the_run_would(self, tmp_path):
+        """Rank 0 alone sees NaN losses, and rank 1 alone asks to shut down after two steps.
+
+        Both ranks resume the count of two that the emergency checkpoint saved, so both stop
+        at step 2, their first step after the resume, as the uninterrupted run does. Two
+        spawns, so the test carries twice the timeout ``_outcomes`` describes.
+        """
+        root = str(tmp_path / "ckpt")
+        outcomes = {
+            case: run_to_outcomes(
+                _train_through_nans,
+                WORLD,
+                (case, root),
+                tmp_path / case,
+                part="run_training()",
+                part_s=DEADLINE_S,
+            )
+            for case in ("save", "resume")
+        }
+        assert outcomes == {
+            "save": {r: "steps=[0, 1] counts=[0, 1]" for r in range(WORLD)},
+            "resume": {r: "steps=[2] counts=[2]" for r in range(WORLD)},
+        }
