@@ -313,6 +313,58 @@ class TestMuon:
         weight_after = model.weight.data.norm().item()
         assert weight_after < weight_before
 
+    @pytest.mark.parametrize("weight_decay", [0.0, 0.1])
+    def test_fallback_group_without_a_decay_takes_muons(self, weight_decay):
+        """A fallback group that sets no ``weight_decay`` decays at Muon's ``weight_decay``,
+        not at AdamW's default, and a group that sets one keeps its own."""
+        matrix = nn.Parameter(torch.ones(4, 4))
+        bare = nn.Parameter(torch.ones(4))
+        own = nn.Parameter(torch.ones(4))
+        optimizer = Muon(
+            [{"params": [matrix]}],
+            [{"params": [bare]}, {"params": [own], "weight_decay": 0.3}],
+            lr=0.1,
+            weight_decay=weight_decay,
+        )
+        for param in (matrix, bare, own):
+            param.grad = torch.zeros_like(param)
+        optimizer.step()
+        torch.testing.assert_close(bare.detach(), torch.full((4,), 1 - 0.1 * weight_decay))
+        torch.testing.assert_close(own.detach(), torch.full((4,), 1 - 0.1 * 0.3))
+        assert optimizer._adam is not None
+        assert [g["weight_decay"] for g in optimizer._adam.param_groups] == [weight_decay, 0.3]
+
+    @pytest.mark.parametrize("lr_multipliers", [{}, {"embedding": 0.5}])
+    @pytest.mark.parametrize("scope", ["exclude_norms_and_biases", "all"])
+    def test_build_optimizer_fallback_decays_at_each_groups_own_rate(self, scope, lr_multipliers):
+        """``build_optimizer`` sets ``weight_decay`` on every group it gives Muon, so the AdamW
+        fallback decays each parameter at the builder's rate for it: ``optimizer.weight_decay``
+        where the scope decays and none elsewhere, never a default of Muon's or AdamW's."""
+        model = nn.ModuleDict(
+            {"embedding": nn.Embedding(16, 8), "linear": nn.Linear(8, 8), "norm": nn.LayerNorm(8)}
+        )
+        config = OptimizerConfig(
+            name="muon",
+            lr=0.1,
+            weight_decay=0.5,
+            weight_decay_scope=scope,
+            lr_multipliers=lr_multipliers,
+        )
+        optimizer = build_optimizer(model, config, module_patterns={"embedding": ["embedding.*"]})
+        names = {param: name for name, param in model.named_parameters()}
+        decayed = set(names.values()) if scope == "all" else {"embedding.weight"}
+        before = {param: param.detach().clone() for param in model.parameters()}
+        for param in model.parameters():
+            param.grad = torch.zeros_like(param)
+        optimizer.step()
+        assert optimizer._adam is not None
+        fallback = [(g, p) for g in optimizer._adam.param_groups for p in g["params"]]
+        assert {names[p] for _, p in fallback} == set(names.values()) - {"linear.weight"}
+        for group, param in fallback:
+            rate = 0.5 if names[param] in decayed else 0.0
+            assert group["weight_decay"] == rate
+            torch.testing.assert_close(param.detach(), before[param] * (1 - group["lr"] * rate))
+
     def test_momentum_config(self):
         config = OptimizerConfig(name="muon", muon_momentum=0.9, muon_ns_steps=3)
         model = nn.Linear(16, 16)
