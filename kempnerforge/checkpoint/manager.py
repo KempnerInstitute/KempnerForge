@@ -1576,9 +1576,9 @@ class CheckpointManager:
                 )
         if distributed:
             dist.broadcast_object_list(outcome, src=0, group=self._sync_group)
-        error = local_error or comparison_error or outcome[0]
-        if error is not None:
-            raise error
+        for error in (local_error, comparison_error, outcome[0]):
+            if error is not None:
+                raise error
 
     def _model_misfit_error(
         self,

@@ -173,16 +173,31 @@ class TestModelAgainstTheCheckpoint:
         with pytest.raises(RuntimeError, match="Rank 0 could not read the DCP index"):
             manager.load(exclude_keys=["optimizer"])
 
-    def test_a_comparison_that_fails_without_a_process_group_raises_its_error(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize("failing", ["_held_model_entries", "_model_misfit"])
+    def test_a_check_that_fails_without_a_process_group_raises_its_own_error(
+        self, tmp_path, monkeypatch, failing
     ):
+        """Listing the model's entries or comparing them fails, with an error that is false in
+        a boolean context, as an exception that is also a container can be. The load raises
+        that error itself."""
         _save(tmp_path)
         model, _, manager = _run(tmp_path)
         before = _snapshot(model)
-        monkeypatch.setattr("kempnerforge.checkpoint.manager._model_misfit", _failing_comparison)
-        with pytest.raises(TypeError, match=COMPARISON_FAILURE):
+        failure = _FalsyError(f"{failing} failed")
+
+        def fail(*_args):
+            raise failure
+
+        monkeypatch.setattr(f"kempnerforge.checkpoint.manager.{failing}", fail)
+        with pytest.raises(_FalsyError) as caught:
             manager.load()
+        assert caught.value is failure
         assert _holds(model, before)
+
+
+class _FalsyError(TypeError):
+    def __bool__(self) -> bool:
+        return False
 
 
 def _failing_comparison(_held, _saved):
