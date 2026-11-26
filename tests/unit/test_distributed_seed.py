@@ -99,6 +99,18 @@ def test_set_seed_same_across_dp_ranks(monkeypatch):
     assert stage0_rank0 != stage1_rank2
 
 
+def test_a_single_process_is_seeded_as_pipeline_stage_zero(monkeypatch):
+    """With one process, ``init_distributed`` seeds as every rank of stage 0 does."""
+    from kempnerforge.config.schema import DistributedConfig
+    from kempnerforge.distributed import setup
+
+    stage0 = _draws_after_init(monkeypatch, rank=0, pp_rank=0)
+    monkeypatch.setattr(setup, "get_world_info", lambda: (0, 0, 1))
+
+    assert setup.init_distributed(DistributedConfig(), seed=42) is None
+    assert [random.random() for _ in range(4)] == stage0
+
+
 def test_set_seed_matches_checkpoint_coverage():
     """Cold-start seeding must cover the same four RNGs the checkpoint path captures.
 

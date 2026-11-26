@@ -177,7 +177,9 @@ def _record_passes(loader, restart) -> list[tuple[torch.Tensor, dict[int, int]]]
     """The CPU RNG and the worker seeds after each pass of a fixed sequence of passes.
 
     Two whole passes, a pass started again after 2 batches, and one more after
-    ``restart(loader)`` stops the workers.
+    ``restart(loader)`` stops the workers. Each pass calls ``iter()`` once, as
+    training does: ``StatefulDataLoader.__iter__`` returns the loader, so
+    ``list(iter(loader))`` would start a second iterator.
     """
     torch.manual_seed(0)
     records = []
@@ -185,8 +187,8 @@ def _record_passes(loader, restart) -> list[tuple[torch.Tensor, dict[int, int]]]
     def record(batches):
         records.append((torch.random.get_rng_state(), _seeds(batches)))
 
-    record(list(iter(loader)))
-    record(list(iter(loader)))
+    record(list(loader))
+    record(list(loader))
     batches = iter(loader)
     partial = [next(batches), next(batches)]
     batches = iter(loader)
@@ -246,7 +248,7 @@ def test_the_saved_state_ends_with_a_pass_only_without_persistent_workers(worker
     _skip_without_worker_sockets(workers)
     loader = _loader(workers)
     try:
-        list(iter(loader))
+        list(loader)
         assert (loader.state_dict()[KEY] is None) == (workers == 0)
     finally:
         loader.close()

@@ -2265,8 +2265,8 @@
         "count": 4
       },
       "tests/unit/test_distributed_seed.py": {
-        "note": "Module-level pytest functions: _set_seed seeds python/numpy/torch.cpu/torch.cuda; varies with pp_rank; consistent across dp ranks through init_distributed, with no rank argument; covers checkpoint surface",
-        "count": 4
+        "note": "Module-level pytest functions: _set_seed seeds python/numpy/torch.cpu/torch.cuda; varies with pp_rank; consistent across dp ranks through init_distributed, with no rank argument; a single process seeded as stage 0; covers checkpoint surface",
+        "count": 5
       },
       "tests/unit/test_data_position.py": {
         "note": "Module-level pytest functions (no Test* classes): the data position across data-parallel and batch size changes, the in-step clamp, mixture and legacy refusals, seed and dataset-length warnings, load_path warm starts through restore_checkpoint and load(dataloader=...), gloo CheckpointManager resume on another world size; gloo CheckpointManager auto-resume (exact_resume) saved on 4 ranks: on 2 ranks with ignore_rank_state_mismatch at the exact global position with fresh RNG, refused on every rank without it, a mixture restarting with a warning, and the saved layout restoring each rank's own state; check_state's verdicts",
