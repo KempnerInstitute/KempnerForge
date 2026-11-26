@@ -57,6 +57,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import _CHECKPOINT_PREFIX
 from torch.distributed.checkpoint import DefaultLoadPlanner, DefaultSavePlanner
+from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata, TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -484,24 +485,15 @@ def _model_misfit(
 ) -> tuple[list[str], list[str]]:
     """Compare the model entries a load reads from a DCP index with what the index holds.
 
-    ``held`` maps the DCP key of each entry, ``model.<name>``, to its global shape, None for an
-    entry that is not a tensor; ``saved`` is the index's ``state_dict_metadata``. A saved key
-    belongs to a held entry when it, or a dotted prefix of it, is held, as DCP flattens an entry
-    that nests.
+    ``held`` maps the key of each entry, as DCP flattens the load's ``{"model": ...}`` state,
+    to its global shape, None for an entry that is not a tensor; ``saved`` is the index's
+    ``state_dict_metadata``.
 
     Returns:
         The model keys of the index that no held entry takes, sorted, and a description of each
         held tensor the index holds at another size, in key order.
     """
-    extra = []
-    for key in saved:
-        if not key.startswith(_MODEL_PREFIX):
-            continue
-        name = key
-        while name and name not in held:
-            name = name.rpartition(".")[0]
-        if not name:
-            extra.append(key)
+    extra = sorted(key for key in saved if key.startswith(_MODEL_PREFIX) and key not in held)
     resized = []
     for key, shape in sorted(held.items()):
         meta = saved.get(key)
@@ -509,7 +501,7 @@ def _model_misfit(
             continue
         if tuple(meta.size) != shape:
             resized.append(f"{key} (saved {list(meta.size)}, this run {list(shape)})")
-    return sorted(extra), resized
+    return extra, resized
 
 
 def _misfit_message(where: Path, extra: Sequence[str], resized: Sequence[str]) -> str:
@@ -1503,15 +1495,15 @@ class CheckpointManager:
         ``model_state`` is the model entry a load reads from ``dcp_dir``, as the checkpoint
         holds it (see ``_present_experts``), and ``every_rank`` names, as the checkpoint does,
         the experts that every expert-parallel rank of this rank's layers holds. Every rank
-        sends rank 0 the index it reads with the global shape of each entry; rank 0 reads each
-        index once, or takes ``saved_keys``, its own read of ``dcp_dir``, and compares it with
-        what the ranks that read it load together: every expert-parallel rank's experts and,
-        when ``restaged``, every pipeline stage's layers. A model tensor the index holds that
-        none of them loads, as a deeper model's layer, or a tensor of another size refuses the
+        sends rank 0 the index it reads with the global shape of each entry, keyed as DCP
+        flattens it, so a nested entry counts by its leaves. Rank 0 reads each index once, or
+        takes ``saved_keys``, its own read of ``dcp_dir``, and compares it with what the ranks
+        that read it load together: every expert-parallel rank's experts and, when
+        ``restaged``, every pipeline stage's layers. A model tensor the index holds that none
+        of them loads, as a deeper model's layer, or a tensor of another size refuses the
         load, and rank 0 broadcasts the verdict, so every rank raises the same error or goes
-        on. A pipeline
-        stage that loads a checkpoint saved without pipeline parallelism outside a process
-        group holds only its own layers, so only their sizes are compared. With
+        on. A pipeline stage that loads a checkpoint saved without pipeline parallelism outside
+        a process group holds only its own layers, so only their sizes are compared. With
         ``checkpoint.ignore_extra_model_tensors``, rank 0 warns of the tensors no rank loads,
         which stay unread, and only a size change refuses.
 
@@ -1519,10 +1511,10 @@ class CheckpointManager:
             ValueError: The checkpoint does not fit the model.
             RuntimeError: Rank 0 could not read an index.
         """
+        flat, _ = flatten_state_dict({"model": dict(model_state)})
         held: dict[str, tuple[int, ...] | None] = {}
-        for name, value in model_state.items():
-            shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
-            held[f"{_MODEL_PREFIX}{name}"] = shape
+        for key, value in flat.items():
+            held[key] = tuple(value.shape) if isinstance(value, torch.Tensor) else None
         for name in every_rank:
             held.setdefault(f"{_MODEL_PREFIX}{name}", None)
         mine = (str(dcp_dir), held)

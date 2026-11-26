@@ -170,6 +170,61 @@ class TestModelAgainstTheCheckpoint:
             manager.load(exclude_keys=["optimizer"])
 
 
+class _ExtraState(torch.nn.Module):
+    """A module whose extra state is a dict of tensors of the given sizes, which DCP stores as
+    one entry per tensor."""
+
+    def __init__(self, sizes: dict[str, int]) -> None:
+        super().__init__()
+        self.proj = torch.nn.Linear(2, 2)
+        self.sizes = sizes
+        self.loaded: dict | None = None
+
+    def get_extra_state(self) -> dict[str, torch.Tensor]:
+        return {name: torch.full((size,), 1.0) for name, size in self.sizes.items()}
+
+    def set_extra_state(self, state: dict) -> None:
+        self.loaded = state
+
+
+class TestNestedEntries:
+    """An entry that nests, as a module's extra state can, is compared by its leaves."""
+
+    @staticmethod
+    def _save(tmp_path, sizes):
+        torch.manual_seed(0)
+        model = _ExtraState(sizes)
+        CheckpointManager(CheckpointConfig(dir=str(tmp_path)), model, _stepped(model)).save(STEP)
+
+    @staticmethod
+    def _load(tmp_path, sizes):
+        model = _ExtraState(sizes)
+        manager = CheckpointManager(
+            CheckpointConfig(dir=str(tmp_path)), model, torch.optim.AdamW(model.parameters())
+        )
+        return model, manager.load
+
+    def test_a_leaf_the_model_does_not_have_is_refused(self, tmp_path):
+        self._save(tmp_path, {"kept": 2, "removed": 3})
+        model, load = self._load(tmp_path, {"kept": 2})
+        with pytest.raises(ValueError, match=r"such as \['model\._extra_state\.removed'\]"):
+            load()
+        assert model.loaded is None
+
+    def test_a_leaf_of_another_size_is_refused(self, tmp_path):
+        self._save(tmp_path, {"kept": 2})
+        _, load = self._load(tmp_path, {"kept": 5})
+        resized = r"model\._extra_state\.kept \(saved \[2\], this run \[5\]\)"
+        with pytest.raises(ValueError, match=resized):
+            load()
+
+    def test_the_same_leaves_load(self, tmp_path):
+        self._save(tmp_path, {"kept": 2})
+        model, load = self._load(tmp_path, {"kept": 2})
+        assert load()[0] == STEP
+        assert model.loaded is not None and set(model.loaded) == {"kept"}
+
+
 class TestFreezeWarningsOnRankZero:
     @pytest.mark.parametrize("ignore", [False, True], ids=["unread", "ignored-mismatch"])
     def test_only_rank_0_warns(self, tmp_path, ignore):
