@@ -164,7 +164,7 @@ apply_fsdp2(model, device_mesh, reshard_after_forward=True)
 |-------|----------|-------------|
 | `True` (default) | All-gather on forward, reshard after, all-gather again on backward | Maximum memory savings; every forward pass reshards |
 | `False` | All-gather once, keep gathered across the step | Pipeline parallel: `1F1B` schedule sends many microbatches through each stage; resharding between them would be wasted work |
-| `int` | Rate-limit concurrency: keep at most `N` blocks gathered at once | Rarely used; middle-ground for memory tuning |
+| `int` (`N`) | Reshard to groups of `N` ranks after forward: each rank keeps `1/N` of every unit, and the backward all-gather runs within its group | Memory between `True` and `False`; `N` must divide the `dp_shard` size |
 
 [`training/entry.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/entry.py)
 passes `reshard_after_forward=False` for pipeline stages and keeps the

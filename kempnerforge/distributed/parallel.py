@@ -493,7 +493,10 @@ def apply_fsdp2(
         reshard_after_forward: Whether to free gathered params after forward.
             True = always reshard (saves memory, default).
             False = keep gathered (useful when PP needs params across microbatches).
-            int = rate-limit the number of concurrent all-gathers.
+            int = the world size to reshard to after forward, a divisor of the
+            ``dp_shard`` size: each unit stays sharded over groups of that many
+            ranks, so the backward all-gather runs within a group, at more memory
+            than True.
     """
     if not has_dp_mesh(device_mesh):
         logger.info("No DP dimensions in mesh; skipping FSDP2")
