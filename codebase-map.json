@@ -1759,9 +1759,10 @@
           "TestCliParsing(6)",
           "TestRegistry(12)",
           "TestEvalConfig(7)",
-          "TestDottedDictOverrides(13)"
+          "TestDottedDictOverrides(13)",
+          "TestChecksReadTheMergedLayers(7)"
         ],
-        "count": 159
+        "count": 166
       },
       "tests/unit/test_training.py": {
         "classes": [
