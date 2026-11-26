@@ -25,9 +25,9 @@ for micro_step in range(grad_accum_steps):       ── maybe_no_sync sets
 
 grad_norm = clip_grad_norm_(model, grad_clip_norm)
 if NaN: drop the routers' counts, zero_grad, maybe stop, skip the update;
-        still run scheduler.step(), freeze stages / phases and the shutdown check
-optimizer.step() ; [MoE] model.balance_routers()
-scheduler.step() ; optimizer.zero_grad()
+        still run freeze stages / phases, scheduler.step() and the shutdown check
+optimizer.step() ; [MoE] model.balance_routers() ; optimizer.zero_grad()
+step += 1 ; freeze stages / phases due at step ; scheduler.step()
 
 tracker.end_step(step, loss, grad_norm, lr, tokens_in_step)
 hook_runner.on_step_end(StepContext(...))
@@ -84,8 +84,12 @@ initializes the collaborators:
   Both loaders are in
   [`kempnerforge.data`](https://github.com/KempnerInstitute/KempnerForge/tree/main/kempnerforge/data).
 - **Eval dataloader and `torch.profiler`** (optional).
-- **Phase schedule** (optional) — for curriculum training, rebalances
-  the mixture at `phase.start_step`.
+- **Phase schedule** (optional): for curriculum training, rebalances
+  the mixture and scales the LR from `phase.start_step`. The phases
+  active at the step the run starts at, step 0 included, apply here, as
+  does the freeze of that step. An optimizer whose state no checkpoint
+  restored then starts at its scheduler's last LR times the active
+  phase's `lr_scale`.
 
 ## Inside the loop: one step
 
@@ -182,9 +186,9 @@ if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
     optimizer.zero_grad()
     if nan_detector.rollback_recommended:
         break
-    _advance_lr_schedule(session)            # scheduler.step() + phase LR scaling
     step += 1
     _apply_step_transitions(session, step)   # freeze stages, then phases (section 9)
+    _advance_lr_schedule(session)            # scheduler.step() + phase LR scaling
     if _shutdown_if_requested(               # saves only finite weights (section 11)
         session, step, tokens_seen, saved_this_step=False, nan_skipped=True
     ):
@@ -193,10 +197,12 @@ if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
 
 optimizer.step()
 _route_balance(session, step_ran=True)       # sigmoid routers balance (MoE)
+optimizer.zero_grad()
+step += 1                                    # section 8
+_apply_step_transitions(session, step)       # freeze stages, then phases (section 9)
 scheduler.step()
 if phase_lr_scale != 1.0:
     for pg in optimizer.param_groups: pg["lr"] *= phase_lr_scale
-optimizer.zero_grad()
 ```
 
 `clip_grad_norm_` wraps PyTorch's utility so it works with FSDP2 sharded
@@ -210,15 +216,17 @@ After `max_consecutive` NaN steps in a row the detector sets
 checkpoint is manual (see
 [NaN detection](../resilience/nan-detection.md#rollback-recommendation)).
 
-A skipped step still counts as a step (section 8): it advances the LR
-schedule, applies the freeze stages and the phases (section 9) due at
-the new step, and runs the shutdown check (section 11), so all three
-stay on the step counter. It skips the update, the token count
+A skipped step still counts as a step (section 8): it applies the freeze
+stages and the phases (section 9) due at the new step, advances the LR
+schedule, and runs the shutdown check (section 11), so all three stay on
+the step counter. It skips the update, the token count
 (section 8), metrics and hooks (section 10), and the rest of the
 periodic work in section 11.
 
-Phase LR scaling applies *after* the scheduler — it multiplies the base
-LR that `scheduler.step()` just computed.
+Phase LR scaling applies *after* the scheduler: it multiplies the base
+LR that `scheduler.step()` just computed, with the `lr_scale` of the
+phase active at the new step, so the step that starts at a phase's
+`start_step` runs at its scale.
 
 ### 8 · Step accounting
 

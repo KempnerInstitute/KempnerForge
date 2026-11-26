@@ -83,9 +83,9 @@ if not nan_detector.check_loss(avg_loss, step, grad_norm=grad_norm):
     optimizer.zero_grad()
     if nan_detector.rollback_recommended:
         break
-    _advance_lr_schedule(session)
     step += 1
     _apply_step_transitions(session, step)
+    _advance_lr_schedule(session)
     if _shutdown_if_requested(
         session, step, tokens_seen, saved_this_step=False, nan_skipped=True
     ):
@@ -125,10 +125,12 @@ that. See
 ```python
 optimizer.step()
 _route_balance(session, step_ran=True)
+optimizer.zero_grad()
+step += 1
+_apply_step_transitions(session, step)   # freeze stages and data phases due at step
 scheduler.step()
 if phase_lr_scale != 1.0:
     for pg in optimizer.param_groups: pg["lr"] *= phase_lr_scale
-optimizer.zero_grad()
 ```
 
 With MoE, `_route_balance` applies the sigmoid routers' balancing right
@@ -142,7 +144,17 @@ LR that `scheduler.step()` just computed. This lets a curriculum phase
 (see [Data](../data/index.md)) halve the LR for a cooldown segment
 without rewriting the scheduler. Both lines live in
 `_advance_lr_schedule`, which a NaN-skipped step also runs, so the
-schedule stays on the step counter.
+schedule stays on the step counter. It runs after the transitions of
+the new step, so the step that starts at a phase's `start_step` runs at
+that phase's `lr_scale` as well as on its weights.
+
+Before the first step, an optimizer whose state no checkpoint restored
+(`CheckpointManager.restored_optimizer` is False), as in a fresh run,
+after a checkpoint saved before the first update, or after a
+`load_path` warm start that leaves the optimizer out, gets the LR its
+scheduler last set, restored with the checkpoint's schedule, times the
+active phase's `lr_scale`. An optimizer restored with its state keeps
+the LR it was saved at.
 
 ## Phase transitions
 

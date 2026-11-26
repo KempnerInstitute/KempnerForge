@@ -166,7 +166,9 @@ phases.
 
 At startup, the training loop walks the phase list and applies every
 phase whose `start_step <= current_step`, logging
-`"Resumed into phase K, lr_scale=S"`. The checkpoint itself tracks
+`"Starting step N in phase K, lr_scale=S"`. A fresh run does the same
+at step 0, so a phase with `start_step = 0` sets the weights and
+`lr_scale` of the first step. The checkpoint itself tracks
 the current phase index (stored in the `ckpt_extra` field), so a
 mid-phase resume lands on the correct weights without re-firing older
 phases.

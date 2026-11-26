@@ -77,6 +77,7 @@ class FakeCheckpointManager:
         self.checkpoint_registrar = None
         self.has_pending_save = False
         self.restored_extra: dict = {}
+        self.restored_optimizer = False
 
     def save(self, step, tokens_seen=0, scheduler=None, dataloader=None, extra=None) -> None:
         self.saves.append((step, tokens_seen, dict(extra or {})))
@@ -1111,7 +1112,7 @@ class TestNanSkippedStep:
         assert resets == [1]
 
     def test_a_phase_reached_by_a_skipped_step_scales_the_lr_from_the_same_update(self):
-        """The phase's ``lr_scale`` first applies to step 3's update, as in an all-finite run."""
+        """The phase's ``lr_scale`` first applies to step 2's update, as in an all-finite run."""
 
         def lr_at_each_step(nan_steps: set[int]) -> list[float]:
             lrs: list[float] = []
@@ -1130,7 +1131,7 @@ class TestNanSkippedStep:
             return lrs
 
         finite = lr_at_each_step(set())
-        assert finite == pytest.approx([0.05, 0.05, 0.05, 0.025])
+        assert finite == pytest.approx([0.05, 0.05, 0.025, 0.025])
         assert lr_at_each_step({1}) == finite
 
     def test_shutdown_is_acted_on_at_the_skipped_step(self):
@@ -4857,7 +4858,10 @@ class TestStageChangeWarmStart:
             exclude_from_loading=["optimizer"],
         )
         assert sorted(rates) == [11, 12]
-        assert rates[11] == {"train/lr": 0.0, "lr/adapter": 0.0}
+        assert rates[11] == {
+            "train/lr": pytest.approx(2e-4 * self._factor(10), rel=1e-6),
+            "lr/adapter": pytest.approx(1e-3 * self._factor(10), rel=1e-6),
+        }
         assert rates[12] == {
             "train/lr": pytest.approx(2e-4 * self._factor(11), rel=1e-6),
             "lr/adapter": pytest.approx(1e-3 * self._factor(11), rel=1e-6),
