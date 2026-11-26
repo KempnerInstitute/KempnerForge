@@ -211,7 +211,7 @@ def test_a_reset_before_the_first_pass_after_a_load_starts_it_as_the_run_does(wo
 
 
 def test_a_loaded_end_of_pass_reset_saved_again_before_its_first_pass_resumes_exactly():
-    """The draw a load replays for an emptied pass is in the CPU RNG a second save keeps."""
+    """A loaded end-of-pass reset keeps its position until ``iter()``, so a second save does."""
     torch.manual_seed(0)
     run = _stream(0)
     try:
