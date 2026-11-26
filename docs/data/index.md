@@ -16,7 +16,7 @@ or multi-source mixture.
 | `data.dataset_path = "..."` | `MemoryMappedDataset` | `DistributedSampler` | Pre-tokenized `.npy` / `.bin` shards. Fastest path. |
 | `data.hf_dataset_name = "..."` (+ `hf_streaming=false`) | `HuggingFaceDataset` | `DistributedSampler` | Eager download, tokenize once, pack into RAM. |
 | `data.hf_dataset_name = "..."` + `hf_streaming=true` | `StreamingHuggingFaceDataset` | (none — `IterableDataset`) | On-the-fly tokenization from a streaming Hub dataset. |
-| `data.datasets = [...]` (non-empty) | `MixtureDataset` over sub-datasets | `MixtureSampler` | Weighted mixing across multiple sources; phase transitions rebalance weights. |
+| `data.datasets = [...]` (non-empty) | `MixtureDataset` over sub-datasets | `MixtureSampler` | Weighted mixing across multiple sources on a text run (a VLM run refuses it); phase transitions rebalance weights. |
 
 All of the map-style datasets and samplers implement `state_dict()` /
 `load_state_dict()`. `StatefulDataLoader` wraps them and tracks the

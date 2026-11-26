@@ -41,7 +41,19 @@ name   = "books"
 
 Each source can be either a mmap directory (`path`) or a HuggingFace
 dataset (`hf_name`). `DataConfig.__post_init__` rejects a
-`DatasetSource` that has neither.
+`DatasetSource` that has neither. A source goes by its `name`, else its
+`path`, else its `hf_name`: its per-dataset metrics carry that name, and
+phase weights name the source by it. No two sources may go by one name,
+so `JobConfig.validate` refuses them, naming each shared name and its
+sources (see
+[Validation rules](../configuration/validation-rules.md#mixture-sources-that-share-a-name)).
+Two sources of one `hf_name`, under different `hf_config` values, need a
+`name` each.
+
+Only a text run builds the mixture. A VLM run reads its data from
+`data.hf_dataset_name` or `[video]`, so `JobConfig.validate` refuses
+`[[data.datasets]]` there (see
+[Validation rules](../configuration/validation-rules.md#a-mixture-on-a-vlm-run)).
 
 Every mmap source globs the same `data.file_pattern`, and each matched
 file is read by its own suffix, so one pattern can cover a `.bin` source
@@ -151,8 +163,11 @@ Constraints (enforced in `DataConfig.__post_init__`):
   `[[data.datasets]]`.
 
 `dataset_weights` and the annealing shortcut below need the
-`[[data.datasets]]` mixture; see
-[Phases without a mixture](#phases-without-a-mixture).
+`[[data.datasets]]` mixture (see
+[Phases without a mixture](#phases-without-a-mixture)), and each of
+their keys must name one of its sources: `JobConfig.validate` refuses a
+key that names none, listing the sources' names (see
+[Validation rules](../configuration/validation-rules.md#mixture-weights-for-unknown-sources)).
 
 ### Annealing shortcut
 
@@ -216,6 +231,7 @@ shortcut would be ignored, so `JobConfig.validate` refuses them on such
 a run, before the process group starts, with an error that names each
 field (see
 [Validation rules](../configuration/validation-rules.md#mixture-weights-without-a-mixture)).
+On a VLM run the same error also names any `[[data.datasets]]`.
 
 ### Resume into the right phase
 

@@ -48,7 +48,7 @@ Each `[[data.datasets]]` block is a
 
 | Field | Meaning |
 |-------|---------|
-| `name`   | Label for per-dataset metrics and phase overrides. Auto-filled from `path`/`hf_name` if empty. |
+| `name`   | Label for per-dataset metrics and the key of the source's phase weights, one per source. Auto-filled from `path`/`hf_name` if empty. |
 | `path`   | Pre-tokenized directory (use with `file_pattern`). |
 | `hf_name` | HuggingFace dataset ID (alternative to `path`). |
 | `hf_config` | HF dataset config (e.g. `"wikitext-103-raw-v1"`). |
@@ -56,7 +56,10 @@ Each `[[data.datasets]]` block is a
 | `token_dtype` | Dtype of the raw `.bin` shards under `path`, `"uint16"` or `"uint32"`. Empty uses `data.token_dtype`; either must agree with a `metadata.yaml` beside the shards (see [Memory-mapped dataset](../data/memory-mapped.md)). |
 
 At least one of `path` / `hf_name` must be set per source, enforced by
-`DataConfig.__post_init__`.
+`DataConfig.__post_init__`. `JobConfig.validate` refuses two sources that
+go by one name, since a phase would give them one weight and their
+metrics would share one label; two configs of one `hf_name` need a `name`
+each.
 
 When any `[[data.datasets]]` is present, `build_data_pipeline` builds a
 [`MixtureDataset`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/data/dataset.py)
@@ -130,7 +133,7 @@ A `[[data.phases]]` entry is a
 | Field | Meaning |
 |-------|---------|
 | `start_step`      | Step at which this phase activates (must be non-negative). |
-| `dataset_weights` | `{name: weight}`; any source not listed keeps its original weight. Needs `[[data.datasets]]`. |
+| `dataset_weights` | `{name: weight}`; each key is a source's name, and any source not listed keeps its original weight. Needs `[[data.datasets]]`. |
 | `lr_scale`        | Multiplier applied to *every* param group's LR once this phase fires, with or without a mixture. |
 
 Constraints (validated in `DataConfig.__post_init__`):
@@ -142,7 +145,9 @@ Constraints (validated in `DataConfig.__post_init__`):
 
 `JobConfig.validate` also refuses `dataset_weights`, and the annealing
 shortcut, on a run that builds no mixture (see
-[Phases without a mixture](#phases-without-a-mixture)).
+[Phases without a mixture](#phases-without-a-mixture)), and a key that
+names no source, listing the sources' names, so a misspelled name stops
+the run at startup instead of leaving that source at its declared weight.
 
 ### What happens on a phase transition
 
@@ -185,8 +190,10 @@ lr_scale   = 0.3
 
 A phase's `dataset_weights` and the annealing shortcut would have
 nothing to reweight there, so `JobConfig.validate` refuses them before
-the process group starts, naming each field. List the sources as
-`[[data.datasets]]` to anneal the mix.
+the process group starts, naming each field. On a text run, list the
+sources as `[[data.datasets]]` to anneal the mix. A VLM run reads its data
+from `data.hf_dataset_name` or `[video]` and refuses `[[data.datasets]]`
+too.
 
 ### Resume behavior
 
@@ -199,10 +206,10 @@ the current phase index (stored in the `ckpt_extra` field), so a
 mid-phase resume lands on the correct weights without re-firing older
 phases.
 
-`mixture_dataset.dataset_names` is the key into `phase.dataset_weights`
-— keep `name` stable across checkpoint / resume or you'll silently
-revert to the original declared weights for any name that no longer
-matches.
+`mixture_dataset.dataset_names` is the key into `phase.dataset_weights`.
+When a source's `name` changes between runs, change the phase keys with
+it: `JobConfig.validate` refuses a key that names no source, so a resume
+with a stale key stops at startup.
 
 ## Annealing shortcut
 
@@ -250,8 +257,6 @@ sum(data/code/tokens)  ≈ (code_prob) × sum over names of sum(data/{name}/toke
 If the shares are off by much more than one batch's worth of tokens,
 double-check:
 
-- `name` values in `[[data.datasets]]` vs any `phase.dataset_weights`
-  overrides (case-sensitive, exact match).
 - That phase `start_step` values haven't already fired before step
   100 (phase transitions change what you're measuring).
 - That `mix_temperature` is what you intended — a temperature other

@@ -307,16 +307,48 @@ class JobConfig:
             )
 
         weighted = self.data.mixture_weight_fields()
-        if weighted and (self.is_vlm or not self.data.datasets):
-            if self.is_vlm:
-                reason, remedy = "a VLM run never builds one", "Remove the weights"
-            else:
-                reason = "this run has none (data.datasets is empty)"
-                remedy = "List the sources as [[data.datasets]] tables or remove the weights"
+        if self.is_vlm:
+            unread = (["data.datasets"] if self.data.datasets else []) + weighted
+            if unread:
+                source = (
+                    "[video]"
+                    if self.is_video
+                    else "data.hf_dataset_name and the other data.hf_* fields"
+                )
+                lr_scale = "; a data phase's lr_scale applies without a mixture" if weighted else ""
+                raise ValueError(
+                    "A VLM run never builds a [[data.datasets]] mixture (it reads its data from "
+                    f"{source}), so these [data] fields would be ignored: {', '.join(unread)}. "
+                    f"Remove them{lr_scale}."
+                )
+        elif weighted and not self.data.datasets:
             raise ValueError(
-                f"{', '.join(weighted)} would reweight a [[data.datasets]] mixture, but "
-                f"{reason}, so the weights would be ignored. {remedy}; a data phase's "
+                f"{', '.join(weighted)} would reweight a [[data.datasets]] mixture, but this run "
+                "has none (data.datasets is empty), so the weights would be ignored. List the "
+                "sources as [[data.datasets]] tables or remove the weights; a data phase's "
                 "lr_scale applies without a mixture."
+            )
+        shared = [
+            " and ".join(f"data.datasets[{i}]" for i in indices) + f" share the name {name!r}"
+            for name, indices in self.data.duplicate_mixture_names().items()
+        ]
+        if shared:
+            raise ValueError(
+                f"{', '.join(shared)}; the mixture knows each [[data.datasets]] source by its "
+                "name (a source without a name goes by its path or hf_name), so these sources "
+                "would take one weight once a data phase starts, and their per-source metrics "
+                "would share one name. Give each source its own name."
+            )
+        unknown = self.data.unknown_mixture_weight_keys()
+        if unknown:
+            named = ", ".join(
+                f"{field} names unknown sources {keys}" for field, keys in unknown.items()
+            )
+            sources = [source.mixture_name for source in self.data.datasets]
+            raise ValueError(
+                f"{named}; the [[data.datasets]] sources are {sources} (a source without a name "
+                "goes by its path or hf_name), and a weight for an unknown source would be "
+                "ignored."
             )
 
         if self.train.fp32_master_weights and self.model.is_moe:

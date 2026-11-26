@@ -2,17 +2,29 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import numpy as np
 import pytest
+import torch
 
 from kempnerforge.config.loader import load_config
 from kempnerforge.config.schema import (
     DataConfig,
     DatasetSource,
     JobConfig,
+    ModelConfig,
     TrainConfig,
     TrainingPhase,
 )
 from kempnerforge.data.sampler import MixtureSampler
+from kempnerforge.training.data_pipeline import (
+    DataPipeline,
+    advance_phases,
+    build_data_pipeline,
+    build_phase_state,
+)
+from kempnerforge.training.runtime import RuntimeContext
 
 
 class TestTrainingPhase:
@@ -473,9 +485,19 @@ class TestMixtureWeightsNeedAMixture:
             phases=[TrainingPhase(start_step=5, dataset_weights={"a": 2.0})],
         )
         refusal = (
-            r"^data\.phases\[0\]\.dataset_weights would reweight a \[\[data\.datasets\]\] "
-            r"mixture, but a VLM run never builds one, so the weights would be ignored\. Remove "
-            r"the weights; a data phase's lr_scale applies without a mixture\.$"
+            r"^A VLM run never builds a \[\[data\.datasets\]\] mixture \(it reads its data from "
+            r"data\.hf_dataset_name and the other data\.hf_\* fields\), so these \[data\] fields "
+            r"would be ignored: data\.datasets, data\.phases\[0\]\.dataset_weights\. Remove them; "
+            r"a data phase's lr_scale applies without a mixture\.$"
+        )
+        with pytest.raises(ValueError, match=refusal):
+            self._vlm(tiny_vlm_configs, data).validate(world_size=1)
+
+    def test_a_vlm_run_refuses_the_annealing_shortcut(self, tiny_vlm_configs):
+        data = DataConfig(anneal_start_step=7, anneal_weights={"a": 2.0})
+        refusal = (
+            r"would be ignored: data\.anneal_start_step and data\.anneal_weights\. Remove them; "
+            r"a data phase's lr_scale applies without a mixture\.$"
         )
         with pytest.raises(ValueError, match=refusal):
             self._vlm(tiny_vlm_configs, data).validate(world_size=1)
@@ -523,3 +545,332 @@ class TestMixtureWeightsNeedAMixture:
         load_config(str(toml), cli_args=[sources]).validate(world_size=1)
         with pytest.raises(ValueError, match=r"^data\.phases\[0\]\.dataset_weights would"):
             load_config(str(toml), cli_args=[]).validate(world_size=1)
+
+
+def _cpu_runtime() -> RuntimeContext:
+    return RuntimeContext(
+        rank=0, local_rank=0, world_size=1, device=torch.device("cpu"), device_mesh=None
+    )
+
+
+def _share(data: DataPipeline, source: int) -> float:
+    """The share of one pass of the mixture sampler's draws that come from source ``source``."""
+    assert data.mixture_dataset is not None and data.mixture_sampler is not None
+    drawn = list(data.mixture_sampler)
+    first, end = data.mixture_dataset.cumulative_sizes[source : source + 2]
+    return sum(first <= index < end for index in drawn) / len(drawn)
+
+
+def _share_after_the_phase(config: JobConfig, data: DataPipeline, source: int) -> float:
+    """The share of the draws from source ``source`` once the step-1 phase is active."""
+    state = build_phase_state(config, data, step=0)
+    advance_phases(state, data, step=1)
+    return _share(data, source)
+
+
+def _text_mixture(sources: list[DatasetSource], **schedule) -> JobConfig:
+    """A tiny text run over ``sources``, each a directory of 500 tokens written here."""
+    for source in sources:
+        Path(source.path).mkdir(parents=True, exist_ok=True)
+        np.save(Path(source.path, "tokens.npy"), np.arange(500, dtype=np.uint16) % 16)
+    return JobConfig(
+        model=ModelConfig(dim=8, n_layers=1, n_heads=1, vocab_size=16, max_seq_len=64),
+        train=TrainConfig(batch_size=2, seq_len=4, max_steps=4, compile_model=False),
+        data=DataConfig(num_workers=0, pin_memory=False, datasets=sources, **schedule),
+    )
+
+
+class TestMixtureWeightsNameSources:
+    """``JobConfig.validate`` refuses a phase's ``dataset_weights`` key, or an ``anneal_weights``
+    key, that names no ``[[data.datasets]]`` source, naming each field with its unknown keys and
+    listing the sources. A source goes by its ``name``, else its ``path``, else its ``hf_name``
+    (``DatasetSource.mixture_name``), the name the mixture builder gives it."""
+
+    def test_the_issue_reproduction(self, tmp_path):
+        """Two sources of one size at equal weights, and a phase at step 1 that sets ``code`` to
+        9.0: spelled right, the config validates and ``code`` takes 0.90 of the draws after the
+        phase; misspelled ``cod``, in a phase or in the annealing shortcut, it is refused."""
+        sources = [DatasetSource(name=name, path=str(tmp_path / name)) for name in ("web", "code")]
+        right = [TrainingPhase(start_step=1, dataset_weights={"code": 9.0})]
+        config = _text_mixture(sources, phases=right)
+        config.validate(world_size=1)
+        data = build_data_pipeline(config, _cpu_runtime())
+        assert _share_after_the_phase(config, data, 1) == pytest.approx(0.9, abs=0.01)
+
+        misspelled = [
+            (
+                {"phases": [TrainingPhase(start_step=1, dataset_weights={"cod": 9.0})]},
+                r"data\.phases\[0\]\.dataset_weights",
+            ),
+            ({"anneal_start_step": 1, "anneal_weights": {"cod": 9.0}}, r"data\.anneal_weights"),
+        ]
+        for schedule, field in misspelled:
+            refusal = (
+                rf"^{field} names unknown sources \['cod'\]; the \[\[data\.datasets\]\] sources "
+                r"are \['web', 'code'\] \(a source without a name goes by its path or hf_name\), "
+                r"and a weight for an unknown source would be ignored\.$"
+            )
+            with pytest.raises(ValueError, match=refusal):
+                _text_mixture(sources, **schedule).validate(world_size=1)
+
+    def test_each_field_is_named_with_its_unknown_keys(self):
+        sources = [DatasetSource(name="web", path="/data/web"), DatasetSource(path="/data/code")]
+        phases = [
+            TrainingPhase(start_step=1, dataset_weights={"web": 1.0, "wbe": 2.0, "code": 1.0}),
+            TrainingPhase(start_step=2, dataset_weights={"/data/code": 3.0}),
+            TrainingPhase(start_step=3, dataset_weights={"/data/web": 1.0}),
+        ]
+        refusal = (
+            r"^data\.phases\[0\]\.dataset_weights names unknown sources \['code', 'wbe'\], "
+            r"data\.phases\[2\]\.dataset_weights names unknown sources \['/data/web'\]; the "
+            r"\[\[data\.datasets\]\] sources are \['web', '/data/code'\] "
+        )
+        with pytest.raises(ValueError, match=refusal):
+            JobConfig(data=DataConfig(datasets=sources, phases=phases)).validate(world_size=1)
+
+    def test_a_key_names_the_source_the_phase_reweights(self, tmp_path):
+        """The builder names each source as ``validate`` does: a source without a ``name`` goes
+        by its ``path``, and a phase keyed by that path takes that source's share."""
+        sources = [
+            DatasetSource(name="web", path=str(tmp_path / "web")),
+            DatasetSource(path=str(tmp_path / "code")),
+        ]
+        phases = [TrainingPhase(start_step=1, dataset_weights={str(tmp_path / "code"): 9.0})]
+        config = _text_mixture(sources, phases=phases)
+        config.validate(world_size=1)
+        data = build_data_pipeline(config, _cpu_runtime())
+        assert data.mixture_dataset is not None
+        assert data.mixture_dataset.dataset_names == [s.mixture_name for s in sources]
+        assert _share_after_the_phase(config, data, 1) == pytest.approx(0.9, abs=0.01)
+
+    def test_a_source_goes_by_its_name_else_its_path_else_its_hf_name(self):
+        assert DatasetSource(name="web", path="/data/web").mixture_name == "web"
+        assert DatasetSource(path="/data/web", hf_name="org/web").mixture_name == "/data/web"
+        assert DatasetSource(hf_name="org/web").mixture_name == "org/web"
+
+    def test_the_unknown_keys_of_each_setting_that_reweights_the_mixture(self):
+        """The settings ``mixture_weight_fields`` lists: each phase's ``dataset_weights``, and
+        ``anneal_weights`` when ``anneal_start_step`` makes it a phase."""
+        sources = [DatasetSource(name="web", path="/data/web"), DatasetSource(hf_name="org/code")]
+        phases = [
+            TrainingPhase(start_step=1, dataset_weights={"web": 1.0, "cod": 2.0, "/data/web": 1.0}),
+            TrainingPhase(start_step=2, dataset_weights={"org/code": 1.0}),
+            TrainingPhase(start_step=3, lr_scale=0.5),
+        ]
+        weighted = DataConfig(datasets=sources, phases=phases)
+        assert weighted.unknown_mixture_weight_keys() == {
+            "data.phases[0].dataset_weights": ["/data/web", "cod"]
+        }
+        shortcut = DataConfig(datasets=sources, anneal_start_step=7, anneal_weights={"code": 2.0})
+        assert shortcut.unknown_mixture_weight_keys() == {"data.anneal_weights": ["code"]}
+        assert DataConfig(datasets=sources).unknown_mixture_weight_keys() == {}
+
+    def test_the_sources_and_the_weights_may_come_from_the_command_line(self, tmp_path):
+        """The check reads the config after the overrides: TOML phase weights against sources
+        given on the command line, and command-line anneal weights against TOML sources."""
+        phases = tmp_path / "phases.toml"
+        phases.write_text("[[data.phases]]\nstart_step = 5\ndataset_weights = { web = 2.0 }\n")
+        named = "--data.datasets=[{'path': '/data/web', 'name': 'web'}]"
+        load_config(str(phases), cli_args=[named]).validate(world_size=1)
+        renamed = "--data.datasets=[{'path': '/data/web', 'name': 'webtext'}]"
+        refusal = (
+            r"^data\.phases\[0\]\.dataset_weights names unknown sources \['web'\]; the "
+            r"\[\[data\.datasets\]\] sources are \['webtext'\] "
+        )
+        with pytest.raises(ValueError, match=refusal):
+            load_config(str(phases), cli_args=[renamed]).validate(world_size=1)
+
+        sources = tmp_path / "sources.toml"
+        sources.write_text('[[data.datasets]]\nname = "web"\npath = "/data/web"\n')
+        anneal = ["--data.anneal_start_step=5", '--data.anneal_weights={"wbe": 2.0}']
+        refusal = r"^data\.anneal_weights names unknown sources \['wbe'\]; the .* \['web'\] "
+        with pytest.raises(ValueError, match=refusal):
+            load_config(str(sources), cli_args=anneal).validate(world_size=1)
+
+
+class TestMixtureSourcesHaveDistinctNames:
+    """``JobConfig.validate`` refuses ``[[data.datasets]]`` sources that go by one
+    ``DatasetSource.mixture_name``, naming each shared name with the sources that go by it. The
+    mixture keeps one declared weight per name, so once a data phase starts the sources that
+    share a name would take one weight, and their per-source metrics would share one name."""
+
+    REASON = (
+        r"; the mixture knows each \[\[data\.datasets\]\] source by its name \(a source without "
+        r"a name goes by its path or hf_name\), so these sources would take one weight once a "
+        r"data phase starts, and their per-source metrics would share one name\. Give each "
+        r"source its own name\.$"
+    )
+
+    def test_the_issue_reproduction(self, tmp_path):
+        """Two sources of one size, both named ``web``, at weights 1.0 and 3.0, and a phase at
+        step 1 that sets only ``lr_scale``: the config validated, and the weight-3.0 source's
+        share of the draws fell from 0.75 to 0.50 when the phase fired. It is refused, naming
+        both sources; with a name each, that source keeps 0.75 across the phase."""
+        paths = [str(tmp_path / "a"), str(tmp_path / "b")]
+        phases = [TrainingPhase(start_step=1, lr_scale=0.5)]
+        twins = [
+            DatasetSource(name="web", path=paths[0], weight=1.0),
+            DatasetSource(name="web", path=paths[1], weight=3.0),
+        ]
+        shared = r"^data\.datasets\[0\] and data\.datasets\[1\] share the name 'web'"
+        with pytest.raises(ValueError, match=shared + self.REASON):
+            _text_mixture(twins, phases=phases).validate(world_size=1)
+
+        apart = [twins[0], DatasetSource(name="code", path=paths[1], weight=3.0)]
+        config = _text_mixture(apart, phases=phases)
+        config.validate(world_size=1)
+        data = build_data_pipeline(config, _cpu_runtime())
+        state = build_phase_state(config, data, step=0)
+        assert _share(data, 1) == pytest.approx(0.75, abs=0.01)
+        advance_phases(state, data, step=1)
+        assert _share(data, 1) == pytest.approx(0.75, abs=0.01)
+
+    def test_unnamed_sources_go_by_their_path_or_hf_name(self):
+        """Two configs of one HF dataset share its ``hf_name``, and one directory listed twice
+        shares its ``path``. Each shared name is given once with every source that goes by it,
+        and a mixture without phases is refused too."""
+        configs = [DatasetSource(hf_name="org/corpus", hf_config=c) for c in ("en", "de")]
+        shared = r"^data\.datasets\[0\] and data\.datasets\[1\] share the name 'org/corpus'"
+        with pytest.raises(ValueError, match=shared + self.REASON):
+            JobConfig(data=DataConfig(datasets=configs)).validate(world_size=1)
+
+        sources = [
+            DatasetSource(name="web", path="/data/web"),
+            DatasetSource(path="/data/code"),
+            DatasetSource(name="web", path="/data/web-2"),
+            DatasetSource(path="/data/code", weight=2.0),
+            DatasetSource(name="web", hf_name="org/web"),
+            DatasetSource(name="books", path="/data/books"),
+        ]
+        shared = (
+            r"^data\.datasets\[0\] and data\.datasets\[2\] and data\.datasets\[4\] share the "
+            r"name 'web', data\.datasets\[1\] and data\.datasets\[3\] share the name '/data/code'"
+        )
+        with pytest.raises(ValueError, match=shared + self.REASON):
+            JobConfig(data=DataConfig(datasets=sources)).validate(world_size=1)
+
+    def test_the_names_two_or_more_sources_go_by(self):
+        """Each maps to the indices of its sources, in order. A ``name`` one source sets and a
+        ``path`` another goes by are one name."""
+        sources = [
+            DatasetSource(name="web", path="/data/web"),
+            DatasetSource(path="/data/code"),
+            DatasetSource(name="web", path="/data/web-2"),
+            DatasetSource(name="/data/code", hf_name="org/code"),
+            DatasetSource(name="books", path="/data/books"),
+        ]
+        assert DataConfig(datasets=sources).duplicate_mixture_names() == {
+            "web": [0, 2],
+            "/data/code": [1, 3],
+        }
+        assert DataConfig(datasets=sources[:2] + sources[4:]).duplicate_mixture_names() == {}
+        assert DataConfig().duplicate_mixture_names() == {}
+
+    def test_the_sources_may_come_from_the_command_line(self, tmp_path):
+        """The check reads the config after the overrides: TOML sources that share a name are
+        refused and pass once the command line renames one, and command-line sources that share
+        a name are refused."""
+        toml = tmp_path / "twins.toml"
+        toml.write_text(
+            '[[data.datasets]]\nname = "web"\npath = "/data/a"\n\n'
+            '[[data.datasets]]\nname = "web"\npath = "/data/b"\n'
+        )
+        shared = r"^data\.datasets\[0\] and data\.datasets\[1\] share the name 'web'"
+        with pytest.raises(ValueError, match=shared + self.REASON):
+            load_config(str(toml), cli_args=[]).validate(world_size=1)
+        renamed = (
+            "--data.datasets=[{'path': '/data/a', 'name': 'web'}, "
+            "{'path': '/data/b', 'name': 'code'}]"
+        )
+        load_config(str(toml), cli_args=[renamed]).validate(world_size=1)
+        twins = "--data.datasets=[{'path': '/data/a'}, {'path': '/data/a', 'weight': 2.0}]"
+        shared = r"^data\.datasets\[0\] and data\.datasets\[1\] share the name '/data/a'"
+        with pytest.raises(ValueError, match=shared + self.REASON):
+            load_config(str(toml), cli_args=[twins]).validate(world_size=1)
+
+
+class TestVlmRunsBuildNoMixture:
+    """A VLM run reads its data from ``data.hf_dataset_name`` and the other ``data.hf_*`` fields,
+    or from ``[video]``, and never builds a ``[[data.datasets]]`` mixture, so ``JobConfig.validate``
+    refuses ``[[data.datasets]]`` there, in one error with any mixture weights (see
+    ``TestMixtureWeightsNeedAMixture``) that names each field and where the run reads its data."""
+
+    @staticmethod
+    def _vlm(tiny_vlm_configs, data: DataConfig) -> JobConfig:
+        model, vision, adapter, vlm = tiny_vlm_configs
+        return JobConfig(
+            model=model,
+            train=TrainConfig(batch_size=1, seq_len=64, max_steps=2, compile_model=False),
+            data=data,
+            vision_encoder=vision,
+            adapter=adapter,
+            vlm=vlm,
+        )
+
+    IMAGE_REFUSAL = (
+        r"^A VLM run never builds a \[\[data\.datasets\]\] mixture \(it reads its data from "
+        r"data\.hf_dataset_name and the other data\.hf_\* fields\), so these \[data\] fields "
+        r"would be ignored: data\.datasets\. Remove them\.$"
+    )
+
+    def test_the_issue_reproduction(self, tiny_vlm_configs):
+        """One ``[[data.datasets]]`` text source beside an image-text ``data.hf_dataset_name``,
+        then the same config without ``data.hf_dataset_name``: both validated, and the run
+        trained on the image-text dataset alone or failed naming only ``data.hf_dataset_name``;
+        both are refused, naming ``data.datasets``."""
+        data = DataConfig(
+            num_workers=0,
+            pin_memory=False,
+            datasets=[DatasetSource(name="text", path="/data/text")],
+            hf_dataset_name="/data/captions",
+            tokenizer_path="/data/tokenizer",
+        )
+        config = self._vlm(tiny_vlm_configs, data)
+        with pytest.raises(ValueError, match=self.IMAGE_REFUSAL):
+            config.validate(world_size=1)
+        config.data.hf_dataset_name = None
+        with pytest.raises(ValueError, match=self.IMAGE_REFUSAL):
+            config.validate(world_size=1)
+
+    def test_lr_scale_phases_leave_the_sources_refused(self, tiny_vlm_configs):
+        data = DataConfig(
+            datasets=[DatasetSource(path="/data/text")],
+            phases=[TrainingPhase(start_step=5, lr_scale=0.5)],
+        )
+        with pytest.raises(ValueError, match=self.IMAGE_REFUSAL):
+            self._vlm(tiny_vlm_configs, data).validate(world_size=1)
+
+    def test_a_video_run_reads_its_data_from_its_video_section(self, tiny_video_configs):
+        model, vision, adapter, vlm, video = tiny_video_configs
+        config = JobConfig(
+            model=model,
+            train=TrainConfig(batch_size=1, seq_len=64),
+            data=DataConfig(datasets=[DatasetSource(path="/data/text")]),
+            vision_encoder=vision,
+            adapter=adapter,
+            vlm=vlm,
+            video=video,
+        )
+        refusal = (
+            r"^A VLM run never builds a \[\[data\.datasets\]\] mixture \(it reads its data from "
+            r"\[video\]\), so these \[data\] fields would be ignored: data\.datasets\. Remove "
+            r"them\.$"
+        )
+        with pytest.raises(ValueError, match=refusal):
+            config.validate(world_size=1)
+
+    def test_the_sources_may_come_from_the_command_line(self, tmp_path):
+        """The check reads the config after the overrides: a VLM TOML validates alone and is
+        refused with sources given on the command line."""
+        toml = tmp_path / "vlm.toml"
+        toml.write_text(
+            "[model]\ndim = 64\nn_layers = 2\nn_heads = 4\nn_kv_heads = 4\nvocab_size = 256\n"
+            "max_seq_len = 64\n"
+            "[train]\nbatch_size = 1\nseq_len = 64\n"
+            '[vision_encoder]\ntype = "random"\nfeature_dim = 96\nnum_tokens = 8\n'
+            "[vlm]\nmax_text_len = 32\n"
+        )
+        load_config(str(toml), cli_args=[]).validate(world_size=1)
+        sources = "--data.datasets=[{'path': '/data/text', 'name': 'text'}]"
+        with pytest.raises(ValueError, match=self.IMAGE_REFUSAL):
+            load_config(str(toml), cli_args=[sources]).validate(world_size=1)

@@ -135,8 +135,14 @@ File:
 - `anneal_start_step ≥ 0`.
 - `phases` and `anneal_start_step > 0` are mutually exclusive.
 
-Weights for a mixture the run does not build are refused by
-[`JobConfig.validate`](#mixture-weights-without-a-mixture).
+`JobConfig.validate` refuses `datasets` and mixture weights on a VLM run
+([A mixture on a VLM run](#a-mixture-on-a-vlm-run)), weights for a mixture
+the run does not build
+([Mixture weights without a mixture](#mixture-weights-without-a-mixture)),
+sources that go by one name
+([Mixture sources that share a name](#mixture-sources-that-share-a-name)),
+and a weight for a source the mixture does not have
+([Mixture weights for unknown sources](#mixture-weights-for-unknown-sources)).
 
 `DatasetSource`:
 
@@ -347,22 +353,68 @@ eval.enabled && distributed.pp > 1 && eval.steps % train.grad_accum_steps != 0  
 Eval runs its batches through the training schedule, `grad_accum_steps` at a
 time, so each eval microbatch has the shape the stages were built for.
 
+### A mixture on a VLM run
+
+```
+vlm set && (data.datasets is nonempty
+            || some data.phases[i].dataset_weights is nonempty
+            || data.anneal_start_step > 0 && data.anneal_weights is nonempty)  →  ValueError
+```
+
+A VLM run reads its data from `data.hf_dataset_name` and the other
+`data.hf_*` fields, or from `[video]`, and never builds a `[[data.datasets]]`
+mixture, so its sources and any weights for them would be dropped silently.
+One error names each such field and where the run reads its data from, and
+asks for their removal. A phase's `lr_scale` needs no mixture: it scales the
+LR on a VLM run too.
+
 ### Mixture weights without a mixture
 
 ```
-(some data.phases[i].dataset_weights is nonempty
- || data.anneal_start_step > 0 && data.anneal_weights is nonempty)
-&& (vlm set || data.datasets is empty)  →  ValueError
+vlm unset && data.datasets is empty
+&& (some data.phases[i].dataset_weights is nonempty
+    || data.anneal_start_step > 0 && data.anneal_weights is nonempty)  →  ValueError
 ```
 
 Only a text run with `[[data.datasets]]` builds a mixture; a run on
-`data.dataset_path` or `data.hf_dataset_name` and every VLM run build none, so
-weights for one would be dropped silently. The error names each field and asks
-for the sources as `[[data.datasets]]` tables (not offered on a VLM run) or the
-weights' removal. A phase's `lr_scale` needs no mixture: it scales the LR on
-any run. The check runs here, on the config after the CLI overrides, so a TOML
-can leave the sources to `--data.datasets`. `DataConfig.mixture_weight_fields`
-lists the fields.
+`data.dataset_path` or `data.hf_dataset_name` builds none, so weights for one
+would be dropped silently. The error names each field and asks for the
+sources as `[[data.datasets]]` tables or the weights' removal. A phase's
+`lr_scale` needs no mixture: it scales the LR on any run.
+`DataConfig.mixture_weight_fields` lists the fields.
+
+### Mixture sources that share a name
+
+```
+two data.datasets sources have one DatasetSource.mixture_name  →  ValueError
+```
+
+The mixture names each source by its `name`, else its `path`, else its
+`hf_name`, and keeps one declared weight per name. Once a data phase or the
+annealing shortcut starts, the sources that share a name would take one
+weight, the one a phase key with that name sets, else the last such source's
+declared weight, and their `loss/{name}` and `data/{name}/tokens` metrics
+would share one name. Two unnamed sources share a name when they list one
+`path`, or one `hf_name` with different `hf_config` values. The error gives
+each shared name with the sources that go by it, by their index in
+`data.datasets`. `DataConfig.duplicate_mixture_names` finds them.
+
+### Mixture weights for unknown sources
+
+```
+a key of some data.phases[i].dataset_weights, or of data.anneal_weights when
+data.anneal_start_step > 0, is no source's DatasetSource.mixture_name  →  ValueError
+```
+
+The mixture names each source by its `name`, else its `path`, else its
+`hf_name`, and a phase reweights a source only through a key equal to that
+name, so a key that matches none would be ignored and the source would keep
+its declared weight. The error names each field with its unknown keys and
+lists the sources' names. `DataConfig.unknown_mixture_weight_keys` finds them.
+
+These four checks run here, on the config after the CLI overrides, so a
+TOML can leave the sources to `--data.datasets` or the weights to
+`--data.anneal_weights`.
 
 ### VLM architectures under tensor parallelism
 
