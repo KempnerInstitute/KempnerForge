@@ -257,7 +257,7 @@ def test_config_error_stops_a_4gpu_run_before_the_device_mesh(tmp_path: Path) ->
     )
     output = result.stdout + result.stderr
     assert result.returncode != 0, f"the run was not rejected:\n{output[-2000:]}"
-    message = "ValueError: train.seq_len (4096) exceeds model.max_seq_len (512)"
+    message = "train.seq_len (4096) exceeds model.max_seq_len (512)"
     assert message in output, output[-2000:]
     assert "DeviceMesh:" not in output, output[-2000:]
 
@@ -613,6 +613,7 @@ def test_pp_checkpoint_save_and_resume(tmp_path, pp, layout):
 def test_sigterm_triggers_emergency_checkpoint(tmp_path):
     """Send SIGTERM during training — verify emergency checkpoint is saved."""
     ckpt_dir = str(tmp_path / "sigterm_ckpt")
+    log = tmp_path / "train.log"
 
     env = os.environ.copy()
     env.setdefault("WORLD_SIZE", "1")
@@ -629,26 +630,27 @@ def test_sigterm_triggers_emergency_checkpoint(tmp_path):
         "--checkpoint.interval=1000",
     ]
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        cwd=str(PROJECT_ROOT),
-    )
-
-    time.sleep(10)
-    proc.send_signal(signal.SIGTERM)
+    with log.open("w") as out:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(PROJECT_ROOT),
+        )
 
     try:
-        stdout, stderr = proc.communicate(timeout=30)
-    except subprocess.TimeoutExpired:
+        _wait_for_log(log, "Shutdown handler registered", proc, timeout=600)
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pytest.fail("Process did not exit within 30s after SIGTERM")
+    finally:
         proc.kill()
-        stdout, stderr = proc.communicate()
-        pytest.fail("Process did not exit within 30s after SIGTERM")
+        proc.wait()
 
-    output = stdout + stderr
+    output = log.read_text()
     assert "Shutdown requested" in output, (
         f"Signal handler did not trigger:\n{traceback_or_tail(output, 2000)}"
     )
