@@ -2027,7 +2027,7 @@
       },
       "tests/unit/test_mixing.py": {
         "classes": [
-          "TestDatasetSource(5)",
+          "TestDatasetSource(7)",
           "TestDataConfigMixing(4)",
           "TestMixingTomlLoading(3)",
           "TestMixtureDataset(10)",
@@ -2036,7 +2036,7 @@
           "TestMixtureSamplerWithDataset(2)",
           "TestMixtureSamplerZeroWeights(8)"
         ],
-        "count": 48
+        "count": 50
       },
       "tests/unit/test_annealing.py": {
         "classes": [
