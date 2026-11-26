@@ -34,7 +34,8 @@ lr_scale        = 0.5
   `hf_dataset_name`).
 - **`mix_temperature`** rescales declared weights before sampling.
 - **`[[data.phases]]`** swaps weights (and scales LR) at specific
-  steps during training.
+  steps during training. The LR scaling also works without a mixture;
+  see [Phases without a mixture](#phases-without-a-mixture).
 
 A fourth control, `anneal_start_step` / `anneal_weights`, is sugar for
 the common "change the mix once, late in training" pattern — see
@@ -129,8 +130,8 @@ A `[[data.phases]]` entry is a
 | Field | Meaning |
 |-------|---------|
 | `start_step`      | Step at which this phase activates (must be non-negative). |
-| `dataset_weights` | `{name: weight}` — any source not listed keeps its original weight. |
-| `lr_scale`        | Multiplier applied to *every* param group's LR once this phase fires. |
+| `dataset_weights` | `{name: weight}`; any source not listed keeps its original weight. Needs `[[data.datasets]]`. |
+| `lr_scale`        | Multiplier applied to *every* param group's LR once this phase fires, with or without a mixture. |
 
 Constraints (validated in `DataConfig.__post_init__`):
 
@@ -139,6 +140,10 @@ Constraints (validated in `DataConfig.__post_init__`):
   below — not both.
 - All `dataset_weights` values must be non-negative; `lr_scale > 0`.
 
+`JobConfig.validate` also refuses `dataset_weights`, and the annealing
+shortcut, on a run that builds no mixture (see
+[Phases without a mixture](#phases-without-a-mixture)).
+
 ### What happens on a phase transition
 
 On the first training step where `step >= phase.start_step`, the loop
@@ -146,10 +151,10 @@ in
 [`training/data_pipeline.py`](https://github.com/KempnerInstitute/KempnerForge/blob/main/kempnerforge/training/data_pipeline.py)
 does two things:
 
-1. Builds a new `weights` list by overriding the original declared
-   weights with `phase.dataset_weights` entries where specified, then
-   calls `sampler.update_weights(new_weights, temperature=config.data.mix_temperature)`
-   — the next `__iter__()` call on the sampler uses the new mix.
+1. On a mixture, builds a new `weights` list by overriding the original
+   declared weights with `phase.dataset_weights` entries where specified,
+   then calls `sampler.update_weights(new_weights, temperature=config.data.mix_temperature)`,
+   and the next `__iter__()` call on the sampler uses the new mix.
 2. Sets `phase_lr_scale = phase.lr_scale`. From this step forward,
    the training loop multiplies every parameter group's LR by
    `phase_lr_scale` after the scheduler has computed the base LR. The
@@ -161,6 +166,27 @@ cosine decay, a phase with `lr_scale = 0.5` means the optimizer sees
 `1.5e-4 → 1.5e-5` while that phase is active. Later phases overwrite
 `phase_lr_scale` with their own value; there's no compounding across
 phases.
+
+### Phases without a mixture
+
+A run on one source (`dataset_path` or `hf_dataset_name`) and every VLM
+run build no mixture, so a phase there only scales the LR, from its
+`start_step` and across a resume as on a mixture run. The data iterator
+is left alone:
+
+```toml
+[data]
+dataset_path = "/data/tokenized/web"
+
+[[data.phases]]
+start_step = 40_000
+lr_scale   = 0.3
+```
+
+A phase's `dataset_weights` and the annealing shortcut would have
+nothing to reweight there, so `JobConfig.validate` refuses them before
+the process group starts, naming each field. List the sources as
+`[[data.datasets]]` to anneal the mix.
 
 ### Resume behavior
 

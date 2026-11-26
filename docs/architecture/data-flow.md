@@ -85,7 +85,8 @@ initializes the collaborators:
   [`kempnerforge.data`](https://github.com/KempnerInstitute/KempnerForge/tree/main/kempnerforge/data).
 - **Eval dataloader and `torch.profiler`** (optional).
 - **Phase schedule** (optional): for curriculum training, rebalances
-  the mixture and scales the LR from `phase.start_step`. The phases
+  a `[[data.datasets]]` mixture and scales the LR, on any run, from
+  `phase.start_step`. The phases
   active at the step the run starts at, step 0 included, apply here, as
   does the freeze of that step. An optimizer whose state no checkpoint
   restored then starts at its scheduler's last LR times the active
@@ -249,7 +250,8 @@ once.
 
 If a mixture phase is due, `sampler.update_weights(...)` rebalances the
 MixtureSampler and `data_iter = None` forces a refresh next microbatch
-so the new weights take effect immediately.
+so the new weights take effect immediately. Without a mixture, a due
+phase sets only `phase_lr_scale`, and the iterator stays.
 
 ### 10 · Metrics and hooks
 

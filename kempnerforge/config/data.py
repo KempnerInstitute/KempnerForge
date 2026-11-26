@@ -43,8 +43,9 @@ class DatasetSource:
 class TrainingPhase:
     """A training phase with custom dataset weights and LR scaling.
 
-    Used for data annealing: at ``start_step``, the mixture sampler switches
-    to ``dataset_weights`` and the learning rate is multiplied by ``lr_scale``.
+    From ``start_step``, the learning rate is multiplied by ``lr_scale`` on any run, and
+    the sampler of a ``[[data.datasets]]`` mixture switches to ``dataset_weights``, which
+    ``JobConfig.validate`` refuses on a run that builds no mixture.
     """
 
     start_step: int = 0

@@ -5,7 +5,8 @@ and runs at its ``lr_scale``, and a ``FreezeStage`` applies from its ``start_ste
 included. An optimizer whose state no checkpoint restored, as after a checkpoint saved before
 the first update or a ``load_path`` warm start that leaves the optimizer out, steps at the
 restored schedule's rate. A resumed run steps with the rate, weights and frozen parameters of
-the uninterrupted one.
+the uninterrupted one. A run without a mixture, on one source or a VLM run, runs at each phase's
+``lr_scale`` the same way.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from kempnerforge.config.vision import VisionEncoderConfig
 from kempnerforge.config.vlm import FreezeSpec, FreezeStage, VLMConfig
 from kempnerforge.distributed.parallel import build_parallel_model
 from kempnerforge.model.transformer import Transformer
-from kempnerforge.training.data_pipeline import build_phase_state
+from kempnerforge.training.data_pipeline import DataPipeline, build_phase_state
 from kempnerforge.training.freeze import apply_freeze_specs
 from kempnerforge.training.loop import (
     StepResult,
@@ -496,4 +497,153 @@ class TestResumeParity:
             exclude=("optimizer",),
         )
         assert sorted(warm) == list(range(stop, self.MAX_STEPS))
+        assert {step: full[step] for step in warm} == warm
+
+
+class TestPhaseWithoutAMixture:
+    """A run whose pipeline builds no mixture, on one source or a VLM run, steps at each data
+    phase's ``lr_scale`` from its ``start_step`` and keeps its data iterator. The ``run_training``
+    runs have phases at step 0 (``lr_scale`` 0.5) and step 3 (0.25), and the VLM run trains the
+    adapter at 0.2 of the LR. Each record is the rate of every param group as the step starts."""
+
+    MAX_STEPS = 6
+
+    def test_a_single_source_run_steps_at_each_phases_lr_scale(self):
+        """Phases at steps 0 (``lr_scale`` 0.5) and 2 (0.25) over a constant LR of 0.05: steps 0
+        and 1 run at 0.025 and steps 2 and 3 at 0.0125, each on the source's next batch."""
+        config = make_config(max_steps=4)
+        config.data = DataConfig(
+            phases=[
+                TrainingPhase(start_step=0, lr_scale=0.5),
+                TrainingPhase(start_step=2, lr_scale=0.25),
+            ]
+        )
+        data = DataPipeline(dataloader=[{"input_ids": torch.full((2, 4), i)} for i in range(4)])
+        seen: list[tuple[int, float, int]] = []
+
+        def step_fn(session: TrainingSession, step: int) -> StepResult:
+            batch = session.batches.next_batch()
+            lr = session.optimizer.param_groups[0]["lr"]
+            seen.append((step, lr, int(batch["input_ids"][0, 0])))
+            session.model(batch["input_ids"]).float().pow(2).mean().backward()
+            return StepResult(loss=1.0, grad_norm=0.0, text_tokens=1)
+
+        phases = build_phase_state(config, data, step=0)
+        run_training_loop(make_session(config, data=data, phases=phases, step_fn=step_fn))
+        rates = [0.025, 0.025, 0.0125, 0.0125]
+        assert seen == [(step, pytest.approx(rate), step) for step, rate in enumerate(rates)]
+
+    @staticmethod
+    def _config(kind: str) -> JobConfig:
+        config = make_config() if kind == "text" else _vlm_config()
+        config.data = DataConfig(
+            phases=[
+                TrainingPhase(start_step=0, lr_scale=0.5),
+                TrainingPhase(start_step=3, lr_scale=0.25),
+            ]
+        )
+        config.optimizer.fused = False
+        config.scheduler.warmup_steps = 2
+        config.scheduler.warmup_start_factor = 0.1
+        config.scheduler.decay_steps = 10
+        if config.vlm is not None:
+            config.optimizer.lr_multipliers = {"adapter": 0.2}
+        return config
+
+    @classmethod
+    def _train(
+        cls,
+        monkeypatch: pytest.MonkeyPatch,
+        kind: str,
+        ckpt_dir: Path,
+        max_steps: int,
+        *,
+        load_path: Path | None = None,
+        exclude: tuple[str, ...] = (),
+    ) -> tuple[dict[int, list[float]], dict[str, torch.Tensor]]:
+        """Run ``run_training`` and return each step's rates and the parameters it ended with."""
+        import kempnerforge.training.entry as entry
+
+        config = cls._config(kind)
+        config.train.max_steps = max_steps
+        config.checkpoint = CheckpointConfig(
+            dir=str(ckpt_dir),
+            interval=1000,
+            load_path=str(load_path) if load_path else None,
+            exclude_from_loading=list(exclude),
+        )
+        torch.manual_seed(0)
+        model = _Model()
+        if config.vlm is not None:
+            apply_freeze_specs(model, config.vlm.freeze, config.vlm.module_patterns)
+        monkeypatch.setattr(entry, "setup_distributed", lambda _config: _runtime())
+        monkeypatch.setattr(entry, "ShutdownHandler", lambda **_kw: FakeShutdownHandler())
+        monkeypatch.setattr(entry, "build_model", lambda *_a, **_k: (model, None))
+        monkeypatch.setattr(entry, "build_profiler", lambda *_a, **_k: None)
+        monkeypatch.setattr(entry, "build_data_pipeline", lambda *_a, **_k: DataPipeline())
+        monkeypatch.setattr(entry, "build_eval_dataloader", lambda *_a, **_k: None)
+        monkeypatch.setattr(entry, "destroy_distributed", lambda: None)
+        records: dict[int, list[float]] = {}
+
+        def step_fn(session: TrainingSession, step: int) -> StepResult:
+            records[step] = [group["lr"] for group in session.optimizer.param_groups]
+            loss = model.transformer(model.adapter(model.vision_encoder(torch.ones(2, DIM))))
+            loss = loss.square().mean()
+            loss.backward()
+            return StepResult(loss=loss.item(), grad_norm=0.0, text_tokens=1)
+
+        entry.run_training(config, step_fn=step_fn)
+        return records, {name: p.detach().clone() for name, p in model.named_parameters()}
+
+    @pytest.mark.parametrize("kind", ["text", "vlm"])
+    def test_a_fresh_run_steps_at_the_schedule_times_each_phases_scale(
+        self, tmp_path, monkeypatch, kind
+    ):
+        """Every param group runs at the schedule's rate times its LR multiplier times the
+        active phase's ``lr_scale``; the config passes validation."""
+        config = self._config(kind)
+        config.validate(world_size=1)
+        records, _ = self._train(monkeypatch, kind, tmp_path / "run", self.MAX_STEPS)
+        probe = torch.optim.SGD([nn.Parameter(torch.zeros(1))], lr=config.optimizer.lr)
+        scheduler = build_scheduler(probe, config.scheduler, self.MAX_STEPS)
+        multipliers = [0.2, 1.0] if kind == "vlm" else [1.0]
+        assert sorted(records) == list(range(self.MAX_STEPS))
+        for step, rates in records.items():
+            phase_scale = 0.5 if step < 3 else 0.25
+            scheduled = scheduler.get_last_lr()[0] * phase_scale
+            assert sorted({round(rate / scheduled, 9) for rate in rates}) == multipliers, step
+            probe.step()
+            scheduler.step()
+
+    @pytest.mark.parametrize(
+        ("kind", "stop"),
+        [("text", 2), ("text", 3), ("text", 4), ("vlm", 3)],
+        ids=lambda value: str(value),
+    )
+    def test_a_resume_steps_as_the_uninterrupted_run(self, tmp_path, monkeypatch, kind, stop):
+        """Saved before (2), at (3) and after (4) the step-3 boundary, with optimizer state."""
+        full, full_params = self._train(monkeypatch, kind, tmp_path / "full", self.MAX_STEPS)
+        self._train(monkeypatch, kind, tmp_path / "split", stop)
+        resumed, resumed_params = self._train(monkeypatch, kind, tmp_path / "split", self.MAX_STEPS)
+        assert sorted(resumed) == list(range(stop, self.MAX_STEPS))
+        assert {step: full[step] for step in resumed} == resumed
+        for name, param in full_params.items():
+            assert torch.equal(resumed_params[name], param), name
+
+    def test_a_warm_start_without_the_optimizer_steps_at_the_phase_lr_scale(
+        self, tmp_path, monkeypatch
+    ):
+        """A ``load_path`` warm start from step 3 that leaves the optimizer out runs each step
+        at the uninterrupted run's rates."""
+        full, _ = self._train(monkeypatch, "text", tmp_path / "full", self.MAX_STEPS)
+        self._train(monkeypatch, "text", tmp_path / "first", 3)
+        warm, _ = self._train(
+            monkeypatch,
+            "text",
+            tmp_path / "second",
+            self.MAX_STEPS,
+            load_path=tmp_path / "first" / "step_3",
+            exclude=("optimizer",),
+        )
+        assert sorted(warm) == list(range(3, self.MAX_STEPS))
         assert {step: full[step] for step in warm} == warm

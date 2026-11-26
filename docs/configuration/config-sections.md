@@ -188,8 +188,8 @@ Single dataset, HuggingFace source, or mixture; optional phase schedule.
 | `pack_sequences` | `bool` | `False` | document-aware packing with cross-doc isolation (feeds `doc_ids` to attention); on a Joint-Decoder VLM run, packs `train.batch_size` image-text documents per micro-batch into rows of `train.seq_len`, each document's image tokens before its text, positions restarting per document |
 | `datasets` | `list[DatasetSource]` | `[]` | multi-dataset mixture (overrides `dataset_path`/`hf_dataset_name` when non-empty) |
 | `mix_temperature` | `float` | `1.0` | weight scaling; `1.0` → as-is, larger → more uniform |
-| `phases` | `list[TrainingPhase]` | `[]` | multi-phase schedule with weight/LR transitions |
-| `anneal_start_step` | `int` | `0` | syntactic sugar for a common 2-phase annealing pattern (`0` = disabled) |
+| `phases` | `list[TrainingPhase]` | `[]` | multi-phase schedule: LR scaling on any run, weight transitions on a `datasets` mixture |
+| `anneal_start_step` | `int` | `0` | syntactic sugar for a common 2-phase annealing pattern of a `datasets` mixture (`0` = disabled) |
 | `anneal_weights` | `dict[str, float]` | `{}` | per-dataset weights applied at `anneal_start_step` |
 
 A `[video]` run builds its dataset from `[video]`, so every `hf_*` field keeps
@@ -214,11 +214,14 @@ Either `path` or `hf_name` must be set per source.
 | Field | Type | Default | Purpose |
 |-------|------|---------|---------|
 | `start_step` | `int` | `0` | step at which the phase activates |
-| `dataset_weights` | `dict[str, float]` | `{}` | per-dataset weights for this phase |
-| `lr_scale` | `float` | `1.0` | multiplier applied to scheduler LR |
+| `dataset_weights` | `dict[str, float]` | `{}` | per-dataset weights for this phase; needs a `datasets` mixture |
+| `lr_scale` | `float` | `1.0` | multiplier applied to scheduler LR, with or without a mixture |
 
 `phases[*].start_step` must be strictly increasing; `phases` and
-`anneal_start_step` are mutually exclusive.
+`anneal_start_step` are mutually exclusive. A run without a `datasets`
+mixture, on one source or a VLM run, takes neither a phase's
+`dataset_weights` nor the annealing shortcut; see
+[Validation rules](validation-rules.md#mixture-weights-without-a-mixture).
 
 ## `[eval]`: `EvalConfig`
 
