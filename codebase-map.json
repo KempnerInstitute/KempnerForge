@@ -119,7 +119,10 @@
           "purpose": "Step-triggered phase with dataset weight overrides and LR scaling for data annealing"
         },
         "DataConfig": {
-          "purpose": "Data pipeline (dataset_path, HF dataset, tokenizer, packing, mixing, phases, annealing)"
+          "purpose": "Data pipeline (dataset_path, HF dataset, tokenizer, packing, mixing, phases, annealing)",
+          "methods": [
+            "mixture_weight_fields() -> list[str] (the phase and anneal settings that reweight a mixture; JobConfig.validate and build_phase_state refuse them without one)"
+          ]
         }
       }
     },
@@ -2071,9 +2074,9 @@
           "TestUpdateWeights(4)",
           "TestPhaseTransitionLogic(5)",
           "TestAnnealingShortcut(4)",
-          "TestMixtureWeightsNeedAMixture(6)"
+          "TestMixtureWeightsNeedAMixture(7)"
         ],
-        "count": 38
+        "count": 39
       },
       "tests/unit/test_hooks.py": {
         "classes": [

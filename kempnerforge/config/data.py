@@ -122,3 +122,18 @@ class DataConfig:
                 "Cannot use both data.phases and data.anneal_start_step; "
                 "use phases for multi-phase scheduling"
             )
+
+    def mixture_weight_fields(self) -> list[str]:
+        """The settings that reweight a ``[[data.datasets]]`` mixture, named for an error.
+
+        Each phase that sets ``dataset_weights``, and ``anneal_start_step`` with
+        ``anneal_weights`` when the two make a phase. A run without a mixture refuses them.
+        """
+        fields = [
+            f"data.phases[{i}].dataset_weights"
+            for i, phase in enumerate(self.phases)
+            if phase.dataset_weights
+        ]
+        if self.anneal_start_step > 0 and self.anneal_weights:
+            fields.append("data.anneal_start_step and data.anneal_weights")
+        return fields

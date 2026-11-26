@@ -306,13 +306,7 @@ class JobConfig:
                 f"batches through the training schedule, grad_accum_steps at a time."
             )
 
-        weighted = [
-            f"data.phases[{i}].dataset_weights"
-            for i, phase in enumerate(self.data.phases)
-            if phase.dataset_weights
-        ]
-        if self.data.anneal_start_step > 0 and self.data.anneal_weights:
-            weighted.append("data.anneal_start_step and data.anneal_weights")
+        weighted = self.data.mixture_weight_fields()
         if weighted and (self.is_vlm or not self.data.datasets):
             if self.is_vlm:
                 reason, remedy = "a VLM run never builds one", "Remove the weights"

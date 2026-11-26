@@ -510,7 +510,19 @@ def build_phase_state(config: JobConfig, data: DataPipeline, step: int) -> Phase
     the ``lr_scale``, and on a mixture the sampler weights, the first step of a fresh run
     uses, and a resume re-derives the phase it stopped in. The ``lr_scale`` applies with or
     without a mixture.
+
+    Raises:
+        ValueError: The config sets mixture weights (``DataConfig.mixture_weight_fields``)
+            and ``data`` has no mixture, whichever builder made it.
     """
+    weighted = config.data.mixture_weight_fields()
+    if weighted and data.mixture_sampler is None:
+        raise ValueError(
+            f"{', '.join(weighted)} would reweight a mixture, but the training data pipeline "
+            "has none, so the weights would be ignored. Train on a [[data.datasets]] mixture "
+            "or a pipeline with mixture_dataset, mixture_sampler and mixture_weights, or "
+            "remove the weights; a data phase's lr_scale applies without a mixture."
+        )
     phases: list[TrainingPhase] = []
     if config.data.phases:
         phases = sorted(config.data.phases, key=lambda p: p.start_step)

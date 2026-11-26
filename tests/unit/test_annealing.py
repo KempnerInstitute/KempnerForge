@@ -497,6 +497,23 @@ class TestMixtureWeightsNeedAMixture:
         shortcut = DataConfig(datasets=sources, anneal_start_step=7, anneal_weights={"b": 3.0})
         JobConfig(data=shortcut).validate(world_size=1)
 
+    def test_the_settings_that_set_mixture_weights(self):
+        """Each phase with ``dataset_weights``, and the annealing shortcut only when its two
+        fields make a phase."""
+        phases = [
+            TrainingPhase(start_step=0, lr_scale=0.5),
+            TrainingPhase(start_step=5, dataset_weights={"a": 2.0}),
+            TrainingPhase(start_step=9, dataset_weights={}),
+        ]
+        assert DataConfig(phases=phases).mixture_weight_fields() == [
+            "data.phases[1].dataset_weights"
+        ]
+        shortcut = DataConfig(anneal_start_step=7, anneal_weights={"a": 2.0})
+        assert shortcut.mixture_weight_fields() == [
+            "data.anneal_start_step and data.anneal_weights"
+        ]
+        assert DataConfig(anneal_weights={"a": 2.0}).mixture_weight_fields() == []
+
     def test_the_mixture_may_come_from_the_command_line(self, tmp_path):
         """The check reads the config after the overrides: phase weights in the TOML pass with
         the sources given on the command line, and are refused without them."""

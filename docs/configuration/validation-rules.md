@@ -361,7 +361,10 @@ weights for one would be dropped silently. The error names each field and asks
 for the sources as `[[data.datasets]]` tables (not offered on a VLM run) or the
 weights' removal. A phase's `lr_scale` needs no mixture: it scales the LR on
 any run. The check runs here, on the config after the CLI overrides, so a TOML
-can leave the sources to `--data.datasets`.
+can leave the sources to `--data.datasets`. `DataConfig.mixture_weight_fields`
+lists the fields. At startup, `build_phase_state` refuses the same fields
+again when the data pipeline it is given has no mixture, whichever builder made
+it.
 
 ### VLM architectures under tensor parallelism
 
